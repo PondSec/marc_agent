@@ -261,6 +261,7 @@ class AppConfig:
         data["memory_dir"] = str(self.memory_dir_path)
         data["helper_dir"] = str(self.helper_dir_path)
         data["full_access"] = self.full_access
+        data["path_scope"] = "system" if self.full_access else "workspace"
         data["branding"] = {
             "name": AGENT_NAME,
             "full_name": AGENT_FULL_NAME,

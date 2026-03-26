@@ -21,6 +21,7 @@ DEFAULT_IGNORES = {
     ".venv",
     "venv",
     ".local_codex_agent",
+    ".marc_a1",
     ".DS_Store",
 }
 
@@ -30,21 +31,28 @@ class WorkspaceError(RuntimeError):
 
 
 class WorkspaceManager:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, allow_outside_root: bool = False):
         self.root = Path(root).expanduser().resolve()
+        self.allow_outside_root = allow_outside_root
         self.root.mkdir(parents=True, exist_ok=True)
 
     def relative_path(self, path: str | Path) -> str:
         resolved = self.resolve_path(path)
-        return resolved.relative_to(self.root).as_posix()
+        return self.display_path(resolved)
+
+    def display_path(self, path: str | Path) -> str:
+        resolved = Path(path).expanduser().resolve(strict=False)
+        if self.is_within_root(resolved):
+            return resolved.relative_to(self.root).as_posix()
+        return str(resolved)
 
     def resolve_path(self, path: str | Path) -> Path:
         target = Path(path)
         if not target.is_absolute():
-            target = (self.root / target).resolve()
+            target = (self.root / target).resolve(strict=False)
         else:
-            target = target.expanduser().resolve()
-        if not self.is_within_root(target):
+            target = target.expanduser().resolve(strict=False)
+        if not self.allow_outside_root and not self.is_within_root(target):
             raise WorkspaceError(f"Path escapes workspace root: {path}")
         return target
 
@@ -55,15 +63,15 @@ class WorkspaceManager:
         return resolved
 
     def is_within_root(self, path: str | Path) -> bool:
-        candidate = Path(path).expanduser().resolve()
+        candidate = Path(path).expanduser().resolve(strict=False)
         try:
             candidate.relative_to(self.root)
             return True
         except ValueError:
             return False
 
-    def should_ignore(self, relative_path: str) -> bool:
-        parts = Path(relative_path).parts
+    def should_ignore(self, display_path: str) -> bool:
+        parts = Path(display_path).parts
         if any(part in DEFAULT_IGNORES for part in parts):
             return True
         return False
@@ -84,13 +92,13 @@ class WorkspaceManager:
                 break
             if not candidate.is_file():
                 continue
-            relative = candidate.relative_to(self.root).as_posix()
-            if self.should_ignore(relative):
+            display = self.display_path(candidate)
+            if self.should_ignore(display):
                 continue
-            if glob_pattern and not fnmatch.fnmatch(relative, glob_pattern):
+            if glob_pattern and not fnmatch.fnmatch(display, glob_pattern):
                 continue
-            results.append(candidate)
-        return sorted(results, key=lambda path: path.relative_to(self.root).as_posix())
+            results.append(candidate.resolve(strict=False))
+        return sorted(results, key=lambda path: self.display_path(path))
 
     def read_text(self, path: str | Path) -> str:
         target = self.resolve_path(path)

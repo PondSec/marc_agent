@@ -17,7 +17,7 @@ from tools.shell import ShellTools
 def build_dispatcher(tmp_path, *, access_mode: str) -> ToolDispatcher:
     config = AppConfig(workspace_root=str(tmp_path), access_mode=access_mode).normalized()
     config.ensure_state_dirs()
-    workspace = WorkspaceManager(tmp_path)
+    workspace = WorkspaceManager(tmp_path, allow_outside_root=config.full_access)
     safety = SafetyManager(config, workspace)
     memory = RepoMemoryStore(config, workspace)
     filesystem = FileSystemTools(config, workspace, safety)
@@ -43,10 +43,28 @@ def test_safe_mode_blocks_write_tools(tmp_path):
     assert "safe mode" in result.message.lower()
 
 
+def test_approval_mode_still_blocks_writing_outside_workspace(tmp_path, tmp_path_factory):
+    dispatcher = build_dispatcher(tmp_path, access_mode="approval")
+    external_dir = tmp_path_factory.mktemp("external_approval")
+    external_file = external_dir / "blocked.txt"
+
+    result = dispatcher.dispatch(
+        "write_file",
+        WriteFileArgs(path=str(external_file), content="blocked").model_dump(),
+        iteration=1,
+    )
+
+    assert result.success is False
+    assert "escapes workspace root" in result.message.lower()
+
+
 def test_full_access_allows_medium_shell_commands(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
     config.ensure_state_dirs()
-    safety = SafetyManager(config, WorkspaceManager(tmp_path))
+    safety = SafetyManager(
+        config,
+        WorkspaceManager(tmp_path, allow_outside_root=config.full_access),
+    )
 
     assessment = safety.assess_shell_command("mkdir build")
 
@@ -63,3 +81,19 @@ def test_approval_mode_blocks_medium_shell_commands(tmp_path):
 
     assert assessment.allowed is False
     assert assessment.risk_level == "medium"
+
+
+def test_full_access_allows_writing_outside_workspace(tmp_path, tmp_path_factory):
+    dispatcher = build_dispatcher(tmp_path, access_mode="full")
+    external_dir = tmp_path_factory.mktemp("external_full")
+    external_file = external_dir / "global.txt"
+
+    result = dispatcher.dispatch(
+        "write_file",
+        WriteFileArgs(path=str(external_file), content="global").model_dump(),
+        iteration=1,
+    )
+
+    assert result.success is True
+    assert external_file.read_text(encoding="utf-8") == "global"
+    assert str(external_file) in result.changed_files[0].path

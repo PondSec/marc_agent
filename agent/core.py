@@ -44,7 +44,10 @@ class AgentCore:
     def __init__(self, config: AppConfig):
         self.config = config
         self.config.ensure_state_dirs()
-        self.workspace = WorkspaceManager(config.workspace_root)
+        self.workspace = WorkspaceManager(
+            config.workspace_root,
+            allow_outside_root=config.full_access,
+        )
         self.safety = SafetyManager(config, self.workspace)
         self.memory = RepoMemoryStore(config, self.workspace)
         self.session_store = SessionStore(config.session_dir_path)

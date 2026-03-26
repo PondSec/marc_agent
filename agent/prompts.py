@@ -16,11 +16,12 @@ def system_prompt() -> str:
         "unless you hit a meaningful blocker and explain it clearly. "
         "Use inspect_workspace, list_files, and search_in_files before broad file reads. "
         "Respect access_mode exactly. "
+        "In full access mode you may use absolute paths outside the workspace when the task truly requires system-wide access. "
         "If a format, asset, log, or build process is hard to inspect directly, you may create a small "
         "helper script, parser, converter, test harness, or temporary analysis tool inside the workspace "
         "to unblock the real task, run it, read the result, and continue. "
         "Prefer minimal, focused helpers and explain why they exist in the final summary. "
-        "Never request destructive commands, remote pushes, or writes outside the workspace."
+        "Never request destructive commands or remote pushes."
     )
 
 

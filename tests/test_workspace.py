@@ -21,3 +21,15 @@ def test_workspace_lists_only_internal_files(tmp_path):
     files = workspace.iter_files()
 
     assert [path.relative_to(tmp_path).as_posix() for path in files] == ["src/app.py"]
+
+
+def test_workspace_full_mode_can_resolve_absolute_path_outside_root(tmp_path, tmp_path_factory):
+    external_dir = tmp_path_factory.mktemp("workspace_external")
+    external_file = external_dir / "outside.txt"
+    external_file.write_text("ok", encoding="utf-8")
+    workspace = WorkspaceManager(tmp_path, allow_outside_root=True)
+
+    resolved = workspace.resolve_path(str(external_file))
+
+    assert resolved == external_file.resolve()
+    assert workspace.display_path(resolved) == str(external_file.resolve())

@@ -59,40 +59,61 @@ class InspectWorkspaceArgs(StrictModel):
 
 
 class ListFilesArgs(StrictModel):
-    path: str = Field(default=".", description="Directory path relative to the workspace root.")
+    path: str = Field(
+        default=".",
+        description="Directory path relative to the workspace root, or absolute in full access mode.",
+    )
     glob: str | None = Field(default=None, description="Optional glob filter.")
     recursive: bool = Field(default=True, description="Whether to recurse into subdirectories.")
     max_results: int = Field(default=200, description="Maximum number of returned paths.")
 
 
 class ReadFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     start_line: int | None = Field(default=None, description="Optional first line to read.")
     end_line: int | None = Field(default=None, description="Optional last line to read.")
 
 
 class WriteFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     content: str = Field(..., description="Full file content to write.")
 
 
 class AppendFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     content: str = Field(..., description="Text to append.")
 
 
 class CreateFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     content: str = Field(default="", description="Initial file content.")
     overwrite: bool = Field(default=False, description="Allow replacing an existing file.")
 
 
 class DeleteFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
 
 
 class ReplaceInFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     find: str = Field(..., description="Literal text to replace.")
     replace: str = Field(..., description="Replacement text.")
     count: int = Field(default=0, description="Maximum replacements; 0 means all.")
@@ -108,18 +129,27 @@ class TextPatch(StrictModel):
 
 
 class PatchFileArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     patches: list[TextPatch] = Field(..., description="Ordered patch operations.")
 
 
 class ShowDiffArgs(StrictModel):
-    path: str = Field(..., description="File path relative to the workspace root.")
+    path: str = Field(
+        ...,
+        description="File path relative to the workspace root, or absolute in full access mode.",
+    )
     new_content: str = Field(..., description="Candidate content to compare against disk.")
 
 
 class SearchInFilesArgs(StrictModel):
     query: str = Field(..., description="Literal or regex search query.")
-    path: str = Field(default=".", description="Directory path relative to the workspace root.")
+    path: str = Field(
+        default=".",
+        description="Directory path relative to the workspace root, or absolute in full access mode.",
+    )
     regex: bool = Field(default=False, description="Interpret query as a regex.")
     glob: str | None = Field(default=None, description="Optional glob filter.")
     case_sensitive: bool = Field(default=False, description="Case-sensitive matching.")
@@ -128,13 +158,19 @@ class SearchInFilesArgs(StrictModel):
 
 class RunShellArgs(StrictModel):
     command: str = Field(..., description="Shell command to execute.")
-    cwd: str = Field(default=".", description="Working directory relative to the workspace root.")
+    cwd: str = Field(
+        default=".",
+        description="Working directory relative to the workspace root, or absolute in full access mode.",
+    )
     timeout: int | None = Field(default=None, description="Timeout in seconds.")
 
 
 class RunTestsArgs(StrictModel):
     command: str = Field(..., description="Targeted test, lint, typecheck, or build command.")
-    cwd: str = Field(default=".", description="Working directory relative to the workspace root.")
+    cwd: str = Field(
+        default=".",
+        description="Working directory relative to the workspace root, or absolute in full access mode.",
+    )
     timeout: int | None = Field(default=None, description="Timeout in seconds.")
 
 

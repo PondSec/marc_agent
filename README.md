@@ -57,7 +57,7 @@ Die Runtime hat jetzt ein klares Zugriffsmodell:
 - `approval`
   Normale Coding-Edits ueber File-Tools sind erlaubt, medium/high-risk Shell- oder Git-Mutationen werden geblockt.
 - `full`
-  Volle agentische Arbeitsweise im erlaubten Workspace: Dateien aendern, Verifikationskommandos ausfuehren, Fix-Loops fahren und lokale Git-Mutationen wie Branch-Erstellung nutzen. Harte Sicherheitsblocker bleiben aktiv.
+  Systemweiter Modus: Dateien lesen und aendern auch ausserhalb von `workspace_root`, absolute Pfade verwenden, Shell-Kommandos auch ausserhalb des Repo ausfuehren und lokal autonom arbeiten. Harte Katastrophen-Blocker bleiben aktiv.
 
 Die zentrale Einstellung ist:
 
@@ -199,6 +199,10 @@ python main.py --access-mode full
 python main.py --dry-run
 ```
 
+Hinweis:
+
+- In `full` koennen Tools und Shell-Kommandos auch absolute Systempfade ausserhalb des Workspace verwenden.
+
 ## CLI
 
 ```bash
@@ -254,12 +258,13 @@ Details stehen in [CONTRIBUTING.md](/Users/pond/Documents/agent_ai/CONTRIBUTING.
 
 Die Runtime bleibt lokal, aber defensiv:
 
-- alle Pfade werden auf den Workspace begrenzt
+- `safe` und `approval` bleiben auf den Workspace begrenzt
+- `full` hebt die Pfadbegrenzung auf und erlaubt systemweiten Dateizugriff
 - harte Shell-Blocker fuer destruktive Kommandos bleiben aktiv
 - Netzwerkzugriff ist standardmaessig aus
 - `safe` blockiert Mutationen
 - `approval` blockiert medium/high-risk Shell-Mutationen
-- `full` erlaubt autonomes Arbeiten, aber keine Hard-Block-Aktionen
+- `full` erlaubt autonomes Arbeiten systemweit, aber keine Hard-Block-Aktionen
 - alle Tool-Calls und Entscheidungen werden geloggt
 - Session-Diffs werden gespeichert und in der GUI angezeigt
 
