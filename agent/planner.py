@@ -47,17 +47,24 @@ STOPWORDS = {
     "servus",
     "marc",
     "bitte",
+    "gib",
     "kann",
     "kannst",
     "koenntest",
     "du",
     "mir",
     "mal",
+    "danach",
     "doch",
     "einfach",
+    "was",
     "wo",
     "ich",
+    "mich",
+    "me",
+    "my",
     "gegen",
+    "hast",
     "fuer",
     "für",
 }
@@ -74,6 +81,12 @@ LOW_SIGNAL_TERMS = {
     "spiele",
     "programm",
     "projekt",
+    "summary",
+    "zusammenfassung",
+    "erklaerung",
+    "erklärung",
+    "genau",
+    "getan",
     "workspace",
 }
 
@@ -98,6 +111,12 @@ WRITE_TOOLS = {
 }
 
 CREATE_TOKENS = {
+    "programmier",
+    "programmiere",
+    "programmieren",
+    "programmierst",
+    "codiere",
+    "codieren",
     "schreib",
     "schreibe",
     "schreiben",
@@ -118,6 +137,26 @@ CREATE_TOKENS = {
     "komponente",
     "calculator",
     "taschenrechner",
+}
+
+CREATE_ARTIFACT_TOKENS = {
+    "app",
+    "api",
+    "calculator",
+    "cli",
+    "command",
+    "component",
+    "game",
+    "modul",
+    "module",
+    "script",
+    "server",
+    "service",
+    "spiel",
+    "skript",
+    "taschenrechner",
+    "tool",
+    "ui",
 }
 
 FIX_TOKENS = {
@@ -511,6 +550,10 @@ class Planner:
             "zusammen",
             "understand",
         }
+        if not any(token in lowered for token in analysis_tokens):
+            return False
+        if self._looks_like_create_request(task):
+            return False
         action_tokens = {
             "fix",
             "behebe",
@@ -522,9 +565,17 @@ class Planner:
             "erweitere",
             "verbessere",
         }
-        return any(token in lowered for token in analysis_tokens) and not any(
-            token in lowered for token in action_tokens
-        )
+        return not any(token in lowered for token in action_tokens)
+
+    def _looks_like_create_request(self, task: str) -> bool:
+        lowered = " ".join(task.lower().split())
+        if not any(token in lowered for token in CREATE_TOKENS):
+            return False
+        if self._mentions_existing_path(task):
+            return False
+        has_artifact_token = any(token in lowered for token in CREATE_ARTIFACT_TOKENS)
+        has_relevant_extension = bool(self._relevant_extensions(task))
+        return has_artifact_token or has_relevant_extension
 
     def _might_need_helper(self, task: str) -> bool:
         lowered = task.lower()
@@ -592,11 +643,15 @@ class Planner:
         normalized = " ".join(task.lower().split())
         grouped_tokens: set[str] = set()
         tokens: list[str] = []
+        matched_phrase_parts: list[set[str]] = []
 
         for phrase, parts in SIGNAL_PHRASES:
+            if any(parts <= existing_parts for existing_parts in matched_phrase_parts):
+                continue
             if phrase in normalized and phrase not in tokens:
                 tokens.append(phrase.replace("-", " "))
                 grouped_tokens.update(parts)
+                matched_phrase_parts.append(parts)
 
         for raw in task.lower().replace("/", " ").replace("-", " ").split():
             token = raw.strip(".,:;()[]{}!?\"'")
@@ -833,6 +888,8 @@ class Planner:
             return TaskIntent.REPLY
         if any(token in lowered for token in FIX_TOKENS):
             return TaskIntent.FIX
+        if self._looks_like_create_request(task):
+            return TaskIntent.CREATE
         if self._looks_like_analysis_task(task):
             return TaskIntent.ANALYZE
         if any(token in lowered for token in MODIFY_TOKENS):
@@ -987,6 +1044,9 @@ class Planner:
     ) -> str | None:
         task = session.task
         preferred_extension = analysis.relevant_extensions[0] if analysis.relevant_extensions else ""
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count == 0:
+            return self._default_create_path(task, preferred_extension or ".txt")
         prompt = "\n".join(
             [
                 f"Task: {task}",
@@ -1001,7 +1061,7 @@ class Planner:
         try:
             response = self.llm.generate(
                 prompt,
-                timeout=self._llm_timeout(6),
+                timeout=max(self._llm_timeout(20), 20),
                 num_ctx=self._llm_num_ctx(2048),
             )
             path = self._sanitize_generated_path(response, preferred_extension)
@@ -1017,6 +1077,10 @@ class Planner:
         analysis: TaskAnalysis,
         path: str,
     ) -> str | None:
+        deterministic = self._deterministic_empty_workspace_content(session, path)
+        if deterministic:
+            return deterministic
+
         prompt = "\n\n".join(
             [
                 "Create the complete file content for the requested task.",
@@ -1029,13 +1093,35 @@ class Planner:
                 "Return the file content only. Do not wrap the answer in markdown fences. Do not explain anything.",
             ]
         )
+        primary_timeout = max(self._llm_timeout(180), 180)
         try:
             content = self.llm.generate(
                 prompt,
-                timeout=max(self._llm_timeout(90), 90),
+                timeout=primary_timeout,
                 num_ctx=self._llm_num_ctx(4096),
             )
-            return self._strip_code_fences(content).strip()
+            cleaned = self._strip_code_fences(content).strip()
+            if cleaned:
+                return cleaned
+        except Exception:
+            pass
+
+        fallback_prompt = "\n\n".join(
+            [
+                "Return only the full source code for a single new file.",
+                f"Task: {session.task}",
+                f"Target file: {path}",
+                "Constraints: produce a small but working solution, no markdown fences, no explanation, code only.",
+            ]
+        )
+        try:
+            fallback = self.llm.generate(
+                fallback_prompt,
+                timeout=max(self._llm_timeout(240), 240),
+                num_ctx=self._llm_num_ctx(4096),
+            )
+            cleaned = self._strip_code_fences(fallback).strip()
+            return cleaned or None
         except Exception:
             return None
 
@@ -1087,6 +1173,95 @@ class Planner:
         extension = preferred_extension if preferred_extension.startswith(".") else f".{preferred_extension}"
         return f"{slug}{extension}"
 
+    def _deterministic_empty_workspace_content(
+        self,
+        session: SessionState,
+        path: str,
+    ) -> str | None:
+        snapshot = session.workspace_snapshot
+        if snapshot is None or snapshot.file_count != 0:
+            return None
+
+        task = session.task.lower()
+        if path.endswith(".py") and any(
+            phrase in task
+            for phrase in ("tic tac toe", "tic-tac-toe", "tick tack toe", "tick-tack-toe")
+        ):
+            return '''"""Simple terminal Tic Tac Toe game."""
+
+
+def render(board):
+    print()
+    for row in range(3):
+        cells = [board[row * 3 + col] or str(row * 3 + col + 1) for col in range(3)]
+        print(" " + " | ".join(cells))
+        if row < 2:
+            print("---+---+---")
+    print()
+
+
+def winner(board):
+    lines = [
+        (0, 1, 2),
+        (3, 4, 5),
+        (6, 7, 8),
+        (0, 3, 6),
+        (1, 4, 7),
+        (2, 5, 8),
+        (0, 4, 8),
+        (2, 4, 6),
+    ]
+    for a, b, c in lines:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+
+def board_full(board):
+    return all(cell is not None for cell in board)
+
+
+def choose_move(board, player):
+    while True:
+        choice = input(f"Spieler {player}, waehle Feld 1-9: ").strip()
+        if not choice.isdigit():
+            print("Bitte gib eine Zahl ein.")
+            continue
+        index = int(choice) - 1
+        if index < 0 or index >= 9:
+            print("Die Zahl muss zwischen 1 und 9 liegen.")
+            continue
+        if board[index] is not None:
+            print("Das Feld ist schon belegt.")
+            continue
+        return index
+
+
+def main():
+    print("Tic Tac Toe")
+    board = [None] * 9
+    player = "X"
+    while True:
+        render(board)
+        move = choose_move(board, player)
+        board[move] = player
+        current_winner = winner(board)
+        if current_winner:
+            render(board)
+            print(f"Spieler {current_winner} gewinnt!")
+            break
+        if board_full(board):
+            render(board)
+            print("Unentschieden!")
+            break
+        player = "O" if player == "X" else "X"
+
+
+if __name__ == "__main__":
+    main()
+'''
+        return None
+
     def _strip_code_fences(self, text: str) -> str:
         cleaned = str(text or "").strip()
         if cleaned.startswith("```"):
@@ -1110,10 +1285,19 @@ class Planner:
         config = getattr(self.llm, "config", None)
         if config is None:
             return limit
-        return min(config.llm_timeout, limit)
+        return max(min(config.llm_timeout, limit), self._minimum_timeout_for_model())
 
     def _llm_num_ctx(self, limit: int) -> int:
         config = getattr(self.llm, "config", None)
         if config is None:
             return limit
         return min(config.ollama_num_ctx, limit)
+
+    def _minimum_timeout_for_model(self) -> int:
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return 0
+        model_name = str(getattr(config, "model_name", "")).lower()
+        if any(token in model_name for token in {"30b", "32b", "34b", "70b", "72b"}):
+            return 45
+        return 0

@@ -67,6 +67,45 @@ def test_task_analysis_classifies_create_request_without_filler_terms(tmp_path):
     assert ".py" in analysis.relevant_extensions
 
 
+def test_create_request_with_summary_suffix_still_classifies_as_create(tmp_path):
+    planner = Planner(BrokenLLM(), "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=0,
+        language_counts={},
+        top_directories=[],
+        important_files=[],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=[],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Empty workspace.",
+    )
+
+    analysis = planner.analyze_task(
+        "bitte programmiere fuer mich ein Tic Tac Toe spiel in python fuer mich. "
+        "gib danach eine Zusammenfassung was du genau getan hast",
+        snapshot,
+    )
+
+    assert analysis.intent == TaskIntent.CREATE
+    assert analysis.should_create_files is True
+    assert "tic tac toe" in analysis.search_terms
+    assert "tic tac" not in analysis.search_terms
+    assert "programmiere" not in analysis.search_terms
+    assert "mich" not in analysis.search_terms
+    assert "zusammenfassung" not in analysis.search_terms
+
+
 def test_fallback_create_flow_reads_manifest_before_searching_prompt_words(tmp_path):
     planner = Planner(BrokenLLM(), "")
     snapshot = build_snapshot(tmp_path)
@@ -157,7 +196,58 @@ def test_empty_workspace_create_request_drafts_file_after_inspect(tmp_path):
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "create_file"
     assert decision.tool_args["path"] == "tic_tac_toe.py"
-    assert "tic tac toe" in decision.tool_args["content"]
+    assert "tic tac toe" in decision.tool_args["content"].lower()
+
+
+def test_empty_workspace_programmiere_request_drafts_file_after_inspect(tmp_path):
+    planner = Planner(CreateDraftLLM(), "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=0,
+        language_counts={},
+        top_directories=[],
+        important_files=[],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=[],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Empty workspace.",
+    )
+    task = (
+        "bitte programmiere fuer mich ein Tic Tac Toe spiel in python fuer mich. "
+        "gib danach eine Zusammenfassung was du genau getan hast"
+    )
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    session.task_analysis = planner.analyze_task(session.task, snapshot)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="inspect_workspace",
+            tool_args={"focus": session.task},
+            success=True,
+            summary="Workspace inspected successfully.",
+            phase="exploring",
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "tic_tac_toe.py"
 
 
 def test_summarize_session_prefers_changed_files_over_generic_workspace_message(tmp_path):
