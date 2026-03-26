@@ -36,11 +36,14 @@ class Planner:
         self.llm = llm
         self.tool_manifest = tool_manifest
         self.logger = logger
+        llm_config = getattr(self.llm, "config", None)
         self.router = IntentRouter(
             llm,
             logger=logger,
-            timeout=self._llm_timeout(12),
-            num_ctx=self._llm_num_ctx(4096),
+            model_name=getattr(llm_config, "router_model_name", None),
+            timeout=max(int(getattr(llm_config, "router_timeout", self._llm_timeout(12))), 12),
+            num_ctx=max(int(getattr(llm_config, "router_num_ctx", 2048)), 512),
+            retries=max(int(getattr(llm_config, "router_retries", 1)), 0),
         )
 
     def interpret_user_request(

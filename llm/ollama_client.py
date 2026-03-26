@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
 from typing import Any, Iterator
 from urllib import error, request
 
@@ -67,11 +69,16 @@ class OllamaClient:
         *,
         system: str | None = None,
         expect_json: bool = False,
+        model: str | None = None,
+        retries: int | None = None,
         timeout: int | None = None,
         num_ctx: int | None = None,
     ) -> str:
+        effective_model = str(model or self.config.model_name)
+        effective_timeout = timeout or self.config.llm_timeout
+        effective_retries = self.config.llm_request_retries if retries is None else max(int(retries), 0)
         payload: dict[str, Any] = {
-            "model": self.config.model_name,
+            "model": effective_model,
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -93,25 +100,39 @@ class OllamaClient:
             method="POST",
         )
 
-        try:
-            with request.urlopen(req, timeout=timeout or self.config.llm_timeout) as response:
-                raw = response.read().decode("utf-8")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise OllamaClientError(f"Ollama HTTP {exc.code}: {detail}") from exc
-        except error.URLError as exc:
-            raise OllamaClientError(f"Could not reach Ollama at {target}: {exc}") from exc
+        last_exception: Exception | None = None
+        for attempt in range(effective_retries + 1):
+            try:
+                with request.urlopen(req, timeout=effective_timeout) as response:
+                    raw = response.read().decode("utf-8")
+                data = json.loads(raw)
+                if "error" in data:
+                    raise OllamaClientError(str(data["error"]))
+                return str(data.get("response", "")).strip()
+            except error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise OllamaClientError(f"Ollama HTTP {exc.code}: {detail}") from exc
+            except (error.URLError, TimeoutError, socket.timeout) as exc:
+                last_exception = exc
+                if attempt >= effective_retries:
+                    break
+                backoff = max(self.config.llm_retry_backoff_ms, 0) / 1000.0
+                time.sleep(backoff * (attempt + 1))
+                continue
 
-        data = json.loads(raw)
-        if "error" in data:
-            raise OllamaClientError(str(data["error"]))
-        return str(data.get("response", "")).strip()
+        if isinstance(last_exception, error.URLError):
+            raise OllamaClientError(f"Could not reach Ollama at {target}: {last_exception}") from last_exception
+        if last_exception is not None:
+            raise OllamaClientError(str(last_exception)) from last_exception
+        raise OllamaClientError(f"Unknown Ollama generation failure for model {effective_model}")
 
     def generate_json(
         self,
         prompt: str,
         *,
         system: str | None = None,
+        model: str | None = None,
+        retries: int | None = None,
         timeout: int | None = None,
         num_ctx: int | None = None,
     ) -> dict[str, Any]:
@@ -119,6 +140,8 @@ class OllamaClient:
             prompt,
             system=system,
             expect_json=True,
+            model=model,
+            retries=retries,
             timeout=timeout,
             num_ctx=num_ctx,
         )

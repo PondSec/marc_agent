@@ -155,6 +155,31 @@ class ModelManager:
 
         return self.catalog()
 
+    def warmup_preferred_models(self) -> None:
+        installed_names = {
+            str(item.get("name"))
+            for item in self.client.list_models_safe()
+            if item.get("name")
+        }
+        for name in _unique_model_names(
+            [
+                self.config.router_model_name,
+                self.config.model_name,
+            ]
+        ):
+            if name not in installed_names:
+                continue
+            try:
+                self.client.generate(
+                    "Reply with OK only.",
+                    model=name,
+                    timeout=self.config.warmup_timeout,
+                    num_ctx=256,
+                    retries=0,
+                )
+            except Exception:
+                continue
+
     def _run_queue(self) -> None:
         while True:
             with self._lock:
@@ -260,3 +285,13 @@ def _map_pull_status(raw_status: str, progress: float | None) -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _unique_model_names(names: list[str | None]) -> list[str]:
+    unique: list[str] = []
+    for name in names:
+        value = str(name or "").strip()
+        if not value or value in unique:
+            continue
+        unique.append(value)
+    return unique

@@ -373,6 +373,10 @@ class TaskManager:
             "max_repair_attempts": config.max_repair_attempts,
             "report_dir": str(config.report_dir_path),
             "model_name": config.model_name,
+            "router_model_name": config.router_model_name,
+            "llm_timeout": config.llm_timeout,
+            "router_timeout": config.router_timeout,
+            "llm_request_retries": config.llm_request_retries,
             "path_scope": "system" if config.full_access else "workspace",
         }
         extra = overrides or {}

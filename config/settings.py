@@ -82,6 +82,7 @@ def _normalize_access_mode(
 class AppConfig:
     ollama_host: str = "http://127.0.0.1:11434"
     model_name: str = "qwen3-coder:30b"
+    router_model_name: str | None = "qwen2.5-coder:14b"
     workspace_root: str = "."
     state_root_override: str | None = None
     access_mode: str = AccessMode.APPROVAL.value
@@ -90,6 +91,10 @@ class AppConfig:
     max_repair_attempts: int = 3
     shell_timeout: int = 120
     llm_timeout: int = 25
+    router_timeout: int = 35
+    llm_request_retries: int = 2
+    llm_retry_backoff_ms: int = 800
+    router_retries: int = 2
     approval_mode: bool = True
     read_only: bool = False
     verbose: bool = False
@@ -102,7 +107,10 @@ class AppConfig:
     max_files_in_context: int = 80
     state_dir_name: str = ".marc_a1"
     ollama_num_ctx: int = 8_192
+    router_num_ctx: int = 2_048
     ollama_temperature: float = 0.1
+    warmup_models_on_startup: bool = True
+    warmup_timeout: int = 45
 
     @classmethod
     def from_sources(
@@ -139,6 +147,7 @@ class AppConfig:
         config = cls(
             ollama_host=str(pick("OLLAMA_HOST", defaults.ollama_host)),
             model_name=str(pick("MODEL_NAME", defaults.model_name)),
+            router_model_name=pick("ROUTER_MODEL_NAME", defaults.router_model_name),
             workspace_root=str(pick("WORKSPACE_ROOT", defaults.workspace_root)),
             access_mode=access_mode.value,
             max_iterations=_parse_int(
@@ -160,6 +169,22 @@ class AppConfig:
             llm_timeout=_parse_int(
                 pick("LLM_TIMEOUT", defaults.llm_timeout),
                 defaults.llm_timeout,
+            ),
+            router_timeout=_parse_int(
+                pick("ROUTER_TIMEOUT", defaults.router_timeout),
+                defaults.router_timeout,
+            ),
+            llm_request_retries=_parse_int(
+                pick("LLM_REQUEST_RETRIES", defaults.llm_request_retries),
+                defaults.llm_request_retries,
+            ),
+            llm_retry_backoff_ms=_parse_int(
+                pick("LLM_RETRY_BACKOFF_MS", defaults.llm_retry_backoff_ms),
+                defaults.llm_retry_backoff_ms,
+            ),
+            router_retries=_parse_int(
+                pick("ROUTER_RETRIES", defaults.router_retries),
+                defaults.router_retries,
             ),
             approval_mode=access_mode == AccessMode.APPROVAL,
             read_only=access_mode == AccessMode.SAFE,
@@ -191,9 +216,21 @@ class AppConfig:
                 pick("OLLAMA_NUM_CTX", defaults.ollama_num_ctx),
                 defaults.ollama_num_ctx,
             ),
+            router_num_ctx=_parse_int(
+                pick("ROUTER_NUM_CTX", defaults.router_num_ctx),
+                defaults.router_num_ctx,
+            ),
             ollama_temperature=_parse_float(
                 pick("OLLAMA_TEMPERATURE", defaults.ollama_temperature),
                 defaults.ollama_temperature,
+            ),
+            warmup_models_on_startup=_parse_bool(
+                pick("WARMUP_MODELS_ON_STARTUP", defaults.warmup_models_on_startup),
+                defaults.warmup_models_on_startup,
+            ),
+            warmup_timeout=_parse_int(
+                pick("WARMUP_TIMEOUT", defaults.warmup_timeout),
+                defaults.warmup_timeout,
             ),
         ).normalized()
 
@@ -283,6 +320,7 @@ class AppConfig:
         }
         data["access_modes"] = [item.value for item in AccessMode]
         data["model_candidates"] = [self.model_name]
+        data["router_preferred_model_name"] = self.router_model_name
         data["agent_profiles"] = [
             {
                 "id": "core",

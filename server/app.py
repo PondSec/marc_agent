@@ -34,7 +34,7 @@ from server.task_manager import (
 
 def create_app(base_config: AppConfig | None = None) -> FastAPI:
     config = base_config or AppConfig.from_sources()
-    config = _with_available_model(config)
+    config = _with_available_models(config)
     config.ensure_state_dirs()
     task_manager = TaskManager(config)
     model_manager = ModelManager(config)
@@ -48,6 +48,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     @app.on_event("startup")
     async def ensure_models_on_startup() -> None:
         await asyncio.to_thread(model_manager.ensure_recommended)
+        if config.warmup_models_on_startup:
+            asyncio.create_task(asyncio.to_thread(model_manager.warmup_preferred_models))
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -65,6 +67,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         preferred_model = config.model_name
         model_candidates = _merge_model_candidates(preferred_model, installed_models)
         public_config["preferred_model_name"] = preferred_model
+        public_config["router_preferred_model_name"] = config.router_model_name
         public_config["installed_ollama_models"] = installed_models
         public_config["model_candidates"] = model_candidates
         public_config["recommended_models"] = model_catalog["recommended_models"]
@@ -231,13 +234,28 @@ def _fetch_installed_ollama_models(config: AppConfig) -> list[dict]:
     return client.list_models_safe()
 
 
-def _with_available_model(config: AppConfig) -> AppConfig:
+def _with_available_models(config: AppConfig) -> AppConfig:
     installed_models = _fetch_installed_ollama_models(config)
     installed_names = [str(item.get("name")) for item in installed_models if item.get("name")]
-    if installed_names and config.model_name not in installed_names:
+    if not installed_names:
+        router_model_name = config.router_model_name or config.model_name
+        return replace(config, router_model_name=router_model_name)
+
+    primary_model = config.model_name
+    if primary_model not in installed_names:
         ranked = sorted(installed_names, key=_model_preference_rank)
-        return replace(config, model_name=ranked[0])
-    return config
+        primary_model = ranked[0]
+
+    router_model = _select_router_model(
+        preferred_router=config.router_model_name,
+        installed_names=installed_names,
+        primary_model=primary_model,
+    )
+    return replace(
+        config,
+        model_name=primary_model,
+        router_model_name=router_model,
+    )
 
 
 def _merge_model_candidates(preferred_model: str, installed_models: list[dict]) -> list[str]:
@@ -258,3 +276,29 @@ def _model_preference_rank(name: str) -> tuple[int, str]:
     if "qwen3" in lowered:
         return (2, lowered)
     return (3, lowered)
+
+
+def _select_router_model(
+    *,
+    preferred_router: str | None,
+    installed_names: list[str],
+    primary_model: str,
+) -> str:
+    if preferred_router and preferred_router in installed_names:
+        return preferred_router
+    if "qwen2.5-coder:14b" in installed_names:
+        return "qwen2.5-coder:14b"
+    coder_ranked = sorted(
+        installed_names,
+        key=_router_model_preference_rank,
+    )
+    if coder_ranked:
+        return coder_ranked[0]
+    return primary_model
+
+
+def _router_model_preference_rank(name: str) -> tuple[int, int, str]:
+    lowered = name.lower()
+    is_coder = 0 if "coder" in lowered else 1
+    is_smallish = 0 if "14b" in lowered or "7b" in lowered or "8b" in lowered else 1
+    return (is_coder, is_smallish, lowered)

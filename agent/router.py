@@ -18,13 +18,17 @@ class IntentRouter:
         llm: LLMProvider,
         *,
         logger: AgentLogger | None = None,
+        model_name: str | None = None,
         timeout: int = 12,
         num_ctx: int = 4096,
+        retries: int = 1,
     ):
         self.llm = llm
         self.logger = logger
+        self.model_name = model_name
         self.timeout = timeout
         self.num_ctx = num_ctx
+        self.retries = max(int(retries), 0)
 
     def interpret_user_request(
         self,
@@ -38,6 +42,8 @@ class IntentRouter:
             payload = self.llm.generate_json(
                 router_prompt(user_input, snapshot, session=session),
                 system=router_system_prompt(),
+                model=self.model_name,
+                retries=self.retries,
                 timeout=self.timeout,
                 num_ctx=self.num_ctx,
             )
@@ -83,6 +89,8 @@ class IntentRouter:
             repaired = self.llm.generate_json(
                 router_repair_prompt(invalid_payload, errors),
                 system=router_system_prompt(),
+                model=self.model_name,
+                retries=max(self.retries, 1),
                 timeout=max(self.timeout, 16),
                 num_ctx=self.num_ctx,
             )
@@ -109,6 +117,8 @@ class IntentRouter:
             payload = self.llm.generate_json(
                 router_prompt(user_input, None, session=None),
                 system=router_system_prompt(),
+                model=self.model_name,
+                retries=max(self.retries, 1),
                 timeout=max(self.timeout + 8, 26),
                 num_ctx=min(self.num_ctx, 2048),
             )

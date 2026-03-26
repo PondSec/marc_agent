@@ -7,7 +7,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from config.settings import AppConfig
-from server.app import create_app
+from server.app import _with_available_models, create_app
 
 
 def create_test_workspace(client: TestClient, root, name: str = "Workspace A") -> dict:
@@ -174,9 +174,30 @@ def test_config_exposes_preferred_and_installed_ollama_models(tmp_path):
     assert response.status_code == 200
     payload = response.json()
     assert payload["preferred_model_name"] == "qwen2.5-coder:14b"
+    assert payload["router_preferred_model_name"] == "qwen2.5-coder:14b"
     assert payload["model_candidates"] == ["qwen2.5-coder:14b"]
     assert payload["installed_ollama_models"][0]["name"] == "qwen2.5-coder:14b"
     assert payload["recommended_models"][0]["name"] == "qwen3-coder:30b"
+
+
+def test_available_models_pick_fast_router_model_when_possible(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3-coder:30b",
+        router_model_name="qwen2.5-coder:14b",
+    )
+
+    with patch(
+        "server.app._fetch_installed_ollama_models",
+        return_value=[
+            {"name": "qwen3-coder:30b"},
+            {"name": "qwen2.5-coder:14b"},
+        ],
+    ):
+        updated = _with_available_models(config)
+
+    assert updated.model_name == "qwen3-coder:30b"
+    assert updated.router_model_name == "qwen2.5-coder:14b"
 
 
 def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_path):

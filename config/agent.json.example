@@ -1,5 +1,6 @@
 {
   "model_name": "qwen3-coder:30b",
+  "router_model_name": "qwen2.5-coder:14b",
   "ollama_host": "http://127.0.0.1:11434",
   "workspace_root": ".",
   "access_mode": "approval",
@@ -7,6 +8,11 @@
   "max_tool_calls": 32,
   "max_repair_attempts": 3,
   "shell_timeout": 120,
+  "llm_timeout": 25,
+  "router_timeout": 35,
+  "llm_request_retries": 2,
+  "llm_retry_backoff_ms": 800,
+  "router_retries": 2,
   "verbose": false,
   "allow_network": false,
   "allow_dangerous_commands": false,
@@ -17,5 +23,8 @@
   "max_files_in_context": 80,
   "state_dir_name": ".marc_a1",
   "ollama_num_ctx": 32768,
-  "ollama_temperature": 0.1
+  "router_num_ctx": 2048,
+  "ollama_temperature": 0.1,
+  "warmup_models_on_startup": true,
+  "warmup_timeout": 45
 }

@@ -10,6 +10,8 @@ class LLMProvider(Protocol):
         *,
         system: str | None = None,
         expect_json: bool = False,
+        model: str | None = None,
+        retries: int | None = None,
         timeout: int | None = None,
         num_ctx: int | None = None,
     ) -> str: ...
@@ -19,6 +21,8 @@ class LLMProvider(Protocol):
         prompt: str,
         *,
         system: str | None = None,
+        model: str | None = None,
+        retries: int | None = None,
         timeout: int | None = None,
         num_ctx: int | None = None,
     ) -> dict[str, Any]: ...
