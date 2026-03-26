@@ -54,6 +54,13 @@ class OllamaClient:
         except OllamaClientError:
             return []
 
+    def is_available(self) -> bool:
+        try:
+            self.list_models()
+        except OllamaClientError:
+            return False
+        return True
+
     def generate(
         self,
         prompt: str,

@@ -6,6 +6,7 @@ from pathlib import Path
 import bootstrap_runtime
 from bootstrap_runtime import (
     build_pip_install_command,
+    ensure_ollama_runtime,
     ensure_runtime_dependencies,
     runtime_python_path,
     runtime_venv_path,
@@ -134,3 +135,57 @@ def test_ensure_runtime_dependencies_reuses_existing_runtime_venv(monkeypatch, t
     ensure_runtime_dependencies(requirements_file="requirements-runtime.txt")
 
     assert activated == [runtime_venv]
+
+
+def test_ensure_ollama_runtime_installs_and_starts_ollama_on_windows(monkeypatch, tmp_path):
+    local_appdata = tmp_path / "LocalAppData"
+    candidate = local_appdata / "Programs" / "Ollama" / "ollama.exe"
+    install_calls: list[str] = []
+    start_calls: list[Path] = []
+    ready_checks = iter([False, False])
+
+    monkeypatch.setattr(bootstrap_runtime.os, "name", "nt", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    monkeypatch.setattr(bootstrap_runtime.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_windows_ollama_candidate_paths",
+        lambda: [candidate],
+    )
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_ollama_api_ready",
+        lambda host: next(ready_checks, False),
+    )
+    monkeypatch.setattr(bootstrap_runtime, "_wait_for_ollama_api", lambda host, timeout_seconds: True)
+
+    def fake_install():
+        install_calls.append("install")
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(bootstrap_runtime, "_install_ollama_windows", fake_install)
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_start_ollama_server",
+        lambda binary: start_calls.append(binary),
+    )
+
+    ensure_ollama_runtime("http://127.0.0.1:11434")
+
+    assert install_calls == ["install"]
+    assert start_calls == [candidate]
+
+
+def test_ensure_ollama_runtime_raises_clear_error_without_local_ollama(monkeypatch):
+    monkeypatch.setattr(bootstrap_runtime.os, "name", "posix", raising=False)
+    monkeypatch.setattr(bootstrap_runtime.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bootstrap_runtime, "_ollama_api_ready", lambda host: False)
+    monkeypatch.setattr(bootstrap_runtime, "_find_ollama_binary", lambda: None)
+
+    try:
+        ensure_ollama_runtime("http://127.0.0.1:11434")
+    except RuntimeError as exc:
+        assert "ollama serve" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError when Ollama is missing")

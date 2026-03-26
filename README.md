@@ -222,6 +222,8 @@ python main.py
 
 Beim ersten Start installiert M.A.R.C A1 fehlende Runtime-Pakete aus `requirements-runtime.txt` und startet danach direkt die Web-App.
 
+Auf Windows prueft der Startpfad jetzt zusaetzlich, ob Ollama vorhanden ist. Wenn `ollama` fehlt, versucht M.A.R.C A1 die offizielle Windows-Installation automatisch anzustossen und wartet danach auf die lokale API unter `OLLAMA_HOST`. Sobald der Server steht, werden die empfohlenen Modelle serverseitig angestossen und ihr Download-Status ist in der Web-GUI sichtbar.
+
 Wenn das System-Python extern verwaltet ist, zum Beispiel bei Homebrew-Python auf macOS oder aehnlichen PEP-668-Setups, weicht M.A.R.C A1 automatisch auf ein repo-lokales Runtime-Venv unter `.marc_a1/runtime-venv` aus. Folge-Starts verwenden dieses Runtime-Venv direkt weiter.
 
 Unter Windows:

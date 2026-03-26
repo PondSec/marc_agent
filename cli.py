@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from bootstrap_runtime import ensure_runtime_dependencies
+from bootstrap_runtime import ensure_ollama_runtime, ensure_runtime_dependencies
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -241,10 +241,12 @@ def main() -> int:
 
     command = args.command
     if command == "task":
+        ensure_ollama_runtime(config.ollama_host)
         return run_task_command(config, args.prompt)
     if command == "inspect":
         return run_inspect_command(config, args.focus)
     if command == "chat":
+        ensure_ollama_runtime(config.ollama_host)
         return run_chat_command(config, args.session_id)
     if command == "diff":
         return run_diff_command(config, args.session_id)

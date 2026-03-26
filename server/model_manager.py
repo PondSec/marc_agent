@@ -118,6 +118,9 @@ class ModelManager:
         }
 
     def ensure_recommended(self) -> dict[str, Any]:
+        if not self.client.is_available():
+            return self.catalog()
+
         installed_names = {
             str(item.get("name"))
             for item in self.client.list_models_safe()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from bootstrap_runtime import ensure_runtime_dependencies
+from bootstrap_runtime import ensure_ollama_runtime, ensure_runtime_dependencies
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,6 +94,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     config = make_config(args)
+    ensure_ollama_runtime(config.ollama_host)
     app = create_app(config)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0

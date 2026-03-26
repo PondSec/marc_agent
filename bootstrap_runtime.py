@@ -4,11 +4,15 @@ import importlib
 import importlib.util
 import json
 import os
+import shutil
 import site
 import subprocess
 import sys
 import sysconfig
+import time
+from contextlib import suppress
 from pathlib import Path
+from urllib import error, request
 
 
 RUNTIME_MODULES = ("fastapi", "httpx", "pydantic", "uvicorn")
@@ -18,6 +22,9 @@ EXTERNALLY_MANAGED_MARKERS = (
     "break-system-packages",
 )
 RUNTIME_VENV_DIRNAME = "runtime-venv"
+DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_WINDOWS_INSTALL_SCRIPT = "irm https://ollama.com/install.ps1 | iex"
+OLLAMA_STARTUP_TIMEOUT_SECONDS = 90
 
 
 def ensure_runtime_dependencies(
@@ -97,6 +104,42 @@ def ensure_runtime_dependencies(
         )
 
 
+def ensure_ollama_runtime(ollama_host: str | None = None) -> None:
+    host = (ollama_host or os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST).strip()
+    if _ollama_api_ready(host):
+        return
+
+    ollama_binary = _find_ollama_binary()
+    if ollama_binary is None and _should_auto_install_ollama():
+        print("[M.A.R.C A1] Ollama wurde nicht gefunden. Starte die Windows-Installation ...")
+        _install_ollama_windows()
+        ollama_binary = _find_ollama_binary()
+
+    if ollama_binary is None:
+        raise RuntimeError(_missing_ollama_message(host))
+
+    if _ollama_api_ready(host):
+        return
+
+    if not _is_local_ollama_host(host):
+        raise RuntimeError(
+            "OLLAMA_HOST ist nicht erreichbar und zeigt nicht auf eine lokale Adresse. "
+            f"Pruefe den Server unter {host}."
+        )
+
+    if _should_auto_start_ollama():
+        print("[M.A.R.C A1] Starte lokalen Ollama-Dienst ...")
+        _start_ollama_server(ollama_binary)
+
+    if _wait_for_ollama_api(host, timeout_seconds=OLLAMA_STARTUP_TIMEOUT_SECONDS):
+        return
+
+    raise RuntimeError(
+        "Ollama wurde gefunden, aber die API ist nicht erreichbar. "
+        f"Pruefe den Dienst unter {host} oder starte 'ollama serve' manuell."
+    )
+
+
 def build_pip_install_command(
     requirements_path: Path,
     *,
@@ -165,6 +208,21 @@ def _ensure_pip() -> None:
         ensurepip.bootstrap(upgrade=True)
 
 
+def _find_ollama_binary() -> Path | None:
+    command = shutil.which("ollama")
+    if command:
+        return Path(command)
+
+    if os.name != "nt":
+        return None
+
+    for candidate in _windows_ollama_candidate_paths():
+        if candidate.exists():
+            _prepend_command_path(candidate.parent)
+            return candidate
+    return None
+
+
 def _should_use_user_site(
     *,
     scope: str | None = None,
@@ -190,6 +248,129 @@ def _run_command(
         text=True,
         capture_output=capture_output,
         check=False,
+    )
+
+
+def _ollama_api_ready(host: str) -> bool:
+    target = host.rstrip("/") + "/api/tags"
+    req = request.Request(target, method="GET")
+    try:
+        with request.urlopen(req, timeout=2) as response:
+            return 200 <= getattr(response, "status", 200) < 500
+    except (error.URLError, TimeoutError, ValueError):
+        return False
+
+
+def _wait_for_ollama_api(host: str, *, timeout_seconds: int) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _ollama_api_ready(host):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _install_ollama_windows() -> None:
+    if os.name != "nt":
+        raise RuntimeError("Automatische Ollama-Installation ist nur fuer Windows hinterlegt.")
+
+    completed = _run_command(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            OLLAMA_WINDOWS_INSTALL_SCRIPT,
+        ],
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        _print_command_output(completed)
+        raise RuntimeError(
+            "Die automatische Ollama-Installation ist fehlgeschlagen. "
+            f"Fuehre in PowerShell aus: {OLLAMA_WINDOWS_INSTALL_SCRIPT}"
+        )
+
+    with suppress(Exception):
+        for candidate in _windows_ollama_candidate_paths():
+            if candidate.exists():
+                _prepend_command_path(candidate.parent)
+                break
+
+
+def _start_ollama_server(ollama_binary: Path) -> None:
+    kwargs: dict[str, object] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": os.name != "nt",
+    }
+    if os.name == "nt":
+        creationflags = 0
+        for flag_name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+            creationflags |= int(getattr(subprocess, flag_name, 0))
+        kwargs["creationflags"] = creationflags
+    else:
+        kwargs["start_new_session"] = True
+
+    subprocess.Popen([str(ollama_binary), "serve"], **kwargs)
+
+
+def _windows_ollama_candidate_paths() -> list[Path]:
+    candidates: list[Path] = []
+    for env_name in ("LOCALAPPDATA", "ProgramFiles", "ProgramW6432"):
+        base = os.environ.get(env_name, "").strip()
+        if not base:
+            continue
+        candidates.append(Path(base) / "Programs" / "Ollama" / "ollama.exe")
+        candidates.append(Path(base) / "Ollama" / "ollama.exe")
+    seen: set[str] = set()
+    unique_candidates: list[Path] = []
+    for candidate in candidates:
+        key = candidate.as_posix().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _prepend_command_path(path: Path) -> None:
+    value = str(path)
+    current_path = os.environ.get("PATH", "")
+    parts = current_path.split(os.pathsep) if current_path else []
+    if value not in parts:
+        os.environ["PATH"] = value + (os.pathsep + current_path if current_path else "")
+
+
+def _should_auto_install_ollama() -> bool:
+    if os.name != "nt":
+        return False
+    return os.environ.get("MARC_A1_AUTO_INSTALL_OLLAMA", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _should_auto_start_ollama() -> bool:
+    return os.environ.get("MARC_A1_AUTO_START_OLLAMA", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_local_ollama_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    return normalized.startswith("http://127.0.0.1") or normalized.startswith("http://localhost") or normalized.startswith("http://0.0.0.0")
+
+
+def _missing_ollama_message(host: str) -> str:
+    if os.name == "nt":
+        return (
+            "Ollama ist nicht installiert oder nicht im PATH. "
+            "Die App versucht es auf Windows automatisch ueber den offiziellen Installer. "
+            f"Wenn das fehlschlaegt, fuehre in PowerShell aus: {OLLAMA_WINDOWS_INSTALL_SCRIPT}. "
+            f"Danach muss die API unter {host} erreichbar sein."
+        )
+    return (
+        "Ollama ist nicht installiert oder nicht im PATH. "
+        "Installiere Ollama und starte danach 'ollama serve'. "
+        f"Erwartete API-Adresse: {host}."
     )
 
 

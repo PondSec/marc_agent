@@ -38,6 +38,10 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     app.state.model_manager = model_manager
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+    @app.on_event("startup")
+    async def ensure_models_on_startup() -> None:
+        await asyncio.to_thread(model_manager.ensure_recommended)
+
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
         return FileResponse(static_dir / "index.html")
