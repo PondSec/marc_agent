@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: M.A.R.C A1 documentation
+    url: https://github.com/PondSec/marc_agent
+    about: Review the repository documentation before opening an issue.

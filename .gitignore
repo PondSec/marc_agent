@@ -1,5 +1,14 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.marc_a1/
 .local_codex_agent/
+.vscode/
+.idea/
+*.pyc
+*.pyo
+*.pyd
 .DS_Store

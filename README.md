@@ -238,6 +238,18 @@ Wichtige Endpunkte:
 
 `/api/sessions/{session_id}/events` streamt Live-Session-Updates per SSE.
 
+## Git Workflow
+
+Das Repo ist auf einen professionelleren Branching-Flow ausgelegt:
+
+- `main` fuer stabile, releasbare Staende
+- `develop` fuer laufende Integration
+- `feature/<topic>` fuer neue Arbeit
+- `fix/<topic>` fuer Fehlerbehebungen
+- `hotfix/<topic>` fuer dringende Korrekturen auf `main`
+
+Details stehen in [CONTRIBUTING.md](/Users/pond/Documents/agent_ai/CONTRIBUTING.md).
+
 ## Sicherheit
 
 Die Runtime bleibt lokal, aber defensiv:
