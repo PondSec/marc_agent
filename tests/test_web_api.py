@@ -10,6 +10,17 @@ from config.settings import AppConfig
 from server.app import create_app
 
 
+def create_test_workspace(client: TestClient, root, name: str = "Workspace A") -> dict:
+    workspace_root = root / name.lower().replace(" ", "-")
+    workspace_root.mkdir()
+    response = client.post(
+        "/api/workspaces",
+        json={"name": name, "path": str(workspace_root)},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
 def test_web_root_serves_gui(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
     config.ensure_state_dirs()
@@ -20,6 +31,30 @@ def test_web_root_serves_gui(tmp_path):
 
     assert response.status_code == 200
     assert "M.A.R.C A1" in response.text
+
+
+def test_workspaces_api_does_not_auto_add_base_workspace(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = TestClient(app)
+
+    response = client.get("/api/workspaces")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_new_chat_requires_explicit_workspace_selection(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = TestClient(app)
+
+    response = client.post("/api/tasks", json={"prompt": "ohne workspace starten"})
+
+    assert response.status_code == 400
+    assert "workspace" in response.json()["detail"].lower()
 
 
 def test_start_task_and_fetch_session_via_api(tmp_path):
@@ -34,10 +69,15 @@ def test_start_task_and_fetch_session_via_api(tmp_path):
     config.ensure_state_dirs()
     app = create_app(config)
     client = TestClient(app)
+    workspace = create_test_workspace(client, tmp_path)
 
     create_response = client.post(
         "/api/tasks",
-        json={"prompt": "Lies die README und fasse das Repo zusammen", "dry_run": True},
+        json={
+            "prompt": "Lies die README und fasse das Repo zusammen",
+            "dry_run": True,
+            "workspace_id": workspace["id"],
+        },
     )
 
     assert create_response.status_code == 202
@@ -197,15 +237,8 @@ def test_workspace_crud_and_follow_up_messages_stay_in_same_chat(tmp_path):
     app = create_app(config)
     client = TestClient(app)
 
+    workspace = create_test_workspace(client, tmp_path)
     workspace_root = tmp_path / "workspace-a"
-    workspace_root.mkdir()
-
-    create_workspace_response = client.post(
-        "/api/workspaces",
-        json={"name": "Workspace A", "path": str(workspace_root)},
-    )
-    assert create_workspace_response.status_code == 201
-    workspace = create_workspace_response.json()
     assert workspace["name"] == "Workspace A"
 
     rename_workspace_response = client.patch(
@@ -336,9 +369,14 @@ def test_stop_requested_updates_running_session(tmp_path):
         return session
 
     with patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        workspace = create_test_workspace(client, tmp_path)
         create_response = client.post(
             "/api/tasks",
-            json={"prompt": "starte einen langen lauf", "dry_run": True},
+            json={
+                "prompt": "starte einen langen lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+            },
         )
 
         assert create_response.status_code == 202
@@ -370,3 +408,94 @@ def test_stop_requested_updates_running_session(tmp_path):
         logs_response = client.get(f"/api/sessions/{session_id}/logs")
         assert logs_response.status_code == 200
         assert any(item["event"] == "task_stop_requested" for item in logs_response.json())
+
+
+def test_delete_session_removes_chat_metadata_and_logs(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        ollama_host="http://127.0.0.1:9",
+        max_iterations=1,
+        shell_timeout=1,
+    )
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = TestClient(app)
+    workspace = create_test_workspace(client, tmp_path)
+
+    create_response = client.post(
+        "/api/tasks",
+        json={"prompt": "Sag kurz hallo", "workspace_id": workspace["id"]},
+    )
+    assert create_response.status_code == 202
+    session_id = create_response.json()["id"]
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        session_response = client.get(f"/api/sessions/{session_id}")
+        assert session_response.status_code == 200
+        if session_response.json()["status"] in {"completed", "partial", "failed"}:
+            break
+        time.sleep(0.1)
+
+    assert (config.session_dir_path / f"{session_id}.json").exists()
+    assert (config.log_dir_path / f"{session_id}.jsonl").exists()
+    assert (config.report_dir_path / f"{session_id}.json").exists()
+
+    delete_response = client.delete(f"/api/sessions/{session_id}")
+    assert delete_response.status_code == 204
+
+    assert not (config.session_dir_path / f"{session_id}.json").exists()
+    assert not (config.log_dir_path / f"{session_id}.jsonl").exists()
+    assert not (config.report_dir_path / f"{session_id}.json").exists()
+
+    session_response = client.get(f"/api/sessions/{session_id}")
+    assert session_response.status_code == 404
+
+    logs_response = client.get(f"/api/sessions/{session_id}/logs")
+    assert logs_response.status_code == 404
+
+    sessions_response = client.get("/api/sessions")
+    assert sessions_response.status_code == 200
+    assert all(item["id"] != session_id for item in sessions_response.json())
+
+
+def test_delete_workspace_removes_workspace_and_associated_chats(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        ollama_host="http://127.0.0.1:9",
+        max_iterations=1,
+        shell_timeout=1,
+    )
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = TestClient(app)
+    workspace = create_test_workspace(client, tmp_path)
+
+    create_response = client.post(
+        "/api/tasks",
+        json={"prompt": "Sag kurz hallo", "workspace_id": workspace["id"]},
+    )
+    assert create_response.status_code == 202
+    session_id = create_response.json()["id"]
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        session_response = client.get(f"/api/sessions/{session_id}")
+        assert session_response.status_code == 200
+        if session_response.json()["status"] in {"completed", "partial", "failed"}:
+            break
+        time.sleep(0.1)
+
+    delete_response = client.delete(f"/api/workspaces/{workspace['id']}")
+    assert delete_response.status_code == 204
+
+    workspaces_response = client.get("/api/workspaces")
+    assert workspaces_response.status_code == 200
+    assert workspaces_response.json() == []
+
+    session_response = client.get(f"/api/sessions/{session_id}")
+    assert session_response.status_code == 404
+
+    sessions_response = client.get("/api/sessions")
+    assert sessions_response.status_code == 200
+    assert sessions_response.json() == []

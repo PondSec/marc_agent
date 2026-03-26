@@ -74,6 +74,16 @@ class WorkspaceStore:
         updated = existing.model_copy(update=update_data)
         return self._replace(updated, workspaces)
 
+    def delete(self, workspace_id: str) -> WorkspaceRecord | None:
+        workspaces = self.list_workspaces()
+        existing = next((item for item in workspaces if item.id == workspace_id), None)
+        if existing is None:
+            return None
+
+        remaining = [item for item in workspaces if item.id != workspace_id]
+        self._write_payload(remaining)
+        return existing
+
     def ensure_default_workspace(self, path: str, name: str) -> WorkspaceRecord:
         resolved = str(Path(path).expanduser().resolve())
         existing = next(

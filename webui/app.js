@@ -194,10 +194,7 @@ async function openSession(sessionId, { updateHistory = true } = {}) {
 function selectWorkspace(workspaceId) {
   state.selectedWorkspaceId = workspaceId;
   if (!state.activeSession || state.activeSession.workspace_id !== workspaceId) {
-    state.activeSessionId = null;
-    state.activeSession = null;
-    disconnectStream();
-    syncHistory(null);
+    clearActiveSession();
   }
   persistPreferences();
   renderApp();
@@ -205,15 +202,19 @@ function selectWorkspace(workspaceId) {
 
 function startNewChat(workspaceId) {
   state.selectedWorkspaceId = workspaceId || state.selectedWorkspaceId;
-  state.activeSessionId = null;
-  state.activeSession = null;
-  state.logs = [];
+  clearActiveSession();
   state.composer.prompt = "";
-  disconnectStream();
-  syncHistory(null);
   persistPreferences();
   renderApp();
   focusComposer();
+}
+
+function clearActiveSession() {
+  state.activeSessionId = null;
+  state.activeSession = null;
+  state.logs = [];
+  disconnectStream();
+  syncHistory(null);
 }
 
 async function submitPrompt({ promptOverride = null, accessModeOverride = null } = {}) {
@@ -266,6 +267,73 @@ function requestCommitAndPush() {
     promptOverride: COMMIT_AND_PUSH_PROMPT,
     accessModeOverride: "full",
   });
+}
+
+async function deleteSession(sessionId) {
+  const session = state.sessions.find((item) => item.id === sessionId);
+  if (!session) {
+    return;
+  }
+  if (isSessionRunning(session)) {
+    showToast("Laufende Chats koennen erst nach dem Abschluss geloescht werden.", "error");
+    return;
+  }
+
+  const label = session.title || session.last_message_preview || session.task || "Dieser Chat";
+  const confirmed = window.confirm(`Chat "${shorten(label, 60)}" wirklich loeschen?`);
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    await fetchJSON(`/api/sessions/${sessionId}`, { method: "DELETE" });
+    if (state.activeSessionId === sessionId) {
+      clearActiveSession();
+    }
+    await refreshSessions();
+    renderApp();
+    showToast("Chat geloescht.");
+  } catch (error) {
+    showToast(`Chat konnte nicht geloescht werden: ${error.message}`, "error");
+  }
+}
+
+async function deleteWorkspace(workspaceId) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) {
+    return;
+  }
+  if (isWorkspaceBusy(workspaceId)) {
+    showToast("Workspaces mit laufenden Chats koennen noch nicht geloescht werden.", "error");
+    return;
+  }
+
+  const sessionCount = state.sessions.filter((session) => session.workspace_id === workspaceId).length;
+  const chatLabel = sessionCount === 1 ? "1 Chat" : `${sessionCount} Chats`;
+  const confirmed = window.confirm(
+    sessionCount
+      ? `Workspace "${workspace.name}" und ${chatLabel} aus der Webapp loeschen?\n\nDer Projektordner auf der Platte bleibt erhalten.`
+      : `Workspace "${workspace.name}" aus der Webapp loeschen?\n\nDer Projektordner auf der Platte bleibt erhalten.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    await fetchJSON(`/api/workspaces/${workspaceId}`, { method: "DELETE" });
+    if (state.activeSession?.workspace_id === workspaceId) {
+      clearActiveSession();
+    }
+    if (state.selectedWorkspaceId === workspaceId) {
+      state.selectedWorkspaceId = null;
+    }
+    persistPreferences();
+    await Promise.all([refreshWorkspaces(), refreshSessions()]);
+    renderApp();
+    showToast("Workspace geloescht.");
+  } catch (error) {
+    showToast(`Workspace konnte nicht geloescht werden: ${error.message}`, "error");
+  }
 }
 
 async function stopSession() {
@@ -376,6 +444,16 @@ function handleClick(event) {
 
   if (action === "edit-workspace") {
     openWorkspaceModal("edit", target.dataset.workspaceId);
+    return;
+  }
+
+  if (action === "delete-workspace") {
+    deleteWorkspace(target.dataset.workspaceId);
+    return;
+  }
+
+  if (action === "delete-session") {
+    deleteSession(target.dataset.sessionId);
     return;
   }
 
@@ -609,6 +687,7 @@ function renderWorkspaceList() {
 function renderWorkspaceItem(workspace) {
   const active = workspace.id === activeWorkspaceId();
   const count = sessionsForWorkspace(workspace.id).length;
+  const disabled = isWorkspaceBusy(workspace.id);
 
   return `
     <div class="workspace-item ${active ? "active" : ""}">
@@ -621,15 +700,32 @@ function renderWorkspaceItem(workspace) {
         <span class="workspace-name">${escapeHtml(workspace.name)}</span>
         <span class="workspace-badge">${count}</span>
       </button>
-      <button
-        class="workspace-edit"
-        type="button"
-        data-action="edit-workspace"
-        data-workspace-id="${escapeHtml(workspace.id)}"
-        aria-label="Workspace bearbeiten"
-      >
-        ${icon("edit")}
-      </button>
+      <div class="workspace-item-actions">
+        <button
+          class="workspace-action"
+          type="button"
+          data-action="edit-workspace"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+          aria-label="Workspace bearbeiten"
+        >
+          ${icon("edit")}
+        </button>
+        <button
+          class="workspace-action danger-button"
+          type="button"
+          data-action="delete-workspace"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+          aria-label="Workspace loeschen"
+          title="${escapeAttribute(
+            disabled
+              ? "Workspace kann erst geloescht werden, wenn keine Chats mehr laufen."
+              : "Workspace aus der Webapp loeschen",
+          )}"
+          ${disabled ? "disabled" : ""}
+        >
+          ${icon("trash")}
+        </button>
+      </div>
     </div>
   `;
 }
@@ -663,16 +759,34 @@ function renderThreadList() {
 function renderThreadItem(session) {
   const active = session.id === state.activeSessionId;
   const title = session.title || session.last_message_preview || session.task || "Neuer Chat";
+  const disabled = isSessionRunning(session);
 
   return `
-    <button
-      class="thread-item ${active ? "active" : ""}"
-      type="button"
-      data-action="open-session"
-      data-session-id="${escapeHtml(session.id)}"
-    >
-      <span class="thread-title">${escapeHtml(shorten(title, 34))}</span>
-    </button>
+    <div class="thread-row ${active ? "active" : ""}">
+      <button
+        class="thread-item ${active ? "active" : ""}"
+        type="button"
+        data-action="open-session"
+        data-session-id="${escapeHtml(session.id)}"
+      >
+        <span class="thread-title">${escapeHtml(shorten(title, 34))}</span>
+      </button>
+      <button
+        class="thread-action danger-button"
+        type="button"
+        data-action="delete-session"
+        data-session-id="${escapeHtml(session.id)}"
+        aria-label="Chat loeschen"
+        title="${escapeAttribute(
+          disabled
+            ? "Chat kann erst geloescht werden, wenn der Lauf beendet ist."
+            : "Chat loeschen",
+        )}"
+        ${disabled ? "disabled" : ""}
+      >
+        ${icon("trash")}
+      </button>
+    </div>
   `;
 }
 
@@ -1422,6 +1536,12 @@ function sessionsForWorkspace(workspaceId) {
     .sort((left, right) => new Date(right.updated_at) - new Date(left.updated_at));
 }
 
+function isWorkspaceBusy(workspaceId) {
+  return state.sessions.some(
+    (session) => session.workspace_id === workspaceId && isSessionRunning(session),
+  );
+}
+
 function getAgentProfiles() {
   return state.config?.agent_profiles || [];
 }
@@ -1594,7 +1714,22 @@ function fetchJSON(url, options) {
       }
       throw new Error(detail || `HTTP ${response.status}`);
     }
-    return response.json();
+    if (response.status === 204) {
+      return null;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    const text = await response.text();
+    if (!text) {
+      return null;
+    }
+    if (contentType.includes("application/json")) {
+      return JSON.parse(text);
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      return text;
+    }
   });
 }
 
@@ -2010,6 +2145,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor"/></svg>',
     close:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>',
+    trash:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5.5 6.5h9M8 6.5V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M7 8.5v6M10 8.5v6M13 8.5v6M6.5 6.5l.6 9a1.8 1.8 0 0 0 1.8 1.5h2.2a1.8 1.8 0 0 0 1.8-1.5l.6-9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     "git-push":
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 14.5h8a2 2 0 0 0 2-2V9.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><path d="M10 12.5V4.5M6.8 7.7 10 4.5l3.2 3.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
     chat:

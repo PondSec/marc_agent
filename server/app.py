@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from config.settings import AGENT_NAME, AppConfig
@@ -22,7 +22,14 @@ from server.schemas import (
     WorkspaceRecord,
     WorkspaceUpdateRequest,
 )
-from server.task_manager import TaskAlreadyRunningError, TaskManager
+from server.task_manager import (
+    SessionBusyError,
+    TaskAlreadyRunningError,
+    TaskManager,
+    WorkspaceBusyError,
+    WorkspaceNotFoundError,
+    WorkspaceRequiredError,
+)
 
 
 def create_app(base_config: AppConfig | None = None) -> FastAPI:
@@ -76,7 +83,15 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         focus: str | None = Query(default=None),
         workspace_id: str | None = Query(default=None),
     ) -> dict:
-        response = task_manager.inspect_workspace_for(workspace_id=workspace_id, focus=focus)
+        try:
+            response = task_manager.inspect_workspace_for(
+                workspace_id=workspace_id,
+                focus=focus,
+            )
+        except WorkspaceRequiredError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         return response.model_dump()
 
     @app.get("/api/workspaces", response_model=list[WorkspaceRecord])
@@ -140,6 +155,10 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             )
         except TaskAlreadyRunningError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except WorkspaceRequiredError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.patch("/api/sessions/{session_id}")
     async def update_session(session_id: str, request: SessionUpdateRequest) -> dict:
@@ -151,6 +170,26 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found.")
         return session.model_dump()
+
+    @app.delete("/api/sessions/{session_id}", status_code=204)
+    async def delete_session(session_id: str) -> Response:
+        try:
+            deleted = task_manager.delete_session(session_id)
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Session not found.")
+        return Response(status_code=204)
+
+    @app.delete("/api/workspaces/{workspace_id}", status_code=204)
+    async def delete_workspace(workspace_id: str) -> Response:
+        try:
+            deleted = task_manager.delete_workspace(workspace_id)
+        except WorkspaceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Workspace not found.")
+        return Response(status_code=204)
 
     @app.get("/api/sessions/{session_id}/events")
     async def stream_session_events(session_id: str) -> StreamingResponse:

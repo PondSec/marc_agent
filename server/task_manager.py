@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copy2
@@ -21,16 +21,35 @@ class TaskAlreadyRunningError(RuntimeError):
     pass
 
 
+class WorkspaceRequiredError(RuntimeError):
+    pass
+
+
+class WorkspaceNotFoundError(RuntimeError):
+    pass
+
+
+class SessionBusyError(RuntimeError):
+    pass
+
+
+class WorkspaceBusyError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class ResolvedWorkspace:
+    id: str | None
+    name: str
+    path: str
+
+
 class TaskManager:
     def __init__(self, base_config: AppConfig):
         self.base_config = base_config
         self.base_config.ensure_state_dirs()
         self.session_store = SessionStore(self.base_config.session_dir_path)
         self.workspace_store = WorkspaceStore(self.base_config.state_root / "workspaces.json")
-        self.default_workspace = self.workspace_store.ensure_default_workspace(
-            str(self.base_config.workspace_path),
-            self.base_config.workspace_path.name or "Workspace",
-        )
         self._sync_workspace_state_to_base()
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
@@ -47,6 +66,10 @@ class TaskManager:
         existing = self.session_store.load(session_id) if session_id else None
         target_session_id = existing.id if existing else session_id
         workspace = self._resolve_workspace(existing, workspace_id)
+        if workspace is None:
+            raise WorkspaceRequiredError(
+                "Select a workspace before starting a new chat."
+            )
         config = self._config_with_overrides(
             overrides or {},
             workspace_root=workspace.path,
@@ -162,6 +185,8 @@ class TaskManager:
         focus: str | None = None,
     ) -> WorkspaceInspectResponse:
         workspace = self._resolve_workspace(None, workspace_id)
+        if workspace is None:
+            raise WorkspaceRequiredError("Select a workspace before inspecting it.")
         config = self._config_with_overrides({}, workspace_root=workspace.path)
         agent = AgentCore(config)
         snapshot = agent.memory.build_snapshot(focus)
@@ -191,6 +216,44 @@ class TaskManager:
         Path(workspace.path).mkdir(parents=True, exist_ok=True)
         self._refresh_session_workspace_labels(workspace.id, workspace.name, workspace.path)
         return workspace
+
+    def delete_session(self, session_id: str) -> bool:
+        session = self.session_store.load(session_id)
+        if session is None:
+            return False
+
+        with self._lock:
+            if self._is_active(session_id):
+                raise SessionBusyError(
+                    "The chat is still running and cannot be deleted yet."
+                )
+            deleted = self.session_store.delete(session_id)
+            self._delete_session_artifacts(session_id)
+            return deleted
+
+    def delete_workspace(self, workspace_id: str) -> bool:
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            return False
+
+        sessions = [
+            session
+            for session in self.session_store.list_sessions(limit=10_000)
+            if session.workspace_id == workspace_id
+        ]
+
+        with self._lock:
+            if any(self._is_active(session.id) for session in sessions):
+                raise WorkspaceBusyError(
+                    "The workspace still has a running chat and cannot be deleted yet."
+                )
+
+            for session in sessions:
+                self.session_store.delete(session.id)
+                self._delete_session_artifacts(session.id)
+
+            deleted_workspace = self.workspace_store.delete(workspace_id)
+            return deleted_workspace is not None
 
     def update_session(
         self,
@@ -384,16 +447,31 @@ class TaskManager:
         self,
         session: SessionState | None,
         workspace_id: str | None,
-    ):
+    ) -> ResolvedWorkspace | None:
         if session is not None and session.workspace_id:
             workspace = self.workspace_store.get(session.workspace_id)
             if workspace is not None:
-                return workspace
+                return ResolvedWorkspace(
+                    id=workspace.id,
+                    name=workspace.name,
+                    path=workspace.path,
+                )
+        if session is not None and session.workspace_root:
+            return self._transient_workspace(
+                session.workspace_root,
+                name=session.workspace_label,
+                workspace_id=session.workspace_id,
+            )
         if workspace_id:
             workspace = self.workspace_store.get(workspace_id)
             if workspace is not None:
-                return workspace
-        return self.default_workspace
+                return ResolvedWorkspace(
+                    id=workspace.id,
+                    name=workspace.name,
+                    path=workspace.path,
+                )
+            raise WorkspaceNotFoundError("Workspace not found.")
+        return None
 
     def _derive_title(self, prompt: str) -> str:
         cleaned = " ".join(str(prompt or "").split()).strip()
@@ -417,13 +495,15 @@ class TaskManager:
             session.append_message("assistant", session.final_response)
 
     def _normalize_session_workspace(self, session: SessionState) -> SessionState:
-        if session.workspace_id and session.workspace_label and session.workspace_root:
+        if session.workspace_label and session.workspace_root:
             return session
+        workspace_label = session.workspace_label
+        if not workspace_label and session.workspace_root:
+            workspace_label = Path(session.workspace_root).name or "Workspace"
         return session.model_copy(
             update={
-                "workspace_id": session.workspace_id or self.default_workspace.id,
-                "workspace_label": session.workspace_label or self.default_workspace.name,
-                "workspace_root": session.workspace_root or self.default_workspace.path,
+                "workspace_label": workspace_label,
+                "workspace_root": session.workspace_root,
             }
         )
 
@@ -518,3 +598,24 @@ class TaskManager:
             return False
         age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
         return age_seconds > max(self.base_config.llm_timeout * 3, 90)
+
+    def _transient_workspace(
+        self,
+        path: str,
+        *,
+        name: str | None = None,
+        workspace_id: str | None = None,
+    ) -> ResolvedWorkspace:
+        resolved_path = str(Path(path).expanduser().resolve())
+        return ResolvedWorkspace(
+            id=workspace_id,
+            name=name or Path(resolved_path).name or "Workspace",
+            path=resolved_path,
+        )
+
+    def _delete_session_artifacts(self, session_id: str) -> None:
+        for target in (
+            self.base_config.log_dir_path / f"{session_id}.jsonl",
+            self.base_config.report_dir_path / f"{session_id}.json",
+        ):
+            target.unlink(missing_ok=True)

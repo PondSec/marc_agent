@@ -185,10 +185,18 @@ svg {
   align-items: center;
 }
 
+.thread-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+}
+
 .workspace-button,
 .thread-item,
 .icon-button,
-.workspace-edit,
+.workspace-action,
+.thread-action,
 .button-secondary,
 .button-primary,
 .button-ghost,
@@ -218,7 +226,8 @@ svg {
 
 .workspace-button:hover,
 .thread-item:hover,
-.workspace-item.active .workspace-edit {
+.workspace-item.active .workspace-action,
+.thread-row.active .thread-action {
   background: var(--hover);
 }
 
@@ -247,7 +256,8 @@ svg {
   text-align: center;
 }
 
-.workspace-edit,
+.workspace-action,
+.thread-action,
 .icon-button {
   width: 32px;
   height: 32px;
@@ -257,12 +267,20 @@ svg {
   background: transparent;
 }
 
-.workspace-edit {
+.workspace-item-actions {
+  display: inline-flex;
+  gap: var(--space-2);
+}
+
+.workspace-action,
+.thread-action {
   opacity: 0.65;
 }
 
-.workspace-item:hover .workspace-edit,
-.workspace-item.active .workspace-edit {
+.workspace-item:hover .workspace-action,
+.workspace-item.active .workspace-action,
+.thread-row:hover .thread-action,
+.thread-row.active .thread-action {
   opacity: 1;
 }
 
@@ -282,6 +300,11 @@ svg {
   white-space: nowrap;
   font-size: 13px;
   font-weight: 500;
+}
+
+.danger-button:hover {
+  color: #ffb1ab;
+  background: rgba(248, 81, 73, 0.12);
 }
 
 .sidebar-empty {
@@ -363,13 +386,15 @@ svg {
 .button-primary:hover,
 .button-ghost:hover,
 .icon-button:hover,
-.workspace-edit:hover,
+.workspace-action:hover,
+.thread-action:hover,
 .send-button:hover {
   background: var(--hover);
 }
 
 button:disabled:hover {
   background: transparent;
+  color: inherit;
 }
 
 .button-primary {
