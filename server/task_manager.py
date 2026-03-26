@@ -8,7 +8,7 @@ from typing import Any
 from agent.core import AgentCore
 from agent.models import SessionState
 from agent.session import SessionStore
-from config.settings import AppConfig
+from config.settings import AccessMode, AppConfig
 from server.schemas import LogRecord, SessionSummary, WorkspaceInspectResponse
 
 
@@ -45,11 +45,22 @@ class TaskManager:
                 task=prompt,
                 status="queued",
                 workspace_root=str(config.workspace_path),
+                access_mode=config.access_mode,
             )
             session.task = prompt
             session.status = "queued"
             session.plan = []
+            session.plan_summary = None
+            session.candidate_files = []
+            session.verification_commands = []
+            session.completion_criteria = []
+            session.helper_artifacts = []
             session.final_response = None
+            session.blockers = []
+            session.validation_status = "not_run"
+            session.repair_attempts = 0
+            session.current_phase = "planning"
+            session.access_mode = config.access_mode
             session.runtime_options = self._runtime_options(config)
             session.touch()
             self.session_store.save(session)
@@ -73,7 +84,9 @@ class TaskManager:
         if session is None:
             return None
         if self._is_active(session_id):
-            return session.model_copy(update={"status": "running"})
+            return session.model_copy(
+                update={"status": "running", "current_phase": session.current_phase}
+            )
         return session
 
     def get_logs(self, session_id: str) -> list[LogRecord]:
@@ -97,7 +110,11 @@ class TaskManager:
 
     def active_sessions(self) -> list[str]:
         with self._lock:
-            inactive = [session_id for session_id, thread in self._threads.items() if not thread.is_alive()]
+            inactive = [
+                session_id
+                for session_id, thread in self._threads.items()
+                if not thread.is_alive()
+            ]
             for session_id in inactive:
                 self._threads.pop(session_id, None)
             return sorted(self._threads.keys())
@@ -108,6 +125,8 @@ class TaskManager:
             agent.run_task(prompt, session=session)
         except Exception as exc:
             session.status = "failed"
+            session.current_phase = "blocked"
+            session.stop_reason = "runtime_exception"
             session.final_response = f"Task crashed: {exc}"
             session.touch()
             agent.session_store.save(session)
@@ -117,18 +136,30 @@ class TaskManager:
 
     def _config_with_overrides(self, overrides: dict[str, Any]) -> AppConfig:
         config = self.base_config
-        for key in ("dry_run", "read_only", "approval_mode", "verbose"):
+        access_mode = overrides.get("access_mode")
+        if access_mode is None:
+            if overrides.get("read_only"):
+                access_mode = AccessMode.SAFE.value
+            elif overrides.get("approval_mode"):
+                access_mode = AccessMode.APPROVAL.value
+        for key in ("dry_run", "verbose"):
             if overrides.get(key) is not None:
                 config = replace(config, **{key: overrides[key]})
+        if access_mode is not None:
+            config = replace(config, access_mode=access_mode).normalized()
+        else:
+            config = config.normalized()
         config.ensure_state_dirs()
         return config
 
     def _runtime_options(self, config: AppConfig) -> dict[str, Any]:
         return {
+            "access_mode": config.access_mode,
             "dry_run": config.dry_run,
             "read_only": config.read_only,
             "approval_mode": config.approval_mode,
             "verbose": config.verbose,
+            "max_repair_attempts": config.max_repair_attempts,
         }
 
     def _summary_for_session(self, session: SessionState) -> SessionSummary:
@@ -137,6 +168,9 @@ class TaskManager:
             id=session.id,
             task=session.task,
             status=status,
+            current_phase=session.current_phase,
+            validation_status=session.validation_status,
+            access_mode=session.access_mode,
             updated_at=session.updated_at,
             iterations=session.iterations,
             changed_file_count=len(session.changed_files),

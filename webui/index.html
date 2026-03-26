@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Local Codex Agent</title>
+    <title>M.A.R.C A1</title>
     <link rel="stylesheet" href="/static/styles.css" />
     <script defer src="/static/app.js"></script>
   </head>
@@ -11,8 +11,12 @@
     <div class="app-shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">Local Coding Agent</p>
-          <h1>Browserkonsole fuer deinen lokalen Codex</h1>
+          <p id="brandEyebrow" class="eyebrow">M.A.R.C A1</p>
+          <h1 id="brandTitle">Modular Autonomous Runtime Core - Agent 1</h1>
+          <p id="brandTagline" class="hero-copy">
+            Lokaler Coding-Agent fuer echte Implementierungsarbeit mit Analyse-, Edit-, Verify-
+            und Repair-Loop.
+          </p>
         </div>
         <div class="topbar-meta">
           <div class="status-block">
@@ -22,6 +26,10 @@
           <div class="status-block">
             <span class="status-label">Workspace</span>
             <strong id="workspaceRoot">-</strong>
+          </div>
+          <div class="status-block">
+            <span class="status-label">Helper Dir</span>
+            <strong id="helperDir">-</strong>
           </div>
         </div>
       </header>
@@ -38,15 +46,27 @@
               <textarea
                 id="taskInput"
                 name="task"
-                rows="7"
-                placeholder="Zum Beispiel: Fuege JWT Login hinzu und zeige mir die geaenderten Dateien."
+                rows="8"
+                placeholder="Zum Beispiel: Fuege JWT Login hinzu, pruefe die bestehende Auth-Architektur, implementiere die Aenderung passend zum Projekt und validiere das Ergebnis."
               ></textarea>
 
-              <div class="toggle-grid">
-                <label class="toggle"><input id="continueToggle" type="checkbox" /> Session fortsetzen</label>
-                <label class="toggle"><input id="dryRunToggle" type="checkbox" /> Dry run</label>
-                <label class="toggle"><input id="readOnlyToggle" type="checkbox" /> Read only</label>
-                <label class="toggle"><input id="approvalToggle" type="checkbox" /> Approval mode</label>
+              <div class="form-grid">
+                <label>
+                  <span class="input-label">Access Mode</span>
+                  <select id="accessModeSelect">
+                    <option value="safe">Safe</option>
+                    <option value="approval" selected>Approval</option>
+                    <option value="full">Full Access</option>
+                  </select>
+                </label>
+                <label class="toggle">
+                  <input id="continueToggle" type="checkbox" />
+                  Session fortsetzen
+                </label>
+                <label class="toggle">
+                  <input id="dryRunToggle" type="checkbox" />
+                  Dry run
+                </label>
               </div>
 
               <div class="button-row">

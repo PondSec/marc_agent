@@ -1,105 +1,181 @@
-# Local Codex-Style Agent
+# M.A.R.C A1
 
-Eine lokal laufende Web-App fuer einen agentischen Coding-Assistenten mit Python, Ollama und `qwen3-coder:30b`.
+Modular Autonomous Runtime Core - Agent 1
 
-## Architekturueberblick
+M.A.R.C A1 ist ein lokaler, selbstgehosteter Coding-Agent fuer echte Entwicklungsarbeit. Die Runtime ist auf agentische Umsetzung optimiert: Repo verstehen, gezielt Dateien finden, Code aendern, Tests ausfuehren, Fehler analysieren, nachbessern und Ergebnisse mit Diffs, Logs und Session-State nachvollziehbar machen.
 
-Die Agent-Engine bleibt erhalten und wird jetzt von einem lokalen Web-Backend gekapselt. Dadurch wird die GUI zur Hauptschnittstelle, ohne dass Planung, Tool-Ausfuehrung, Safety oder Session-State neu geschrieben werden muessen.
+## Was Aus Dem Bestehenden Projekt Geworden Ist
 
-Die Architektur besteht aus sieben Schichten:
+Der vorherige Stand hatte bereits brauchbare Grundbausteine:
+
+- Python-Backend mit FastAPI
+- lokale Weboberflaeche
+- Tool-Dispatcher fuer Filesystem, Search, Shell und Git
+- Workspace-Sicherheitsgrenzen
+- Session-Store und Logdateien
+- Basistests fuer zentrale Runtime-Bausteine
+
+Die groessten Luecken lagen im agentischen Verhalten:
+
+- kein sauberes `access_mode` Modell
+- zu lineare Agent-Schleife ohne starke Verify-/Repair-Logik
+- zu schwache Abschlusskriterien nach Codeaenderungen
+- wenig Sichtbarkeit fuer Phase, Validation-Status und Stop-Gruende
+- keine explizite Ermutigung, bei Hindernissen Hilfsskripte oder Parser zu bauen
+- Branding, Doku und UI noch nicht auf einen ernsthaften Agenten ausgerichtet
+
+M.A.R.C A1 behebt genau diese Punkte, ohne das Projekt blind neu zu schreiben.
+
+## Kernfaehigkeiten
+
+M.A.R.C A1 ist auf diese Arbeitsweise ausgelegt:
+
+1. Task verstehen und Repo gezielt analysieren
+2. relevante Dateien priorisieren und lesen
+3. bestehende Architektur respektieren
+4. fokussierte Aenderungen ueber mehrere Dateien hinweg machen
+5. Tests, Lint, Build oder andere Projektchecks gezielt ausfuehren
+6. Fehler aus Logs und Tool-Outputs lesen
+7. iterativ nachbessern
+8. Status, Tool-Calls, Diffs, Blocker und Ergebnisse sichtbar machen
+
+Wenn noetig darf M.A.R.C A1 auch kleine Hilfswerkzeuge bauen, zum Beispiel:
+
+- Analyse-Skripte
+- Parser oder Konverter
+- Test-Harnesses
+- temporaere Log- oder Format-Inspektoren
+
+Das Ziel ist immer die Hauptaufgabe. Hilfsskripte sind ein Mittel zum Zweck, nicht der Fokus.
+
+## Access Modes
+
+Die Runtime hat jetzt ein klares Zugriffsmodell:
+
+- `safe`
+  Nur lesende Exploration und low-risk Verifikation. Schreibende Tools und mutierende Shell-Aktionen sind blockiert.
+- `approval`
+  Normale Coding-Edits ueber File-Tools sind erlaubt, medium/high-risk Shell- oder Git-Mutationen werden geblockt.
+- `full`
+  Volle agentische Arbeitsweise im erlaubten Workspace: Dateien aendern, Verifikationskommandos ausfuehren, Fix-Loops fahren und lokale Git-Mutationen wie Branch-Erstellung nutzen. Harte Sicherheitsblocker bleiben aktiv.
+
+Die zentrale Einstellung ist:
+
+```json
+{
+  "access_mode": "safe | approval | full"
+}
+```
+
+Legacy-Flags wie `--read-only` und `--approval-mode` werden weiter akzeptiert, intern aber auf `access_mode` normalisiert.
+
+## Agentischer Ablauf
+
+Die Runtime arbeitet in einer expliziten Schleife:
+
+1. `planning`
+2. `exploring`
+3. `editing`
+4. `verifying`
+5. `repairing`
+6. `completed` oder `blocked`
+
+Zusatzregeln:
+
+- Kein verfruehtes Finish nach Codeaenderungen ohne Validation, falls ein sinnvoller Check verfuegbar ist
+- wiederholte Verify-Fehlschlaege werden als Repair-Versuche gezaehlt
+- sinnvolle Stop-Gruende werden gespeichert, zum Beispiel `validated`, `blocked`, `max_iterations_reached`
+- Helper-Artefakte werden in der Session sichtbar gemacht
+
+## Architektur
+
+Die Architektur bleibt modular, ist aber jetzt staerker auf echte Agentik ausgerichtet:
 
 1. Web-GUI
-   `webui/` enthaelt die lokale Browseroberflaeche fuer Task-Eingabe, Session-Navigation, Live-Status, Tool-Calls, Logs und Diffs.
+   `webui/` ist die Hauptoberflaeche fuer Tasks, Sessions, Live-Status, Tool-Calls, Logs und Diffs.
 2. Web-Backend
-   `server/app.py` stellt die HTTP-API bereit, `server/task_manager.py` startet Hintergrund-Tasks und kapselt Sessions, Logs und Live-Updates.
-3. Agent-Schicht
-   `agent/core.py`, `planner.py`, `executor.py`, `memory.py`, `session.py` bilden weiterhin den Plan-and-Execute-Loop.
-4. LLM-Schicht
+   `server/` kapselt API, Session-Lifecycle und Live-Streams.
+3. Agent-Core
+   `agent/core.py`, `planner.py`, `memory.py`, `models.py` steuern Planung, Phasen, Verify-/Repair-Loop und Session-State.
+4. Runtime
+   `runtime/` validiert Tool-Calls, loggt Ereignisse und erzwingt Workspace-Grenzen.
+5. Tools
+   `tools/` enthaelt Filesystem-, Search-, Shell-, Git- und Safety-Logik.
+6. LLM-Schicht
    `llm/ollama_client.py` spricht mit Ollama, `llm/schemas.py` erzwingt strukturierte JSON-Entscheidungen.
-5. Runtime-Schicht
-   `runtime/tool_dispatcher.py`, `runtime/logger.py`, `runtime/workspace.py` validieren Tool-Aufrufe, loggen Schritte und begrenzen alle Pfade auf den Workspace.
-6. Tool-Schicht
-   `tools/` kapselt Filesystem, Search, Shell, Git, Diffs und Safety-Regeln.
 7. Optionale CLI
-   `cli.py` bleibt fuer Skripting und Debugging verfuegbar, ist aber nicht mehr die primaere Nutzung.
-
-## Was die GUI kann
-
-Die Browseroberflaeche deckt die bisherigen CLI-Hauptfunktionen ab:
-
-- Tasks starten
-- bestehende Sessions ansehen
-- Session-Verlauf verfolgen
-- Live-Status waehrend der Ausfuehrung sehen
-- Tool-Aufrufe und Ausgaben ansehen
-- geaenderte Dateien und Diffs ansehen
-- Workspace inspizieren
-- Runtime-Konfiguration ansehen
-
-Die Agent-Engine selbst wird nicht dupliziert. Die GUI steuert dieselbe `AgentCore`-Runtime wie vorher die CLI.
+   `cli.py` ist fuer Debugging und Automatisierung da, aber nicht der Hauptfokus.
 
 ## Projektstruktur
 
 ```text
 .
-├── .env.example
-├── .gitignore
-├── README.md
-├── cli.py
-├── main.py
-├── requirements.txt
-├── agent
-│   ├── __init__.py
-│   ├── core.py
-│   ├── executor.py
-│   ├── memory.py
-│   ├── models.py
-│   ├── planner.py
-│   ├── prompts.py
-│   └── session.py
-├── config
-│   ├── __init__.py
-│   ├── agent.json.example
-│   └── settings.py
-├── llm
-│   ├── __init__.py
-│   ├── ollama_client.py
-│   └── schemas.py
-├── runtime
-│   ├── __init__.py
-│   ├── logger.py
-│   ├── tool_dispatcher.py
-│   └── workspace.py
-├── server
-│   ├── __init__.py
-│   ├── app.py
-│   ├── schemas.py
-│   └── task_manager.py
-├── tests
-│   ├── test_dispatcher.py
-│   ├── test_filesystem.py
-│   ├── test_safety.py
-│   ├── test_shell.py
-│   ├── test_web_api.py
-│   └── test_workspace.py
-├── tools
-│   ├── __init__.py
-│   ├── difftools.py
-│   ├── filesystem.py
-│   ├── gittools.py
-│   ├── registry.py
-│   ├── safety.py
-│   ├── search.py
-│   └── shell.py
-└── webui
-    ├── app.js
-    ├── index.html
-    └── styles.css
+|-- .env.example
+|-- README.md
+|-- cli.py
+|-- main.py
+|-- requirements.txt
+|-- agent
+|   |-- core.py
+|   |-- executor.py
+|   |-- memory.py
+|   |-- models.py
+|   |-- planner.py
+|   |-- prompts.py
+|   `-- session.py
+|-- config
+|   |-- agent.json.example
+|   `-- settings.py
+|-- llm
+|   |-- ollama_client.py
+|   `-- schemas.py
+|-- runtime
+|   |-- logger.py
+|   |-- tool_dispatcher.py
+|   `-- workspace.py
+|-- server
+|   |-- app.py
+|   |-- schemas.py
+|   `-- task_manager.py
+|-- tests
+|   |-- test_access_modes.py
+|   |-- test_dispatcher.py
+|   |-- test_filesystem.py
+|   |-- test_safety.py
+|   |-- test_shell.py
+|   |-- test_web_api.py
+|   `-- test_workspace.py
+|-- tools
+|   |-- difftools.py
+|   |-- filesystem.py
+|   |-- gittools.py
+|   |-- registry.py
+|   |-- safety.py
+|   |-- search.py
+|   `-- shell.py
+`-- webui
+    |-- app.js
+    |-- index.html
+    `-- styles.css
 ```
 
-## Web-First Nutzung
+## Starten
 
-Server starten:
+Du brauchst kein manuelles `venv`, wenn du das nicht willst. Auf einem frischen Rechner reicht:
+
+```bash
+python main.py
+```
+
+Beim ersten Start installiert M.A.R.C A1 fehlende Runtime-Pakete selbst aus `requirements-runtime.txt` und startet danach direkt die Web-App.
+
+Unter Windows geht auch:
+
+```bat
+start_marc_a1.bat
+```
+
+Wenn du trotzdem isoliert arbeiten willst, bleibt ein `venv` weiterhin moeglich:
 
 ```bash
 python3 -m venv .venv
@@ -107,26 +183,32 @@ python3 -m venv .venv
 .venv/bin/python main.py
 ```
 
-Danach im Browser oeffnen:
+Dann im Browser:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-Optionale Server-Parameter:
+Wichtige Optionen:
 
 ```bash
-.venv/bin/python main.py --host 0.0.0.0 --port 8080
-.venv/bin/python main.py --dry-run
-.venv/bin/python main.py --read-only
-.venv/bin/python main.py --approval-mode
+python main.py --host 0.0.0.0 --port 8080
+python main.py --access-mode safe
+python main.py --access-mode approval
+python main.py --access-mode full
+python main.py --dry-run
+```
+
+## CLI
+
+```bash
+python cli.py task "Fuege JWT Login hinzu"
+python cli.py inspect --focus auth
+python cli.py diff
+python cli.py config show
 ```
 
 ## Ollama Setup
-
-1. Ollama starten
-2. Modell ziehen
-3. Test-Run machen
 
 ```bash
 ollama serve
@@ -134,18 +216,16 @@ ollama pull qwen3-coder:30b
 ollama run qwen3-coder:30b
 ```
 
-Offizielle Ollama-Modellseite:
-[qwen3-coder:30b](https://ollama.com/library/qwen3-coder%3A30b-a3b-fp16)
-
 Wichtige Defaults:
 
 - `OLLAMA_HOST=http://127.0.0.1:11434`
 - `MODEL_NAME=qwen3-coder:30b`
 - `WORKSPACE_ROOT=.`
+- `ACCESS_MODE=approval`
 
-## API Ueberblick
+## API
 
-Das Backend ist lokal gedacht und stellt unter anderem diese Endpunkte bereit:
+Wichtige Endpunkte:
 
 - `GET /api/health`
 - `GET /api/config`
@@ -156,76 +236,59 @@ Das Backend ist lokal gedacht und stellt unter anderem diese Endpunkte bereit:
 - `GET /api/sessions/{session_id}/events`
 - `POST /api/tasks`
 
-`/api/sessions/{session_id}/events` liefert Live-Updates per Server-Sent Events.
+`/api/sessions/{session_id}/events` streamt Live-Session-Updates per SSE.
 
-## Sicherheitsmodell
+## Sicherheit
 
-Der Agent bleibt konservativ:
+Die Runtime bleibt lokal, aber defensiv:
 
-- Alle Pfade werden gegen `workspace_root` aufgeloest.
-- Schreibzugriffe ausserhalb des Workspace werden blockiert.
-- `read_only` blockiert mutierende File- und Shell-Aktionen.
-- Shell-Kommandos werden klassifiziert als `low`, `medium`, `high`, `blocked`.
-- Harte Blockregeln greifen fuer `sudo`, `shutdown`, `reboot`, `git reset --hard`, `git clean -fdx`, `git push --force`.
-- Netzwerkkommandos bleiben standardmaessig deaktiviert.
-- `approval_mode` blockiert riskante Shell- und Git-Aktionen.
-- Alle Tool-Calls werden als JSONL geloggt.
-- Diffs werden pro Session gespeichert und in der GUI sichtbar gemacht.
+- alle Pfade werden auf den Workspace begrenzt
+- harte Shell-Blocker fuer destruktive Kommandos bleiben aktiv
+- Netzwerkzugriff ist standardmaessig aus
+- `safe` blockiert Mutationen
+- `approval` blockiert medium/high-risk Shell-Mutationen
+- `full` erlaubt autonomes Arbeiten, aber keine Hard-Block-Aktionen
+- alle Tool-Calls und Entscheidungen werden geloggt
+- Session-Diffs werden gespeichert und in der GUI angezeigt
 
-## Umgang mit grossen Projekten
+Interner Zustand liegt standardmaessig in:
 
-Die Runtime ist weiterhin auf groessere Repositories ausgelegt:
-
-- Repo-Snapshot statt blindem Komplett-Read
-- Priorisierung von README, Manifests, Configs, Services, Routes und Tests
-- `inspect_workspace`, `list_files`, `search_in_files` als gezielte Erkundungswerkzeuge
-- Session-Memory mit kompakten Output-Exzerpten
-- konfigurierbare Grenzen fuer Lesegroesse, Suchtreffer, Iterationen und Tool-Calls
-
-## Optionale CLI
-
-Die CLI existiert weiterhin fuer Automatisierung oder Debugging, ist aber nicht mehr die Hauptschnittstelle:
-
-```bash
-.venv/bin/python cli.py task "Fuege JWT Login hinzu"
-.venv/bin/python cli.py inspect --focus auth
-.venv/bin/python cli.py diff
-.venv/bin/python cli.py config show
+```text
+.marc_a1/
 ```
+
+Darin befinden sich Sessions, Logs, Memory und ein Helper-Verzeichnis fuer agentische Hilfsskripte.
+
+Bootstrap-Verhalten:
+
+- `main.py` und `cli.py` installieren fehlende Runtime-Abhaengigkeiten automatisch
+- ausserhalb eines `venv` wird standardmaessig per `pip install --user` installiert
+- das Verhalten kann ueber `MARC_A1_PIP_SCOPE=user|global|auto` gesteuert werden
+- zusaetzliche Pip-Argumente koennen ueber `MARC_A1_PIP_EXTRA_ARGS` gesetzt werden
 
 ## Tests
 
-Ausfuehren mit:
-
 ```bash
-.venv/bin/python -m pytest
+python -m pytest -q
 ```
 
 Abgedeckt sind aktuell:
 
-- Workspace-Pfadsicherheit
-- Safety-Rules fuer Shell-Kommandos
+- Workspace-Sicherheit
 - Tool-Argumentvalidierung
-- Patch- und Dateiaenderungslogik
-- Shell-Timeout-Verhalten
-- Web-API fuer GUI-Startpfad, Session-Liste und lokale Task-Ausloesung
+- File-Patching und Diffs
+- Shell-Schutz und Timeout-Verhalten
+- Access-Mode-Logik
+- Web-API und Session-Metadaten
 
-## Erweiterungsmoeglichkeiten
+## Erweiterbarkeit
 
-Naechste sinnvolle Ausbaustufen:
+Sinnvolle naechste Ausbaustufen:
 
-- VS Code Extension auf Basis derselben HTTP-API
-- Docker-Sandbox fuer Tool-Ausfuehrung
-- SSH-Tool mit Host-Allowlist
-- HTTP-Tools fuer interne APIs
-- Repo-Index mit Dateisummaries und Symbol-Layer
-- Approval-UI fuer riskante Aktionen
+- Docker-Exec Tool
+- SSH-Exec Tool mit Allowlist
+- HTTP-Request Tool fuer interne APIs
+- Approval-UI fuer medium/high-risk Aktionen
+- Repo-Index mit Symbol-Layer
 - Multi-Agent-Orchestrierung fuer Explore/Edit/Verify
-- Background Queue fuer laengere Jobs
-
-## Annahmen
-
-- Python 3.11+ ist verfuegbar.
-- Ollama ist lokal erreichbar.
-- Das Modell liefert meist valides JSON; bei Problemen faellt die Agent-Runtime auf Heuristiken zurueck.
-- Die Web-App ist lokal und single-user-orientiert, nicht als oeffentlich gehaertete Multi-User-Plattform gedacht.
+- persistente Hintergrund-Queue

@@ -17,7 +17,7 @@ def test_web_root_serves_gui(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "Browserkonsole" in response.text
+    assert "M.A.R.C A1" in response.text
 
 
 def test_start_task_and_fetch_session_via_api(tmp_path):
@@ -54,6 +54,9 @@ def test_start_task_and_fetch_session_via_api(tmp_path):
     assert session_payload is not None
     assert session_payload["id"] == session_id
     assert session_payload["status"] in {"completed", "partial"}
+    assert session_payload["access_mode"] == config.access_mode
+    assert "validation_status" in session_payload
+    assert "current_phase" in session_payload
 
     logs_response = client.get(f"/api/sessions/{session_id}/logs")
     assert logs_response.status_code == 200

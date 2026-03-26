@@ -25,7 +25,7 @@ def build_dispatcher(tmp_path) -> ToolDispatcher:
     gittools = GitTools(config, workspace)
     registry = build_default_registry(filesystem, search, shell, gittools)
     logger = AgentLogger(config.log_dir_path, "test-session", verbose=False)
-    return ToolDispatcher(registry, logger)
+    return ToolDispatcher(registry, logger, safety)
 
 
 def test_dispatcher_rejects_invalid_tool_args(tmp_path):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StrictModel(BaseModel):
@@ -34,10 +34,16 @@ class PlanningResponse(StrictModel):
     summary: str = Field(..., description="High-level summary of the task.")
     steps: list[str] = Field(..., description="Ordered plan steps.")
     files_to_inspect: list[str] = Field(
-        default_factory=list, description="Likely relevant files or directories."
+        default_factory=list,
+        description="Likely relevant files or directories.",
     )
     tests_to_run: list[str] = Field(
-        default_factory=list, description="Likely validation commands."
+        default_factory=list,
+        description="Likely validation commands.",
+    )
+    completion_criteria: list[str] = Field(
+        default_factory=list,
+        description="Conditions that should be true before returning final output.",
     )
 
 
@@ -96,7 +102,8 @@ class TextPatch(StrictModel):
     old: str = Field(..., description="Existing text that must be present.")
     new: str = Field(..., description="Replacement text.")
     expected_count: int = Field(
-        default=1, description="Expected number of occurrences to replace."
+        default=1,
+        description="Expected number of occurrences to replace.",
     )
 
 
@@ -121,6 +128,12 @@ class SearchInFilesArgs(StrictModel):
 
 class RunShellArgs(StrictModel):
     command: str = Field(..., description="Shell command to execute.")
+    cwd: str = Field(default=".", description="Working directory relative to the workspace root.")
+    timeout: int | None = Field(default=None, description="Timeout in seconds.")
+
+
+class RunTestsArgs(StrictModel):
+    command: str = Field(..., description="Targeted test, lint, typecheck, or build command.")
     cwd: str = Field(default=".", description="Working directory relative to the workspace root.")
     timeout: int | None = Field(default=None, description="Timeout in seconds.")
 

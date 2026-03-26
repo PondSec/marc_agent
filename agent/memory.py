@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
+from agent.models import WorkspaceSnapshot
 from config.settings import AppConfig
 from runtime.workspace import WorkspaceManager
-from agent.models import WorkspaceSnapshot
 
 
 LANGUAGE_MAP = {
@@ -28,6 +28,32 @@ LANGUAGE_MAP = {
     ".sql": "sql",
     ".html": "html",
     ".css": "css",
+}
+
+FOCUS_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "eine",
+    "einen",
+    "oder",
+    "und",
+    "fuer",
+    "mit",
+    "der",
+    "die",
+    "das",
+    "den",
+    "dem",
+    "des",
+    "zum",
+    "zur",
+    "task",
+    "projekt",
 }
 
 
@@ -86,7 +112,15 @@ class RepoMemoryStore:
         lines = [
             f"Workspace: {snapshot.root}",
             f"Files: {snapshot.file_count}",
-            f"Languages: {', '.join(f'{k}={v}' for k, v in snapshot.language_counts.items()) or 'none detected'}",
+            (
+                "Languages: "
+                + (
+                    ", ".join(
+                        f"{key}={value}" for key, value in snapshot.language_counts.items()
+                    )
+                    or "none detected"
+                )
+            ),
             f"Top directories: {', '.join(snapshot.top_directories) or '(flat workspace)'}",
             "",
             "Important files:",
@@ -96,8 +130,8 @@ class RepoMemoryStore:
             lines.append(f"- {path}: {brief}")
         if snapshot.likely_commands:
             lines.extend(["", "Likely validation commands:"])
-            for cmd in snapshot.likely_commands:
-                lines.append(f"- {cmd}")
+            for command in snapshot.likely_commands:
+                lines.append(f"- {command}")
         lines.extend(["", "Summary:", snapshot.repo_summary])
         return "\n".join(lines)
 
@@ -118,31 +152,64 @@ class RepoMemoryStore:
         score = 0
         if name.startswith("readme"):
             score += 120
-        if name in {"pyproject.toml", "package.json", "requirements.txt", "cargo.toml", "go.mod"}:
+        if name in {
+            "pyproject.toml",
+            "package.json",
+            "requirements.txt",
+            "cargo.toml",
+            "go.mod",
+            "makefile",
+            "dockerfile",
+            ".env.example",
+        }:
             score += 110
-        if name in {"dockerfile", "docker-compose.yml", "docker-compose.yaml", ".env.example"}:
-            score += 90
-        if any(token in rel for token in ("config", "settings", "routes", "controllers", "services", "src/")):
+        if any(
+            token in rel
+            for token in (
+                "config",
+                "settings",
+                "routes",
+                "controllers",
+                "services",
+                "middleware",
+                "models",
+                "schema",
+                "server/",
+                "agent/",
+                "runtime/",
+                "tools/",
+                "src/",
+            )
+        ):
             score += 60
         if "/tests/" in f"/{rel}" or name.startswith("test_") or name.endswith("_test.py"):
             score += 80
         if rel.endswith((".md", ".rst")):
             score += 30
-        if focus and focus.lower() in rel:
-            score += 100
+        for term in self._focus_terms(focus):
+            if term in rel:
+                score += 75
         return score
 
     def _detect_commands(self, files: list[str]) -> list[str]:
         commands: list[str] = []
         lower = {path.lower() for path in files}
-        if "pyproject.toml" in lower or "requirements.txt" in lower or any(
+        if {"pyproject.toml", "requirements.txt", "pytest.ini", "tox.ini"} & lower or any(
             path.endswith(".py") for path in lower
         ):
             commands.extend(["pytest -q", "python -m pytest"])
+        if "ruff.toml" in lower or ".ruff.toml" in lower:
+            commands.append("ruff check .")
+        if "mypy.ini" in lower or "pyrightconfig.json" in lower:
+            commands.append("mypy .")
         if "package.json" in lower:
-            commands.extend(["npm test", "npm run lint"])
+            commands.extend(["npm test", "npm run lint", "npm run build"])
+        if "pnpm-lock.yaml" in lower:
+            commands.extend(["pnpm test", "pnpm lint", "pnpm build"])
+        if "yarn.lock" in lower:
+            commands.extend(["yarn test", "yarn lint", "yarn build"])
         if "cargo.toml" in lower:
-            commands.append("cargo test")
+            commands.extend(["cargo test", "cargo check"])
         if "go.mod" in lower:
             commands.append("go test ./...")
         return list(dict.fromkeys(commands))
@@ -168,3 +235,15 @@ class RepoMemoryStore:
         if focus:
             summary += f" Current focus hint: {focus}."
         return summary
+
+    def _focus_terms(self, focus: str | None) -> list[str]:
+        if not focus:
+            return []
+        tokens = []
+        for raw in focus.lower().replace("/", " ").replace("-", " ").split():
+            token = raw.strip(".,:;()[]{}!?\"'")
+            if len(token) < 3 or token in FOCUS_STOPWORDS:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+        return tokens[:6]

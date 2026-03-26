@@ -4,14 +4,12 @@ import argparse
 import json
 import sys
 
-from agent.core import AgentCore
-from agent.session import SessionStore
-from config.settings import AppConfig
+from bootstrap_runtime import ensure_runtime_dependencies
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Optional CLI for the local Codex-style coding agent."
+        description="Optional CLI for the M.A.R.C A1 coding runtime."
     )
     parser.add_argument(
         "--config",
@@ -26,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace root. Defaults to the current directory.",
     )
     parser.add_argument(
+        "--access-mode",
+        choices=["safe", "approval", "full"],
+        default=None,
+        help="Runtime access mode: safe, approval, or full.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose console logging.",
@@ -38,12 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Disable all mutating tools.",
+        help="Legacy alias for --access-mode safe.",
     )
     parser.add_argument(
         "--approval-mode",
         action="store_true",
-        help="Require approval for medium/high-risk shell commands and git mutations.",
+        help="Legacy alias for --access-mode approval.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -86,12 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_config(args: argparse.Namespace) -> AppConfig:
+def make_config(args: argparse.Namespace):
+    from config.settings import AccessMode, AppConfig
+
+    access_mode = args.access_mode
+    if access_mode is None and args.read_only:
+        access_mode = AccessMode.SAFE.value
+    if access_mode is None and args.approval_mode:
+        access_mode = AccessMode.APPROVAL.value
+
     overrides = {
-        "verbose": args.verbose,
-        "dry_run": args.dry_run,
-        "read_only": args.read_only,
-        "approval_mode": args.approval_mode,
+        "verbose": args.verbose if args.verbose else None,
+        "dry_run": args.dry_run if args.dry_run else None,
+        "access_mode": access_mode,
     }
     return AppConfig.from_sources(
         workspace_override=args.workspace,
@@ -104,11 +115,30 @@ def print_session_result(session) -> None:
     print(f"Session: {session.id}")
     print(f"Task: {session.task}")
     print(f"Status: {session.status}")
+    print(f"Phase: {session.current_phase}")
+    print(f"Access mode: {session.access_mode}")
+    print(f"Validation: {session.validation_status}")
     print(f"Iterations: {session.iterations}")
+    if session.stop_reason:
+        print(f"Stop reason: {session.stop_reason}")
+    if session.plan_summary:
+        print(f"\nPlan summary:\n{session.plan_summary}")
     if session.plan:
         print("\nPlan:")
         for item in session.plan:
             print(f"- [{item.status}] {item.step}")
+    if session.candidate_files:
+        print("\nCandidate files:")
+        for path in session.candidate_files[:10]:
+            print(f"- {path}")
+    if session.verification_commands:
+        print("\nVerification commands:")
+        for command in session.verification_commands:
+            print(f"- {command}")
+    if session.helper_artifacts:
+        print("\nHelper artifacts:")
+        for path in session.helper_artifacts:
+            print(f"- {path}")
     if session.changed_files:
         print("\nChanged files:")
         for change in session.changed_files:
@@ -117,26 +147,36 @@ def print_session_result(session) -> None:
         print("\nExecuted commands:")
         for command in session.executed_commands:
             print(f"- {command}")
+    if session.blockers:
+        print("\nBlockers:")
+        for blocker in session.blockers:
+            print(f"- {blocker}")
     if session.final_response:
         print("\nResult:")
         print(session.final_response)
 
 
-def run_task_command(config: AppConfig, prompt: str) -> int:
+def run_task_command(config, prompt: str) -> int:
+    from agent.core import AgentCore
+
     agent = AgentCore(config)
     session = agent.run_task(prompt)
     print_session_result(session)
     return 0 if session.status in {"completed", "partial"} else 1
 
 
-def run_inspect_command(config: AppConfig, focus: str | None) -> int:
+def run_inspect_command(config, focus: str | None) -> int:
+    from agent.core import AgentCore
+
     agent = AgentCore(config)
     snapshot_text = agent.inspect_workspace(focus=focus)
     print(snapshot_text)
     return 0
 
 
-def run_diff_command(config: AppConfig, session_id: str | None) -> int:
+def run_diff_command(config, session_id: str | None) -> int:
+    from agent.session import SessionStore
+
     store = SessionStore(config.session_dir_path)
     session = store.load(session_id) if session_id else store.load_last()
     if session is None:
@@ -153,14 +193,17 @@ def run_diff_command(config: AppConfig, session_id: str | None) -> int:
     return 0
 
 
-def run_chat_command(config: AppConfig, session_id: str | None) -> int:
+def run_chat_command(config, session_id: str | None) -> int:
+    from agent.core import AgentCore
+    from agent.session import SessionStore
+
     agent = AgentCore(config)
     store = SessionStore(config.session_dir_path)
     session = store.load(session_id) if session_id else None
     print("Interactive chat. Type 'exit' or 'quit' to stop.")
     while True:
         try:
-            prompt = input("\nagent> ").strip()
+            prompt = input("\nmarc> ").strip()
         except EOFError:
             print()
             break
@@ -173,12 +216,14 @@ def run_chat_command(config: AppConfig, session_id: str | None) -> int:
     return 0
 
 
-def run_config_show(config: AppConfig) -> int:
+def run_config_show(config) -> int:
     print(json.dumps(config.to_public_dict(), indent=2, sort_keys=True))
     return 0
 
 
 def main() -> int:
+    ensure_runtime_dependencies()
+
     parser = build_parser()
     args = parser.parse_args()
     config = make_config(args)

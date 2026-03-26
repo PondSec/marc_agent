@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from config.settings import AppConfig
+from config.settings import AGENT_NAME, AppConfig
 from server.schemas import HealthResponse, SessionSummary, TaskCreateRequest
 from server.task_manager import TaskAlreadyRunningError, TaskManager
 
@@ -19,7 +19,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     task_manager = TaskManager(config)
     static_dir = Path(__file__).resolve().parent.parent / "webui"
 
-    app = FastAPI(title="Local Codex Agent GUI", version="0.2.0")
+    app = FastAPI(title=f"{AGENT_NAME} Web Console", version="1.0.0")
     app.state.task_manager = task_manager
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -64,7 +64,13 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
                 request.prompt,
                 session_id=request.session_id,
                 overrides=request.model_dump(
-                    include={"dry_run", "read_only", "approval_mode", "verbose"}
+                    include={
+                        "access_mode",
+                        "dry_run",
+                        "read_only",
+                        "approval_mode",
+                        "verbose",
+                    }
                 ),
             )
         except TaskAlreadyRunningError as exc:
@@ -90,7 +96,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
                 sent_logs = len(logs)
 
                 if session is not None and session.status in {"completed", "failed", "partial"}:
-                    yield _sse("done", {"status": session.status})
+                    yield _sse("done", {"status": session.status, "phase": session.current_phase})
                     break
 
                 yield ": keep-alive\n\n"

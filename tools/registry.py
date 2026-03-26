@@ -19,6 +19,7 @@ from llm.schemas import (
     ReadFileArgs,
     ReplaceInFileArgs,
     RunShellArgs,
+    RunTestsArgs,
     SearchInFilesArgs,
     ShowDiffArgs,
     WriteFileArgs,
@@ -31,6 +32,9 @@ class ToolSpec:
     description: str
     input_model: type[BaseModel]
     handler: Callable[[BaseModel], dict]
+    category: str = "general"
+    mutating: bool = False
+    destructive: bool = False
 
     def prompt_line(self) -> str:
         fields = []
@@ -39,7 +43,13 @@ class ToolSpec:
             annotation = getattr(field.annotation, "__name__", str(field.annotation))
             fields.append(f"{name}:{annotation} ({required})")
         signature = ", ".join(fields) if fields else "no args"
-        return f"- {self.name}({signature}): {self.description}"
+        traits = [self.category]
+        if self.mutating:
+            traits.append("mutating")
+        if self.destructive:
+            traits.append("destructive")
+        trait_text = ", ".join(traits)
+        return f"- {self.name} [{trait_text}] ({signature}): {self.description}"
 
 
 class ToolRegistry:
@@ -69,6 +79,7 @@ def build_default_registry(
             description="Build a focused repository summary and identify important files.",
             input_model=InspectWorkspaceArgs,
             handler=search.inspect_workspace,
+            category="inspect",
         )
     )
     registry.register(
@@ -77,6 +88,7 @@ def build_default_registry(
             description="List files under a directory, optionally filtered by glob.",
             input_model=ListFilesArgs,
             handler=search.list_files,
+            category="inspect",
         )
     )
     registry.register(
@@ -85,6 +97,7 @@ def build_default_registry(
             description="Search for literal text or regex matches across files.",
             input_model=SearchInFilesArgs,
             handler=search.search_in_files,
+            category="inspect",
         )
     )
     registry.register(
@@ -93,6 +106,7 @@ def build_default_registry(
             description="Read a file or a selected line range.",
             input_model=ReadFileArgs,
             handler=filesystem.read_file,
+            category="read",
         )
     )
     registry.register(
@@ -101,6 +115,8 @@ def build_default_registry(
             description="Write full content to a file and return a diff.",
             input_model=WriteFileArgs,
             handler=filesystem.write_file,
+            category="write",
+            mutating=True,
         )
     )
     registry.register(
@@ -109,6 +125,8 @@ def build_default_registry(
             description="Append content to a file and return a diff.",
             input_model=AppendFileArgs,
             handler=filesystem.append_file,
+            category="write",
+            mutating=True,
         )
     )
     registry.register(
@@ -117,6 +135,8 @@ def build_default_registry(
             description="Create a new file with optional initial content.",
             input_model=CreateFileArgs,
             handler=filesystem.create_file,
+            category="write",
+            mutating=True,
         )
     )
     registry.register(
@@ -125,6 +145,9 @@ def build_default_registry(
             description="Delete a single file inside the workspace.",
             input_model=DeleteFileArgs,
             handler=filesystem.delete_file,
+            category="write",
+            mutating=True,
+            destructive=True,
         )
     )
     registry.register(
@@ -133,6 +156,8 @@ def build_default_registry(
             description="Perform a literal text replacement inside a file.",
             input_model=ReplaceInFileArgs,
             handler=filesystem.replace_in_file,
+            category="write",
+            mutating=True,
         )
     )
     registry.register(
@@ -141,6 +166,8 @@ def build_default_registry(
             description="Apply validated text patch operations to a file.",
             input_model=PatchFileArgs,
             handler=filesystem.patch_file,
+            category="write",
+            mutating=True,
         )
     )
     registry.register(
@@ -149,6 +176,7 @@ def build_default_registry(
             description="Preview a diff without modifying the file.",
             input_model=ShowDiffArgs,
             handler=filesystem.show_diff,
+            category="read",
         )
     )
     registry.register(
@@ -157,6 +185,16 @@ def build_default_registry(
             description="Run a guarded shell command inside the workspace.",
             input_model=RunShellArgs,
             handler=shell.run_shell,
+            category="execute",
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="run_tests",
+            description="Run a targeted test, lint, typecheck, or build command.",
+            input_model=RunTestsArgs,
+            handler=shell.run_tests,
+            category="verify",
         )
     )
     registry.register(
@@ -165,6 +203,7 @@ def build_default_registry(
             description="Run git status --short.",
             input_model=EmptyArgs,
             handler=gittools.git_status,
+            category="git",
         )
     )
     registry.register(
@@ -173,6 +212,7 @@ def build_default_registry(
             description="Show git diff output.",
             input_model=GitDiffArgs,
             handler=gittools.git_diff,
+            category="git",
         )
     )
     registry.register(
@@ -181,6 +221,7 @@ def build_default_registry(
             description="Show recent git history.",
             input_model=GitLogArgs,
             handler=gittools.git_log,
+            category="git",
         )
     )
     registry.register(
@@ -189,6 +230,8 @@ def build_default_registry(
             description="Create and switch to a new local branch.",
             input_model=GitCreateBranchArgs,
             handler=gittools.git_create_branch,
+            category="git",
+            mutating=True,
         )
     )
     return registry

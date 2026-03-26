@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from config.settings import AppConfig
+from config.settings import AccessMode, AppConfig
 from llm.schemas import EmptyArgs, GitCreateBranchArgs, GitDiffArgs, GitLogArgs
 from runtime.workspace import WorkspaceManager
 
@@ -29,13 +29,12 @@ class GitTools:
         )
 
     def git_create_branch(self, args: GitCreateBranchArgs) -> dict:
-        if self.config.read_only:
-            return {"success": False, "message": "Read-only mode blocks branch creation."}
-        if self.config.approval_mode:
+        if self.config.access_mode != AccessMode.FULL.value:
             return {
                 "success": False,
-                "message": "Approval mode blocks branch creation until approved.",
+                "message": "Branch creation requires full access mode.",
                 "risk_level": "medium",
+                "blocked": True,
             }
         if self.config.dry_run:
             return {
@@ -57,7 +56,9 @@ class GitTools:
         )
         return {
             "success": completed.returncode == 0,
-            "message": completed.stdout.strip() or completed.stderr.strip() or "git command finished",
+            "message": completed.stdout.strip()
+            or completed.stderr.strip()
+            or "git command finished",
             "stdout": completed.stdout[-self.config.max_read_chars :],
             "stderr": completed.stderr[-self.config.max_read_chars :],
             "exit_code": completed.returncode,

@@ -3,18 +3,24 @@ from __future__ import annotations
 import json
 
 from agent.models import SessionState, WorkspaceSnapshot
+from config.settings import AGENT_FULL_NAME, AGENT_NAME
 
 
 def system_prompt() -> str:
     return (
-        "You are a local coding agent. "
-        "You must behave like a practical software engineering assistant, not a chatbot. "
+        f"You are {AGENT_NAME} ({AGENT_FULL_NAME}), a local autonomous coding agent. "
+        "Behave like a serious implementation system, not a chatbot. "
         "Always return valid JSON only. "
-        "Prefer targeted exploration over reading the whole repository. "
-        "Use inspect_workspace, list_files, and search_in_files before loading many files. "
-        "Only use shell commands for testing, linting, builds, or safe repository inspection. "
-        "Never request destructive commands, remote pushes, or writes outside the workspace. "
-        "When enough evidence is collected, finish with a concise, implementation-focused summary."
+        "Prefer inspect -> search -> read -> edit -> verify -> repair -> final. "
+        "Do not finish after code changes until at least one targeted validation command succeeds, "
+        "unless you hit a meaningful blocker and explain it clearly. "
+        "Use inspect_workspace, list_files, and search_in_files before broad file reads. "
+        "Respect access_mode exactly. "
+        "If a format, asset, log, or build process is hard to inspect directly, you may create a small "
+        "helper script, parser, converter, test harness, or temporary analysis tool inside the workspace "
+        "to unblock the real task, run it, read the result, and continue. "
+        "Prefer minimal, focused helpers and explain why they exist in the final summary. "
+        "Never request destructive commands, remote pushes, or writes outside the workspace."
     )
 
 
@@ -25,7 +31,9 @@ def planning_prompt(task: str, snapshot: WorkspaceSnapshot) -> str:
         f"Workspace summary:\n{snapshot.repo_summary}\n\n"
         f"Important files:\n{json.dumps(snapshot.important_files[:12], indent=2)}\n\n"
         f"Likely commands:\n{json.dumps(snapshot.likely_commands, indent=2)}\n\n"
-        "Return JSON with keys: summary, steps, files_to_inspect, tests_to_run."
+        "Return JSON with keys: summary, steps, files_to_inspect, tests_to_run, completion_criteria.\n"
+        "Prefer high-signal files, likely verification commands, and explicit completion conditions.\n"
+        "If helper tooling may be needed, include that in the plan."
     )
 
 
@@ -39,7 +47,9 @@ def decision_prompt(
             "tool": item.tool_name,
             "args": item.tool_args,
             "success": item.success,
+            "phase": item.phase,
             "summary": item.summary,
+            "expected_outcome": item.expected_outcome,
             "output_excerpt": item.output_excerpt,
         }
         for item in session.tool_calls[-6:]
@@ -47,19 +57,33 @@ def decision_prompt(
     changed_files = [item.path for item in session.changed_files[-10:]]
     prompt = {
         "task": task,
-        "workspace_summary": session.workspace_snapshot.model_dump() if session.workspace_snapshot else {},
+        "access_mode": session.access_mode,
+        "current_phase": session.current_phase,
+        "validation_status": session.validation_status,
+        "repair_attempts": session.repair_attempts,
+        "workspace_summary": (
+            session.workspace_snapshot.model_dump() if session.workspace_snapshot else {}
+        ),
+        "plan_summary": session.plan_summary,
         "plan": [item.model_dump() for item in session.plan],
+        "candidate_files": session.candidate_files[:20],
+        "verification_commands": session.verification_commands,
+        "completion_criteria": session.completion_criteria,
         "iteration": session.iterations,
         "recent_tool_calls": recent_calls,
         "changed_files": changed_files,
-        "notes": session.notes[-6:],
+        "notes": session.notes[-8:],
+        "blockers": session.blockers,
+        "last_error": session.last_error,
         "tool_manifest": tool_manifest,
         "instructions": {
             "strategy": [
                 "Inspect before editing.",
                 "Prefer the smallest sufficient file set.",
-                "Run tests or targeted validation after code changes.",
-                "Finish when the task is completed or when a blocker must be reported.",
+                "Patch the existing architecture instead of duplicating logic.",
+                "After edits, run targeted validation and keep iterating until it passes or a real blocker remains.",
+                "When blocked by format or tooling limitations, build a tiny helper script or parser only if it materially advances the task.",
+                "Do not finalize while unverified code changes remain.",
             ],
             "output_contract": {
                 "thought_summary": "string",
@@ -72,7 +96,6 @@ def decision_prompt(
         },
     }
     return (
-        "Decide the next best action for the coding task. "
-        "Return JSON only.\n\n"
+        "Decide the next best action for the coding task. Return JSON only.\n\n"
         + json.dumps(prompt, indent=2)
     )

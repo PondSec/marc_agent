@@ -46,9 +46,8 @@ async function startTask(event) {
   const body = {
     prompt,
     session_id: continueSession ? state.activeSessionId : null,
+    access_mode: document.getElementById("accessModeSelect").value,
     dry_run: document.getElementById("dryRunToggle").checked,
-    read_only: document.getElementById("readOnlyToggle").checked,
-    approval_mode: document.getElementById("approvalToggle").checked,
     verbose: true,
   };
 
@@ -69,14 +68,30 @@ async function startTask(event) {
 async function refreshHealth() {
   const health = await fetchJSON("/api/health");
   document.getElementById("serverHealth").textContent = health.ok
-    ? `Online · ${health.active_sessions.length} aktiv`
+    ? `Online - ${health.active_sessions.length} aktiv`
     : "Offline";
 }
 
 async function refreshConfig() {
   state.config = await fetchJSON("/api/config");
   document.getElementById("workspaceRoot").textContent = state.config.workspace_root;
+  document.getElementById("helperDir").textContent = state.config.helper_dir;
   document.getElementById("configView").textContent = JSON.stringify(state.config, null, 2);
+
+  const branding = state.config.branding || {};
+  document.getElementById("brandEyebrow").textContent = branding.name || "M.A.R.C A1";
+  document.getElementById("brandTitle").textContent =
+    branding.full_name || "Modular Autonomous Runtime Core - Agent 1";
+  document.getElementById("brandTagline").textContent =
+    branding.tagline || "Lokaler Coding-Agent fuer echte Implementierungsarbeit.";
+
+  const accessModeSelect = document.getElementById("accessModeSelect");
+  accessModeSelect.innerHTML = (state.config.access_modes || ["safe", "approval", "full"])
+    .map(
+      (mode) =>
+        `<option value="${escapeHtml(mode)}"${mode === state.config.access_mode ? " selected" : ""}>${escapeHtml(labelForAccessMode(mode))}</option>`,
+    )
+    .join("");
 }
 
 async function inspectWorkspace() {
@@ -103,7 +118,7 @@ async function loadSession(sessionId) {
   state.activeSessionId = sessionId;
   state.activeSession = await fetchJSON(`/api/sessions/${sessionId}`);
   state.logs = await fetchJSON(`/api/sessions/${sessionId}/logs`);
-  if (state.activeSession.changed_files.length > 0) {
+  if ((state.activeSession.changed_files || []).length > 0) {
     const exists = state.activeSession.changed_files.some(
       (change) => change.path === state.selectedDiffPath,
     );
@@ -122,7 +137,7 @@ function connectStream(sessionId) {
   const stream = new EventSource(`/api/sessions/${sessionId}/events`);
   stream.addEventListener("session", (event) => {
     state.activeSession = JSON.parse(event.data);
-    if (state.activeSession.changed_files.length > 0 && !state.selectedDiffPath) {
+    if ((state.activeSession.changed_files || []).length > 0 && !state.selectedDiffPath) {
       state.selectedDiffPath = state.activeSession.changed_files[0].path;
     }
     renderAll();
@@ -179,11 +194,12 @@ function renderSessions() {
         <article class="session-card ${isActive ? "active" : ""}" data-session-id="${escapeHtml(session.id)}">
           <header>
             <div>
-              <h3>${escapeHtml(shorten(session.task, 80))}</h3>
+              <h3>${escapeHtml(shorten(session.task, 72))}</h3>
               <p>${escapeHtml(formatDate(session.updated_at))}</p>
             </div>
             <span class="status-chip ${escapeHtml(session.status)}">${escapeHtml(session.status)}</span>
           </header>
+          <p>${escapeHtml(session.current_phase)} - ${escapeHtml(session.validation_status)} - ${escapeHtml(labelForAccessMode(session.access_mode))}</p>
           <p>${session.tool_call_count} Tool-Calls | ${session.changed_file_count} Dateiaenderungen</p>
         </article>
       `;
@@ -208,7 +224,7 @@ function renderSession() {
     badge.className = "status-chip neutral";
     badge.textContent = "Idle";
     meta.innerHTML = `<div class="empty-state">Starte einen Task oder waehle eine gespeicherte Session aus.</div>`;
-    timeline.innerHTML = `<div class="empty-state">Hier erscheinen Plan, Tool-Aufrufe, Ausgaben und Ergebnisse des Agenten.</div>`;
+    timeline.innerHTML = `<div class="empty-state">Hier erscheinen Plan, Tool-Aufrufe, Verifikation, Reparaturschleifen und Ergebnisse des Agenten.</div>`;
     return;
   }
 
@@ -217,27 +233,51 @@ function renderSession() {
   badge.textContent = state.activeSession.status;
 
   const options = state.activeSession.runtime_options || {};
+  const blockers = state.activeSession.blockers || [];
   meta.innerHTML = `
     <div>
       <span class="meta-pill">Session ${escapeHtml(state.activeSession.id)}</span>
+      <span class="meta-pill">Phase ${escapeHtml(state.activeSession.current_phase)}</span>
+      <span class="meta-pill">Validation ${escapeHtml(state.activeSession.validation_status)}</span>
+      <span class="meta-pill">${escapeHtml(labelForAccessMode(state.activeSession.access_mode))}</span>
       <span class="meta-pill">Iterationen ${state.activeSession.iterations}</span>
+      <span class="meta-pill">Repair ${state.activeSession.repair_attempts}</span>
       <span class="meta-pill">Dry run ${options.dry_run ? "an" : "aus"}</span>
-      <span class="meta-pill">Read only ${options.read_only ? "an" : "aus"}</span>
-      <span class="meta-pill">Approval ${options.approval_mode ? "an" : "aus"}</span>
+      <span class="meta-pill">Stop ${escapeHtml(state.activeSession.stop_reason || "-")}</span>
     </div>
+    ${
+      blockers.length
+        ? `<div class="warning-box">${blockers.map((item) => escapeHtml(item)).join("<br />")}</div>`
+        : ""
+    }
   `;
+
+  const summaryBits = [
+    state.activeSession.plan_summary
+      ? `<p>${escapeHtml(state.activeSession.plan_summary)}</p>`
+      : "",
+    state.activeSession.final_response
+      ? `<p>${escapeHtml(state.activeSession.final_response)}</p>`
+      : `<p>Session laeuft oder wartet auf das naechste Tool-Ergebnis.</p>`,
+    renderFlatList("Plan", state.activeSession.plan?.map((item) => `${item.status} - ${item.step}`) || []),
+    renderFlatList("Candidate Files", state.activeSession.candidate_files || []),
+    renderFlatList("Verification", state.activeSession.verification_commands || []),
+    renderFlatList("Completion Criteria", state.activeSession.completion_criteria || []),
+    renderFlatList("Helper Artifacts", state.activeSession.helper_artifacts || []),
+  ]
+    .filter(Boolean)
+    .join("");
 
   const cards = [];
   cards.push(`
     <article class="timeline-card summary-card">
       <header>
         <div>
-          <h3>Abschluss / Status</h3>
+          <h3>Session Summary</h3>
           <p class="muted-contrast">${escapeHtml(formatDate(state.activeSession.updated_at))}</p>
         </div>
       </header>
-      <p>${escapeHtml(state.activeSession.final_response || "Session laeuft oder wartet auf das naechste Tool-Ergebnis.")}</p>
-      ${renderPlanList(state.activeSession.plan)}
+      ${summaryBits}
     </article>
   `);
 
@@ -247,17 +287,19 @@ function renderSession() {
         <header>
           <div>
             <h3>${escapeHtml(call.tool_name)}</h3>
-            <p>Iteration ${call.iteration} | ${escapeHtml(call.timestamp)}</p>
+            <p>Iteration ${call.iteration} | Phase ${escapeHtml(call.phase || "-")} | ${escapeHtml(call.timestamp)}</p>
           </div>
           <span class="status-chip ${call.success ? "completed" : "failed"}">${call.success ? "ok" : "fail"}</span>
         </header>
         <p>${escapeHtml(call.summary)}</p>
+        <p><strong>Ziel:</strong> ${escapeHtml(call.expected_outcome || "-")}</p>
+        <p><strong>Gedanke:</strong> ${escapeHtml(call.thought_summary || "-")}</p>
         <pre>${escapeHtml(call.output_excerpt || "(kein Output-Exzerpt)")}</pre>
       </article>
     `);
   });
 
-  if (state.activeSession.notes.length) {
+  if ((state.activeSession.notes || []).length) {
     cards.push(`
       <article class="timeline-card">
         <header>
@@ -273,13 +315,16 @@ function renderSession() {
   timeline.innerHTML = cards.join("");
 }
 
-function renderPlanList(plan) {
-  if (!plan || !plan.length) {
+function renderFlatList(title, items) {
+  if (!items || !items.length) {
     return "";
   }
-  return `<ul>${plan
-    .map((item) => `<li>${escapeHtml(item.status)} · ${escapeHtml(item.step)}</li>`)
-    .join("")}</ul>`;
+  return `
+    <div class="summary-block">
+      <h4>${escapeHtml(title)}</h4>
+      <ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+    </div>
+  `;
 }
 
 function renderDiffs() {
@@ -363,8 +408,14 @@ function renderWorkspace() {
   container.innerHTML = `
     <article class="workspace-card">
       <p>${escapeHtml(state.workspace.text)}</p>
-      <ul>${importantFiles}</ul>
-      <div>${commands || '<span class="meta-pill">Keine Befehle erkannt</span>'}</div>
+      <div class="summary-block">
+        <h4>Priorisierte Dateien</h4>
+        <ul>${importantFiles}</ul>
+      </div>
+      <div class="summary-block">
+        <h4>Vermutete Checks</h4>
+        <div>${commands || '<span class="meta-pill">Keine Befehle erkannt</span>'}</div>
+      </div>
     </article>
   `;
 }
@@ -384,7 +435,7 @@ async function fetchJSON(url, options = {}) {
   return response.json();
 }
 
-function shorten(text, maxLength) {
+function shorten(text, maxLength = 80) {
   return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
 }
 
@@ -394,6 +445,13 @@ function formatDate(value) {
     return value;
   }
   return date.toLocaleString();
+}
+
+function labelForAccessMode(mode) {
+  if (mode === "safe") return "Safe";
+  if (mode === "approval") return "Approval";
+  if (mode === "full") return "Full Access";
+  return mode || "-";
 }
 
 function escapeHtml(value) {

@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 
 from config.settings import AppConfig
-from llm.schemas import RunShellArgs
+from llm.schemas import RunShellArgs, RunTestsArgs
 from runtime.workspace import WorkspaceManager
 from tools.safety import SafetyManager
 
@@ -20,51 +20,65 @@ class ShellTools:
         self.safety = safety
 
     def run_shell(self, args: RunShellArgs) -> dict:
-        assessment = self.safety.assess_shell_command(args.command)
+        return self._run_command(args.command, args.cwd, args.timeout)
+
+    def run_tests(self, args: RunTestsArgs) -> dict:
+        result = self._run_command(args.command, args.cwd, args.timeout)
+        result["message"] = (
+            f"Validation command exited with {result['exit_code']}."
+            if "exit_code" in result
+            else result["message"]
+        )
+        return result
+
+    def _run_command(self, command: str, cwd: str, timeout: int | None) -> dict:
+        assessment = self.safety.assess_shell_command(command)
         if not assessment.allowed:
             return {
                 "success": False,
                 "message": "; ".join(assessment.reasons),
                 "risk_level": assessment.risk_level,
                 "blocked": True,
+                "command": command,
             }
 
-        cwd = self.workspace.resolve_directory(args.cwd)
-        if not cwd.exists():
+        working_dir = self.workspace.resolve_directory(cwd)
+        if not working_dir.exists():
             return {
                 "success": False,
-                "message": f"Working directory does not exist: {cwd}",
+                "message": f"Working directory does not exist: {working_dir}",
                 "risk_level": assessment.risk_level,
                 "blocked": True,
+                "command": command,
             }
         if self.config.dry_run:
             return {
                 "success": True,
-                "message": f"Dry run: would execute '{args.command}' in {cwd}",
+                "message": f"Dry run: would execute '{command}' in {working_dir}",
                 "risk_level": assessment.risk_level,
                 "stdout": "",
                 "stderr": "",
                 "exit_code": 0,
-                "command": args.command,
+                "command": command,
             }
 
-        timeout = args.timeout or self.config.shell_timeout
+        effective_timeout = timeout or self.config.shell_timeout
         try:
             completed = subprocess.run(
-                ["/bin/bash", "-lc", args.command],
-                cwd=cwd,
+                ["/bin/bash", "-lc", command],
+                cwd=working_dir,
                 text=True,
                 capture_output=True,
-                timeout=timeout,
+                timeout=effective_timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired:
             return {
                 "success": False,
-                "message": f"Command timed out after {timeout} seconds.",
+                "message": f"Command timed out after {effective_timeout} seconds.",
                 "risk_level": assessment.risk_level,
                 "timeout": True,
-                "command": args.command,
+                "command": command,
             }
 
         stdout = completed.stdout[-self.config.max_read_chars :]
@@ -76,5 +90,5 @@ class ShellTools:
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": completed.returncode,
-            "command": args.command,
+            "command": command,
         }

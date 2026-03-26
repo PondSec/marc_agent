@@ -8,7 +8,7 @@ from tools.shell import ShellTools
 
 
 def test_shell_command_timeout(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), shell_timeout=1)
+    config = AppConfig(workspace_root=str(tmp_path), shell_timeout=1, access_mode="full").normalized()
     config.ensure_state_dirs()
     workspace = WorkspaceManager(tmp_path)
     safety = SafetyManager(config, workspace)
