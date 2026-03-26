@@ -57,6 +57,10 @@ def test_start_task_and_fetch_session_via_api(tmp_path):
     assert session_payload["access_mode"] == config.access_mode
     assert "validation_status" in session_payload
     assert "current_phase" in session_payload
+    assert "workflow_stage" in session_payload
+    assert "report" in session_payload
+    assert session_payload["report"]["summary"]
+    assert session_payload["report"]["report_path"]
 
     logs_response = client.get(f"/api/sessions/{session_id}/logs")
     assert logs_response.status_code == 200

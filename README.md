@@ -22,6 +22,9 @@ Die groessten Luecken lagen im agentischen Verhalten:
 - zu schwache Abschlusskriterien nach Codeaenderungen
 - wenig Sichtbarkeit fuer Phase, Validation-Status und Stop-Gruende
 - keine explizite Ermutigung, bei Hindernissen Hilfsskripte oder Parser zu bauen
+- zu wenig strukturierte Repo-Inspektion mit Projekt- und Workflow-Awareness
+- zu wenig Diagnostik aus fehlgeschlagenen Tests, Shell-Kommandos und Safety-Blockern
+- zu duenne Abschlussberichte fuer Sessions
 - Branding, Doku und UI noch nicht auf einen ernsthaften Agenten ausgerichtet
 
 M.A.R.C A1 behebt genau diese Punkte, ohne das Projekt blind neu zu schreiben.
@@ -34,10 +37,10 @@ M.A.R.C A1 ist auf diese Arbeitsweise ausgelegt:
 2. relevante Dateien priorisieren und lesen
 3. bestehende Architektur respektieren
 4. fokussierte Aenderungen ueber mehrere Dateien hinweg machen
-5. Tests, Lint, Build oder andere Projektchecks gezielt ausfuehren
-6. Fehler aus Logs und Tool-Outputs lesen
+5. projektbezogene Validation-Plaene fuer Tests, Lint, Typechecks und Build ableiten
+6. Fehler aus Logs, Tool-Outputs und fehlgeschlagenen Checks diagnostizieren
 7. iterativ nachbessern
-8. Status, Tool-Calls, Diffs, Blocker und Ergebnisse sichtbar machen
+8. Status, Tool-Calls, Validation-Runs, Diagnosen, Diffs, Blocker und Ergebnisse sichtbar machen
 
 Wenn noetig darf M.A.R.C A1 auch kleine Hilfswerkzeuge bauen, zum Beispiel:
 
@@ -73,18 +76,22 @@ Legacy-Flags wie `--read-only` und `--approval-mode` werden weiter akzeptiert, i
 
 Die Runtime arbeitet in einer expliziten Schleife:
 
-1. `planning`
-2. `exploring`
-3. `editing`
-4. `verifying`
-5. `repairing`
-6. `completed` oder `blocked`
+1. `discover`
+2. `plan`
+3. `act`
+4. `verify`
+5. `repair`
+6. `report`
+
+Intern werden diese Workflow-Stufen ueber konkrete Laufphasen wie `planning`, `exploring`, `editing`, `verifying`, `repairing` und `reporting` umgesetzt.
 
 Zusatzregeln:
 
-- Kein verfruehtes Finish nach Codeaenderungen ohne Validation, falls ein sinnvoller Check verfuegbar ist
+- Kein verfruehtes Finish nach Codeaenderungen ohne vollstaendigen Validation-Plan, falls sinnvolle Checks verfuegbar sind
 - wiederholte Verify-Fehlschlaege werden als Repair-Versuche gezaehlt
 - sinnvolle Stop-Gruende werden gespeichert, zum Beispiel `validated`, `blocked`, `max_iterations_reached`
+- fehlgeschlagene Checks werden als strukturierte Diagnosen mit Datei-Hinweisen gespeichert
+- jede Session erzeugt einen Abschlussbericht unter `.marc_a1/reports/`
 - Helper-Artefakte werden in der Session sichtbar gemacht
 
 ## Architektur
@@ -96,7 +103,7 @@ Die Architektur bleibt modular, ist aber jetzt staerker auf echte Agentik ausger
 2. Web-Backend
    `server/` kapselt API, Session-Lifecycle und Live-Streams.
 3. Agent-Core
-   `agent/core.py`, `planner.py`, `memory.py`, `models.py` steuern Planung, Phasen, Verify-/Repair-Loop und Session-State.
+   `agent/core.py`, `planner.py`, `memory.py`, `verification.py`, `diagnostics.py`, `reporting.py` steuern Planung, Repo-Verstaendnis, Validation-Plan, Diagnose, Verify-/Repair-Loop und Session-State.
 4. Runtime
    `runtime/` validiert Tool-Calls, loggt Ereignisse und erzwingt Workspace-Grenzen.
 5. Tools
@@ -238,6 +245,14 @@ Wichtige Endpunkte:
 - `GET /api/sessions/{session_id}`
 - `GET /api/sessions/{session_id}/logs`
 - `GET /api/sessions/{session_id}/events`
+
+Die Session-Antworten enthalten unter anderem:
+
+- `workflow_stage`
+- `validation_plan`
+- `validation_runs`
+- `diagnostics`
+- `report`
 - `POST /api/tasks`
 
 `/api/sessions/{session_id}/events` streamt Live-Session-Updates per SSE.

@@ -3,17 +3,23 @@ from __future__ import annotations
 import json
 from typing import Iterable
 
+from agent.diagnostics import FailureAnalyzer
 from agent.executor import Executor
 from agent.memory import RepoMemoryStore
 from agent.models import (
+    DiagnosticRecord,
     FileChangeRecord,
     PlanItem,
     SessionState,
     ToolCallRecord,
+    ValidationCommand,
+    ValidationRunRecord,
     WorkspaceSnapshot,
 )
 from agent.planner import Planner
+from agent.reporting import SessionReporter
 from agent.session import SessionStore
+from agent.verification import ValidationPlanner
 from config.settings import AppConfig
 from llm.ollama_client import OllamaClient
 from llm.schemas import AgentActionType, AgentDecision
@@ -51,6 +57,12 @@ class AgentCore:
         self.safety = SafetyManager(config, self.workspace)
         self.memory = RepoMemoryStore(config, self.workspace)
         self.session_store = SessionStore(config.session_dir_path)
+        self.failure_analyzer = FailureAnalyzer(
+            self.workspace,
+            max_excerpt=self.config.max_read_chars,
+        )
+        self.validation_planner = ValidationPlanner()
+        self.reporter = SessionReporter(config)
 
     def inspect_workspace(self, focus: str | None = None) -> str:
         snapshot = self.memory.build_snapshot(focus)
@@ -83,20 +95,9 @@ class AgentCore:
         if session.workspace_snapshot is None:
             session.workspace_snapshot = self.memory.build_snapshot(task)
         if not session.plan:
-            session.current_phase = "planning"
-            plan = planner.create_plan(task, session.workspace_snapshot)
-            session.plan_summary = plan.summary
-            session.plan = [PlanItem(step=step) for step in plan.steps]
-            if session.plan:
-                session.plan[0].status = "in_progress"
-            session.candidate_files = self._unique(
-                plan.files_to_inspect or session.workspace_snapshot.important_files[:12]
-            )
-            session.verification_commands = self._unique(
-                plan.tests_to_run or session.workspace_snapshot.likely_commands[:6]
-            )
-            session.completion_criteria = self._unique(plan.completion_criteria)
-            session.current_phase = "exploring"
+            self._initialize_session(task, session, planner)
+        else:
+            self._refresh_session_context(task, session)
         self.session_store.save(session)
 
         logger.log_event(
@@ -106,6 +107,7 @@ class AgentCore:
             workspace=str(self.workspace.root),
             access_mode=self.config.access_mode,
             dry_run=self.config.dry_run,
+            workflow_stage=session.workflow_stage,
         )
 
         final_response: str | None = None
@@ -114,12 +116,14 @@ class AgentCore:
             and len(session.tool_calls) < self.config.max_tool_calls
         ):
             session.current_phase = self._determine_phase(session)
+            session.workflow_stage = self._determine_workflow_stage(session)
             decision = planner.decide_next_action(task, session)
             decision = self._enforce_iteration_rules(session, decision)
             logger.log_event(
                 "decision",
                 iteration=session.iterations + 1,
                 phase=session.current_phase,
+                workflow_stage=session.workflow_stage,
                 action_type=decision.action_type,
                 tool_name=decision.tool_name,
                 expected_outcome=decision.expected_outcome,
@@ -153,7 +157,8 @@ class AgentCore:
             if command and command not in session.executed_commands:
                 session.executed_commands.append(command)
             self._append_note(session, result)
-            self._update_session_after_result(session, decision, result)
+            self._add_diagnostics(session, result)
+            self._update_session_after_result(task, session, decision, result)
             self._advance_plan(session, result)
             session.touch()
             self.session_store.save(session)
@@ -163,13 +168,22 @@ class AgentCore:
             session.status = "partial" if session.tool_calls else "failed"
             final_response = planner.summarize_session(session)
 
-        session.final_response = final_response
-        if session.status == "running":
-            session.status = self._resolve_final_status(session)
+        session.status = self._resolve_final_status(session)
+        session.current_phase = "reporting"
+        session.workflow_stage = "report"
+        session.report = self.reporter.build_report(session)
+        report_summary = self.reporter.render_final_response(session)
+        if final_response and final_response != report_summary:
+            session.final_response = f"{final_response}\n\n{report_summary}"
+        else:
+            session.final_response = report_summary
+
         if session.status == "completed":
             session.current_phase = "completed"
+            session.workflow_stage = "completed"
         elif session.blockers:
             session.current_phase = "blocked"
+            session.workflow_stage = "blocked"
         session.touch()
         self.session_store.save(session)
         logger.log_event(
@@ -177,11 +191,65 @@ class AgentCore:
             session_id=session.id,
             status=session.status,
             phase=session.current_phase,
+            workflow_stage=session.workflow_stage,
             iterations=session.iterations,
             validation_status=session.validation_status,
             stop_reason=session.stop_reason,
+            report_path=session.report.report_path if session.report else None,
         )
         return session
+
+    def _initialize_session(
+        self,
+        task: str,
+        session: SessionState,
+        planner: Planner,
+    ) -> None:
+        session.current_phase = "planning"
+        session.workflow_stage = "plan"
+        plan = planner.create_plan(task, session.workspace_snapshot)
+        session.plan_summary = plan.summary
+        session.plan = [PlanItem(step=step) for step in plan.steps]
+        if session.plan:
+            session.plan[0].status = "in_progress"
+        self._refresh_session_context(task, session, planned_files=plan.files_to_inspect)
+        session.completion_criteria = self._unique(plan.completion_criteria)
+        session.current_phase = "exploring"
+        session.workflow_stage = "discover"
+
+    def _refresh_session_context(
+        self,
+        task: str,
+        session: SessionState,
+        *,
+        planned_files: list[str] | None = None,
+    ) -> None:
+        snapshot = session.workspace_snapshot
+        if snapshot is None:
+            return
+        candidate_files = [
+            *(planned_files or []),
+            *snapshot.focus_files,
+            *snapshot.important_files[:18],
+        ]
+        diagnostic_files = [
+            path
+            for item in session.diagnostics[-6:]
+            for path in item.file_hints
+        ]
+        session.candidate_files = self._unique([*diagnostic_files, *candidate_files])[:24]
+        session.validation_plan = self.validation_planner.build_plan(
+            task,
+            snapshot,
+            changed_files=[item.path for item in session.changed_files],
+        )
+        session.verification_commands = [item.command for item in session.validation_plan]
+        if not session.completion_criteria:
+            session.completion_criteria = [
+                "Relevant files were inspected before editing.",
+                "Changes were validated with the project-aware command plan or blocked with a clear reason.",
+                "Final output includes changed files, commands, diagnostics, and stop reason.",
+            ]
 
     def _append_note(self, session: SessionState, result) -> None:
         if result.data.get("snapshot"):
@@ -190,7 +258,33 @@ class AgentCore:
         if result.data.get("exit_code") is not None:
             note += f" (exit={result.data['exit_code']})"
         session.notes.append(note)
-        session.notes = session.notes[-30:]
+        session.notes = session.notes[-40:]
+
+    def _add_diagnostics(self, session: SessionState, result) -> None:
+        diagnostics = self.failure_analyzer.analyze(result, iteration=session.iterations)
+        if not diagnostics:
+            return
+        for diagnostic in diagnostics:
+            if self._diagnostic_exists(session.diagnostics, diagnostic):
+                continue
+            session.diagnostics.append(diagnostic)
+            session.diagnostics = session.diagnostics[-20:]
+            if diagnostic.file_hints:
+                session.candidate_files = self._unique(
+                    [*diagnostic.file_hints, *session.candidate_files]
+                )[:24]
+
+    def _diagnostic_exists(
+        self,
+        diagnostics: list[DiagnosticRecord],
+        candidate: DiagnosticRecord,
+    ) -> bool:
+        return any(
+            item.category == candidate.category
+            and item.summary == candidate.summary
+            and item.command == candidate.command
+            for item in diagnostics
+        )
 
     def _advance_plan(self, session: SessionState, result) -> None:
         if not session.plan:
@@ -242,13 +336,32 @@ class AgentCore:
             return "blocked"
         if session.validation_status == "failed":
             return "repairing"
-        if session.changed_files and session.validation_status != "passed":
+        if session.changed_files and self.validation_planner.pending_commands(session):
             return "verifying"
         if session.tool_calls and session.tool_calls[-1].tool_name in WRITE_TOOLS:
             return "editing"
         if session.plan and any(item.status == "in_progress" for item in session.plan):
             return "exploring"
         return "exploring"
+
+    def _determine_workflow_stage(self, session: SessionState) -> str:
+        if session.blockers:
+            return "blocked"
+        if session.current_phase == "planning":
+            return "plan"
+        if session.current_phase == "exploring":
+            return "discover"
+        if session.current_phase == "editing":
+            return "act"
+        if session.current_phase == "verifying":
+            return "verify"
+        if session.current_phase == "repairing":
+            return "repair"
+        if session.current_phase == "reporting":
+            return "report"
+        if session.current_phase == "completed":
+            return "completed"
+        return "discover"
 
     def _enforce_iteration_rules(
         self,
@@ -277,57 +390,97 @@ class AgentCore:
         ):
             command = self._pick_validation_command(session)
             if command:
-                return AgentDecision(
-                    thought_summary="Code changed but is not yet validated.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="run_tests",
-                    tool_args={"command": command, "cwd": ".", "timeout": self.config.shell_timeout},
-                    expected_outcome="Verify the current implementation before finalizing.",
-                    final_response=None,
+                return self._validation_decision(
+                    "Code changed but the validation plan is not complete yet.",
+                    command,
                 )
             session.stop_reason = "validation_command_missing"
         return decision
 
-    def _update_session_after_result(self, session: SessionState, decision, result) -> None:
+    def _validation_decision(
+        self,
+        thought_summary: str,
+        command: ValidationCommand,
+    ) -> AgentDecision:
+        return AgentDecision(
+            thought_summary=thought_summary,
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="run_tests",
+            tool_args={
+                "command": command.command,
+                "cwd": command.cwd,
+                "timeout": self.config.shell_timeout,
+            },
+            expected_outcome=f"Run the next {command.kind} validation step.",
+            final_response=None,
+        )
+
+    def _update_session_after_result(self, task: str, session: SessionState, decision, result) -> None:
         if result.data.get("snapshot"):
             session.workspace_snapshot = WorkspaceSnapshot.model_validate(result.data["snapshot"])
-            if not session.candidate_files:
-                session.candidate_files = self._unique(
-                    session.workspace_snapshot.important_files[:12]
-                )
+            self._refresh_session_context(task, session)
 
         if decision.tool_name == "search_in_files" and result.success:
             matched_paths = [item["path"] for item in result.data.get("matches", [])]
             session.candidate_files = self._unique(
                 [*matched_paths[:10], *session.candidate_files]
-            )
+            )[:24]
 
         if decision.tool_name == "list_files" and result.success:
             session.candidate_files = self._unique(
                 [*result.data.get("files", [])[:20], *session.candidate_files]
-            )
+            )[:24]
 
         if decision.tool_name in WRITE_TOOLS and result.success:
+            session.edit_generation += 1
             session.validation_status = "not_run"
             session.last_error = None
             session.blockers = []
             self._track_helper_artifacts(session, result.changed_files)
+            self._refresh_session_context(task, session)
 
         if decision.tool_name in VERIFY_TOOLS:
-            if result.success:
-                session.validation_status = "passed"
-                session.repair_attempts = 0
-                session.last_error = None
-            elif result.data.get("blocked"):
-                session.validation_status = "blocked"
-                self._add_blocker(session, result.message)
-            else:
-                session.validation_status = "failed"
+            self._record_validation_run(session, decision, result)
+            session.validation_status = self.validation_planner.rollup_status(session)
+            if session.validation_status == "failed":
                 session.repair_attempts += 1
                 session.last_error = self._build_output_excerpt(result.data) or result.message
+            elif session.validation_status == "passed":
+                session.repair_attempts = 0
+                session.last_error = None
+            elif session.validation_status == "blocked":
+                self._add_blocker(session, result.message)
 
         if not result.success and result.data.get("blocked"):
             self._add_blocker(session, result.message)
+
+    def _record_validation_run(self, session: SessionState, decision, result) -> None:
+        command_text = result.data.get("command") or decision.tool_args.get("command", "")
+        plan_item = next(
+            (item for item in session.validation_plan if item.command == command_text),
+            None,
+        )
+        status = "passed"
+        if result.data.get("blocked"):
+            status = "blocked"
+        elif result.data.get("timeout"):
+            status = "timeout"
+        elif not result.success:
+            status = "failed"
+        run = ValidationRunRecord(
+            command=command_text,
+            cwd=str(decision.tool_args.get("cwd", ".")),
+            kind=plan_item.kind if plan_item else "check",
+            status=status,
+            exit_code=result.data.get("exit_code"),
+            risk_level=result.risk_level,
+            iteration=session.iterations,
+            edit_generation=session.edit_generation,
+            summary=result.message,
+            excerpt=self._build_output_excerpt(result.data),
+        )
+        session.validation_runs.append(run)
+        session.validation_runs = session.validation_runs[-20:]
 
     def _add_blocker(self, session: SessionState, message: str) -> None:
         if message not in session.blockers:
@@ -360,20 +513,27 @@ class AgentCore:
                 if change.path not in session.helper_artifacts:
                     session.helper_artifacts.append(change.path)
 
-    def _pick_validation_command(self, session: SessionState) -> str | None:
-        for command in session.verification_commands:
-            if command:
-                return command
+    def _pick_validation_command(self, session: SessionState) -> ValidationCommand | None:
+        command = self.validation_planner.next_command(session)
+        if command is not None:
+            return command
+
         if session.workspace_snapshot:
-            for command in session.workspace_snapshot.likely_commands:
-                if command:
-                    return command
+            fallback_plan = self.validation_planner.build_plan(
+                session.task,
+                session.workspace_snapshot,
+                changed_files=[item.path for item in session.changed_files],
+            )
+            if fallback_plan:
+                session.validation_plan = fallback_plan
+                session.verification_commands = [item.command for item in fallback_plan]
+                return self.validation_planner.next_command(session)
         return None
 
     def _resolve_final_status(self, session: SessionState) -> str:
         if session.blockers or session.validation_status in {"failed", "blocked"}:
             return "partial"
-        if session.changed_files and session.validation_status != "passed":
+        if session.changed_files and self.validation_planner.pending_commands(session):
             return "partial"
         return "completed" if session.tool_calls else "failed"
 
@@ -382,8 +542,8 @@ class AgentCore:
             return "blocked"
         if session.changed_files and session.validation_status == "passed":
             return "validated"
-        if session.changed_files and session.validation_status != "passed":
-            return "unverified_changes"
+        if session.changed_files and self.validation_planner.pending_commands(session):
+            return "validation_incomplete"
         return "analysis_complete"
 
     def _derive_limit_reason(self, session: SessionState) -> str:
@@ -402,6 +562,7 @@ class AgentCore:
             "verbose": self.config.verbose,
             "max_repair_attempts": self.config.max_repair_attempts,
             "helper_dir": str(self.config.helper_dir_path),
+            "report_dir": str(self.config.report_dir_path),
         }
 
     def _unique(self, values: Iterable[str]) -> list[str]:

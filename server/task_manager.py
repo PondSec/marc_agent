@@ -60,6 +60,12 @@ class TaskManager:
             session.validation_status = "not_run"
             session.repair_attempts = 0
             session.current_phase = "planning"
+            session.workflow_stage = "plan"
+            session.edit_generation = 0
+            session.validation_plan = []
+            session.validation_runs = []
+            session.diagnostics = []
+            session.report = None
             session.access_mode = config.access_mode
             session.runtime_options = self._runtime_options(config)
             session.touch()
@@ -85,7 +91,11 @@ class TaskManager:
             return None
         if self._is_active(session_id):
             return session.model_copy(
-                update={"status": "running", "current_phase": session.current_phase}
+                update={
+                    "status": "running",
+                    "current_phase": session.current_phase,
+                    "workflow_stage": session.workflow_stage,
+                }
             )
         return session
 
@@ -126,6 +136,7 @@ class TaskManager:
         except Exception as exc:
             session.status = "failed"
             session.current_phase = "blocked"
+            session.workflow_stage = "blocked"
             session.stop_reason = "runtime_exception"
             session.final_response = f"Task crashed: {exc}"
             session.touch()
@@ -160,6 +171,7 @@ class TaskManager:
             "approval_mode": config.approval_mode,
             "verbose": config.verbose,
             "max_repair_attempts": config.max_repair_attempts,
+            "report_dir": str(config.report_dir_path),
         }
 
     def _summary_for_session(self, session: SessionState) -> SessionSummary:
@@ -169,6 +181,7 @@ class TaskManager:
             task=session.task,
             status=status,
             current_phase=session.current_phase,
+            workflow_stage=session.workflow_stage,
             validation_status=session.validation_status,
             access_mode=session.access_mode,
             updated_at=session.updated_at,

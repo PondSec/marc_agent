@@ -24,6 +24,7 @@ class SessionSummary(StrictModel):
     task: str
     status: str
     current_phase: str
+    workflow_stage: str
     validation_status: str
     access_mode: str
     updated_at: str

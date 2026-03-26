@@ -243,6 +243,10 @@ class AppConfig:
         return self.state_root / "helpers"
 
     @property
+    def report_dir_path(self) -> Path:
+        return self.state_root / "reports"
+
+    @property
     def full_access(self) -> bool:
         return self.access_mode == AccessMode.FULL.value
 
@@ -251,6 +255,7 @@ class AppConfig:
         self.log_dir_path.mkdir(parents=True, exist_ok=True)
         self.memory_dir_path.mkdir(parents=True, exist_ok=True)
         self.helper_dir_path.mkdir(parents=True, exist_ok=True)
+        self.report_dir_path.mkdir(parents=True, exist_ok=True)
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -260,6 +265,7 @@ class AppConfig:
         data["log_dir"] = str(self.log_dir_path)
         data["memory_dir"] = str(self.memory_dir_path)
         data["helper_dir"] = str(self.helper_dir_path)
+        data["report_dir"] = str(self.report_dir_path)
         data["full_access"] = self.full_access
         data["path_scope"] = "system" if self.full_access else "workspace"
         data["branding"] = {

@@ -175,6 +175,9 @@ function disconnectStream() {
 function renderAll() {
   renderSessions();
   renderSession();
+  renderValidation();
+  renderDiagnostics();
+  renderReport();
   renderDiffs();
   renderLogs();
   renderWorkspace();
@@ -199,7 +202,7 @@ function renderSessions() {
             </div>
             <span class="status-chip ${escapeHtml(session.status)}">${escapeHtml(session.status)}</span>
           </header>
-          <p>${escapeHtml(session.current_phase)} - ${escapeHtml(session.validation_status)} - ${escapeHtml(labelForAccessMode(session.access_mode))}</p>
+          <p>${escapeHtml(session.workflow_stage || session.current_phase)} - ${escapeHtml(session.validation_status)} - ${escapeHtml(labelForAccessMode(session.access_mode))}</p>
           <p>${session.tool_call_count} Tool-Calls | ${session.changed_file_count} Dateiaenderungen</p>
         </article>
       `;
@@ -238,6 +241,7 @@ function renderSession() {
     <div>
       <span class="meta-pill">Session ${escapeHtml(state.activeSession.id)}</span>
       <span class="meta-pill">Phase ${escapeHtml(state.activeSession.current_phase)}</span>
+      <span class="meta-pill">Workflow ${escapeHtml(state.activeSession.workflow_stage || "-")}</span>
       <span class="meta-pill">Validation ${escapeHtml(state.activeSession.validation_status)}</span>
       <span class="meta-pill">${escapeHtml(labelForAccessMode(state.activeSession.access_mode))}</span>
       <span class="meta-pill">Iterationen ${state.activeSession.iterations}</span>
@@ -262,6 +266,10 @@ function renderSession() {
     renderFlatList("Plan", state.activeSession.plan?.map((item) => `${item.status} - ${item.step}`) || []),
     renderFlatList("Candidate Files", state.activeSession.candidate_files || []),
     renderFlatList("Verification", state.activeSession.verification_commands || []),
+    renderFlatList(
+      "Diagnostics",
+      (state.activeSession.diagnostics || []).slice(-5).map((item) => `${item.category} - ${item.summary}`),
+    ),
     renderFlatList("Completion Criteria", state.activeSession.completion_criteria || []),
     renderFlatList("Helper Artifacts", state.activeSession.helper_artifacts || []),
   ]
@@ -363,6 +371,91 @@ function renderDiffs() {
   viewer.textContent = selected.diff || "(kein Diff gespeichert)";
 }
 
+function renderValidation() {
+  const container = document.getElementById("validationList");
+  const runs = state.activeSession?.validation_runs || [];
+  if (!runs.length) {
+    container.innerHTML = `<div class="empty-state">Noch keine Validation-Laeufe gespeichert.</div>`;
+    return;
+  }
+
+  container.innerHTML = runs
+    .slice()
+    .reverse()
+    .map(
+      (run) => `
+        <article class="log-card">
+          <header>
+            <div>
+              <h3>${escapeHtml(run.kind || "check")} - ${escapeHtml(run.status)}</h3>
+              <p>${escapeHtml(run.command)}</p>
+            </div>
+          </header>
+          <p>Edit-Generation ${escapeHtml(run.edit_generation)} | Iteration ${escapeHtml(run.iteration || "-")} | Exit ${escapeHtml(run.exit_code ?? "-")}</p>
+          <pre>${escapeHtml(run.excerpt || run.summary || "(kein Output gespeichert)")}</pre>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderDiagnostics() {
+  const container = document.getElementById("diagnosticList");
+  const diagnostics = state.activeSession?.diagnostics || [];
+  if (!diagnostics.length) {
+    container.innerHTML = `<div class="empty-state">Noch keine Diagnosen fuer diese Session.</div>`;
+    return;
+  }
+
+  container.innerHTML = diagnostics
+    .slice()
+    .reverse()
+    .map(
+      (item) => `
+        <article class="log-card">
+          <header>
+            <div>
+              <h3>${escapeHtml(item.category)}</h3>
+              <p>${escapeHtml(item.summary)}</p>
+            </div>
+          </header>
+          <p>${escapeHtml(item.command || item.tool_name || item.source || "-")}</p>
+          ${renderFlatList("Dateihinweise", item.file_hints || [])}
+          ${renderFlatList("Naechste Schritte", item.action_hints || [])}
+          <pre>${escapeHtml(item.excerpt || "(kein Exzerpt gespeichert)")}</pre>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderReport() {
+  const container = document.getElementById("reportView");
+  const report = state.activeSession?.report;
+  if (!report) {
+    container.innerHTML = `<div class="empty-state">Noch kein Abschlussbericht fuer diese Session.</div>`;
+    return;
+  }
+
+  container.innerHTML = `
+    <article class="workspace-card">
+      <p>${escapeHtml(report.summary || "-")}</p>
+      <div class="summary-block">
+        <h4>Status</h4>
+        <div>
+          <span class="meta-pill">${escapeHtml(report.status || "-")}</span>
+          <span class="meta-pill">Stop ${escapeHtml(report.stop_reason || "-")}</span>
+        </div>
+      </div>
+      ${renderFlatList("Dateien", report.changed_files || [])}
+      ${renderFlatList("Kommandos", report.commands || [])}
+      ${renderFlatList("Blocker", report.blockers || [])}
+      ${renderFlatList("Helper", report.helper_artifacts || [])}
+      ${report.report_path ? `<p><strong>Report Datei:</strong> ${escapeHtml(report.report_path)}</p>` : ""}
+    </article>
+  `;
+}
+
 function renderLogs() {
   const container = document.getElementById("logList");
   if (!state.logs.length) {
@@ -401,20 +494,49 @@ function renderWorkspace() {
     .slice(0, 8)
     .map((path) => `<li>${escapeHtml(path)}</li>`)
     .join("");
-  const commands = (snapshot.likely_commands || [])
-    .map((command) => `<span class="meta-pill">${escapeHtml(command)}</span>`)
+  const commands = (snapshot.validation_commands || [])
+    .map((command) => `<span class="meta-pill">${escapeHtml(command.kind)}: ${escapeHtml(command.command)}</span>`)
+    .join("");
+  const workflowCommands = (snapshot.workflow_commands || [])
+    .map((command) => `<span class="meta-pill">${escapeHtml(command.kind)}: ${escapeHtml(command.command)}</span>`)
+    .join("");
+  const labels = (snapshot.project_labels || [])
+    .map((label) => `<span class="meta-pill">${escapeHtml(label)}</span>`)
+    .join("");
+  const repoMap = (snapshot.repo_map || [])
+    .map((line) => `<li>${escapeHtml(line)}</li>`)
+    .join("");
+  const manifests = (snapshot.manifests || [])
+    .slice(0, 8)
+    .map((path) => `<li>${escapeHtml(path)}</li>`)
     .join("");
 
   container.innerHTML = `
     <article class="workspace-card">
       <p>${escapeHtml(state.workspace.text)}</p>
       <div class="summary-block">
+        <h4>Projektlabels</h4>
+        <div>${labels || '<span class="meta-pill">Keine Labels erkannt</span>'}</div>
+      </div>
+      <div class="summary-block">
         <h4>Priorisierte Dateien</h4>
         <ul>${importantFiles}</ul>
       </div>
       <div class="summary-block">
-        <h4>Vermutete Checks</h4>
+        <h4>Validation Plan</h4>
         <div>${commands || '<span class="meta-pill">Keine Befehle erkannt</span>'}</div>
+      </div>
+      <div class="summary-block">
+        <h4>Workflow Awareness</h4>
+        <div>${workflowCommands || '<span class="meta-pill">Keine weiteren Workflow-Signale</span>'}</div>
+      </div>
+      <div class="summary-block">
+        <h4>Manifeste</h4>
+        <ul>${manifests || "<li>Keine Manifest-Dateien erkannt</li>"}</ul>
+      </div>
+      <div class="summary-block">
+        <h4>Repo Map</h4>
+        <ul>${repoMap || "<li>Keine Repo-Map verfuegbar</li>"}</ul>
       </div>
     </article>
   `;
