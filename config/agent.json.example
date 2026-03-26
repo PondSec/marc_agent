@@ -1,0 +1,20 @@
+{
+  "model_name": "qwen3-coder:30b",
+  "ollama_host": "http://127.0.0.1:11434",
+  "workspace_root": ".",
+  "max_iterations": 14,
+  "max_tool_calls": 24,
+  "shell_timeout": 120,
+  "approval_mode": false,
+  "read_only": false,
+  "verbose": false,
+  "allow_network": false,
+  "allow_dangerous_commands": false,
+  "dry_run": false,
+  "diff_preview_mode": "unified",
+  "max_read_chars": 14000,
+  "max_search_results": 200,
+  "max_files_in_context": 80,
+  "ollama_num_ctx": 32768,
+  "ollama_temperature": 0.1
+}

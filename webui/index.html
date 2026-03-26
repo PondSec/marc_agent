@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Codex Agent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local Coding Agent</p>
+          <h1>Browserkonsole fuer deinen lokalen Codex</h1>
+        </div>
+        <div class="topbar-meta">
+          <div class="status-block">
+            <span class="status-label">Server</span>
+            <strong id="serverHealth">Pruefe...</strong>
+          </div>
+          <div class="status-block">
+            <span class="status-label">Workspace</span>
+            <strong id="workspaceRoot">-</strong>
+          </div>
+        </div>
+      </header>
+
+      <div class="layout">
+        <aside class="panel sidebar">
+          <section class="panel-section">
+            <div class="section-head">
+              <h2>Neuer Task</h2>
+              <button id="newSessionButton" class="ghost-button" type="button">Neue Session</button>
+            </div>
+            <form id="taskForm" class="task-form">
+              <label for="taskInput">Aufgabe</label>
+              <textarea
+                id="taskInput"
+                name="task"
+                rows="7"
+                placeholder="Zum Beispiel: Fuege JWT Login hinzu und zeige mir die geaenderten Dateien."
+              ></textarea>
+
+              <div class="toggle-grid">
+                <label class="toggle"><input id="continueToggle" type="checkbox" /> Session fortsetzen</label>
+                <label class="toggle"><input id="dryRunToggle" type="checkbox" /> Dry run</label>
+                <label class="toggle"><input id="readOnlyToggle" type="checkbox" /> Read only</label>
+                <label class="toggle"><input id="approvalToggle" type="checkbox" /> Approval mode</label>
+              </div>
+
+              <div class="button-row">
+                <button class="primary-button" type="submit">Task starten</button>
+                <button id="inspectButton" class="secondary-button" type="button">Workspace scannen</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-head">
+              <h2>Sessions</h2>
+              <button id="refreshSessionsButton" class="ghost-button" type="button">Aktualisieren</button>
+            </div>
+            <div id="sessionList" class="session-list"></div>
+          </section>
+        </aside>
+
+        <main class="panel timeline-panel">
+          <section class="panel-section focus-panel">
+            <div class="session-banner">
+              <div>
+                <p class="eyebrow">Aktive Session</p>
+                <h2 id="sessionTitle">Noch keine Session ausgewaehlt</h2>
+              </div>
+              <div id="sessionBadge" class="status-chip neutral">Idle</div>
+            </div>
+            <div id="sessionMeta" class="session-meta"></div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-head">
+              <h2>Agentenverlauf</h2>
+              <span id="liveHint" class="live-hint">Keine Live-Verbindung</span>
+            </div>
+            <div id="timeline" class="timeline"></div>
+          </section>
+        </main>
+
+        <aside class="panel details-panel">
+          <section class="panel-section">
+            <div class="section-head">
+              <h2>Workspace</h2>
+              <button id="refreshConfigButton" class="ghost-button" type="button">Config laden</button>
+            </div>
+            <div id="workspaceSummary" class="workspace-summary"></div>
+          </section>
+
+          <section class="panel-section">
+            <h2>Geaenderte Dateien</h2>
+            <div id="diffList" class="diff-list"></div>
+            <pre id="diffViewer" class="code-viewer">Waehle eine Session mit Aenderungen aus.</pre>
+          </section>
+
+          <section class="panel-section">
+            <h2>Logs</h2>
+            <div id="logList" class="log-list"></div>
+          </section>
+
+          <section class="panel-section">
+            <h2>Konfiguration</h2>
+            <pre id="configView" class="code-viewer">Konfiguration wird geladen...</pre>
+          </section>
+        </aside>
+      </div>
+    </div>
+  </body>
+</html>
