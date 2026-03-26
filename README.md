@@ -222,6 +222,8 @@ python main.py
 
 Beim ersten Start installiert M.A.R.C A1 fehlende Runtime-Pakete aus `requirements-runtime.txt` und startet danach direkt die Web-App.
 
+Wenn das System-Python extern verwaltet ist, zum Beispiel bei Homebrew-Python auf macOS oder aehnlichen PEP-668-Setups, weicht M.A.R.C A1 automatisch auf ein repo-lokales Runtime-Venv unter `.marc_a1/runtime-venv` aus. Folge-Starts verwenden dieses Runtime-Venv direkt weiter.
+
 Unter Windows:
 
 ```bat
@@ -332,7 +334,9 @@ Die Runtime bleibt lokal, aber defensiv:
 Bootstrap-Verhalten:
 
 - `main.py` und `cli.py` installieren fehlende Runtime-Abhaengigkeiten automatisch
-- ausserhalb eines `venv` wird standardmaessig per `pip install --user` installiert
+- ausserhalb eines `venv` wird zuerst ein normaler lokaler Pip-Installationsversuch unternommen
+- falls das Host-Python extern verwaltet ist oder der direkte Installationsversuch scheitert, erstellt M.A.R.C A1 automatisch ein repo-lokales Runtime-Venv unter `.marc_a1/runtime-venv`
+- dieses Runtime-Venv wird danach fuer weitere Starts wiederverwendet
 - das Verhalten kann ueber `MARC_A1_PIP_SCOPE=user|global|auto` gesteuert werden
 - zusaetzliche Pip-Argumente koennen ueber `MARC_A1_PIP_EXTRA_ARGS` gesetzt werden
 

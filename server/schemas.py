@@ -12,25 +12,44 @@ class StrictModel(BaseModel):
 class TaskCreateRequest(StrictModel):
     prompt: str = Field(..., min_length=1)
     session_id: str | None = None
+    workspace_id: str | None = None
     access_mode: Literal["safe", "approval", "full"] | None = None
     dry_run: bool | None = None
     read_only: bool | None = None
     approval_mode: bool | None = None
     verbose: bool | None = None
+    model_name: str | None = None
+    agent_profile: str | None = None
+    execution_profile: Literal["fast", "balanced", "deep"] | None = None
+
+
+class SessionUpdateRequest(StrictModel):
+    archived: bool | None = None
+    stop_requested: bool | None = None
 
 
 class SessionSummary(StrictModel):
     id: str
     task: str
+    title: str | None = None
     status: str
     current_phase: str
     workflow_stage: str
     validation_status: str
     access_mode: str
+    workspace_id: str | None = None
+    workspace_label: str | None = None
+    created_at: str
     updated_at: str
     iterations: int
     changed_file_count: int
     tool_call_count: int
+    message_count: int = 0
+    last_message_preview: str | None = None
+    archived: bool = False
+    archived_at: str | None = None
+    stop_requested: bool = False
+    stop_reason: str | None = None
     runtime_options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -48,3 +67,48 @@ class LogRecord(StrictModel):
 class WorkspaceInspectResponse(StrictModel):
     text: str
     snapshot: dict[str, Any]
+
+
+class WorkspaceRecord(StrictModel):
+    id: str
+    name: str
+    path: str
+    created_at: str
+    updated_at: str
+
+
+class WorkspaceCreateRequest(StrictModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    path: str = Field(..., min_length=1)
+
+
+class WorkspaceUpdateRequest(StrictModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    path: str | None = Field(default=None, min_length=1)
+
+
+class ModelInventory(StrictModel):
+    name: str
+    size: int | None = None
+    modified_at: str | None = None
+    family: str | None = None
+    parameter_size: str | None = None
+
+
+class RecommendedModelStatus(StrictModel):
+    name: str
+    label: str
+    summary: str
+    installed: bool = False
+    status: Literal["installed", "missing", "queued", "pulling", "verifying", "failed"]
+    progress: float | None = None
+    completed_bytes: int | None = None
+    total_bytes: int | None = None
+    message: str | None = None
+    error: str | None = None
+    updated_at: str | None = None
+
+
+class ModelCatalogResponse(StrictModel):
+    installed_models: list[ModelInventory] = Field(default_factory=list)
+    recommended_models: list[RecommendedModelStatus] = Field(default_factory=list)

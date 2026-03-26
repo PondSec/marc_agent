@@ -83,11 +83,13 @@ class AppConfig:
     ollama_host: str = "http://127.0.0.1:11434"
     model_name: str = "qwen3-coder:30b"
     workspace_root: str = "."
+    state_root_override: str | None = None
     access_mode: str = AccessMode.APPROVAL.value
     max_iterations: int = 18
     max_tool_calls: int = 32
     max_repair_attempts: int = 3
     shell_timeout: int = 120
+    llm_timeout: int = 25
     approval_mode: bool = True
     read_only: bool = False
     verbose: bool = False
@@ -99,7 +101,7 @@ class AppConfig:
     max_search_results: int = 200
     max_files_in_context: int = 80
     state_dir_name: str = ".marc_a1"
-    ollama_num_ctx: int = 32_768
+    ollama_num_ctx: int = 8_192
     ollama_temperature: float = 0.1
 
     @classmethod
@@ -154,6 +156,10 @@ class AppConfig:
             shell_timeout=_parse_int(
                 pick("SHELL_TIMEOUT", defaults.shell_timeout),
                 defaults.shell_timeout,
+            ),
+            llm_timeout=_parse_int(
+                pick("LLM_TIMEOUT", defaults.llm_timeout),
+                defaults.llm_timeout,
             ),
             approval_mode=access_mode == AccessMode.APPROVAL,
             read_only=access_mode == AccessMode.SAFE,
@@ -224,6 +230,8 @@ class AppConfig:
 
     @property
     def state_root(self) -> Path:
+        if self.state_root_override:
+            return Path(self.state_root_override).expanduser().resolve()
         return self.workspace_path / self.state_dir_name
 
     @property
@@ -274,4 +282,42 @@ class AppConfig:
             "tagline": AGENT_TAGLINE,
         }
         data["access_modes"] = [item.value for item in AccessMode]
+        data["model_candidates"] = [self.model_name]
+        data["agent_profiles"] = [
+            {
+                "id": "core",
+                "label": "MARC A1 Core",
+                "description": "Allround-Run fuer neue Features, Refactors und Analysen.",
+            },
+            {
+                "id": "review",
+                "label": "Code Review",
+                "description": "Fokus auf Risiken, Regressionen und Validierung.",
+            },
+            {
+                "id": "repair",
+                "label": "Repair Loop",
+                "description": "Fehler beheben, Checks erneut ausfuehren und stabilisieren.",
+            },
+        ]
+        data["execution_profiles"] = [
+            {
+                "id": "fast",
+                "label": "Schnell",
+                "description": "Kuerzerer Lauf mit weniger Iterationen.",
+            },
+            {
+                "id": "balanced",
+                "label": "Ausgewogen",
+                "description": "Standardprofil fuer die meisten Aufgaben.",
+            },
+            {
+                "id": "deep",
+                "label": "Tief",
+                "description": "Mehr Iterationen und groessere Verifikationstiefe.",
+            },
+        ]
+        data["capabilities"] = {
+            "session_archiving": True,
+        }
         return data

@@ -33,3 +33,23 @@ def test_workspace_full_mode_can_resolve_absolute_path_outside_root(tmp_path, tm
 
     assert resolved == external_file.resolve()
     assert workspace.display_path(resolved) == str(external_file.resolve())
+
+
+def test_workspace_iter_files_skips_external_symlink_targets(tmp_path, tmp_path_factory):
+    external_dir = tmp_path_factory.mktemp("workspace_external_symlink")
+    external_python = external_dir / "python3.14"
+    external_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    workspace = WorkspaceManager(tmp_path)
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    symlink_path = tmp_path / ".venv" / "bin" / "python3.14"
+    try:
+        symlink_path.symlink_to(external_python)
+    except OSError:
+        pytest.skip("symlink creation is not available on this platform")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+
+    files = workspace.iter_files()
+
+    assert [path.relative_to(tmp_path).as_posix() for path in files] == ["src/app.py"]

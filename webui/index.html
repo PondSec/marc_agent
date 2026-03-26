@@ -3,150 +3,18 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0d1117" />
     <title>M.A.R.C A1</title>
     <link rel="stylesheet" href="/static/styles.css" />
     <script defer src="/static/app.js"></script>
   </head>
   <body>
-    <div class="app-shell">
-      <header class="topbar">
-        <div>
-          <p id="brandEyebrow" class="eyebrow">M.A.R.C A1</p>
-          <h1 id="brandTitle">Modular Autonomous Runtime Core - Agent 1</h1>
-          <p id="brandTagline" class="hero-copy">
-            Lokaler Coding-Agent fuer echte Implementierungsarbeit mit Analyse-, Edit-, Verify-
-            und Repair-Loop.
-          </p>
-        </div>
-        <div class="topbar-meta">
-          <div class="status-block">
-            <span class="status-label">Server</span>
-            <strong id="serverHealth">Pruefe...</strong>
-          </div>
-          <div class="status-block">
-            <span class="status-label">Workspace</span>
-            <strong id="workspaceRoot">-</strong>
-          </div>
-          <div class="status-block">
-            <span class="status-label">Helper Dir</span>
-            <strong id="helperDir">-</strong>
-          </div>
-        </div>
-      </header>
-
-      <div class="layout">
-        <aside class="panel sidebar">
-          <section class="panel-section">
-            <div class="section-head">
-              <h2>Neuer Task</h2>
-              <button id="newSessionButton" class="ghost-button" type="button">Neue Session</button>
-            </div>
-            <form id="taskForm" class="task-form">
-              <label for="taskInput">Aufgabe</label>
-              <textarea
-                id="taskInput"
-                name="task"
-                rows="8"
-                placeholder="Zum Beispiel: Fuege JWT Login hinzu, pruefe die bestehende Auth-Architektur, implementiere die Aenderung passend zum Projekt und validiere das Ergebnis."
-              ></textarea>
-
-              <div class="form-grid">
-                <label>
-                  <span class="input-label">Access Mode</span>
-                  <select id="accessModeSelect">
-                    <option value="safe">Safe</option>
-                    <option value="approval" selected>Approval</option>
-                    <option value="full">Full Access</option>
-                  </select>
-                </label>
-                <label class="toggle">
-                  <input id="continueToggle" type="checkbox" />
-                  Session fortsetzen
-                </label>
-                <label class="toggle">
-                  <input id="dryRunToggle" type="checkbox" />
-                  Dry run
-                </label>
-              </div>
-
-              <div class="button-row">
-                <button class="primary-button" type="submit">Task starten</button>
-                <button id="inspectButton" class="secondary-button" type="button">Workspace scannen</button>
-              </div>
-            </form>
-          </section>
-
-          <section class="panel-section">
-            <div class="section-head">
-              <h2>Sessions</h2>
-              <button id="refreshSessionsButton" class="ghost-button" type="button">Aktualisieren</button>
-            </div>
-            <div id="sessionList" class="session-list"></div>
-          </section>
-        </aside>
-
-        <main class="panel timeline-panel">
-          <section class="panel-section focus-panel">
-            <div class="session-banner">
-              <div>
-                <p class="eyebrow">Aktive Session</p>
-                <h2 id="sessionTitle">Noch keine Session ausgewaehlt</h2>
-              </div>
-              <div id="sessionBadge" class="status-chip neutral">Idle</div>
-            </div>
-            <div id="sessionMeta" class="session-meta"></div>
-          </section>
-
-          <section class="panel-section">
-            <div class="section-head">
-              <h2>Agentenverlauf</h2>
-              <span id="liveHint" class="live-hint">Keine Live-Verbindung</span>
-            </div>
-            <div id="timeline" class="timeline"></div>
-          </section>
-        </main>
-
-        <aside class="panel details-panel">
-          <section class="panel-section">
-            <div class="section-head">
-              <h2>Workspace</h2>
-              <button id="refreshConfigButton" class="ghost-button" type="button">Config laden</button>
-            </div>
-            <div id="workspaceSummary" class="workspace-summary"></div>
-          </section>
-
-          <section class="panel-section">
-            <h2>Validation</h2>
-            <div id="validationList" class="log-list"></div>
-          </section>
-
-          <section class="panel-section">
-            <h2>Diagnostik</h2>
-            <div id="diagnosticList" class="log-list"></div>
-          </section>
-
-          <section class="panel-section">
-            <h2>Abschlussbericht</h2>
-            <div id="reportView" class="workspace-summary"></div>
-          </section>
-
-          <section class="panel-section">
-            <h2>Geaenderte Dateien</h2>
-            <div id="diffList" class="diff-list"></div>
-            <pre id="diffViewer" class="code-viewer">Waehle eine Session mit Aenderungen aus.</pre>
-          </section>
-
-          <section class="panel-section">
-            <h2>Logs</h2>
-            <div id="logList" class="log-list"></div>
-          </section>
-
-          <section class="panel-section">
-            <h2>Konfiguration</h2>
-            <pre id="configView" class="code-viewer">Konfiguration wird geladen...</pre>
-          </section>
-        </aside>
+    <div id="app" class="app-root"></div>
+    <noscript>
+      <div class="noscript-shell">
+        <h1>M.A.R.C A1</h1>
+        <p>Diese Oberfläche benoetigt JavaScript, um Sessions, Live-Status und Agent-Flows darzustellen.</p>
       </div>
-    </div>
+    </noscript>
   </body>
 </html>

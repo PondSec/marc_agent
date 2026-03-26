@@ -5,6 +5,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
+from llm.schemas import TaskAnalysis
 
 
 AgentPhase = Literal[
@@ -157,11 +158,21 @@ class ToolRunResult(StrictModel):
     changed_files: list[FileChangeRecord] = Field(default_factory=list)
 
 
+class ChatMessage(StrictModel):
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    role: Literal["user", "assistant", "system"] = "user"
+    content: str
+    created_at: str = Field(default_factory=utc_now)
+
+
 class SessionState(StrictModel):
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
     task: str
+    title: str | None = None
     status: Literal["queued", "running", "completed", "failed", "partial"] = "running"
     workspace_root: str
+    workspace_id: str | None = None
+    workspace_label: str | None = None
     access_mode: str = "approval"
     current_phase: AgentPhase = "planning"
     workflow_stage: WorkflowStage = "plan"
@@ -172,6 +183,7 @@ class SessionState(StrictModel):
     repair_attempts: int = 0
     edit_generation: int = 0
     plan_summary: str | None = None
+    task_analysis: TaskAnalysis | None = None
     plan: list[PlanItem] = Field(default_factory=list)
     candidate_files: list[str] = Field(default_factory=list)
     verification_commands: list[str] = Field(default_factory=list)
@@ -186,7 +198,11 @@ class SessionState(StrictModel):
     diagnostics: list[DiagnosticRecord] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
+    messages: list[ChatMessage] = Field(default_factory=list)
     runtime_options: dict[str, Any] = Field(default_factory=dict)
+    stop_requested: bool = False
+    archived: bool = False
+    archived_at: str | None = None
     stop_reason: str | None = None
     last_error: str | None = None
     final_response: str | None = None
@@ -194,3 +210,9 @@ class SessionState(StrictModel):
 
     def touch(self) -> None:
         self.updated_at = utc_now()
+
+    def append_message(self, role: Literal["user", "assistant", "system"], content: str) -> None:
+        text = str(content or "").strip()
+        if not text:
+            return
+        self.messages.append(ChatMessage(role=role, content=text))

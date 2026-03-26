@@ -36,6 +36,15 @@ class WorkspaceManager:
         self.allow_outside_root = allow_outside_root
         self.root.mkdir(parents=True, exist_ok=True)
 
+    def _workspace_display_path(self, path: str | Path) -> str | None:
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            target = self.root / target
+        try:
+            return target.absolute().relative_to(self.root).as_posix()
+        except ValueError:
+            return None
+
     def relative_path(self, path: str | Path) -> str:
         resolved = self.resolve_path(path)
         return self.display_path(resolved)
@@ -85,20 +94,23 @@ class WorkspaceManager:
         max_results: int = 5_000,
     ) -> list[Path]:
         start_dir = self.resolve_directory(start)
-        results: list[Path] = []
+        results: list[tuple[str, Path]] = []
         iterator = start_dir.rglob("*") if recursive else start_dir.glob("*")
         for candidate in iterator:
             if len(results) >= max_results:
                 break
             if not candidate.is_file():
                 continue
-            display = self.display_path(candidate)
+            display = self._workspace_display_path(candidate) or self.display_path(candidate)
             if self.should_ignore(display):
                 continue
             if glob_pattern and not fnmatch.fnmatch(display, glob_pattern):
                 continue
-            results.append(candidate.resolve(strict=False))
-        return sorted(results, key=lambda path: self.display_path(path))
+            resolved = candidate.resolve(strict=False)
+            if not self.allow_outside_root and candidate.is_symlink() and not self.is_within_root(resolved):
+                continue
+            results.append((display, candidate.absolute()))
+        return [path for _, path in sorted(results, key=lambda item: item[0])]
 
     def read_text(self, path: str | Path) -> str:
         target = self.resolve_path(path)

@@ -139,7 +139,10 @@ class RepoMemoryStore:
         focus_terms = self._focus_terms(focus)
 
         for path in files:
-            rel = path.relative_to(self.workspace.root).as_posix()
+            try:
+                rel = path.relative_to(self.workspace.root).as_posix()
+            except ValueError:
+                continue
             language = LANGUAGE_MAP.get(path.suffix.lower(), "other")
             language_counts[language] += 1
             top_dir = rel.split("/", 1)[0] if "/" in rel else "."

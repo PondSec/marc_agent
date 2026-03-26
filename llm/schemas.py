@@ -15,6 +15,15 @@ class AgentActionType(str, Enum):
     FINAL = "final"
 
 
+class TaskIntent(str, Enum):
+    REPLY = "reply"
+    ANALYZE = "analyze"
+    INSPECT = "inspect"
+    MODIFY = "modify"
+    CREATE = "create"
+    FIX = "fix"
+
+
 class AgentDecision(StrictModel):
     thought_summary: str = Field(..., description="Short reasoning summary.")
     action_type: AgentActionType = Field(..., description="Next action type.")
@@ -27,6 +36,39 @@ class AgentDecision(StrictModel):
     final_response: str | None = Field(
         None,
         description="Filled only when action_type=final.",
+    )
+
+
+class TaskAnalysis(StrictModel):
+    summary: str = Field(..., description="Short summary of what the user wants.")
+    intent: TaskIntent = Field(..., description="High-level task kind.")
+    requires_repo_context: bool = Field(
+        default=True,
+        description="Whether repository inspection is needed before acting.",
+    )
+    should_create_files: bool = Field(
+        default=False,
+        description="Whether the task likely needs creating a new file.",
+    )
+    deliverable: str | None = Field(
+        default=None,
+        description="Concrete expected output such as script, fix, summary, or answer.",
+    )
+    search_terms: list[str] = Field(
+        default_factory=list,
+        description="High-signal terms worth searching for when inspection is needed.",
+    )
+    target_paths: list[str] = Field(
+        default_factory=list,
+        description="Likely relevant files to inspect first.",
+    )
+    relevant_extensions: list[str] = Field(
+        default_factory=list,
+        description="Likely file extensions involved in the task.",
+    )
+    direct_response: str | None = Field(
+        default=None,
+        description="Filled only when intent=reply and no repo work is needed.",
     )
 
 

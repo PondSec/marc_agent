@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable
+from typing import Callable, Iterable
 
 from agent.diagnostics import FailureAnalyzer
 from agent.executor import Executor
@@ -68,7 +68,13 @@ class AgentCore:
         snapshot = self.memory.build_snapshot(focus)
         return self.memory.render_snapshot(snapshot)
 
-    def run_task(self, task: str, session: SessionState | None = None) -> SessionState:
+    def run_task(
+        self,
+        task: str,
+        session: SessionState | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> SessionState:
         session = session or SessionState(
             task=task,
             workspace_root=str(self.workspace.root),
@@ -115,6 +121,23 @@ class AgentCore:
             session.iterations < self.config.max_iterations
             and len(session.tool_calls) < self.config.max_tool_calls
         ):
+            if self._should_stop(session, should_stop):
+                session.stop_requested = True
+                session.stop_reason = "user_cancelled"
+                session.status = "partial"
+                logger.log_event(
+                    "task_stopped",
+                    session_id=session.id,
+                    phase=session.current_phase,
+                    workflow_stage=session.workflow_stage,
+                )
+                final_response = (
+                    "Ich habe den laufenden Agenten auf deinen Wunsch gestoppt."
+                    "\n\n"
+                    "Du kannst direkt weiterschreiben oder einen neuen Chat starten."
+                )
+                break
+
             session.current_phase = self._determine_phase(session)
             session.workflow_stage = self._determine_workflow_stage(session)
             decision = planner.decide_next_action(task, session)
@@ -133,7 +156,7 @@ class AgentCore:
             if decision.action_type == AgentActionType.FINAL:
                 final_response = decision.final_response or planner.summarize_session(session)
                 session.stop_reason = session.stop_reason or self._derive_stop_reason(session)
-                session.status = self._resolve_final_status(session)
+                session.status = self._resolve_final_status(session, final_action=True)
                 break
 
             session.iterations += 1
@@ -168,19 +191,22 @@ class AgentCore:
             session.status = "partial" if session.tool_calls else "failed"
             final_response = planner.summarize_session(session)
 
-        session.status = self._resolve_final_status(session)
+        session.status = self._resolve_final_status(session, final_action=final_response is not None)
         session.current_phase = "reporting"
         session.workflow_stage = "report"
         session.report = self.reporter.build_report(session)
-        report_summary = self.reporter.render_final_response(session)
-        if final_response and final_response != report_summary:
-            session.final_response = f"{final_response}\n\n{report_summary}"
-        else:
-            session.final_response = report_summary
+        session.final_response = self.reporter.render_final_response(
+            session,
+            draft_response=final_response,
+        )
+        session.append_message("assistant", session.final_response)
 
         if session.status == "completed":
             session.current_phase = "completed"
             session.workflow_stage = "completed"
+        elif session.stop_reason == "user_cancelled":
+            session.current_phase = "blocked"
+            session.workflow_stage = "blocked"
         elif session.blockers:
             session.current_phase = "blocked"
             session.workflow_stage = "blocked"
@@ -199,6 +225,20 @@ class AgentCore:
         )
         return session
 
+    def _should_stop(
+        self,
+        session: SessionState,
+        should_stop: Callable[[], bool] | None,
+    ) -> bool:
+        if session.stop_requested:
+            return True
+        if should_stop is None:
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:
+            return False
+
     def _initialize_session(
         self,
         task: str,
@@ -207,7 +247,15 @@ class AgentCore:
     ) -> None:
         session.current_phase = "planning"
         session.workflow_stage = "plan"
-        plan = planner.create_plan(task, session.workspace_snapshot)
+        session.task_analysis = planner.analyze_task(task, session.workspace_snapshot)
+        if session.task_analysis.direct_response:
+            session.plan_summary = "Respond directly without repository work."
+            session.plan = []
+            session.completion_criteria = ["Return a concise, user-facing reply."]
+            session.current_phase = "exploring"
+            session.workflow_stage = "discover"
+            return
+        plan = planner.create_plan(task, session.workspace_snapshot, session.task_analysis)
         session.plan_summary = plan.summary
         session.plan = [PlanItem(step=step) for step in plan.steps]
         if session.plan:
@@ -227,8 +275,18 @@ class AgentCore:
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return
+        task_analysis = session.task_analysis
+        extension_candidates: list[str] = []
+        if task_analysis and task_analysis.relevant_extensions:
+            extension_candidates = [
+                path
+                for path in snapshot.important_files[:24]
+                if any(path.endswith(extension) for extension in task_analysis.relevant_extensions)
+            ]
         candidate_files = [
+            *(task_analysis.target_paths if task_analysis else []),
             *(planned_files or []),
+            *extension_candidates,
             *snapshot.focus_files,
             *snapshot.important_files[:18],
         ]
@@ -530,12 +588,16 @@ class AgentCore:
                 return self.validation_planner.next_command(session)
         return None
 
-    def _resolve_final_status(self, session: SessionState) -> str:
+    def _resolve_final_status(self, session: SessionState, *, final_action: bool = False) -> str:
+        if session.stop_reason == "user_cancelled" or session.stop_requested:
+            return "partial"
         if session.blockers or session.validation_status in {"failed", "blocked"}:
             return "partial"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "partial"
-        return "completed" if session.tool_calls else "failed"
+        if final_action or session.tool_calls:
+            return "completed"
+        return "failed"
 
     def _derive_stop_reason(self, session: SessionState) -> str:
         if session.blockers:
