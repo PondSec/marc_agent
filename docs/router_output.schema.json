@@ -1,0 +1,221 @@
+{
+  "$defs": {
+    "RouteActionName": {
+      "enum": [
+        "respond_directly",
+        "ask_clarification",
+        "inspect_workspace",
+        "search_workspace",
+        "read_relevant_files",
+        "create_artifact",
+        "update_artifact",
+        "delete_artifact",
+        "plan_work",
+        "run_validation",
+        "summarize_result"
+      ],
+      "title": "RouteActionName",
+      "type": "string"
+    },
+    "RouteActionStep": {
+      "additionalProperties": false,
+      "properties": {
+        "step": {
+          "description": "1-based action order.",
+          "minimum": 1,
+          "title": "Step",
+          "type": "integer"
+        },
+        "action": {
+          "$ref": "#/$defs/RouteActionName",
+          "description": "Executor action from the approved catalog."
+        },
+        "reason": {
+          "description": "Why this step is needed.",
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step",
+        "action",
+        "reason"
+      ],
+      "title": "RouteActionStep",
+      "type": "object"
+    },
+    "RouteEntities": {
+      "additionalProperties": false,
+      "properties": {
+        "target_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Type of the primary target.",
+          "title": "Target Type"
+        },
+        "target_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Name of the primary target.",
+          "title": "Target Name"
+        },
+        "target_paths": {
+          "description": "Concrete files or directories when they are already known.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Target Paths",
+          "type": "array"
+        },
+        "attributes": {
+          "description": "Useful extracted attributes.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Attributes",
+          "type": "array"
+        },
+        "constraints": {
+          "description": "Execution constraints or limits.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Constraints",
+          "type": "array"
+        }
+      },
+      "title": "RouteEntities",
+      "type": "object"
+    },
+    "RouteIntent": {
+      "enum": [
+        "inspect",
+        "create",
+        "update",
+        "delete",
+        "search",
+        "explain",
+        "plan",
+        "unknown"
+      ],
+      "title": "RouteIntent",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "user_goal": {
+      "description": "What the user is ultimately trying to achieve.",
+      "minLength": 1,
+      "title": "User Goal",
+      "type": "string"
+    },
+    "intent": {
+      "$ref": "#/$defs/RouteIntent",
+      "description": "High-level request intent."
+    },
+    "entities": {
+      "$ref": "#/$defs/RouteEntities"
+    },
+    "requested_outcome": {
+      "description": "Concrete expected result or deliverable.",
+      "minLength": 1,
+      "title": "Requested Outcome",
+      "type": "string"
+    },
+    "action_plan": {
+      "description": "Ordered execution plan using the approved action catalog.",
+      "items": {
+        "$ref": "#/$defs/RouteActionStep"
+      },
+      "title": "Action Plan",
+      "type": "array"
+    },
+    "needs_clarification": {
+      "description": "Whether the agent must ask follow-up questions.",
+      "title": "Needs Clarification",
+      "type": "boolean"
+    },
+    "clarification_questions": {
+      "description": "One to three targeted questions when clarification is required.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 3,
+      "title": "Clarification Questions",
+      "type": "array"
+    },
+    "confidence": {
+      "description": "Confidence score between 0 and 1.",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "safe_to_execute": {
+      "description": "Whether the executor may proceed without extra input.",
+      "title": "Safe To Execute",
+      "type": "boolean"
+    },
+    "repo_context_needed": {
+      "default": true,
+      "description": "Whether repository inspection is needed before the final answer or mutation.",
+      "title": "Repo Context Needed",
+      "type": "boolean"
+    },
+    "search_terms": {
+      "description": "High-signal search phrases derived by the router.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Search Terms",
+      "type": "array"
+    },
+    "relevant_extensions": {
+      "description": "Likely relevant file extensions such as .py or .ts.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Relevant Extensions",
+      "type": "array"
+    },
+    "direct_response": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional direct reply when no repository work is needed.",
+      "title": "Direct Response"
+    }
+  },
+  "required": [
+    "user_goal",
+    "intent",
+    "requested_outcome",
+    "needs_clarification",
+    "confidence",
+    "safe_to_execute"
+  ],
+  "title": "RouterOutput",
+  "type": "object"
+}

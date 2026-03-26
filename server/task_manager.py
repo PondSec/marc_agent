@@ -99,6 +99,7 @@ class TaskManager:
             session.plan = []
             session.plan_summary = None
             session.task_analysis = None
+            session.router_result = None
             session.candidate_files = []
             session.verification_commands = []
             session.completion_criteria = []

@@ -132,22 +132,63 @@ http://127.0.0.1:8000
 
 ## Architektur
 
-Die Architektur ist modular, aber klar auf agentische Entwicklungsarbeit ausgerichtet:
+Die Architektur ist modular, aber klar auf agentische Entwicklungsarbeit ausgerichtet.
+
+Die Intent- und Tool-Logik ist jetzt sauber in zwei Phasen getrennt:
+
+1. Intent- und Goal-Interpretation
+   `agent/router.py` ruft den LLM-basierten Router auf und erzwingt ueber `llm/schemas.py` ein strikt validiertes `RouterOutput`-JSON. Diese Phase extrahiert Nutzerziel, Intent, Entitaeten, Rueckfragen, Safety-Signal und einen Action-Plan.
+2. Execution und Tool-Ausfuehrung
+   `agent/planner.py` arbeitet danach nur noch mit dem validierten Router-Output. Die Tool-Auswahl kommt nicht mehr direkt aus dem Rohprompt, sondern aus `router_result -> validator -> executor`.
+
+Der Produktionspfad ist damit:
+
+```text
+user text -> IntentRouter -> RouterOutput validation/repair -> Planner.execute_action_from_plan -> ToolDispatcher
+```
+
+Die restliche Architektur bleibt bewusst modular:
 
 1. Web-GUI
    `webui/` ist die Hauptoberflaeche fuer Tasks, Sessions, Live-Status, Diffs, Logs und Reports.
 2. Web-Backend
    `server/` kapselt API, Session-Lifecycle und Live-Streams.
 3. Agent-Core
-   `agent/core.py`, `planner.py`, `memory.py`, `verification.py`, `diagnostics.py` und `reporting.py` steuern Planung, Repo-Verstaendnis, Validation, Diagnose, Repair-Loop und Abschlussbericht.
+   `agent/core.py`, `router.py`, `planner.py`, `memory.py`, `verification.py`, `diagnostics.py` und `reporting.py` steuern Routing, Planung, Repo-Verstaendnis, Validation, Diagnose, Repair-Loop und Abschlussbericht.
 4. Runtime
    `runtime/` erzwingt Workspace-Grenzen, Tool-Dispatching und Logging.
 5. Tools
    `tools/` enthaelt Filesystem-, Search-, Shell-, Git- und Safety-Logik.
 6. LLM-Schicht
-   `llm/ollama_client.py` spricht mit Ollama, `llm/schemas.py` erzwingt strukturierte JSON-Entscheidungen.
+   `llm/provider.py` definiert die austauschbare Provider-Schnittstelle, `llm/ollama_client.py` spricht mit Ollama, `llm/schemas.py` erzwingt strukturierte Router- und Tool-Entscheidungen.
 7. Optionale CLI
    `cli.py` ist fuer Debugging, Automatisierung und schnelle lokale Nutzung da.
+
+## Router-Contract
+
+Der Router arbeitet mit einem strikt validierten Contract aus `llm/schemas.py`:
+
+- `intent`: `inspect | create | update | delete | search | explain | plan | unknown`
+- `entities`: Zieltyp, Zielname, konkrete Zielpfade, Attribute und Constraints
+- `action_plan`: nur erlaubte, ausfuehrbare Action-Namen aus einem festen Catalog
+- `needs_clarification`: gezielte Rueckfragen statt Blindflug
+- `safe_to_execute`: explizite Safety-Entscheidung
+- `confidence`: Float zwischen `0.0` und `1.0`
+
+Wenn der LLM-Output das Schema verletzt, folgt ein Repair-Schritt. Erst danach darf die Execution-Phase starten.
+
+## Neue Intents Erweitern
+
+Neue Intents oder Actions werden an genau diesen Stellen ergaenzt:
+
+1. `llm/schemas.py`
+   Neues Enum-Mitglied im Intent- oder Action-Catalog plus Modellregeln.
+2. `agent/prompts.py`
+   Router-Prompt und Action-Catalog erweitern, damit der LLM die neue Kategorie sauber ausgeben kann.
+3. `agent/planner.py`
+   Execution-Zweig fuer die neue Action implementieren. Diese Schicht arbeitet nur mit dem validierten Router-Output.
+4. `tests/test_router.py` und `tests/test_planner.py`
+   Neue freie Formulierungen, Validierungsfaelle und Execution-Pfade absichern.
 
 ## Projektstruktur
 
@@ -170,12 +211,14 @@ Die Architektur ist modular, aber klar auf agentische Entwicklungsarbeit ausgeri
 |   |-- planner.py
 |   |-- prompts.py
 |   |-- reporting.py
+|   |-- router.py
 |   |-- session.py
 |   `-- verification.py
 |-- config
 |   |-- agent.json.example
 |   `-- settings.py
 |-- llm
+|   |-- provider.py
 |   |-- ollama_client.py
 |   `-- schemas.py
 |-- runtime
@@ -200,7 +243,10 @@ Die Architektur ist modular, aber klar auf agentische Entwicklungsarbeit ausgeri
 |   |-- test_diagnostics.py
 |   |-- test_dispatcher.py
 |   |-- test_filesystem.py
+|   |-- test_planner.py
 |   |-- test_repo_inspection.py
+|   |-- test_reporting.py
+|   |-- test_router.py
 |   |-- test_safety.py
 |   |-- test_shell.py
 |   |-- test_validation_planner.py

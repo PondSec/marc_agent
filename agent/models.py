@@ -5,7 +5,8 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
-from llm.schemas import TaskAnalysis
+
+from llm.schemas import RouterOutput
 
 
 AgentPhase = Literal[
@@ -183,7 +184,8 @@ class SessionState(StrictModel):
     repair_attempts: int = 0
     edit_generation: int = 0
     plan_summary: str | None = None
-    task_analysis: TaskAnalysis | None = None
+    task_analysis: dict[str, Any] | None = None
+    router_result: RouterOutput | None = None
     plan: list[PlanItem] = Field(default_factory=list)
     candidate_files: list[str] = Field(default_factory=list)
     verification_commands: list[str] = Field(default_factory=list)

@@ -96,7 +96,7 @@ class AgentCore:
         dispatcher = ToolDispatcher(registry, logger, self.safety)
         executor = Executor(dispatcher)
         llm = OllamaClient(self.config)
-        planner = Planner(llm, registry.render_for_prompt())
+        planner = Planner(llm, registry.render_for_prompt(), logger=logger)
 
         if session.workspace_snapshot is None:
             session.workspace_snapshot = self.memory.build_snapshot(task)
@@ -247,15 +247,20 @@ class AgentCore:
     ) -> None:
         session.current_phase = "planning"
         session.workflow_stage = "plan"
-        session.task_analysis = planner.analyze_task(task, session.workspace_snapshot, session=session)
-        if session.task_analysis.direct_response:
+        session.router_result = planner.interpret_user_request(
+            task,
+            session.workspace_snapshot,
+            session=session,
+        )
+        session.task_analysis = session.router_result.model_dump()
+        if session.router_result.direct_response and not session.router_result.repo_context_needed:
             session.plan_summary = "Respond directly without repository work."
             session.plan = []
             session.completion_criteria = ["Return a concise, user-facing reply."]
             session.current_phase = "exploring"
             session.workflow_stage = "discover"
             return
-        plan = planner.create_plan(task, session.workspace_snapshot, session.task_analysis)
+        plan = planner.create_plan(task, session.workspace_snapshot, session.router_result)
         session.plan_summary = plan.summary
         session.plan = [PlanItem(step=step) for step in plan.steps]
         if session.plan:
@@ -275,16 +280,16 @@ class AgentCore:
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return
-        task_analysis = session.task_analysis
+        route = session.router_result
         extension_candidates: list[str] = []
-        if task_analysis and task_analysis.relevant_extensions:
+        if route and route.relevant_extensions:
             extension_candidates = [
                 path
                 for path in snapshot.important_files[:24]
-                if any(path.endswith(extension) for extension in task_analysis.relevant_extensions)
+                if any(path.endswith(extension) for extension in route.relevant_extensions)
             ]
         candidate_files = [
-            *(task_analysis.target_paths if task_analysis else []),
+            *((route.entities.target_paths if route else [])),
             *(planned_files or []),
             *extension_candidates,
             *snapshot.focus_files,

@@ -7,43 +7,60 @@ from config.settings import AppConfig
 from llm.schemas import AgentActionType
 
 
-class BrokenLLM:
+class ScriptedLLM:
+    def __init__(self, json_payloads=None):
+        self.json_payloads = list(json_payloads or [])
+
     def generate_json(self, *args, **kwargs):
-        raise RuntimeError("llm unavailable")
+        if not self.json_payloads:
+            raise RuntimeError("No JSON payload configured")
+        return self.json_payloads.pop(0)
+
+    def generate(self, *args, **kwargs):
+        raise RuntimeError("No text generation configured")
 
 
-def test_planner_fallback_replies_to_simple_greeting_without_tooling(tmp_path):
-    planner = Planner(BrokenLLM(), "")
-    session = SessionState(task="hallo?", workspace_root=str(tmp_path))
-
-    decision = planner.decide_next_action(session.task, session)
-
-    assert decision.action_type == AgentActionType.FINAL
-    assert "Hallo" in (decision.final_response or "")
-    assert "analysieren" in (decision.final_response or "")
-
-
-def test_planner_replies_to_intro_question_without_repo_scan(tmp_path):
-    planner = Planner(BrokenLLM(), "")
-    session = SessionState(task="hallo wer bist du?", workspace_root=str(tmp_path))
-
-    decision = planner.decide_next_action(session.task, session)
-
-    assert decision.action_type == AgentActionType.FINAL
-    assert "Coding-Agent" in (decision.final_response or "")
-
-
-def test_planner_focus_terms_ignore_greeting_and_keep_signal_phrase():
-    planner = Planner(BrokenLLM(), "")
-
-    terms = planner._focus_terms(
-        "hallo Marc kannst du ein python code schreiben wo ich Tick Tack Toe gegen ein computer ki spiele?"
+def test_planner_direct_response_is_user_facing(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            json_payloads=[
+                {
+                    "user_goal": "Answer who the agent is.",
+                    "intent": "explain",
+                    "entities": {
+                        "target_type": None,
+                        "target_name": None,
+                        "target_paths": [],
+                        "attributes": [],
+                        "constraints": [],
+                    },
+                    "requested_outcome": "Provide a short capability explanation.",
+                    "action_plan": [
+                        {
+                            "step": 1,
+                            "action": "respond_directly",
+                            "reason": "No repository work is required.",
+                        }
+                    ],
+                    "needs_clarification": False,
+                    "clarification_questions": [],
+                    "confidence": 0.94,
+                    "safe_to_execute": True,
+                    "repo_context_needed": False,
+                    "search_terms": [],
+                    "relevant_extensions": [],
+                    "direct_response": "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.",
+                }
+            ]
+        ),
+        "",
     )
+    session = SessionState(task="Wer bist du?", workspace_root=str(tmp_path))
 
-    assert "hallo" not in terms
-    assert "marc" not in terms
-    assert "kannst" not in terms
-    assert "tick tack toe" in terms
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "lokaler Coding-Agent" in (decision.final_response or "")
 
 
 def test_reporter_replaces_machine_summary_with_user_facing_response(tmp_path):

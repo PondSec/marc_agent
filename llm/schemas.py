@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -15,13 +15,143 @@ class AgentActionType(str, Enum):
     FINAL = "final"
 
 
-class TaskIntent(str, Enum):
-    REPLY = "reply"
-    ANALYZE = "analyze"
+class RouteIntent(str, Enum):
     INSPECT = "inspect"
-    MODIFY = "modify"
     CREATE = "create"
-    FIX = "fix"
+    UPDATE = "update"
+    DELETE = "delete"
+    SEARCH = "search"
+    EXPLAIN = "explain"
+    PLAN = "plan"
+    UNKNOWN = "unknown"
+
+
+class RouteActionName(str, Enum):
+    RESPOND_DIRECTLY = "respond_directly"
+    ASK_CLARIFICATION = "ask_clarification"
+    INSPECT_WORKSPACE = "inspect_workspace"
+    SEARCH_WORKSPACE = "search_workspace"
+    READ_RELEVANT_FILES = "read_relevant_files"
+    CREATE_ARTIFACT = "create_artifact"
+    UPDATE_ARTIFACT = "update_artifact"
+    DELETE_ARTIFACT = "delete_artifact"
+    PLAN_WORK = "plan_work"
+    RUN_VALIDATION = "run_validation"
+    SUMMARIZE_RESULT = "summarize_result"
+
+
+def _compact_strings(values: list[str], *, limit: int | None = None) -> list[str]:
+    unique: list[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text or text in unique:
+            continue
+        unique.append(text)
+    if limit is not None:
+        return unique[:limit]
+    return unique
+
+
+class RouteEntities(StrictModel):
+    target_type: str | None = Field(default=None, description="Type of the primary target.")
+    target_name: str | None = Field(default=None, description="Name of the primary target.")
+    target_paths: list[str] = Field(
+        default_factory=list,
+        description="Concrete files or directories when they are already known.",
+    )
+    attributes: list[str] = Field(default_factory=list, description="Useful extracted attributes.")
+    constraints: list[str] = Field(default_factory=list, description="Execution constraints or limits.")
+
+    @model_validator(mode="after")
+    def normalize(self) -> RouteEntities:
+        self.target_type = str(self.target_type or "").strip() or None
+        self.target_name = str(self.target_name or "").strip() or None
+        self.target_paths = _compact_strings(self.target_paths, limit=8)
+        self.attributes = _compact_strings(self.attributes, limit=8)
+        self.constraints = _compact_strings(self.constraints, limit=8)
+        return self
+
+
+class RouteActionStep(StrictModel):
+    step: int = Field(..., ge=1, description="1-based action order.")
+    action: RouteActionName = Field(..., description="Executor action from the approved catalog.")
+    reason: str = Field(..., min_length=1, description="Why this step is needed.")
+
+    @model_validator(mode="after")
+    def normalize(self) -> RouteActionStep:
+        self.reason = str(self.reason or "").strip()
+        return self
+
+
+class RouterOutput(StrictModel):
+    user_goal: str = Field(..., min_length=1, description="What the user is ultimately trying to achieve.")
+    intent: RouteIntent = Field(..., description="High-level request intent.")
+    entities: RouteEntities = Field(default_factory=RouteEntities)
+    requested_outcome: str = Field(
+        ...,
+        min_length=1,
+        description="Concrete expected result or deliverable.",
+    )
+    action_plan: list[RouteActionStep] = Field(
+        default_factory=list,
+        description="Ordered execution plan using the approved action catalog.",
+    )
+    needs_clarification: bool = Field(..., description="Whether the agent must ask follow-up questions.")
+    clarification_questions: list[str] = Field(
+        default_factory=list,
+        max_length=3,
+        description="One to three targeted questions when clarification is required.",
+    )
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score between 0 and 1.")
+    safe_to_execute: bool = Field(..., description="Whether the executor may proceed without extra input.")
+    repo_context_needed: bool = Field(
+        default=True,
+        description="Whether repository inspection is needed before the final answer or mutation.",
+    )
+    search_terms: list[str] = Field(
+        default_factory=list,
+        description="High-signal search phrases derived by the router.",
+    )
+    relevant_extensions: list[str] = Field(
+        default_factory=list,
+        description="Likely relevant file extensions such as .py or .ts.",
+    )
+    direct_response: str | None = Field(
+        default=None,
+        description="Optional direct reply when no repository work is needed.",
+    )
+
+    @model_validator(mode="after")
+    def normalize(self) -> RouterOutput:
+        self.user_goal = str(self.user_goal or "").strip()
+        self.requested_outcome = str(self.requested_outcome or "").strip()
+        self.clarification_questions = _compact_strings(self.clarification_questions, limit=3)
+        self.search_terms = _compact_strings(self.search_terms, limit=6)
+        self.relevant_extensions = _compact_strings(self.relevant_extensions, limit=6)
+        ordered_steps = sorted(self.action_plan, key=lambda item: item.step)
+        for index, item in enumerate(ordered_steps, start=1):
+            item.step = index
+        self.action_plan = ordered_steps
+        self.direct_response = str(self.direct_response or "").strip() or None
+
+        if not self.action_plan:
+            raise ValueError("action_plan must contain at least one step")
+        if self.needs_clarification:
+            if not self.clarification_questions:
+                raise ValueError(
+                    "clarification_questions must contain one to three entries when clarification is required"
+                )
+            if self.safe_to_execute:
+                raise ValueError("safe_to_execute must be false when clarification is required")
+        if self.intent == RouteIntent.UNKNOWN and self.safe_to_execute:
+            raise ValueError("unknown intent cannot be marked safe_to_execute")
+        if self.direct_response and self.needs_clarification:
+            raise ValueError("direct_response cannot be set while clarification is required")
+        return self
+
+
+def router_output_schema() -> dict[str, Any]:
+    return RouterOutput.model_json_schema()
 
 
 class AgentDecision(StrictModel):
@@ -36,39 +166,6 @@ class AgentDecision(StrictModel):
     final_response: str | None = Field(
         None,
         description="Filled only when action_type=final.",
-    )
-
-
-class TaskAnalysis(StrictModel):
-    summary: str = Field(..., description="Short summary of what the user wants.")
-    intent: TaskIntent = Field(..., description="High-level task kind.")
-    requires_repo_context: bool = Field(
-        default=True,
-        description="Whether repository inspection is needed before acting.",
-    )
-    should_create_files: bool = Field(
-        default=False,
-        description="Whether the task likely needs creating a new file.",
-    )
-    deliverable: str | None = Field(
-        default=None,
-        description="Concrete expected output such as script, fix, summary, or answer.",
-    )
-    search_terms: list[str] = Field(
-        default_factory=list,
-        description="High-signal terms worth searching for when inspection is needed.",
-    )
-    target_paths: list[str] = Field(
-        default_factory=list,
-        description="Likely relevant files to inspect first.",
-    )
-    relevant_extensions: list[str] = Field(
-        default_factory=list,
-        description="Likely file extensions involved in the task.",
-    )
-    direct_response: str | None = Field(
-        default=None,
-        description="Filled only when intent=reply and no repo work is needed.",
     )
 
 

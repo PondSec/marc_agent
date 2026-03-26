@@ -1,76 +1,36 @@
 from __future__ import annotations
 
-from agent.models import FileChangeRecord, SessionState, ToolCallRecord, WorkspaceSnapshot
+from pathlib import Path
+
+from agent.models import FileChangeRecord, SessionState, ToolCallRecord, ValidationCommand, WorkspaceSnapshot
 from agent.planner import Planner
-from agent.prompts import decision_prompt
-from llm.schemas import AgentActionType, TaskIntent
+from llm.schemas import AgentActionType, RouteIntent
 
 
-class BrokenLLM:
+class ScriptedLLM:
+    def __init__(self, json_payloads=None, text_payloads=None):
+        self.json_payloads = list(json_payloads or [])
+        self.text_payloads = list(text_payloads or [])
+
     def generate_json(self, *args, **kwargs):
-        raise RuntimeError("llm unavailable")
+        if not self.json_payloads:
+            raise RuntimeError("No JSON payload configured")
+        return self.json_payloads.pop(0)
 
     def generate(self, *args, **kwargs):
-        raise RuntimeError("llm unavailable")
+        if not self.text_payloads:
+            raise RuntimeError("No text payload configured")
+        return self.text_payloads.pop(0)
 
 
-class CreateDraftLLM(BrokenLLM):
-    def __init__(self):
-        self.calls = 0
-
-    def generate(self, *args, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
-            return "tic_tac_toe.py"
-        return "print('tic tac toe')\n"
-
-
-class ModelFirstCreateLLM(BrokenLLM):
-    def __init__(self):
-        self.analysis_prompts: list[str] = []
-
-    def generate_json(self, prompt, *args, **kwargs):
-        self.analysis_prompts.append(prompt)
-        return {
-            "summary": "Create a Python Tic Tac Toe implementation.",
-            "intent": "create",
-            "requires_repo_context": True,
-            "should_create_files": True,
-            "deliverable": "New implementation",
-            "search_terms": ["tic tac toe"],
-            "target_paths": [],
-            "relevant_extensions": [".py"],
-            "direct_response": None,
-        }
-
-
-class ContextAwareFollowUpLLM(BrokenLLM):
-    def __init__(self):
-        self.analysis_prompts: list[str] = []
-
-    def generate_json(self, prompt, *args, **kwargs):
-        self.analysis_prompts.append(prompt)
-        return {
-            "summary": "Modify the recently created Tic Tac Toe implementation.",
-            "intent": "modify",
-            "requires_repo_context": True,
-            "should_create_files": False,
-            "deliverable": "Updated implementation",
-            "search_terms": [],
-            "target_paths": ["tic_tac_toe.py"],
-            "relevant_extensions": [".py"],
-            "direct_response": None,
-        }
-
-
-def build_snapshot(tmp_path) -> WorkspaceSnapshot:
+def build_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(
         root=str(tmp_path),
         file_count=4,
         language_counts={"python": 2, "markdown": 1, "toml": 1},
         top_directories=["app", "tests"],
         important_files=["pyproject.toml", "README.md", "app/main.py", "tests/test_main.py"],
-        focus_files=[],
+        focus_files=["app/main.py"],
         file_briefs={
             "pyproject.toml": "Project metadata",
             "README.md": "Usage guide",
@@ -91,333 +51,361 @@ def build_snapshot(tmp_path) -> WorkspaceSnapshot:
     )
 
 
-def test_task_analysis_classifies_create_request_without_filler_terms(tmp_path):
-    planner = Planner(BrokenLLM(), "")
-    analysis = planner.analyze_task(
-        "hallo schreib bitte ein python script das ein Taschenrechner ist",
-        build_snapshot(tmp_path),
+def route_payload(
+    *,
+    intent: str,
+    action_plan,
+    target_paths=None,
+    direct_response=None,
+    needs_clarification=False,
+    clarification_questions=None,
+    safe_to_execute=True,
+    repo_context_needed=True,
+    target_name=None,
+):
+    return {
+        "user_goal": "Handle the user request safely.",
+        "intent": intent,
+        "entities": {
+            "target_type": "file" if target_paths else None,
+            "target_name": target_name,
+            "target_paths": target_paths or [],
+            "attributes": [],
+            "constraints": [],
+        },
+        "requested_outcome": "Produce the requested result.",
+        "action_plan": action_plan,
+        "needs_clarification": needs_clarification,
+        "clarification_questions": clarification_questions or [],
+        "confidence": 0.91 if safe_to_execute else 0.31,
+        "safe_to_execute": safe_to_execute,
+        "repo_context_needed": repo_context_needed,
+        "search_terms": [target_name] if target_name else [],
+        "relevant_extensions": [Path(target_paths[0]).suffix] if target_paths else [".py"],
+        "direct_response": direct_response,
+    }
+
+
+def test_planner_returns_direct_response_from_router(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="explain",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "respond_directly",
+                        "reason": "The user only wants a short explanation.",
+                    }
+                ],
+                direct_response="Ich bin dein lokaler Agent fuer Analyse, Planung und Code-Aenderungen.",
+                repo_context_needed=False,
+            )
+        ]
     )
-
-    assert analysis.intent == TaskIntent.CREATE
-    assert analysis.should_create_files is True
-    assert "hallo" not in analysis.search_terms
-    assert "schreib" not in analysis.search_terms
-    assert ".py" in analysis.relevant_extensions
-
-
-def test_create_request_with_summary_suffix_still_classifies_as_create(tmp_path):
-    planner = Planner(BrokenLLM(), "")
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=0,
-        language_counts={},
-        top_directories=[],
-        important_files=[],
-        focus_files=[],
-        file_briefs={},
-        manifests=[],
-        configs=[],
-        test_files=[],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=[],
-        repo_map=[],
-        project_labels=[],
-        likely_commands=[],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Empty workspace.",
-    )
-
-    analysis = planner.analyze_task(
-        "bitte programmiere fuer mich ein Tic Tac Toe spiel in python fuer mich. "
-        "gib danach eine Zusammenfassung was du genau getan hast",
-        snapshot,
-    )
-
-    assert analysis.intent == TaskIntent.CREATE
-    assert analysis.should_create_files is True
-    assert "tic tac toe" in analysis.search_terms
-    assert "tic tac" not in analysis.search_terms
-    assert "programmiere" not in analysis.search_terms
-    assert "mich" not in analysis.search_terms
-    assert "zusammenfassung" not in analysis.search_terms
-
-
-def test_analyze_task_prefers_model_for_free_form_create_prompt(tmp_path):
-    llm = ModelFirstCreateLLM()
     planner = Planner(llm, "")
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=0,
-        language_counts={},
-        top_directories=[],
-        important_files=[],
-        focus_files=[],
-        file_briefs={},
-        manifests=[],
-        configs=[],
-        test_files=[],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=[],
-        repo_map=[],
-        project_labels=[],
-        likely_commands=[],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Empty workspace.",
+    session = SessionState(task="Wer bist du?", workspace_root=str(tmp_path))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "lokaler Agent" in (decision.final_response or "")
+
+
+def test_planner_asks_for_clarification_when_router_requires_it(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="unknown",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "ask_clarification",
+                        "reason": "The target is ambiguous.",
+                    }
+                ],
+                needs_clarification=True,
+                clarification_questions=["Welche Datei oder welchen Bereich meinst du genau?"],
+                safe_to_execute=False,
+                repo_context_needed=False,
+            )
+        ]
     )
-
-    analysis = planner.analyze_task("bau mir ein python tic tac toe", snapshot)
-
-    assert analysis.intent == TaskIntent.CREATE
-    assert llm.analysis_prompts
-
-
-def test_analyze_task_uses_recent_thread_context_for_follow_up(tmp_path):
-    llm = ContextAwareFollowUpLLM()
     planner = Planner(llm, "")
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=1,
-        language_counts={"python": 1},
-        top_directories=[],
-        important_files=["tic_tac_toe.py"],
-        focus_files=["tic_tac_toe.py"],
-        file_briefs={"tic_tac_toe.py": "Tic Tac Toe game"},
-        manifests=[],
-        configs=[],
-        test_files=[],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=["tic_tac_toe.py"],
-        repo_map=["tic_tac_toe.py"],
-        project_labels=["python"],
-        likely_commands=[],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Single Python game file.",
+    session = SessionState(task="Mach das mal anders", workspace_root=str(tmp_path))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Praezisierung" in (decision.final_response or "")
+    assert "Welche Datei" in (decision.final_response or "")
+
+
+def test_planner_reads_target_file_before_update(tmp_path):
+    target = tmp_path / "app" / "main.py"
+    target.parent.mkdir()
+    target.write_text("print('hello')\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "read_relevant_files",
+                        "reason": "Inspect the current target file first.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested update.",
+                    },
+                ],
+                target_paths=["app/main.py"],
+                target_name="app/main.py",
+            )
+        ]
     )
+    planner = Planner(llm, "")
     session = SessionState(
-        task="mach das anders",
+        task="Aktualisiere app/main.py",
         workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
-    )
-    session.append_message("user", "programmiere bitte ein python tic tac toe")
-    session.append_message("assistant", "Ich habe tic_tac_toe.py erstellt.")
-    session.append_message("user", "mach das anders")
-    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="created"))
-
-    analysis = planner.analyze_task(session.task, snapshot, session=session)
-
-    assert analysis.intent == TaskIntent.MODIFY
-    assert analysis.target_paths == ["tic_tac_toe.py"]
-    assert "programmiere bitte ein python tic tac toe" in llm.analysis_prompts[0]
-    assert "tic_tac_toe.py" in llm.analysis_prompts[0]
-
-
-def test_fallback_create_flow_reads_manifest_before_searching_prompt_words(tmp_path):
-    planner = Planner(BrokenLLM(), "")
-    snapshot = build_snapshot(tmp_path)
-    session = SessionState(
-        task="hallo schreib bitte ein python script das ein Taschenrechner ist",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
-    )
-    session.task_analysis = planner.analyze_task(session.task, snapshot)
-    session.tool_calls.append(
-        ToolCallRecord(
-            iteration=1,
-            tool_name="inspect_workspace",
-            tool_args={"focus": session.task},
-            success=True,
-            summary="Workspace inspected successfully.",
-            phase="exploring",
-        )
+        workspace_snapshot=build_snapshot(tmp_path),
     )
 
     decision = planner.decide_next_action(session.task, session)
 
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "read_file"
-    assert decision.tool_args["path"] == "pyproject.toml"
+    assert decision.tool_args["path"] == "app/main.py"
 
 
-def test_decision_prompt_stays_compact_with_snapshot_context(tmp_path):
-    planner = Planner(BrokenLLM(), "")
-    snapshot = build_snapshot(tmp_path)
-    session = SessionState(
-        task="Bitte behebe den Fehler im Python-Projekt",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
+def test_planner_generates_write_after_update_target_is_read(tmp_path):
+    target = tmp_path / "app" / "main.py"
+    target.parent.mkdir()
+    target.write_text("print('hello')\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested update.",
+                    }
+                ],
+                target_paths=["app/main.py"],
+                target_name="app/main.py",
+            )
+        ],
+        text_payloads=["print('updated')\n"],
     )
-    session.task_analysis = planner.analyze_task(session.task, snapshot)
-    session.plan_summary = "Inspect error, patch file, rerun targeted checks."
-    session.candidate_files = ["app/main.py", "tests/test_main.py"]
-    session.verification_commands = ["python -m pytest"]
-
-    prompt = decision_prompt(session.task, session, "tool manifest placeholder")
-
-    assert len(prompt) < 9000
-
-
-def test_empty_workspace_create_request_drafts_file_after_inspect(tmp_path):
-    planner = Planner(CreateDraftLLM(), "")
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=0,
-        language_counts={},
-        top_directories=[],
-        important_files=[],
-        focus_files=[],
-        file_briefs={},
-        manifests=[],
-        configs=[],
-        test_files=[],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=[],
-        repo_map=[],
-        project_labels=[],
-        likely_commands=[],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Empty workspace.",
-    )
-    session = SessionState(
-        task="kannst du bitte ein python tic tac toe spiel schreiben?",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
-    )
-    session.task_analysis = planner.analyze_task(session.task, snapshot)
-    session.tool_calls.append(
-        ToolCallRecord(
-            iteration=1,
-            tool_name="inspect_workspace",
-            tool_args={"focus": session.task},
-            success=True,
-            summary="Workspace inspected successfully.",
-            phase="exploring",
-        )
-    )
-
-    decision = planner.decide_next_action(session.task, session)
-
-    assert decision.action_type == AgentActionType.CALL_TOOL
-    assert decision.tool_name == "create_file"
-    assert decision.tool_args["path"] == "tic_tac_toe.py"
-    assert "tic tac toe" in decision.tool_args["content"].lower()
-
-
-def test_empty_workspace_programmiere_request_drafts_file_after_inspect(tmp_path):
-    planner = Planner(CreateDraftLLM(), "")
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=0,
-        language_counts={},
-        top_directories=[],
-        important_files=[],
-        focus_files=[],
-        file_briefs={},
-        manifests=[],
-        configs=[],
-        test_files=[],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=[],
-        repo_map=[],
-        project_labels=[],
-        likely_commands=[],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Empty workspace.",
-    )
-    task = (
-        "bitte programmiere fuer mich ein Tic Tac Toe spiel in python fuer mich. "
-        "gib danach eine Zusammenfassung was du genau getan hast"
-    )
-    session = SessionState(
-        task=task,
-        workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
-    )
-    session.task_analysis = planner.analyze_task(session.task, snapshot)
-    session.tool_calls.append(
-        ToolCallRecord(
-            iteration=1,
-            tool_name="inspect_workspace",
-            tool_args={"focus": session.task},
-            success=True,
-            summary="Workspace inspected successfully.",
-            phase="exploring",
-        )
-    )
-
-    decision = planner.decide_next_action(session.task, session)
-
-    assert decision.action_type == AgentActionType.CALL_TOOL
-    assert decision.tool_name == "create_file"
-    assert decision.tool_args["path"] == "tic_tac_toe.py"
-
-
-def test_follow_up_modify_request_reads_recent_changed_file_first(tmp_path):
-    (tmp_path / "tic_tac_toe.py").write_text("def main():\n    pass\n", encoding="utf-8")
-    llm = ContextAwareFollowUpLLM()
     planner = Planner(llm, "")
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=1,
-        language_counts={"python": 1},
-        top_directories=[],
-        important_files=["tic_tac_toe.py"],
-        focus_files=["tic_tac_toe.py"],
-        file_briefs={"tic_tac_toe.py": "Tic Tac Toe game"},
-        manifests=[],
-        configs=[],
-        test_files=[],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=["tic_tac_toe.py"],
-        repo_map=["tic_tac_toe.py"],
-        project_labels=["python"],
-        likely_commands=[],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Single Python game file.",
-    )
     session = SessionState(
-        task="mach das anders",
+        task="Aktualisiere app/main.py",
         workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
+        workspace_snapshot=build_snapshot(tmp_path),
     )
-    session.append_message("user", "programmiere bitte ein python tic tac toe")
-    session.append_message("assistant", "Ich habe tic_tac_toe.py erstellt.")
-    session.append_message("user", "mach das anders")
-    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="created"))
-    session.task_analysis = planner.analyze_task(session.task, snapshot, session=session)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app/main.py"},
+            success=True,
+            summary="Read app/main.py.",
+            output_excerpt="print('hello')\n",
+        )
+    )
 
     decision = planner.decide_next_action(session.task, session)
 
     assert decision.action_type == AgentActionType.CALL_TOOL
-    assert decision.tool_name == "read_file"
-    assert decision.tool_args["path"] == "tic_tac_toe.py"
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app/main.py"
+    assert "updated" in decision.tool_args["content"]
 
 
-def test_summarize_session_prefers_changed_files_over_generic_workspace_message(tmp_path):
-    planner = Planner(BrokenLLM(), "")
+def test_planner_uses_route_to_create_new_file(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="create",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "create_artifact",
+                        "reason": "Create the requested new module.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "run_validation",
+                        "reason": "Validate the generated code.",
+                    },
+                ],
+                target_paths=["tools/new_agent.py"],
+                target_name="tools/new_agent.py",
+            )
+        ],
+        text_payloads=["print('new agent')\n"],
+    )
+    planner = Planner(llm, "")
     session = SessionState(
-        task="schreib bitte ein python script das ein taschenrechner ist",
+        task="Erstelle tools/new_agent.py",
         workspace_root=str(tmp_path),
-        validation_status="not_run",
-    )
-    session.changed_files.append(
-        {
-            "path": "calculator.py",
-            "operation": "create",
-        }
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=0,
+            language_counts={},
+            top_directories=[],
+            important_files=[],
+            focus_files=[],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=[],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Empty workspace.",
+        ),
     )
 
-    summary = planner.summarize_session(session)
+    decision = planner.decide_next_action(session.task, session)
 
-    assert "umgesetzt" in summary
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "tools/new_agent.py"
+
+
+def test_planner_runs_validation_after_changes(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "run_validation",
+                        "reason": "Validate the changed code.",
+                    }
+                ],
+                target_paths=["app/main.py"],
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Aktualisiere app/main.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        verification_commands=["python -m pytest"],
+        validation_plan=[ValidationCommand(command="python -m pytest")],
+    )
+    session.changed_files.append(FileChangeRecord(path="app/main.py", operation="write"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python -m pytest"
+
+
+def test_planner_returns_plan_intent_as_final_response(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="plan",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "plan_work",
+                        "reason": "Outline the migration in clear stages.",
+                    }
+                ],
+                repo_context_needed=False,
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Mach mir einen Plan", workspace_root=str(tmp_path))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Vorgehen" in (decision.final_response or "")
+
+
+def test_planner_deletes_only_after_target_has_been_read(tmp_path):
+    target = tmp_path / "obsolete.py"
+    target.write_text("print('old')\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="delete",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "delete_artifact",
+                        "reason": "Remove the obsolete file safely.",
+                    }
+                ],
+                target_paths=["obsolete.py"],
+                target_name="obsolete.py",
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Loesche obsolete.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "obsolete.py"},
+            success=True,
+            summary="Read obsolete.py.",
+            output_excerpt="print('old')\n",
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "delete_file"
+    assert decision.tool_args["path"] == "obsolete.py"
+
+
+def test_analyze_task_returns_router_output_model(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="search",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "search_workspace",
+                        "reason": "Locate matching code.",
+                    }
+                ],
+                target_name="auth middleware",
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+
+    route = planner.analyze_task("Wo ist die Auth-Middleware?", build_snapshot(tmp_path))
+
+    assert route.intent == RouteIntent.SEARCH
+    assert route.entities.target_name == "auth middleware"

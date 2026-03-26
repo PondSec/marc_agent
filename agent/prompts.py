@@ -4,126 +4,227 @@ import json
 
 from agent.models import SessionState, WorkspaceSnapshot
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
-from llm.schemas import TaskAnalysis
+from llm.schemas import RouteActionName, RouterOutput
 
 
 def system_prompt() -> str:
     return (
         f"You are {AGENT_NAME} ({AGENT_FULL_NAME}), a local autonomous coding agent. "
-        "Always return valid JSON only. "
-        "If the user asks a simple greeting, clarification, or question that can be answered safely without repo work, reply directly instead of forcing tool use. "
-        "Inspect before editing, prefer existing architecture, and avoid searching filler words from the prompt. "
-        "Use the recent conversation, changed files, and latest tool results to resolve follow-up requests like 'make it different' or 'change that'. "
-        "For create requests, read only the minimum manifest, README, or nearby example needed before writing files. "
-        "After code changes, run the relevant validation command before finishing unless there is a real blocker. "
-        "Respect access_mode exactly and never ask for destructive remote actions."
+        "Use the validated router output as the source of truth. "
+        "Never select tools directly from the raw user prompt. "
+        "Inspect before editing, prefer the smallest sufficient change, and respect access mode."
     )
 
 
-def planning_prompt(task: str, snapshot: WorkspaceSnapshot) -> str:
-    return planning_prompt_with_analysis(task, snapshot, None)
-
-
-def planning_prompt_with_analysis(
-    task: str,
-    snapshot: WorkspaceSnapshot,
-    analysis: TaskAnalysis | None,
-) -> str:
-    compact_snapshot = _compact_workspace_snapshot(snapshot)
-    analysis_data = _compact_task_analysis(analysis)
+def router_system_prompt() -> str:
+    actions = ", ".join(action.value for action in RouteActionName)
     return (
-        "Create a practical implementation plan for this coding task.\n\n"
-        f"Task:\n{task}\n\n"
-        f"Task analysis:\n{json.dumps(analysis_data, indent=2)}\n\n"
-        f"Workspace context:\n{json.dumps(compact_snapshot, indent=2)}\n\n"
-        "Return JSON with keys: summary, steps, files_to_inspect, tests_to_run, completion_criteria.\n"
-        "Prefer high-signal files, multi-step validation commands, and explicit completion conditions.\n"
-        "If the task is about creating something new, inspect only the minimum files needed to match project conventions before editing.\n"
-        "If helper tooling may be needed, include that in the plan."
+        f"You are {AGENT_NAME} ({AGENT_FULL_NAME}), a goal-oriented routing model. "
+        "Return valid JSON only. "
+        "Infer the user's true intent semantically, not from keyword matching. "
+        "Be resilient to paraphrases, slang, typos, indirect wishes, and mixed German/English phrasing. "
+        "Focus on the user's end goal, the minimum safe action plan, missing information, and whether execution is safe. "
+        f"Allowed action names are: {actions}. "
+        "If information is missing or the request is risky, ask one to three precise clarification questions instead of guessing."
     )
 
 
-def task_analysis_prompt(
+def router_prompt(
     task: str,
     snapshot: WorkspaceSnapshot | None,
     session: SessionState | None = None,
 ) -> str:
-    workspace = _compact_workspace_snapshot(snapshot, detail="minimal")
+    workspace = _compact_workspace_snapshot(snapshot, detail="router")
     recent_messages = _compact_recent_messages(session)
-    recent_calls = _compact_recent_calls(session)
     changed_files = [item.path for item in session.changed_files[-6:]] if session else []
+    action_catalog = [
+        {
+            "action": RouteActionName.RESPOND_DIRECTLY.value,
+            "when": "Use when the request can be answered without any tool call.",
+        },
+        {
+            "action": RouteActionName.ASK_CLARIFICATION.value,
+            "when": "Use when required parameters, scope, or risk decisions are missing.",
+        },
+        {
+            "action": RouteActionName.INSPECT_WORKSPACE.value,
+            "when": "Use when repository structure or context must be gathered first.",
+        },
+        {
+            "action": RouteActionName.SEARCH_WORKSPACE.value,
+            "when": "Use when the target must be located semantically in the codebase.",
+        },
+        {
+            "action": RouteActionName.READ_RELEVANT_FILES.value,
+            "when": "Use when specific files should be inspected before replying or changing code.",
+        },
+        {
+            "action": RouteActionName.CREATE_ARTIFACT.value,
+            "when": "Use when the user wants something new to be added.",
+        },
+        {
+            "action": RouteActionName.UPDATE_ARTIFACT.value,
+            "when": "Use when existing code or content should be changed.",
+        },
+        {
+            "action": RouteActionName.DELETE_ARTIFACT.value,
+            "when": "Use when something should be removed.",
+        },
+        {
+            "action": RouteActionName.PLAN_WORK.value,
+            "when": "Use when the user primarily wants a plan or implementation strategy.",
+        },
+        {
+            "action": RouteActionName.RUN_VALIDATION.value,
+            "when": "Use when execution should include tests, linting, or another verification step.",
+        },
+        {
+            "action": RouteActionName.SUMMARIZE_RESULT.value,
+            "when": "Use as the final step after inspection or mutation work.",
+        },
+    ]
+    schema_shape = {
+        "user_goal": "string",
+        "intent": "inspect | create | update | delete | search | explain | plan | unknown",
+        "entities": {
+            "target_type": "string | null",
+            "target_name": "string | null",
+            "target_paths": ["string"],
+            "attributes": ["string"],
+            "constraints": ["string"],
+        },
+        "requested_outcome": "string",
+        "action_plan": [
+            {
+                "step": 1,
+                "action": "one_of_the_allowed_action_names",
+                "reason": "string",
+            }
+        ],
+        "needs_clarification": True,
+        "clarification_questions": ["string"],
+        "confidence": 0.0,
+        "safe_to_execute": False,
+        "repo_context_needed": True,
+        "search_terms": ["string"],
+        "relevant_extensions": [".py"],
+        "direct_response": "string | null",
+    }
     lines = [
-        "Analyze the user's latest request before choosing tools.",
-        f"Task: {_trim_text(task, 320)}",
+        "Interpret the user's latest request.",
+        f"User request: {_trim_text(task, 600)}",
         f"Recent conversation: {_format_objects(recent_messages)}",
         f"Recently changed files: {_format_list(changed_files)}",
-        f"Recent tool calls: {_format_objects(recent_calls)}",
-        f"Workspace labels: {_format_list(workspace.get('project_labels'))}",
-        f"Top directories: {_format_list(workspace.get('top_directories'))}",
-        f"Manifests: {_format_list(workspace.get('manifests'))}",
-        f"Entrypoints: {_format_list(workspace.get('entrypoints'))}",
-        f"Focus files: {_format_list(workspace.get('focus_files'))}",
-        f"Repo summary: {_trim_text(str(workspace.get('repo_summary', '')), 180)}",
-        "Rules: use recent conversation to understand references like 'that', 'it', or 'do it differently'; ignore greetings/filler words; prefer create for write/build/create requests; prefer fix or modify for follow-up change requests; prefer reply only for pure conversation; keep target_paths short and real; keep search_terms high-signal.",
-        "Return JSON only with keys: summary, intent, requires_repo_context, should_create_files, deliverable, search_terms, target_paths, relevant_extensions, direct_response.",
+        f"Workspace context: {json.dumps(workspace, ensure_ascii=False)}",
+        f"Allowed actions: {json.dumps(action_catalog, ensure_ascii=False)}",
+        "Routing rules:",
+        "- Infer intent from meaning, not literal verbs.",
+        "- Extract the user's end goal and likely target entities.",
+        "- Detect when the request is ambiguous, unsafe, or missing a required parameter.",
+        "- Prefer the smallest practical action plan.",
+        "- Use intent=unknown when the request cannot be interpreted safely enough.",
+        "- For direct conversational answers, set direct_response and use respond_directly.",
+        "- For ambiguous requests, set needs_clarification=true, safe_to_execute=false, and add 1-3 precise questions.",
+        "- For executable requests, set needs_clarification=false and safe_to_execute=true only when enough information is present.",
+        f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
     ]
     return "\n".join(lines)
 
 
-def decision_prompt(
-    task: str,
-    session: SessionState,
-    tool_manifest: str,
+def router_repair_prompt(
+    invalid_payload: dict[str, object],
+    errors: list[dict[str, object]],
 ) -> str:
-    del tool_manifest
-    recent_calls = [
-        {
-            "tool": item.tool_name,
-            "success": item.success,
-            "summary": item.summary,
-        }
-        for item in session.tool_calls[-3:]
-    ]
-    analysis = _compact_task_analysis(session.task_analysis)
-    workspace = _compact_workspace_snapshot(
-        session.workspace_snapshot,
-        detail="decision",
+    return "\n".join(
+        [
+            "Repair the invalid router JSON output and return valid JSON only.",
+            f"Invalid payload: {json.dumps(invalid_payload, ensure_ascii=False, default=str)}",
+            f"Validation errors: {json.dumps(errors, ensure_ascii=False, default=str)}",
+            "Do not add prose. Keep the same user intent and fix only the schema or safety issues.",
+        ]
     )
-    diagnostics = [
-        f"{item.category}: {item.summary}"
-        for item in session.diagnostics[-2:]
+
+
+def choose_path_prompt(route: RouterOutput, session: SessionState) -> str:
+    snapshot = _compact_workspace_snapshot(session.workspace_snapshot, detail="decision")
+    return "\n".join(
+        [
+            "Choose one relative workspace file path for a new implementation.",
+            f"Route: {json.dumps(_compact_route(route), ensure_ascii=False)}",
+            f"Workspace context: {json.dumps(snapshot, ensure_ascii=False)}",
+            f"Already read files: {_format_list(_read_paths(session))}",
+            "Return only the path, with no explanation or markdown.",
+        ]
+    )
+
+
+def generate_content_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    current_content: str | None = None,
+) -> str:
+    sections = [
+        "Produce the full file content for the requested task.",
+        f"Validated route: {json.dumps(_compact_route(route), ensure_ascii=False)}",
+        f"Target path: {path}",
+        f"Workspace context: {json.dumps(_compact_workspace_snapshot(session.workspace_snapshot, detail='decision'), ensure_ascii=False)}",
+        f"Inspected context: {_inspected_context(session)}",
     ]
-    validation_runs = [
-        f"{item.status} {item.kind or 'check'} {item.command}"
-        for item in session.validation_runs[-2:]
-    ]
-    recent_messages = _compact_recent_messages(session)
-    lines = [
-        "Decide the next best action for the coding task.",
-        f"Task: {_trim_text(task, 320)}",
-        f"Recent conversation: {_format_objects(recent_messages)}",
-        f"Intent: {analysis.get('intent')}",
-        f"Task summary: {_trim_text(str(analysis.get('summary', '')), 180)}",
-        f"Deliverable: {analysis.get('deliverable') or 'none'}",
-        f"Access mode: {session.access_mode}",
-        f"Phase: {session.current_phase} | workflow_stage: {session.workflow_stage}",
-        f"Validation status: {session.validation_status} | repair_attempts: {session.repair_attempts}",
-        f"Project labels: {_format_list(workspace.get('project_labels'))}",
-        f"Manifests: {_format_list(workspace.get('manifests'))}",
-        f"Entrypoints: {_format_list(workspace.get('entrypoints'))}",
-        f"Candidate files: {_format_list(session.candidate_files[:6])}",
-        f"Recent calls: {_format_objects(recent_calls)}",
-        f"Recent diagnostics: {_format_list(diagnostics)}",
-        f"Changed files: {_format_list([item.path for item in session.changed_files[-4:]])}",
-        f"Validation plan: {_format_objects(session.validation_plan[:3], formatter=_format_validation_command)}",
-        f"Validation runs: {_format_list(validation_runs)}",
-        f"Blockers: {_format_list(session.blockers[:3])}",
-        f"Last error: {_trim_text(session.last_error or '', 180)}",
-        f"Tools: {_format_list(_compact_tool_manifest())}",
-        "Rules: inspect before editing; prefer the smallest sufficient file set; reply directly only for pure conversation; do not search one prompt token at a time; for create intent read the minimum manifest/README/example first; after edits run validation before finalizing.",
-        "Return JSON only with keys: thought_summary, action_type, tool_name, tool_args, expected_outcome, final_response.",
-    ]
-    return "\n".join(lines)
+    if current_content is not None:
+        sections.extend(
+            [
+                "Current file content:",
+                current_content,
+                "Return the full updated file content only. No markdown fences. No explanation.",
+            ]
+        )
+    else:
+        sections.append("Return the full new file content only. No markdown fences. No explanation.")
+    return "\n\n".join(sections)
+
+
+def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
+    recent_notes = session.notes[-12:]
+    recent_calls = _compact_recent_calls(session)
+    report_context = {
+        "route": _compact_route(route),
+        "changed_files": [item.path for item in session.changed_files[-8:]],
+        "validation_status": session.validation_status,
+        "recent_tool_calls": recent_calls,
+        "notes": recent_notes,
+        "blockers": session.blockers[-6:],
+    }
+    return "\n".join(
+        [
+            "Write a concise user-facing response for the completed or blocked task.",
+            f"Context: {json.dumps(report_context, ensure_ascii=False)}",
+            "Mention the main outcome, changed files or inspected files when relevant, and any blocker or validation status.",
+            "Do not emit JSON.",
+        ]
+    )
+
+
+def planning_prompt(
+    route: RouterOutput,
+    snapshot: WorkspaceSnapshot | None,
+) -> str:
+    return planning_prompt_with_route(route, snapshot)
+
+
+def planning_prompt_with_route(
+    route: RouterOutput,
+    snapshot: WorkspaceSnapshot | None,
+) -> str:
+    compact_snapshot = _compact_workspace_snapshot(snapshot, detail="decision")
+    return "\n".join(
+        [
+            "Summarize the validated router plan into practical execution steps.",
+            f"Route: {json.dumps(_compact_route(route), ensure_ascii=False)}",
+            f"Workspace context: {json.dumps(compact_snapshot, ensure_ascii=False)}",
+        ]
+    )
 
 
 def _compact_recent_messages(session: SessionState | None) -> list[dict[str, str]]:
@@ -147,22 +248,8 @@ def _compact_recent_calls(session: SessionState | None) -> list[dict[str, object
             "success": item.success,
             "summary": _trim_text(item.summary, 120),
         }
-        for item in session.tool_calls[-4:]
+        for item in session.tool_calls[-6:]
     ]
-
-
-def _compact_validation_command(command) -> dict[str, object]:
-    return {
-        "command": command.command,
-        "cwd": command.cwd,
-        "kind": command.kind,
-        "required": command.required,
-        "reason": command.reason,
-    }
-
-
-def _compact_workspace_snapshot(snapshot: WorkspaceSnapshot | None) -> dict[str, object]:
-    return _compact_workspace_snapshot(snapshot, detail="standard")
 
 
 def _compact_workspace_snapshot(
@@ -172,70 +259,69 @@ def _compact_workspace_snapshot(
 ) -> dict[str, object]:
     if snapshot is None:
         return {}
-    important_limit = 6 if detail == "decision" else 8
-    focus_limit = 4 if detail == "minimal" else 6
-    important_files = snapshot.important_files[:important_limit]
-    focus_files = snapshot.focus_files[:focus_limit]
-    file_briefs = {
-        path: _trim_text(snapshot.file_briefs.get(path, ""), 120)
-        for path in [*focus_files[:2], *important_files[:3]]
-        if snapshot.file_briefs.get(path) and detail != "minimal"
-    }
-    payload = {
+    important_limit = 10 if detail == "router" else 6
+    focus_limit = 8 if detail == "router" else 4
+    payload: dict[str, object] = {
         "project_labels": snapshot.project_labels[:8],
-        "top_directories": snapshot.top_directories[:6],
-        "manifests": snapshot.manifests[:4],
-        "entrypoints": snapshot.entrypoints[:4],
-        "focus_files": focus_files,
-        "important_files": important_files,
-        "repo_summary": _trim_text(snapshot.repo_summary, 320 if detail == "decision" else 220),
+        "top_directories": snapshot.top_directories[:8],
+        "manifests": snapshot.manifests[:6],
+        "entrypoints": snapshot.entrypoints[:6],
+        "focus_files": snapshot.focus_files[:focus_limit],
+        "important_files": snapshot.important_files[:important_limit],
+        "repo_summary": _trim_text(snapshot.repo_summary, 320),
+        "likely_commands": snapshot.likely_commands[:4],
     }
-    if file_briefs:
-        payload["file_briefs"] = file_briefs
-    if detail != "minimal":
-        payload["likely_commands"] = snapshot.likely_commands[:4]
-    if detail == "standard":
-        payload["validation_commands"] = [
-            _compact_validation_command(item)
-            for item in snapshot.validation_commands[:4]
-        ]
+    if detail != "router":
+        payload["file_briefs"] = {
+            path: _trim_text(snapshot.file_briefs.get(path, ""), 120)
+            for path in snapshot.important_files[:4]
+            if snapshot.file_briefs.get(path)
+        }
     return payload
 
 
-def _compact_task_analysis(analysis: TaskAnalysis | None) -> dict[str, object]:
-    if analysis is None:
+def _compact_route(route: RouterOutput | None) -> dict[str, object]:
+    if route is None:
         return {}
     return {
-        "summary": analysis.summary,
-        "intent": analysis.intent,
-        "requires_repo_context": analysis.requires_repo_context,
-        "should_create_files": analysis.should_create_files,
-        "deliverable": analysis.deliverable,
-        "search_terms": analysis.search_terms[:4],
-        "target_paths": analysis.target_paths[:6],
-        "relevant_extensions": analysis.relevant_extensions[:4],
-        "direct_response": analysis.direct_response,
+        "user_goal": route.user_goal,
+        "intent": route.intent,
+        "entities": route.entities.model_dump(),
+        "requested_outcome": route.requested_outcome,
+        "action_plan": [item.model_dump() for item in route.action_plan],
+        "needs_clarification": route.needs_clarification,
+        "clarification_questions": route.clarification_questions,
+        "confidence": route.confidence,
+        "safe_to_execute": route.safe_to_execute,
+        "repo_context_needed": route.repo_context_needed,
+        "search_terms": route.search_terms,
+        "relevant_extensions": route.relevant_extensions,
+        "direct_response": route.direct_response,
     }
 
 
-def _compact_tool_manifest() -> list[str]:
+def _inspected_context(session: SessionState) -> str:
+    sections: list[str] = []
+    for item in session.tool_calls:
+        if item.tool_name != "read_file":
+            continue
+        path = str(item.tool_args.get("path", "")).strip()
+        excerpt = (item.output_excerpt or "").strip()
+        if not path or not excerpt:
+            continue
+        sections.append(f"{path}:\n{excerpt[:1200]}")
+        if len(sections) >= 3:
+            break
+    if not sections and session.workspace_snapshot:
+        sections.append(session.workspace_snapshot.repo_summary[:1000])
+    return "\n\n".join(sections) or "none"
+
+
+def _read_paths(session: SessionState) -> list[str]:
     return [
-        "inspect_workspace(focus)",
-        "list_files(path,glob,recursive,max_results)",
-        "search_in_files(query,path,glob,regex,case_sensitive,max_results)",
-        "read_file(path,start_line,end_line)",
-        "create_file(path,content,overwrite)",
-        "write_file(path,content)",
-        "append_file(path,content)",
-        "replace_in_file(path,find,replace,count)",
-        "patch_file(path,patches)",
-        "show_diff(path,new_content)",
-        "run_shell(command,cwd,timeout)",
-        "run_tests(command,cwd,timeout)",
-        "git_status{}",
-        "git_diff(path,cached,context_lines)",
-        "git_log(limit)",
-        "git_create_branch(name)",
+        str(item.tool_args.get("path") or "").strip()
+        for item in session.tool_calls
+        if item.tool_name == "read_file" and str(item.tool_args.get("path") or "").strip()
     ]
 
 
@@ -258,9 +344,5 @@ def _format_objects(values: list[object], formatter=None) -> str:
     if not values:
         return "none"
     if formatter is None:
-        formatter = lambda value: json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return " | ".join(formatter(value) for value in values)
-
-
-def _format_validation_command(command) -> str:
-    return f"{command.kind}:{command.command}"
+        formatter = lambda item: item
+    return json.dumps([formatter(item) for item in values], ensure_ascii=False)

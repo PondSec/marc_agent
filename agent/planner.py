@@ -5,530 +5,427 @@ import re
 
 from agent.models import SessionState, WorkspaceSnapshot
 from agent.prompts import (
-    decision_prompt,
-    planning_prompt_with_analysis,
-    system_prompt,
-    task_analysis_prompt,
+    choose_path_prompt,
+    final_response_prompt,
+    generate_content_prompt,
 )
-from llm.ollama_client import OllamaClient
-from llm.schemas import AgentActionType, AgentDecision, PlanningResponse, TaskAnalysis, TaskIntent
-
-
-STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "this",
-    "that",
-    "from",
-    "ein",
-    "eine",
-    "einen",
-    "und",
-    "oder",
-    "fuer",
-    "mit",
-    "der",
-    "die",
-    "das",
-    "ist",
-    "mein",
-    "dein",
-    "repo",
-    "projekt",
-    "agent",
-    "coding",
-    "hallo",
-    "hello",
-    "hi",
-    "hey",
-    "moin",
-    "servus",
-    "marc",
-    "bitte",
-    "gib",
-    "kann",
-    "kannst",
-    "koenntest",
-    "du",
-    "mir",
-    "mal",
-    "danach",
-    "doch",
-    "einfach",
-    "jetzt",
-    "was",
-    "wo",
-    "ich",
-    "mich",
-    "me",
-    "my",
-    "will",
-    "gegen",
-    "hast",
-    "fuer",
-    "für",
-}
-
-LOW_SIGNAL_TERMS = {
-    "code",
-    "python",
-    "javascript",
-    "typescript",
-    "computer",
-    "ki",
-    "ai",
-    "spiel",
-    "spiele",
-    "programm",
-    "projekt",
-    "summary",
-    "zusammenfassung",
-    "erklaerung",
-    "erklärung",
-    "erklaere",
-    "erkläre",
-    "kurz",
-    "genau",
-    "getan",
-    "gemacht",
-    "anders",
-    "datei",
-    "mach",
-    "bau",
-    "workspace",
-}
-
-SIGNAL_PHRASES = (
-    ("tic tac toe", {"tic", "tac", "toe"}),
-    ("tick tack toe", {"tick", "tack", "toe"}),
-    ("tick-tack-toe", {"tick", "tack", "toe"}),
-    ("tic-tac-toe", {"tic", "tac", "toe"}),
-    ("todo app", {"todo", "app"}),
-    ("to do app", {"to", "do", "app"}),
-    ("rest api", {"rest", "api"}),
-    ("tic tac", {"tic", "tac"}),
-    ("tick tack", {"tick", "tack"}),
+from agent.router import IntentRouter
+from llm.provider import LLMProvider
+from llm.schemas import (
+    AgentActionType,
+    AgentDecision,
+    PlanningResponse,
+    RouteActionName,
+    RouteIntent,
+    RouterOutput,
 )
+from runtime.logger import AgentLogger
 
-WRITE_TOOLS = {
-    "write_file",
-    "append_file",
-    "create_file",
-    "replace_in_file",
-    "patch_file",
-}
 
-CREATE_TOKENS = {
-    "programmier",
-    "programmiere",
-    "programmieren",
-    "programmierst",
-    "codiere",
-    "codieren",
-    "schreib",
-    "schreibe",
-    "schreiben",
-    "schreibst",
-    "write",
-    "create",
-    "erstelle",
-    "erstellen",
-    "baue",
-    "build",
-    "implement",
-    "implementiere",
-    "generate",
-    "erzeuge",
-    "script",
-    "skript",
-    "component",
-    "komponente",
-    "calculator",
-    "taschenrechner",
-}
-
-CREATE_ARTIFACT_TOKENS = {
-    "app",
-    "api",
-    "calculator",
-    "cli",
-    "command",
-    "component",
-    "game",
-    "modul",
-    "module",
-    "script",
-    "server",
-    "service",
-    "spiel",
-    "skript",
-    "taschenrechner",
-    "tool",
-    "ui",
-}
-
-FIX_TOKENS = {
-    "fix",
-    "bug",
-    "behebe",
-    "reparier",
-    "repair",
-    "defekt",
-    "kaputt",
-    "error",
-    "fehler",
-    "broken",
-}
-
-MODIFY_TOKENS = {
-    "aendere",
-    "ändere",
-    "update",
-    "aktualisiere",
-    "refactor",
-    "umbau",
-    "verbessere",
-    "erweitere",
-    "anpassen",
-}
-
-INSPECT_TOKENS = {
-    "finde",
-    "suche",
-    "inspect",
-    "pruef",
-    "prüf",
-    "show",
-    "zeige",
-    "read",
-    "lies",
-}
-
-LANGUAGE_EXTENSIONS = {
-    "python": ".py",
-    "py": ".py",
-    "javascript": ".js",
-    "js": ".js",
-    "typescript": ".ts",
-    "ts": ".ts",
-    "tsx": ".tsx",
-    "jsx": ".jsx",
-    "react": ".tsx",
-    "html": ".html",
-    "css": ".css",
-    "json": ".json",
-    "markdown": ".md",
-    "md": ".md",
-    "shell": ".sh",
-    "bash": ".sh",
-}
+WRITE_INTENTS = {RouteIntent.CREATE, RouteIntent.UPDATE, RouteIntent.DELETE}
 
 
 class Planner:
-    def __init__(self, llm: OllamaClient, tool_manifest: str):
+    def __init__(
+        self,
+        llm: LLMProvider,
+        tool_manifest: str,
+        *,
+        logger: AgentLogger | None = None,
+    ):
         self.llm = llm
         self.tool_manifest = tool_manifest
+        self.logger = logger
+        self.router = IntentRouter(
+            llm,
+            logger=logger,
+            timeout=self._llm_timeout(12),
+            num_ctx=self._llm_num_ctx(4096),
+        )
+
+    def interpret_user_request(
+        self,
+        task: str,
+        snapshot: WorkspaceSnapshot | None,
+        session: SessionState | None = None,
+    ) -> RouterOutput:
+        return self.router.interpret_user_request(task, snapshot, session=session)
+
+    def validate_router_output(self, payload: dict[str, object]) -> RouterOutput:
+        return self.router.validate_router_output(payload)
 
     def analyze_task(
         self,
         task: str,
         snapshot: WorkspaceSnapshot | None,
         session: SessionState | None = None,
-    ) -> TaskAnalysis:
-        heuristic = self._fallback_task_analysis(task, snapshot)
-        if heuristic.intent == TaskIntent.REPLY:
-            return heuristic
-        try:
-            data = self.llm.generate_json(
-                task_analysis_prompt(task, snapshot, session=session),
-                system=system_prompt(),
-                timeout=self._llm_timeout(8),
-                num_ctx=self._llm_num_ctx(4096),
-            )
-            analysis = TaskAnalysis.model_validate(data)
-            return self._normalize_task_analysis(task, snapshot, analysis, session=session)
-        except Exception:
-            return heuristic
+    ) -> RouterOutput:
+        return self.interpret_user_request(task, snapshot, session=session)
 
     def create_plan(
         self,
         task: str,
-        snapshot: WorkspaceSnapshot,
-        analysis: TaskAnalysis | None = None,
+        snapshot: WorkspaceSnapshot | None,
+        route: RouterOutput | None = None,
     ) -> PlanningResponse:
-        return self._fallback_plan(task, snapshot, analysis)
-
-    def decide_next_action(self, task: str, session: SessionState) -> AgentDecision:
-        analysis = session.task_analysis or self.analyze_task(
-            task,
-            session.workspace_snapshot,
-            session=session,
-        )
-        if analysis.direct_response:
-            return AgentDecision(
-                thought_summary="The prompt is a direct conversational question and does not need repo work.",
-                action_type=AgentActionType.FINAL,
-                tool_name=None,
-                tool_args={},
-                expected_outcome="Reply directly in natural language.",
-                final_response=analysis.direct_response,
-            )
-        deterministic = self._deterministic_next_decision(session, analysis)
-        if deterministic is not None:
-            return deterministic
-        create_draft = self._draft_create_decision(session, analysis)
-        if create_draft is not None:
-            return create_draft
-        try:
-            data = self.llm.generate_json(
-                decision_prompt(task, session, self.tool_manifest),
-                system=system_prompt(),
-                timeout=self._llm_timeout(8),
-                num_ctx=self._llm_num_ctx(4096),
-            )
-            decision = AgentDecision.model_validate(data)
-            return self._normalize_decision(session, analysis, decision)
-        except Exception:
-            return self._fallback_decision(session, analysis)
-
-    def _fallback_plan(
-        self,
-        task: str,
-        snapshot: WorkspaceSnapshot,
-        analysis: TaskAnalysis | None = None,
-    ) -> PlanningResponse:
-        steps = [
-            "Discover the repo shape, manifests, tests, scripts, and architecture boundaries.",
-            "Plan the smallest file set that should be read or searched before editing.",
-            "Act on the existing implementation points instead of creating parallel architecture.",
-            "Verify with the project-aware validation plan, not just a single command.",
-            "Repair from concrete diagnostics until validation passes or a blocker is clear.",
-            "Report changed files, commands, diagnostics, diffs, and stop reason.",
-        ]
-        if analysis and analysis.intent == TaskIntent.CREATE:
-            steps = [
-                "Inspect the smallest manifest, README, or nearby example needed to match project conventions.",
-                "Create or update only the files required for the requested deliverable.",
-                "Run the most relevant validation or smoke test for the new code.",
-                "Report changed files, commands, diagnostics, diffs, and remaining risks.",
-            ]
-        elif self._looks_like_analysis_task(task):
-            steps = [
-                "Discover the repository layout, entrypoints, and major subsystems.",
-                "Read the highest-signal files for the requested analysis.",
-                "Report strengths, weaknesses, and the highest-priority gaps.",
-            ]
-        if self._might_need_helper(task):
-            steps.insert(
-                min(4, len(steps)),
-                "If direct inspection is insufficient, create a small helper script or parser to unblock the task.",
-            )
+        route = route or self.interpret_user_request(task, snapshot)
+        steps = [item.reason for item in route.action_plan]
+        if route.safe_to_execute and route.intent in WRITE_INTENTS:
+            if not any(item.action == RouteActionName.RUN_VALIDATION for item in route.action_plan):
+                steps.append("Validate the resulting change with the most relevant project command.")
         completion = [
-            "Relevant files were inspected before editing.",
-            "Any code changes were validated with the project-aware command plan or the blocker is explicit.",
-            "Final output includes changed files, commands, diagnostics, and remaining risks.",
+            "The final action follows the validated router output, not the raw prompt.",
+            "Missing information triggers targeted clarification instead of blind execution.",
         ]
+        if route.intent in WRITE_INTENTS:
+            completion.append("Any code or file change is validated or clearly reported as blocked.")
+        else:
+            completion.append("The response explains the result or plan in user-facing language.")
+        tests = snapshot.likely_commands[:4] if snapshot is not None else []
         return PlanningResponse(
-            summary=(
-                "Work from repository discovery into focused edits, multi-step verification, repair, and reporting."
-            ),
-            steps=steps,
-            files_to_inspect=snapshot.focus_files[:6] or snapshot.important_files[:10],
-            tests_to_run=[item.command for item in snapshot.validation_commands[:4]]
-            or snapshot.likely_commands[:4],
+            summary=route.requested_outcome,
+            steps=steps or [route.user_goal],
+            files_to_inspect=route.entities.target_paths[:8],
+            tests_to_run=tests,
             completion_criteria=completion,
         )
 
-    def _fallback_decision(
-        self,
-        session: SessionState,
-        analysis: TaskAnalysis | None = None,
-    ) -> AgentDecision:
-        analysis = analysis or session.task_analysis or self._fallback_task_analysis(
+    def decide_next_action(self, task: str, session: SessionState) -> AgentDecision:
+        del task
+        route = session.router_result or self.interpret_user_request(
             session.task,
             session.workspace_snapshot,
+            session=session,
         )
-        tool_names = [item.tool_name for item in session.tool_calls]
-        read_paths = {
-            item.tool_args.get("path")
-            for item in session.tool_calls
-            if item.tool_name == "read_file"
-        }
-        searched_queries = {
-            str(item.tool_args.get("query", "")).lower()
-            for item in session.tool_calls
-            if item.tool_name == "search_in_files"
-        }
-        snapshot = session.workspace_snapshot
-        analysis_task = analysis.intent == TaskIntent.ANALYZE or self._looks_like_analysis_task(
-            session.task
-        )
-        focus_terms = analysis.search_terms or self._focus_terms(session.task)
-        diagnostic_files = [
-            path for item in session.diagnostics[-6:] for path in item.file_hints
-        ]
+        session.router_result = route
+        session.task_analysis = route.model_dump()
 
-        if analysis.direct_response:
-            return AgentDecision(
-                thought_summary="A short conversational prompt does not need repository inspection.",
-                action_type=AgentActionType.FINAL,
-                tool_name=None,
-                tool_args={},
-                expected_outcome="Reply naturally and invite a concrete task.",
-                final_response=analysis.direct_response,
+        if route.needs_clarification:
+            return self._final_decision(
+                "The router requires clarification before any execution.",
+                self._clarification_response(route),
             )
 
-        if not tool_names:
-            bootstrap_file = self._pick_bootstrap_file(session, analysis, read_paths)
-            if bootstrap_file:
-                return AgentDecision(
-                    thought_summary="Read the closest manifest or example before creating new code.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="read_file",
-                    tool_args={"path": bootstrap_file},
-                    expected_outcome="Match existing project conventions before editing.",
-                    final_response=None,
-                )
-            return AgentDecision(
-                thought_summary="Need a repository map and validation plan before selecting files.",
-                action_type=AgentActionType.CALL_TOOL,
-                tool_name="inspect_workspace",
-                tool_args={"focus": session.task},
-                expected_outcome="Identify relevant files, workflows, and validation commands.",
-                final_response=None,
+        if not route.safe_to_execute:
+            return self._final_decision(
+                "Execution is not safe enough to continue without more user input.",
+                self._unsafe_response(route),
             )
 
-        if Path(session.workspace_root, ".git").exists() and "git_status" not in tool_names:
-            return AgentDecision(
-                thought_summary="Checking git status avoids blind edits on a dirty worktree.",
-                action_type=AgentActionType.CALL_TOOL,
-                tool_name="git_status",
-                tool_args={},
-                expected_outcome="See current repository status before further work.",
-                final_response=None,
+        if route.direct_response and not route.repo_context_needed and not session.tool_calls:
+            return self._final_decision(
+                "The validated route can be answered directly without repository work.",
+                route.direct_response,
             )
 
-        if analysis.intent == TaskIntent.CREATE:
-            bootstrap_file = self._pick_bootstrap_file(session, analysis, read_paths)
-            if bootstrap_file:
-                return AgentDecision(
-                    thought_summary="Read one more high-signal file before creating new code.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="read_file",
-                    tool_args={"path": bootstrap_file},
-                    expected_outcome="Clarify local conventions for the new deliverable.",
-                    final_response=None,
+        if session.changed_files:
+            command = self._pick_validation_command(session)
+            if command is not None:
+                return self._validation_decision(
+                    "Changed files must go through the remaining validation plan.",
+                    command,
                 )
 
-        if focus_terms and analysis.intent in {
-            TaskIntent.ANALYZE,
-            TaskIntent.INSPECT,
-            TaskIntent.MODIFY,
-            TaskIntent.FIX,
-        }:
-            for term in focus_terms:
-                if term not in searched_queries:
+        decision = self.execute_action_from_plan(route, session)
+        self._log(
+            "execution_plan_selected",
+            intent=route.intent,
+            safe_to_execute=route.safe_to_execute,
+            action_type=decision.action_type,
+            tool_name=decision.tool_name,
+        )
+        return decision
+
+    def execute_action_from_plan(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> AgentDecision:
+        read_paths = set(self._read_paths(session))
+        searched_queries = set(self._searched_queries(session))
+        inspected = any(item.tool_name == "inspect_workspace" for item in session.tool_calls)
+        candidate_paths = self._candidate_paths(route, session)
+
+        for step in route.action_plan:
+            if step.action == RouteActionName.ASK_CLARIFICATION:
+                return self._final_decision(
+                    "The next plan step is clarification.",
+                    self._clarification_response(route),
+                )
+
+            if step.action == RouteActionName.RESPOND_DIRECTLY:
+                return self._final_decision(
+                    "The plan resolves with a direct response.",
+                    route.direct_response or self._compose_user_response(route, session),
+                )
+
+            if step.action == RouteActionName.INSPECT_WORKSPACE and not inspected:
+                return AgentDecision(
+                    thought_summary=step.reason,
+                    action_type=AgentActionType.CALL_TOOL,
+                    tool_name="inspect_workspace",
+                    tool_args={"focus": route.user_goal},
+                    expected_outcome="Collect repository structure and validation context.",
+                    final_response=None,
+                )
+
+            if step.action == RouteActionName.SEARCH_WORKSPACE:
+                query = self._best_search_query(route)
+                if query and query not in searched_queries:
                     return AgentDecision(
-                        thought_summary="Search task-specific keywords before broad file reads.",
+                        thought_summary=step.reason,
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="search_in_files",
-                        tool_args={"query": term, "path": ".", "max_results": 30},
-                        expected_outcome="Find candidate files related to the task.",
+                        tool_args={"query": query, "path": ".", "max_results": 30},
+                        expected_outcome="Locate candidate files that match the routed target.",
                         final_response=None,
                     )
 
-        candidates = session.candidate_files or (snapshot.important_files if snapshot else [])
-        for candidate in [*diagnostic_files, *candidates[:16]]:
-            if candidate not in read_paths:
-                return AgentDecision(
-                    thought_summary="Read the highest-signal file instead of guessing.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="read_file",
-                    tool_args={"path": candidate},
-                    expected_outcome="Collect concrete implementation or failure context.",
-                    final_response=None,
-                )
-
-        if session.changed_files and session.validation_status in {"not_run", "failed"}:
-            command = self._pick_validation_command(session)
-            if command:
-                return AgentDecision(
-                    thought_summary="Changed code must run through the remaining validation plan.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="run_tests",
-                    tool_args={"command": command, "cwd": ".", "timeout": 120},
-                    expected_outcome="Validate current changes or reproduce remaining failures.",
-                    final_response=None,
-                )
-
-        if session.validation_status == "failed" and session.repair_attempts >= 1:
-            if diagnostic_files:
-                unread = next((path for path in diagnostic_files if path not in read_paths), None)
-                if unread:
+            if step.action == RouteActionName.READ_RELEVANT_FILES:
+                candidate = self._next_unread_candidate(candidate_paths, read_paths)
+                if candidate is not None:
                     return AgentDecision(
-                        thought_summary="Inspect the file hinted by the failing validation before giving up.",
+                        thought_summary=step.reason,
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
-                        tool_args={"path": unread},
-                        expected_outcome="Understand the failing area for a repair attempt.",
+                        tool_args={"path": candidate},
+                        expected_outcome="Inspect the most relevant file before proceeding.",
                         final_response=None,
                     )
+                query = self._best_search_query(route)
+                if not candidate_paths and query and query not in searched_queries:
+                    return AgentDecision(
+                        thought_summary="A search is needed before concrete files can be read.",
+                        action_type=AgentActionType.CALL_TOOL,
+                        tool_name="search_in_files",
+                        tool_args={"query": query, "path": ".", "max_results": 30},
+                        expected_outcome="Find files that likely satisfy the routed goal.",
+                        final_response=None,
+                    )
+
+            if step.action == RouteActionName.CREATE_ARTIFACT:
+                bootstrap = self._next_create_bootstrap(route, session, read_paths)
+                if bootstrap is not None:
+                    return AgentDecision(
+                        thought_summary="Read a nearby manifest or example before creating new code.",
+                        action_type=AgentActionType.CALL_TOOL,
+                        tool_name="read_file",
+                        tool_args={"path": bootstrap},
+                        expected_outcome="Match existing conventions before generating a new artifact.",
+                        final_response=None,
+                    )
+                draft = self._draft_create_decision(route, session)
+                if draft is not None:
+                    return draft
+
+            if step.action == RouteActionName.UPDATE_ARTIFACT:
+                target = self._primary_target_path(route, session)
+                if target is None:
+                    query = self._best_search_query(route)
+                    if query and query not in searched_queries:
+                        return AgentDecision(
+                            thought_summary="The update target still needs to be located in the workspace.",
+                            action_type=AgentActionType.CALL_TOOL,
+                            tool_name="search_in_files",
+                            tool_args={"query": query, "path": ".", "max_results": 30},
+                            expected_outcome="Find the file that should be updated.",
+                            final_response=None,
+                        )
+                    return self._final_decision(
+                        "The update target is still ambiguous.",
+                        self._clarification_response(
+                            route.model_copy(
+                                update={
+                                    "needs_clarification": True,
+                                    "clarification_questions": [
+                                        "Welche Datei oder welcher konkrete Bereich soll aktualisiert werden?"
+                                    ],
+                                    "safe_to_execute": False,
+                                }
+                            )
+                        ),
+                    )
+                if target not in read_paths:
+                    return AgentDecision(
+                        thought_summary="Read the target file before generating an update.",
+                        action_type=AgentActionType.CALL_TOOL,
+                        tool_name="read_file",
+                        tool_args={"path": target},
+                        expected_outcome="Inspect the current implementation before editing it.",
+                        final_response=None,
+                    )
+                draft = self._draft_update_decision(route, session, target)
+                if draft is not None:
+                    return draft
+
+            if step.action == RouteActionName.DELETE_ARTIFACT:
+                target = self._primary_target_path(route, session)
+                if target is None:
+                    query = self._best_search_query(route)
+                    if query and query not in searched_queries:
+                        return AgentDecision(
+                            thought_summary="Locate the deletion target before removing anything.",
+                            action_type=AgentActionType.CALL_TOOL,
+                            tool_name="search_in_files",
+                            tool_args={"query": query, "path": ".", "max_results": 30},
+                            expected_outcome="Find the file or artifact that should be deleted.",
+                            final_response=None,
+                        )
+                    return self._final_decision(
+                        "Deletion requires a concrete target path.",
+                        self._clarification_response(
+                            route.model_copy(
+                                update={
+                                    "needs_clarification": True,
+                                    "clarification_questions": [
+                                        "Welche Datei oder welches Artefakt soll ich loeschen?"
+                                    ],
+                                    "safe_to_execute": False,
+                                }
+                            )
+                        ),
+                    )
+                if target not in read_paths:
+                    return AgentDecision(
+                        thought_summary="Read the target once before deleting it.",
+                        action_type=AgentActionType.CALL_TOOL,
+                        tool_name="read_file",
+                        tool_args={"path": target},
+                        expected_outcome="Confirm the deletion target before removing it.",
+                        final_response=None,
+                    )
+                return AgentDecision(
+                    thought_summary=step.reason,
+                    action_type=AgentActionType.CALL_TOOL,
+                    tool_name="delete_file",
+                    tool_args={"path": target},
+                    expected_outcome="Delete the routed target artifact.",
+                    final_response=None,
+                )
+
+            if step.action == RouteActionName.PLAN_WORK:
+                return self._final_decision(
+                    "The user primarily asked for a plan.",
+                    self._render_plan_response(route),
+                )
+
+            if step.action == RouteActionName.RUN_VALIDATION and session.changed_files:
+                command = self._pick_validation_command(session)
+                if command is not None:
+                    return self._validation_decision(step.reason, command)
+
+            if step.action == RouteActionName.SUMMARIZE_RESULT:
+                return self._final_decision(
+                    "The routed execution plan is ready to summarize.",
+                    self._compose_user_response(route, session),
+                )
+
+        if route.repo_context_needed and not session.tool_calls:
             return AgentDecision(
-                thought_summary="Validation is still failing and deterministic fallback cannot repair further.",
-                action_type=AgentActionType.FINAL,
-                tool_name=None,
-                tool_args={},
-                expected_outcome="Report the blocker and current repository state.",
-                final_response=self.summarize_session(session),
+                thought_summary="The route needs repository context before a safe answer.",
+                action_type=AgentActionType.CALL_TOOL,
+                tool_name="inspect_workspace",
+                tool_args={"focus": route.user_goal},
+                expected_outcome="Collect repository structure and relevant entrypoints.",
+                final_response=None,
             )
 
-        if analysis_task and (session.tool_calls or session.notes):
-            return AgentDecision(
-                thought_summary="Enough inspection context exists for a concrete analysis summary.",
-                action_type=AgentActionType.FINAL,
-                tool_name=None,
-                tool_args={},
-                expected_outcome="Provide an architecture and gap analysis.",
-                final_response=self.summarize_session(session),
-            )
-
-        return AgentDecision(
-            thought_summary="No better deterministic next step is available.",
-            action_type=AgentActionType.FINAL,
-            tool_name=None,
-            tool_args={},
-            expected_outcome="Provide a concise task summary.",
-            final_response=self.summarize_session(session),
+        return self._final_decision(
+            "No further tool step is required by the routed plan.",
+            self._compose_user_response(route, session),
         )
 
     def summarize_session(self, session: SessionState) -> str:
-        direct_reply = session.task_analysis.direct_response if session.task_analysis else None
-        if direct_reply is None:
-            direct_reply = self._direct_reply_for_prompt(session.task)
-        if direct_reply is not None:
-            return direct_reply
-
+        route = session.router_result
+        if route is not None and route.direct_response and not session.tool_calls:
+            return route.direct_response
         if session.changed_files and session.validation_status == "passed":
             return "Ich habe die Aufgabe umgesetzt und validiert."
-
         if session.changed_files and session.validation_status == "failed":
-            return "Ich habe die Aufgabe weitgehend umgesetzt, aber die Validierung ist noch nicht sauber."
-
+            return "Ich habe die Aufgabe umgesetzt, aber die Validierung ist noch nicht sauber."
         if session.changed_files:
             return "Ich habe die Aufgabe umgesetzt."
-
-        if session.status == "completed":
-            return "Ich habe die Anfrage bearbeitet, aber keinen Code geaendert."
-
-        if session.blockers:
-            return "Ich bin auf einen Blocker gestossen und konnte die Aufgabe noch nicht sauber abschliessen."
-
-        if session.validation_status == "failed":
-            return "Ich habe Fortschritt gemacht, aber die Validierung ist noch nicht sauber durchgelaufen."
-
+        if route is not None and route.intent == RouteIntent.PLAN:
+            return self._render_plan_response(route)
+        if route is not None and route.needs_clarification:
+            return self._clarification_response(route)
         return "Ich habe den Workspace untersucht, aber noch kein belastbares Abschlussergebnis erreicht."
+
+    def _draft_create_decision(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> AgentDecision | None:
+        path = self._choose_create_path(route, session)
+        if not path:
+            return None
+        content = self._generate_file_content(route, session, path=path)
+        if not content:
+            return self._final_decision(
+                "The new artifact could not be generated from the routed goal.",
+                "Ich konnte noch keinen belastbaren Inhalt fuer die neue Datei erzeugen.",
+            )
+        absolute_target = Path(session.workspace_root, path)
+        tool_name = "write_file" if absolute_target.exists() else "create_file"
+        tool_args = {"path": path, "content": content}
+        if tool_name == "create_file":
+            tool_args["overwrite"] = False
+        return AgentDecision(
+            thought_summary=f"Create the routed artifact in {path}.",
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            expected_outcome="Add the requested artifact to the workspace.",
+            final_response=None,
+        )
+
+    def _draft_update_decision(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        target: str,
+    ) -> AgentDecision | None:
+        current_content = self._current_file_content(session, target)
+        if current_content is None:
+            return None
+        content = self._generate_file_content(
+            route,
+            session,
+            path=target,
+            current_content=current_content,
+        )
+        if not content:
+            return self._final_decision(
+                "The update content could not be generated from the routed goal.",
+                "Ich konnte noch keine belastbare Aktualisierung fuer die Zieldatei erzeugen.",
+            )
+        if content.strip() == current_content.strip():
+            return self._final_decision(
+                "The routed update does not change the current file content.",
+                "Ich habe keine belastbare inhaltliche Aenderung fuer die Zieldatei ableiten koennen.",
+            )
+        return AgentDecision(
+            thought_summary=f"Update {target} according to the routed goal.",
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="write_file",
+            tool_args={"path": target, "content": content},
+            expected_outcome="Apply the requested update to the target artifact.",
+            final_response=None,
+        )
+
+    def _validation_decision(
+        self,
+        thought_summary: str,
+        command: str,
+    ) -> AgentDecision:
+        return AgentDecision(
+            thought_summary=thought_summary,
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="run_tests",
+            tool_args={"command": command, "cwd": ".", "timeout": 120},
+            expected_outcome="Run the next validation step for the current changes.",
+            final_response=None,
+        )
 
     def _pick_validation_command(self, session: SessionState) -> str | None:
         passed = {
@@ -543,635 +440,207 @@ class Planner:
             if command and command not in passed:
                 return command
         snapshot = session.workspace_snapshot
-        if snapshot:
-            for item in snapshot.validation_commands:
-                if item.command not in passed:
-                    return item.command
-            for command in snapshot.likely_commands:
-                if command and command not in passed:
-                    return command
-        return None
-
-    def _looks_like_analysis_task(self, task: str) -> bool:
-        lowered = task.lower()
-        analysis_tokens = {
-            "analyse",
-            "analysiere",
-            "bewerte",
-            "review",
-            "explain",
-            "erklaer",
-            "summarize",
-            "zusammen",
-            "understand",
-        }
-        if not any(token in lowered for token in analysis_tokens):
-            return False
-        if self._looks_like_create_request(task):
-            return False
-        action_tokens = {
-            "fix",
-            "behebe",
-            "implement",
-            "fuege",
-            "refactor",
-            "baue",
-            "schreibe",
-            "erweitere",
-            "verbessere",
-        }
-        return not any(token in lowered for token in action_tokens)
-
-    def _looks_like_create_request(self, task: str) -> bool:
-        lowered = " ".join(task.lower().split())
-        if not any(token in lowered for token in CREATE_TOKENS):
-            return False
-        if self._mentions_existing_path(task):
-            return False
-        has_artifact_token = any(token in lowered for token in CREATE_ARTIFACT_TOKENS)
-        has_relevant_extension = bool(self._relevant_extensions(task))
-        return has_artifact_token or has_relevant_extension
-
-    def _might_need_helper(self, task: str) -> bool:
-        lowered = task.lower()
-        helper_tokens = {
-            "log",
-            "asset",
-            "format",
-            "parser",
-            "convert",
-            "analyse",
-            "analyze",
-            "build",
-            "trace",
-        }
-        return any(token in lowered for token in helper_tokens)
-
-    def _looks_like_greeting(self, task: str) -> bool:
-        normalized = " ".join(task.lower().split()).strip("!?., ")
-        if not normalized:
-            return False
-        greetings = {
-            "hallo",
-            "hello",
-            "hi",
-            "hey",
-            "moin",
-            "servus",
-            "guten morgen",
-            "guten tag",
-            "guten abend",
-        }
-        return normalized in greetings
-
-    def _direct_reply_for_prompt(self, task: str) -> str | None:
-        normalized = " ".join(task.lower().split()).strip()
-        if not normalized:
-            return None
-        if self._looks_like_greeting(task):
-            return (
-                "Hallo. Ich bin bereit."
-                "\n\n"
-                "Wenn du magst, kann ich den Code analysieren, einen Fehler suchen oder "
-                "eine Aenderung umsetzen."
-            )
-        intro_fragments = (
-            "wer bist du",
-            "who are you",
-            "was kannst du",
-            "what can you do",
-            "was machst du",
-            "what do you do",
-            "hilfe",
-            "help",
-        )
-        if any(fragment in normalized for fragment in intro_fragments):
-            return (
-                "Ich bin M.A.R.C A1, dein lokaler Coding-Agent fuer den gewaehlten Workspace."
-                "\n\n"
-                "Ich kann Code analysieren, Aenderungen umsetzen, Fehler suchen, Tests anstossen "
-                "und dir normale Rueckfragen zum Projekt beantworten."
-            )
-        return None
-
-    def _focus_terms(self, task: str) -> list[str]:
-        normalized = " ".join(task.lower().split())
-        grouped_tokens: set[str] = set()
-        tokens: list[str] = []
-        matched_phrase_parts: list[set[str]] = []
-
-        for phrase, parts in SIGNAL_PHRASES:
-            if any(parts <= existing_parts for existing_parts in matched_phrase_parts):
-                continue
-            if phrase in normalized and phrase not in tokens:
-                tokens.append(phrase.replace("-", " "))
-                grouped_tokens.update(parts)
-                matched_phrase_parts.append(parts)
-
-        for raw in task.lower().replace("/", " ").replace("-", " ").split():
-            token = raw.strip(".,:;()[]{}!?\"'")
-            if (
-                len(token) < 3
-                or token in STOPWORDS
-                or token in LOW_SIGNAL_TERMS
-                or token in CREATE_TOKENS
-                or token in FIX_TOKENS
-                or token in MODIFY_TOKENS
-                or token in INSPECT_TOKENS
-                or token in grouped_tokens
-            ):
-                continue
-            if token not in tokens:
-                tokens.append(token)
-        return tokens[:4]
-
-    def _normalize_decision(
-        self,
-        session: SessionState,
-        analysis: TaskAnalysis,
-        decision: AgentDecision,
-    ) -> AgentDecision:
-        read_paths = {
-            item.tool_args.get("path")
-            for item in session.tool_calls
-            if item.tool_name == "read_file"
-        }
-        if decision.action_type != AgentActionType.CALL_TOOL:
-            return decision
-        if decision.tool_name != "search_in_files":
-            return decision
-        if analysis.intent != TaskIntent.CREATE:
-            return decision
-        query = str(decision.tool_args.get("query", "")).strip().lower()
-        if self._is_high_signal_search_term(query):
-            return decision
-        bootstrap_file = self._pick_bootstrap_file(session, analysis, read_paths)
-        if bootstrap_file is None:
-            return decision
-        return AgentDecision(
-            thought_summary="Read a high-signal project file before creating new code.",
-            action_type=AgentActionType.CALL_TOOL,
-            tool_name="read_file",
-            tool_args={"path": bootstrap_file},
-            expected_outcome="Understand local conventions before creating files.",
-            final_response=None,
-        )
-
-    def _deterministic_next_decision(
-        self,
-        session: SessionState,
-        analysis: TaskAnalysis,
-    ) -> AgentDecision | None:
-        tool_names = [item.tool_name for item in session.tool_calls]
-        read_paths = {
-            item.tool_args.get("path")
-            for item in session.tool_calls
-            if item.tool_name == "read_file"
-        }
-        if not session.tool_calls:
-            bootstrap_file = self._pick_bootstrap_file(session, analysis, read_paths)
-            if bootstrap_file:
-                return AgentDecision(
-                    thought_summary="Read the closest manifest or example before creating new code.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="read_file",
-                    tool_args={"path": bootstrap_file},
-                    expected_outcome="Match existing project conventions before editing.",
-                    final_response=None,
-                )
-            return AgentDecision(
-                thought_summary="Need a repository map and validation plan before selecting files.",
-                action_type=AgentActionType.CALL_TOOL,
-                tool_name="inspect_workspace",
-                tool_args={"focus": session.task},
-                expected_outcome="Identify relevant files, workflows, and validation commands.",
-                final_response=None,
-            )
-
-        if analysis.intent == TaskIntent.CREATE and len(read_paths) < 2:
-            bootstrap_file = self._pick_bootstrap_file(session, analysis, read_paths)
-            if bootstrap_file:
-                return AgentDecision(
-                    thought_summary="Read one more high-signal file before creating new code.",
-                    action_type=AgentActionType.CALL_TOOL,
-                    tool_name="read_file",
-                    tool_args={"path": bootstrap_file},
-                    expected_outcome="Clarify local conventions for the new deliverable.",
-                    final_response=None,
-                )
-        if Path(session.workspace_root, ".git").exists() and "git_status" not in tool_names:
-            return AgentDecision(
-                thought_summary="Check git status before creating or editing files in a repository.",
-                action_type=AgentActionType.CALL_TOOL,
-                tool_name="git_status",
-                tool_args={},
-                expected_outcome="See current repository status before further work.",
-                final_response=None,
-            )
-        return None
-
-    def _draft_create_decision(
-        self,
-        session: SessionState,
-        analysis: TaskAnalysis,
-    ) -> AgentDecision | None:
-        if analysis.intent != TaskIntent.CREATE:
-            return None
-        if session.changed_files:
-            return None
-        tool_names = [item.tool_name for item in session.tool_calls]
-        if any(tool_name in WRITE_TOOLS for tool_name in tool_names):
-            return None
-        read_calls = [item for item in session.tool_calls if item.tool_name == "read_file"]
-        if len(read_calls) < 1 and not self._can_create_without_reads(session, analysis):
-            return None
-        if Path(session.workspace_root, ".git").exists() and "git_status" not in tool_names:
-            return None
-
-        path = self._choose_create_path(session, analysis)
-        if not path:
-            return None
-        content = self._generate_file_content(session, analysis, path)
-        if not content:
-            return None
-        absolute_target = Path(session.workspace_root, path)
-        tool_name = "write_file" if absolute_target.exists() else "create_file"
-        tool_args = {"path": path, "content": content}
-        if tool_name == "create_file":
-            tool_args["overwrite"] = False
-        return AgentDecision(
-            thought_summary=f"Create the requested implementation in {path}.",
-            action_type=AgentActionType.CALL_TOOL,
-            tool_name=tool_name,
-            tool_args=tool_args,
-            expected_outcome="Add the requested implementation to the workspace.",
-            final_response=None,
-        )
-
-    def _can_create_without_reads(
-        self,
-        session: SessionState,
-        analysis: TaskAnalysis,
-    ) -> bool:
-        snapshot = session.workspace_snapshot
         if snapshot is None:
-            return True
-        if snapshot.file_count == 0:
-            return True
-        return self._pick_bootstrap_file(session, analysis, set()) is None
-
-    def _fallback_task_analysis(
-        self,
-        task: str,
-        snapshot: WorkspaceSnapshot | None,
-    ) -> TaskAnalysis:
-        direct_reply = self._direct_reply_for_prompt(task)
-        if direct_reply is not None:
-            return TaskAnalysis(
-                summary="The user expects a direct conversational reply.",
-                intent=TaskIntent.REPLY,
-                requires_repo_context=False,
-                should_create_files=False,
-                deliverable="Natural language reply",
-                search_terms=[],
-                target_paths=[],
-                relevant_extensions=[],
-                direct_response=direct_reply,
-            )
-
-        intent = self._infer_intent(task)
-        relevant_extensions = self._relevant_extensions(task)
-        search_terms = self._focus_terms(task)
-        target_paths = self._heuristic_target_paths(
-            snapshot,
-            intent=intent,
-            relevant_extensions=relevant_extensions,
-            search_terms=search_terms,
-        )
-        return TaskAnalysis(
-            summary=self._analysis_summary(task, intent),
-            intent=intent,
-            requires_repo_context=intent != TaskIntent.REPLY,
-            should_create_files=intent == TaskIntent.CREATE,
-            deliverable=self._deliverable_hint(task, intent),
-            search_terms=search_terms,
-            target_paths=target_paths,
-            relevant_extensions=relevant_extensions,
-            direct_response=None,
-        )
-
-    def _normalize_task_analysis(
-        self,
-        task: str,
-        snapshot: WorkspaceSnapshot | None,
-        analysis: TaskAnalysis,
-        session: SessionState | None = None,
-    ) -> TaskAnalysis:
-        heuristic = self._fallback_task_analysis(task, snapshot)
-        relevant_extensions = self._unique_terms(
-            [*analysis.relevant_extensions, *self._relevant_extensions(task)]
-        )[:4]
-        search_terms = [
-            term
-            for term in self._unique_terms([*analysis.search_terms, *self._focus_terms(task)])
-            if self._is_high_signal_search_term(term)
-        ][:4]
-        changed_paths = (
-            self._unique_terms([item.path for item in session.changed_files[-6:]])
-            if session is not None
-            else []
-        )
-        normalized_intent = analysis.intent
-        if analysis.intent in {TaskIntent.ANALYZE, TaskIntent.INSPECT} and heuristic.intent in {
-            TaskIntent.CREATE,
-            TaskIntent.MODIFY,
-            TaskIntent.FIX,
-        }:
-            normalized_intent = heuristic.intent
-        target_paths = self._normalize_target_paths(
-            snapshot,
-            [*analysis.target_paths, *changed_paths],
-            normalized_intent,
-            relevant_extensions,
-            search_terms,
-        )
-        direct_response = analysis.direct_response
-        if normalized_intent == TaskIntent.REPLY and not direct_response:
-            direct_response = self._direct_reply_for_prompt(task)
-        return analysis.model_copy(
-            update={
-                "intent": normalized_intent,
-                "requires_repo_context": False
-                if normalized_intent == TaskIntent.REPLY
-                else analysis.requires_repo_context,
-                "should_create_files": analysis.should_create_files
-                or normalized_intent == TaskIntent.CREATE,
-                "deliverable": analysis.deliverable or self._deliverable_hint(task, normalized_intent),
-                "search_terms": search_terms,
-                "target_paths": target_paths,
-                "relevant_extensions": relevant_extensions,
-                "direct_response": direct_response,
-            }
-        )
-
-    def _infer_intent(self, task: str) -> TaskIntent:
-        lowered = " ".join(task.lower().split())
-        if self._looks_like_greeting(task) or self._direct_reply_for_prompt(task) is not None:
-            return TaskIntent.REPLY
-        if any(token in lowered for token in FIX_TOKENS):
-            return TaskIntent.FIX
-        if self._looks_like_create_request(task):
-            return TaskIntent.CREATE
-        if self._looks_like_analysis_task(task):
-            return TaskIntent.ANALYZE
-        if any(token in lowered for token in MODIFY_TOKENS):
-            return TaskIntent.MODIFY
-        if any(token in lowered for token in CREATE_TOKENS):
-            if self._mentions_existing_path(task):
-                return TaskIntent.MODIFY
-            return TaskIntent.CREATE
-        if any(token in lowered for token in INSPECT_TOKENS):
-            return TaskIntent.INSPECT
-        if "?" in task:
-            return TaskIntent.ANALYZE
-        return TaskIntent.INSPECT
-
-    def _mentions_existing_path(self, task: str) -> bool:
-        return bool(
-            re.search(
-                r"[\w./-]+\.(py|js|ts|tsx|jsx|json|md|html|css|sh|toml|ya?ml|go|rs|java|kt|rb)",
-                task.lower(),
-            )
-        )
-
-    def _relevant_extensions(self, task: str) -> list[str]:
-        lowered = task.lower()
-        return [
-            extension
-            for token, extension in LANGUAGE_EXTENSIONS.items()
-            if token in lowered
-        ][:4]
-
-    def _analysis_summary(self, task: str, intent: TaskIntent) -> str:
-        summaries = {
-            TaskIntent.REPLY: "Answer the user directly without repository work.",
-            TaskIntent.ANALYZE: "Inspect the repository and return an explanation or assessment.",
-            TaskIntent.INSPECT: "Inspect the repository to find the relevant implementation area.",
-            TaskIntent.MODIFY: "Change existing code in the repository to satisfy the request.",
-            TaskIntent.CREATE: "Create a new implementation that matches the user's requested deliverable.",
-            TaskIntent.FIX: "Diagnose the failure and repair the existing implementation.",
-        }
-        return summaries.get(intent, f"Handle the request: {task}")
-
-    def _deliverable_hint(self, task: str, intent: TaskIntent) -> str | None:
-        lowered = task.lower()
-        if intent == TaskIntent.CREATE:
-            if "script" in lowered or "skript" in lowered:
-                return "New script"
-            if "component" in lowered or "komponente" in lowered:
-                return "New component"
-            if "api" in lowered:
-                return "New API implementation"
-            if "calculator" in lowered or "taschenrechner" in lowered:
-                return "Calculator implementation"
-            return "New implementation"
-        if intent == TaskIntent.FIX:
-            return "Bug fix"
-        if intent == TaskIntent.ANALYZE:
-            return "Analysis summary"
+            return None
+        for command in snapshot.likely_commands:
+            if command and command not in passed:
+                return command
         return None
 
-    def _heuristic_target_paths(
-        self,
-        snapshot: WorkspaceSnapshot | None,
-        *,
-        intent: TaskIntent,
-        relevant_extensions: list[str],
-        search_terms: list[str],
-    ) -> list[str]:
-        if snapshot is None:
-            return []
+    def _candidate_paths(self, route: RouterOutput, session: SessionState) -> list[str]:
         candidates: list[str] = []
-        if intent == TaskIntent.CREATE:
-            candidates.extend(snapshot.manifests[:4])
-            candidates.extend(snapshot.entrypoints[:4])
-        candidates.extend(snapshot.focus_files[:8])
-        if relevant_extensions:
-            candidates.extend(
-                path
-                for path in snapshot.important_files[:20]
-                if any(path.endswith(extension) for extension in relevant_extensions)
-            )
-        if search_terms:
-            lowered_terms = tuple(search_terms)
-            candidates.extend(
-                path
-                for path in snapshot.important_files[:20]
-                if any(term in path.lower() for term in lowered_terms)
-            )
-        candidates.extend(snapshot.important_files[:8])
-        return self._unique_terms(candidates)[:8]
+        candidates.extend(route.entities.target_paths)
+        if route.entities.target_name and self._looks_like_path(route.entities.target_name):
+            candidates.append(route.entities.target_name)
+        candidates.extend(session.candidate_files)
+        if session.workspace_snapshot is not None:
+            candidates.extend(session.workspace_snapshot.focus_files)
+            candidates.extend(session.workspace_snapshot.important_files[:12])
+        return self._unique_paths(candidates)
 
-    def _normalize_target_paths(
-        self,
-        snapshot: WorkspaceSnapshot | None,
-        proposed_paths: list[str],
-        intent: TaskIntent,
-        relevant_extensions: list[str],
-        search_terms: list[str],
-    ) -> list[str]:
-        snapshot_paths = set()
-        if snapshot is not None:
-            snapshot_paths.update(snapshot.important_files)
-            snapshot_paths.update(snapshot.focus_files)
-            snapshot_paths.update(snapshot.manifests)
-            snapshot_paths.update(snapshot.entrypoints)
-        normalized = [
-            path
-            for path in self._unique_terms(proposed_paths)
-            if path in snapshot_paths or not snapshot_paths
-        ]
-        if normalized:
-            return normalized[:8]
-        return self._heuristic_target_paths(
-            snapshot,
-            intent=intent,
-            relevant_extensions=relevant_extensions,
-            search_terms=search_terms,
-        )
+    def _primary_target_path(self, route: RouterOutput, session: SessionState) -> str | None:
+        candidates = self._candidate_paths(route, session)
+        return candidates[0] if candidates else None
 
-    def _pick_bootstrap_file(
+    def _next_unread_candidate(
         self,
-        session: SessionState,
-        analysis: TaskAnalysis,
+        candidates: list[str],
         read_paths: set[str],
     ) -> str | None:
-        snapshot = session.workspace_snapshot
-        if snapshot is None:
-            return None
-        candidates = self._normalize_target_paths(
-            snapshot,
-            analysis.target_paths,
-            analysis.intent,
-            analysis.relevant_extensions,
-            analysis.search_terms,
-        )
-        if analysis.intent == TaskIntent.CREATE:
-            candidates = self._unique_terms(
-                [
-                    *candidates,
-                    *snapshot.manifests[:4],
-                    *snapshot.entrypoints[:4],
-                ]
-            )
         for candidate in candidates:
-            if candidate and candidate not in read_paths and Path(session.workspace_root, candidate).exists():
+            if candidate and candidate not in read_paths and Path(candidate).suffix:
                 return candidate
         return None
 
-    def _choose_create_path(
+    def _next_create_bootstrap(
         self,
+        route: RouterOutput,
         session: SessionState,
-        analysis: TaskAnalysis,
+        read_paths: set[str],
     ) -> str | None:
-        task = session.task
-        preferred_extension = analysis.relevant_extensions[0] if analysis.relevant_extensions else ""
         snapshot = session.workspace_snapshot
-        if snapshot is not None and snapshot.file_count == 0:
-            return self._default_create_path(task, preferred_extension or ".txt")
-        prompt = "\n".join(
-            [
-                f"Task: {task}",
-                f"Deliverable: {analysis.deliverable or 'new implementation'}",
-                f"Project labels: {', '.join(session.workspace_snapshot.project_labels[:6]) if session.workspace_snapshot else 'none'}",
-                f"Read files: {', '.join(item.tool_args.get('path', '') for item in session.tool_calls if item.tool_name == 'read_file')}",
-                f"Preferred extension: {preferred_extension or 'choose the most sensible extension'}",
-                "Choose one relative workspace file path for the new implementation.",
-                "Prefer a simple path, no explanation, path only.",
-            ]
-        )
+        if snapshot is None or snapshot.file_count == 0:
+            return None
+        candidates = [
+            *snapshot.manifests[:4],
+            *snapshot.entrypoints[:4],
+            *snapshot.focus_files[:4],
+        ]
+        for candidate in self._unique_paths(candidates):
+            absolute = Path(session.workspace_root, candidate)
+            if candidate not in read_paths and absolute.exists():
+                return candidate
+        return None
+
+    def _best_search_query(self, route: RouterOutput) -> str | None:
+        for candidate in [
+            *route.search_terms,
+            route.entities.target_name,
+            route.requested_outcome,
+            route.user_goal,
+        ]:
+            text = str(candidate or "").strip()
+            if len(text) >= 3:
+                return text[:120]
+        return None
+
+    def _choose_create_path(self, route: RouterOutput, session: SessionState) -> str:
+        for candidate in route.entities.target_paths:
+            if candidate:
+                return candidate
+        if route.entities.target_name and self._looks_like_path(route.entities.target_name):
+            return route.entities.target_name
         try:
             response = self.llm.generate(
-                prompt,
+                choose_path_prompt(route, session),
                 timeout=max(self._llm_timeout(20), 20),
                 num_ctx=self._llm_num_ctx(2048),
             )
-            path = self._sanitize_generated_path(response, preferred_extension)
+            path = self._sanitize_generated_path(response, self._preferred_extension(route))
             if path:
                 return path
-        except Exception:
-            pass
-        return self._default_create_path(task, preferred_extension or ".txt")
+        except Exception as exc:
+            self._log("path_generation_error", error=str(exc), route=route.model_dump())
+        return self._default_new_path(route)
 
     def _generate_file_content(
         self,
+        route: RouterOutput,
         session: SessionState,
-        analysis: TaskAnalysis,
+        *,
         path: str,
+        current_content: str | None = None,
     ) -> str | None:
-        deterministic = self._deterministic_empty_workspace_content(session, path)
-        if deterministic:
-            return deterministic
-
-        prompt = "\n\n".join(
-            [
-                "Create the complete file content for the requested task.",
-                f"Task: {session.task}",
-                f"Target file: {path}",
-                f"Deliverable: {analysis.deliverable or 'new implementation'}",
-                f"Project labels: {', '.join(session.workspace_snapshot.project_labels[:6]) if session.workspace_snapshot else 'none'}",
-                self._inspected_context(session),
-                "Requirements: single-file solution, minimal working implementation, keep the code concise, prefer simple terminal/CLI interaction unless the task explicitly asks for a web or GUI app.",
-                "Return the file content only. Do not wrap the answer in markdown fences. Do not explain anything.",
-            ]
-        )
-        primary_timeout = max(self._llm_timeout(180), 180)
         try:
             content = self.llm.generate(
-                prompt,
-                timeout=primary_timeout,
-                num_ctx=self._llm_num_ctx(4096),
+                generate_content_prompt(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                ),
+                timeout=max(self._llm_timeout(180), 180),
+                num_ctx=self._llm_num_ctx(8192),
             )
-            cleaned = self._strip_code_fences(content).strip()
-            if cleaned:
-                return cleaned
-        except Exception:
-            pass
-
-        fallback_prompt = "\n\n".join(
-            [
-                "Return only the full source code for a single new file.",
-                f"Task: {session.task}",
-                f"Target file: {path}",
-                "Constraints: produce a small but working solution, no markdown fences, no explanation, code only.",
-            ]
-        )
-        try:
-            fallback = self.llm.generate(
-                fallback_prompt,
-                timeout=max(self._llm_timeout(240), 240),
-                num_ctx=self._llm_num_ctx(4096),
-            )
-            cleaned = self._strip_code_fences(fallback).strip()
-            return cleaned or None
-        except Exception:
+        except Exception as exc:
+            self._log("content_generation_error", error=str(exc), path=path)
             return None
+        cleaned = self._strip_code_fences(content).strip()
+        return cleaned or None
 
-    def _inspected_context(self, session: SessionState) -> str:
-        sections: list[str] = []
-        for item in session.tool_calls:
-            if item.tool_name != "read_file":
-                continue
-            path = str(item.tool_args.get("path", "")).strip()
-            excerpt = (item.output_excerpt or "").strip()
-            if not path or not excerpt:
-                continue
-            sections.append(f"Inspected {path}:\n{excerpt[:1200]}")
-            if len(sections) >= 2:
-                break
-        if not sections and session.workspace_snapshot:
-            sections.append(f"Workspace summary:\n{session.workspace_snapshot.repo_summary[:800]}")
-        return "\n\n".join(sections)
+    def _current_file_content(self, session: SessionState, path: str) -> str | None:
+        target = Path(session.workspace_root, path)
+        if not target.exists() or target.is_dir():
+            return None
+        return target.read_text(encoding="utf-8")
+
+    def _clarification_response(self, route: RouterOutput) -> str:
+        questions = route.clarification_questions[:3]
+        if not questions:
+            return "Ich brauche noch eine kurze Praezisierung, bevor ich sicher weitermachen kann."
+        lines = ["Ich brauche noch eine kurze Praezisierung, bevor ich loslege.", ""]
+        for question in questions:
+            lines.append(f"- {question}")
+        return "\n".join(lines)
+
+    def _unsafe_response(self, route: RouterOutput) -> str:
+        if route.needs_clarification:
+            return self._clarification_response(route)
+        return (
+            "Ich fuehre das noch nicht aus, weil der Router die Anfrage noch nicht als sicher genug eingestuft hat."
+        )
+
+    def _render_plan_response(self, route: RouterOutput) -> str:
+        lines = [f"Ziel: {route.user_goal}", "", "Vorgehen:"]
+        for item in route.action_plan:
+            lines.append(f"{item.step}. {item.reason}")
+        return "\n".join(lines)
+
+    def _compose_user_response(self, route: RouterOutput, session: SessionState) -> str:
+        if route.direct_response and not session.tool_calls and not session.changed_files:
+            return route.direct_response
+        if route.intent == RouteIntent.PLAN:
+            return self._render_plan_response(route)
+        try:
+            response = self.llm.generate(
+                final_response_prompt(route, session),
+                timeout=max(self._llm_timeout(20), 20),
+                num_ctx=self._llm_num_ctx(4096),
+            ).strip()
+            if response:
+                return self._strip_code_fences(response).strip()
+        except Exception as exc:
+            self._log("final_response_generation_error", error=str(exc))
+        return self.summarize_session(session)
+
+    def _final_decision(
+        self,
+        thought_summary: str,
+        final_response: str,
+    ) -> AgentDecision:
+        return AgentDecision(
+            thought_summary=thought_summary,
+            action_type=AgentActionType.FINAL,
+            tool_name=None,
+            tool_args={},
+            expected_outcome="Return a user-facing response.",
+            final_response=final_response,
+        )
+
+    def _read_paths(self, session: SessionState) -> list[str]:
+        return [
+            str(item.tool_args.get("path") or "").strip()
+            for item in session.tool_calls
+            if item.tool_name == "read_file" and str(item.tool_args.get("path") or "").strip()
+        ]
+
+    def _searched_queries(self, session: SessionState) -> list[str]:
+        return [
+            str(item.tool_args.get("query") or "").strip()
+            for item in session.tool_calls
+            if item.tool_name == "search_in_files" and str(item.tool_args.get("query") or "").strip()
+        ]
+
+    def _preferred_extension(self, route: RouterOutput) -> str:
+        for extension in route.relevant_extensions:
+            normalized = str(extension or "").strip()
+            if normalized.startswith("."):
+                return normalized
+        primary = self._primary_target_name(route)
+        if "." in primary:
+            return Path(primary).suffix or ".txt"
+        return ".txt"
+
+    def _primary_target_name(self, route: RouterOutput) -> str:
+        return str(route.entities.target_name or route.requested_outcome or "generated_output")
+
+    def _default_new_path(self, route: RouterOutput) -> str:
+        target = self._primary_target_name(route).lower()
+        slug = re.sub(r"[^a-z0-9]+", "_", target).strip("_") or "generated_output"
+        extension = self._preferred_extension(route)
+        if not slug.endswith(extension):
+            return f"{slug}{extension}"
+        return slug
 
     def _sanitize_generated_path(
         self,
@@ -1181,12 +650,9 @@ class Planner:
         text = self._strip_code_fences(raw).strip().splitlines()[0].strip("`'\" ")
         if not text:
             return None
-        text = text.lstrip("./")
-        text = text.replace("\\", "/")
-        text = re.sub(r"\s+", "_", text)
-        if "/" in text:
-            parts = [part for part in text.split("/") if part not in {"", ".", ".."}]
-            text = "/".join(parts)
+        text = text.lstrip("./").replace("\\", "/")
+        parts = [part for part in text.split("/") if part not in {"", ".", ".."}]
+        text = "/".join(parts)
         if not text:
             return None
         if preferred_extension and not text.endswith(preferred_extension):
@@ -1194,161 +660,36 @@ class Planner:
                 text = f"{text}{preferred_extension}"
         return text
 
-    def _default_create_path(self, task: str, preferred_extension: str) -> str:
-        meaningful = [
-            token
-            for token in self._focus_terms(task)
-            if token not in LOW_SIGNAL_TERMS
-        ]
-        base = meaningful[0] if meaningful else "generated_output"
-        slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_") or "generated_output"
-        extension = preferred_extension if preferred_extension.startswith(".") else f".{preferred_extension}"
-        return f"{slug}{extension}"
+    def _looks_like_path(self, value: str) -> bool:
+        text = str(value or "").strip()
+        return bool(re.search(r"[\w./-]+\.[a-z0-9]{1,8}$", text, re.IGNORECASE))
 
-    def _deterministic_empty_workspace_content(
-        self,
-        session: SessionState,
-        path: str,
-    ) -> str | None:
-        snapshot = session.workspace_snapshot
-        if snapshot is None or snapshot.file_count != 0:
-            return None
-
-        task = session.task.lower()
-        if path.endswith(".py") and any(
-            phrase in task
-            for phrase in ("tic tac toe", "tic-tac-toe", "tick tack toe", "tick-tack-toe")
-        ):
-            return '''"""Simple terminal Tic Tac Toe game."""
-
-
-def render(board):
-    print()
-    for row in range(3):
-        cells = [board[row * 3 + col] or str(row * 3 + col + 1) for col in range(3)]
-        print(" " + " | ".join(cells))
-        if row < 2:
-            print("---+---+---")
-    print()
-
-
-def winner(board):
-    lines = [
-        (0, 1, 2),
-        (3, 4, 5),
-        (6, 7, 8),
-        (0, 3, 6),
-        (1, 4, 7),
-        (2, 5, 8),
-        (0, 4, 8),
-        (2, 4, 6),
-    ]
-    for a, b, c in lines:
-        if board[a] and board[a] == board[b] == board[c]:
-            return board[a]
-    return None
-
-
-def board_full(board):
-    return all(cell is not None for cell in board)
-
-
-def choose_move(board, player):
-    while True:
-        choice = input(f"Spieler {player}, waehle Feld 1-9: ").strip()
-        if not choice.isdigit():
-            print("Bitte gib eine Zahl ein.")
-            continue
-        index = int(choice) - 1
-        if index < 0 or index >= 9:
-            print("Die Zahl muss zwischen 1 und 9 liegen.")
-            continue
-        if board[index] is not None:
-            print("Das Feld ist schon belegt.")
-            continue
-        return index
-
-
-def main():
-    print("Tic Tac Toe")
-    board = [None] * 9
-    player = "X"
-    while True:
-        render(board)
-        move = choose_move(board, player)
-        board[move] = player
-        current_winner = winner(board)
-        if current_winner:
-            render(board)
-            print(f"Spieler {current_winner} gewinnt!")
-            break
-        if board_full(board):
-            render(board)
-            print("Unentschieden!")
-            break
-        player = "O" if player == "X" else "X"
-
-
-if __name__ == "__main__":
-    main()
-'''
-        return None
+    def _unique_paths(self, values: list[str]) -> list[str]:
+        unique: list[str] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text or text in unique:
+                continue
+            unique.append(text)
+        return unique[:24]
 
     def _strip_code_fences(self, text: str) -> str:
         cleaned = str(text or "").strip()
         if cleaned.startswith("```"):
-            parts = cleaned.split("```")
-            if len(parts) >= 3:
-                cleaned = parts[1]
-        return cleaned.removeprefix("python").removeprefix("py").strip()
+            cleaned = "\n".join(cleaned.splitlines()[1:])
+        if cleaned.endswith("```"):
+            cleaned = "\n".join(cleaned.splitlines()[:-1])
+        return cleaned.strip()
 
-    def _unique_terms(self, values: list[str]) -> list[str]:
-        seen: set[str] = set()
-        items: list[str] = []
-        for value in values:
-            normalized = str(value or "").strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            items.append(normalized)
-        return items
+    def _llm_timeout(self, minimum: int) -> int:
+        configured = getattr(getattr(self.llm, "config", None), "llm_timeout", minimum)
+        return max(int(configured), minimum)
 
-    def _is_high_signal_search_term(self, value: str) -> bool:
-        normalized = str(value or "").strip().lower()
-        if len(normalized) < 3:
-            return False
-        parts = [part for part in normalized.replace("-", " ").split() if part]
-        if not parts:
-            return False
-        meaningful = [
-            part
-            for part in parts
-            if part not in STOPWORDS
-            and part not in LOW_SIGNAL_TERMS
-            and part not in CREATE_TOKENS
-            and part not in MODIFY_TOKENS
-            and part not in FIX_TOKENS
-            and part not in INSPECT_TOKENS
-        ]
-        return bool(meaningful)
+    def _llm_num_ctx(self, minimum: int) -> int:
+        configured = getattr(getattr(self.llm, "config", None), "ollama_num_ctx", minimum)
+        return max(int(configured), minimum)
 
-    def _llm_timeout(self, limit: int) -> int:
-        config = getattr(self.llm, "config", None)
-        if config is None:
-            return limit
-        return max(min(config.llm_timeout, limit), self._minimum_timeout_for_model())
-
-    def _llm_num_ctx(self, limit: int) -> int:
-        config = getattr(self.llm, "config", None)
-        if config is None:
-            return limit
-        return min(config.ollama_num_ctx, limit)
-
-    def _minimum_timeout_for_model(self) -> int:
-        config = getattr(self.llm, "config", None)
-        if config is None:
-            return 0
-        model_name = str(getattr(config, "model_name", "")).lower()
-        if any(token in model_name for token in {"30b", "32b", "34b", "70b", "72b"}):
-            return 45
-        return 0
+    def _log(self, event: str, **payload) -> None:
+        if self.logger is None:
+            return
+        self.logger.log_event(event, **payload)

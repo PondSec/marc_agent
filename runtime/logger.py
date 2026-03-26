@@ -20,6 +20,6 @@ class AgentLogger:
     def log_event(self, event: str, **payload: Any) -> None:
         record = {"timestamp": self._timestamp(), "event": event, "payload": payload}
         with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         if self.verbose:
-            print(f"[{event}] {json.dumps(payload, ensure_ascii=False)[:500]}")
+            print(f"[{event}] {json.dumps(payload, ensure_ascii=False, default=str)[:500]}")
