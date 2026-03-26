@@ -1,4 +1,6 @@
 const STORAGE_KEY = "marc_a1.workspace_ui.v3";
+const COMMIT_AND_PUSH_PROMPT =
+  "Bitte pruefe den aktuellen Git-Status in diesem Workspace, erstelle einen kleinen sinnvollen Commit mit einer kurzen passenden Message und pushe den aktuellen Branch zu origin. Wenn es nichts zu committen gibt oder der Push scheitert, erklaere kurz den Grund im Chat.";
 
 const state = {
   config: null,
@@ -214,11 +216,15 @@ function startNewChat(workspaceId) {
   focusComposer();
 }
 
-async function submitPrompt() {
-  const prompt = state.composer.prompt.trim();
+async function submitPrompt({ promptOverride = null, accessModeOverride = null } = {}) {
+  const prompt = String(promptOverride ?? state.composer.prompt).trim();
   const workspaceId = state.activeSession?.workspace_id || state.selectedWorkspaceId;
   if (!prompt) {
     showToast("Bitte schreibe zuerst eine Nachricht.", "error");
+    return;
+  }
+  if (isSessionRunning(state.activeSession)) {
+    showToast("Warte bitte, bis der aktuelle Agent-Schritt abgeschlossen ist.", "error");
     return;
   }
   if (!workspaceId) {
@@ -231,7 +237,7 @@ async function submitPrompt() {
     prompt,
     session_id: state.activeSessionId,
     workspace_id: workspaceId,
-    access_mode: state.composer.accessMode,
+    access_mode: accessModeOverride || state.composer.accessMode,
     dry_run: state.composer.dryRun,
     verbose: true,
     model_name: state.composer.modelName || state.config?.model_name || null,
@@ -245,12 +251,21 @@ async function submitPrompt() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    state.composer.prompt = "";
+    if (promptOverride === null) {
+      state.composer.prompt = "";
+    }
     await refreshSessions();
     await openSession(session.id);
   } catch (error) {
     showToast(`Nachricht konnte nicht gesendet werden: ${error.message}`, "error");
   }
+}
+
+function requestCommitAndPush() {
+  submitPrompt({
+    promptOverride: COMMIT_AND_PUSH_PROMPT,
+    accessModeOverride: "full",
+  });
 }
 
 async function stopSession() {
@@ -331,6 +346,11 @@ function handleClick(event) {
 
   if (action === "new-chat") {
     startNewChat(target.dataset.workspaceId);
+    return;
+  }
+
+  if (action === "commit-push") {
+    requestCommitAndPush();
     return;
   }
 
@@ -709,6 +729,7 @@ function renderExecutionProfileOptions() {
 
 function renderTopBar() {
   const workspace = workspaceForSession(state.activeSession) || selectedWorkspace();
+  const commitDisabled = !workspace || isSessionRunning(state.activeSession);
 
   return `
     <header class="top-bar">
@@ -723,6 +744,20 @@ function renderTopBar() {
           >
             Neuer Chat
           </button>
+          <button
+            class="icon-button top-bar-icon"
+            type="button"
+            data-action="commit-push"
+            aria-label="Commit und Push an den Agenten senden"
+            title="${escapeAttribute(
+              commitDisabled
+                ? "Commit und Push ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
+                : "Commit und Push anfordern",
+            )}"
+            ${commitDisabled ? "disabled" : ""}
+          >
+            ${icon("git-push")}
+          </button>
         </div>
       </div>
     </header>
@@ -732,9 +767,11 @@ function renderTopBar() {
 function renderChatContainer() {
   return `
     <section class="chat-stage">
-      <div class="chat-container">
-        <div class="message-list">
-          ${renderChatStateMessages()}
+      <div class="chat-stage-inner">
+        <div class="chat-container">
+          <div class="message-list">
+            ${renderChatStateMessages()}
+          </div>
         </div>
       </div>
     </section>
@@ -834,30 +871,32 @@ function renderChatInput() {
 
   return `
     <footer class="chat-input-shell">
-      <div class="chat-input-container">
-        <div class="composer-toolbar">
-          <span class="chat-hint">${escapeHtml(chatHint)}</span>
-          <button class="button-ghost" type="button" data-action="open-settings-modal">
-            Optionen
-          </button>
-        </div>
-        ${modelInstallNotice ? renderModelInstallStrip(modelInstallNotice) : ""}
-        ${thought ? renderThoughtStrip(thought) : ""}
-        <div class="chat-input-row">
-          <textarea
-            id="composerInput"
-            class="chat-input"
-            rows="3"
-            placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
-          ></textarea>
-          <button
-            class="send-button ${running ? "stop" : "send"}"
-            type="button"
-            data-action="${running ? "stop-session" : "submit-prompt"}"
-            aria-label="${running ? "Stoppen" : "Senden"}"
-          >
-            ${icon(running ? "stop" : "arrow")}
-          </button>
+      <div class="chat-input-inner">
+        <div class="chat-input-container">
+          <div class="composer-toolbar">
+            <span class="chat-hint">${escapeHtml(chatHint)}</span>
+            <button class="button-ghost" type="button" data-action="open-settings-modal">
+              Optionen
+            </button>
+          </div>
+          ${modelInstallNotice ? renderModelInstallStrip(modelInstallNotice) : ""}
+          ${thought ? renderThoughtStrip(thought) : ""}
+          <div class="chat-input-row">
+            <textarea
+              id="composerInput"
+              class="chat-input"
+              rows="3"
+              placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
+            ></textarea>
+            <button
+              class="send-button ${running ? "stop" : "send"}"
+              type="button"
+              data-action="${running ? "stop-session" : "submit-prompt"}"
+              aria-label="${running ? "Stoppen" : "Senden"}"
+            >
+              ${icon(running ? "stop" : "arrow")}
+            </button>
+          </div>
         </div>
       </div>
     </footer>
@@ -1971,6 +2010,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor"/></svg>',
     close:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>',
+    "git-push":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 14.5h8a2 2 0 0 0 2-2V9.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><path d="M10 12.5V4.5M6.8 7.7 10 4.5l3.2 3.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
     chat:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 4.5h12v8H7.5L4 15z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     search:
