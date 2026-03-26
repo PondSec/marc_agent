@@ -9,15 +9,20 @@ from runtime.logger import AgentLogger
 
 
 class ScriptedLLM:
-    def __init__(self, json_payloads=None, fail=False):
+    def __init__(self, json_payloads=None, fail=False, fail_times: int = 0, fail_message: str = "llm unavailable"):
         self.json_payloads = list(json_payloads or [])
         self.fail = fail
+        self.fail_times = fail_times
+        self.fail_message = fail_message
         self.prompts: list[str] = []
 
     def generate_json(self, prompt, *args, **kwargs):
         self.prompts.append(prompt)
         if self.fail:
-            raise RuntimeError("llm unavailable")
+            raise RuntimeError(self.fail_message)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError(self.fail_message)
         if not self.json_payloads:
             raise RuntimeError("No JSON payload configured")
         return self.json_payloads.pop(0)
@@ -156,6 +161,42 @@ def test_router_fallback_still_answers_simple_intro_questions():
     assert route.intent == RouteIntent.EXPLAIN
     assert route.safe_to_execute is True
     assert "Coding-Agent" in (route.direct_response or "")
+
+
+def test_router_timeout_retry_can_recover_with_second_attempt():
+    llm = ScriptedLLM(
+        json_payloads=[
+            make_payload(
+                "bitte programmier mir ein Tic tac toe spiel in python",
+                intent="create",
+                action="create_artifact",
+            )
+        ],
+        fail_times=1,
+        fail_message="timed out",
+    )
+    router = IntentRouter(llm)
+
+    route = router.interpret_user_request("bitte programmier mir ein Tic tac toe spiel in python", None)
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.safe_to_execute is True
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+
+
+def test_router_timeout_fallback_classifies_clear_create_request_without_llm():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    route = router.interpret_user_request(
+        "ich moechte ein Tic Tac Toe spiel in python haben das ich spielen kann",
+        None,
+    )
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.safe_to_execute is True
+    assert route.needs_clarification is False
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+    assert ".py" in route.relevant_extensions
 
 
 def test_router_schema_contains_core_contract_fields():
