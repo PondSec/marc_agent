@@ -13,6 +13,7 @@ def system_prompt() -> str:
         "Always return valid JSON only. "
         "If the user asks a simple greeting, clarification, or question that can be answered safely without repo work, reply directly instead of forcing tool use. "
         "Inspect before editing, prefer existing architecture, and avoid searching filler words from the prompt. "
+        "Use the recent conversation, changed files, and latest tool results to resolve follow-up requests like 'make it different' or 'change that'. "
         "For create requests, read only the minimum manifest, README, or nearby example needed before writing files. "
         "After code changes, run the relevant validation command before finishing unless there is a real blocker. "
         "Respect access_mode exactly and never ask for destructive remote actions."
@@ -45,18 +46,25 @@ def planning_prompt_with_analysis(
 def task_analysis_prompt(
     task: str,
     snapshot: WorkspaceSnapshot | None,
+    session: SessionState | None = None,
 ) -> str:
     workspace = _compact_workspace_snapshot(snapshot, detail="minimal")
+    recent_messages = _compact_recent_messages(session)
+    recent_calls = _compact_recent_calls(session)
+    changed_files = [item.path for item in session.changed_files[-6:]] if session else []
     lines = [
         "Analyze the user's latest request before choosing tools.",
         f"Task: {_trim_text(task, 320)}",
+        f"Recent conversation: {_format_objects(recent_messages)}",
+        f"Recently changed files: {_format_list(changed_files)}",
+        f"Recent tool calls: {_format_objects(recent_calls)}",
         f"Workspace labels: {_format_list(workspace.get('project_labels'))}",
         f"Top directories: {_format_list(workspace.get('top_directories'))}",
         f"Manifests: {_format_list(workspace.get('manifests'))}",
         f"Entrypoints: {_format_list(workspace.get('entrypoints'))}",
         f"Focus files: {_format_list(workspace.get('focus_files'))}",
         f"Repo summary: {_trim_text(str(workspace.get('repo_summary', '')), 180)}",
-        "Rules: ignore greetings/filler words; prefer create for write/build/create requests; prefer fix for bug/error reports; prefer reply only for pure conversation; keep target_paths short and real; keep search_terms high-signal.",
+        "Rules: use recent conversation to understand references like 'that', 'it', or 'do it differently'; ignore greetings/filler words; prefer create for write/build/create requests; prefer fix or modify for follow-up change requests; prefer reply only for pure conversation; keep target_paths short and real; keep search_terms high-signal.",
         "Return JSON only with keys: summary, intent, requires_repo_context, should_create_files, deliverable, search_terms, target_paths, relevant_extensions, direct_response.",
     ]
     return "\n".join(lines)
@@ -89,9 +97,11 @@ def decision_prompt(
         f"{item.status} {item.kind or 'check'} {item.command}"
         for item in session.validation_runs[-2:]
     ]
+    recent_messages = _compact_recent_messages(session)
     lines = [
         "Decide the next best action for the coding task.",
         f"Task: {_trim_text(task, 320)}",
+        f"Recent conversation: {_format_objects(recent_messages)}",
         f"Intent: {analysis.get('intent')}",
         f"Task summary: {_trim_text(str(analysis.get('summary', '')), 180)}",
         f"Deliverable: {analysis.get('deliverable') or 'none'}",
@@ -114,6 +124,31 @@ def decision_prompt(
         "Return JSON only with keys: thought_summary, action_type, tool_name, tool_args, expected_outcome, final_response.",
     ]
     return "\n".join(lines)
+
+
+def _compact_recent_messages(session: SessionState | None) -> list[dict[str, str]]:
+    if session is None:
+        return []
+    return [
+        {
+            "role": item.role,
+            "content": _trim_text(item.content, 220),
+        }
+        for item in session.messages[-6:]
+    ]
+
+
+def _compact_recent_calls(session: SessionState | None) -> list[dict[str, object]]:
+    if session is None:
+        return []
+    return [
+        {
+            "tool": item.tool_name,
+            "success": item.success,
+            "summary": _trim_text(item.summary, 120),
+        }
+        for item in session.tool_calls[-4:]
+    ]
 
 
 def _compact_validation_command(command) -> dict[str, object]:

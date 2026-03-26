@@ -247,7 +247,7 @@ class AgentCore:
     ) -> None:
         session.current_phase = "planning"
         session.workflow_stage = "plan"
-        session.task_analysis = planner.analyze_task(task, session.workspace_snapshot)
+        session.task_analysis = planner.analyze_task(task, session.workspace_snapshot, session=session)
         if session.task_analysis.direct_response:
             session.plan_summary = "Respond directly without repository work."
             session.plan = []

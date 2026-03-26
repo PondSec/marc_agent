@@ -57,12 +57,14 @@ STOPWORDS = {
     "danach",
     "doch",
     "einfach",
+    "jetzt",
     "was",
     "wo",
     "ich",
     "mich",
     "me",
     "my",
+    "will",
     "gegen",
     "hast",
     "fuer",
@@ -85,8 +87,16 @@ LOW_SIGNAL_TERMS = {
     "zusammenfassung",
     "erklaerung",
     "erklärung",
+    "erklaere",
+    "erkläre",
+    "kurz",
     "genau",
     "getan",
+    "gemacht",
+    "anders",
+    "datei",
+    "mach",
+    "bau",
     "workspace",
 }
 
@@ -225,19 +235,20 @@ class Planner:
         self,
         task: str,
         snapshot: WorkspaceSnapshot | None,
+        session: SessionState | None = None,
     ) -> TaskAnalysis:
         heuristic = self._fallback_task_analysis(task, snapshot)
-        if heuristic.intent in {TaskIntent.REPLY, TaskIntent.CREATE, TaskIntent.FIX}:
+        if heuristic.intent == TaskIntent.REPLY:
             return heuristic
         try:
             data = self.llm.generate_json(
-                task_analysis_prompt(task, snapshot),
+                task_analysis_prompt(task, snapshot, session=session),
                 system=system_prompt(),
                 timeout=self._llm_timeout(8),
                 num_ctx=self._llm_num_ctx(4096),
             )
             analysis = TaskAnalysis.model_validate(data)
-            return self._normalize_task_analysis(task, snapshot, analysis)
+            return self._normalize_task_analysis(task, snapshot, analysis, session=session)
         except Exception:
             return heuristic
 
@@ -250,7 +261,11 @@ class Planner:
         return self._fallback_plan(task, snapshot, analysis)
 
     def decide_next_action(self, task: str, session: SessionState) -> AgentDecision:
-        analysis = session.task_analysis or self.analyze_task(task, session.workspace_snapshot)
+        analysis = session.task_analysis or self.analyze_task(
+            task,
+            session.workspace_snapshot,
+            session=session,
+        )
         if analysis.direct_response:
             return AgentDecision(
                 thought_summary="The prompt is a direct conversational question and does not need repo work.",
@@ -688,7 +703,7 @@ class Planner:
         if analysis.intent != TaskIntent.CREATE:
             return decision
         query = str(decision.tool_args.get("query", "")).strip().lower()
-        if query and query not in STOPWORDS and query not in LOW_SIGNAL_TERMS and len(query) >= 4:
+        if self._is_high_signal_search_term(query):
             return decision
         bootstrap_file = self._pick_bootstrap_file(session, analysis, read_paths)
         if bootstrap_file is None:
@@ -850,31 +865,48 @@ class Planner:
         task: str,
         snapshot: WorkspaceSnapshot | None,
         analysis: TaskAnalysis,
+        session: SessionState | None = None,
     ) -> TaskAnalysis:
+        heuristic = self._fallback_task_analysis(task, snapshot)
         relevant_extensions = self._unique_terms(
             [*analysis.relevant_extensions, *self._relevant_extensions(task)]
         )[:4]
-        search_terms = self._unique_terms(
-            [*analysis.search_terms, *self._focus_terms(task)]
-        )[:4]
+        search_terms = [
+            term
+            for term in self._unique_terms([*analysis.search_terms, *self._focus_terms(task)])
+            if self._is_high_signal_search_term(term)
+        ][:4]
+        changed_paths = (
+            self._unique_terms([item.path for item in session.changed_files[-6:]])
+            if session is not None
+            else []
+        )
+        normalized_intent = analysis.intent
+        if analysis.intent in {TaskIntent.ANALYZE, TaskIntent.INSPECT} and heuristic.intent in {
+            TaskIntent.CREATE,
+            TaskIntent.MODIFY,
+            TaskIntent.FIX,
+        }:
+            normalized_intent = heuristic.intent
         target_paths = self._normalize_target_paths(
             snapshot,
-            analysis.target_paths,
-            analysis.intent,
+            [*analysis.target_paths, *changed_paths],
+            normalized_intent,
             relevant_extensions,
             search_terms,
         )
         direct_response = analysis.direct_response
-        if analysis.intent == TaskIntent.REPLY and not direct_response:
+        if normalized_intent == TaskIntent.REPLY and not direct_response:
             direct_response = self._direct_reply_for_prompt(task)
         return analysis.model_copy(
             update={
+                "intent": normalized_intent,
                 "requires_repo_context": False
-                if analysis.intent == TaskIntent.REPLY
+                if normalized_intent == TaskIntent.REPLY
                 else analysis.requires_repo_context,
                 "should_create_files": analysis.should_create_files
-                or analysis.intent == TaskIntent.CREATE,
-                "deliverable": analysis.deliverable or self._deliverable_hint(task, analysis.intent),
+                or normalized_intent == TaskIntent.CREATE,
+                "deliverable": analysis.deliverable or self._deliverable_hint(task, normalized_intent),
                 "search_terms": search_terms,
                 "target_paths": target_paths,
                 "relevant_extensions": relevant_extensions,
@@ -1280,6 +1312,25 @@ if __name__ == "__main__":
             seen.add(normalized)
             items.append(normalized)
         return items
+
+    def _is_high_signal_search_term(self, value: str) -> bool:
+        normalized = str(value or "").strip().lower()
+        if len(normalized) < 3:
+            return False
+        parts = [part for part in normalized.replace("-", " ").split() if part]
+        if not parts:
+            return False
+        meaningful = [
+            part
+            for part in parts
+            if part not in STOPWORDS
+            and part not in LOW_SIGNAL_TERMS
+            and part not in CREATE_TOKENS
+            and part not in MODIFY_TOKENS
+            and part not in FIX_TOKENS
+            and part not in INSPECT_TOKENS
+        ]
+        return bool(meaningful)
 
     def _llm_timeout(self, limit: int) -> int:
         config = getattr(self.llm, "config", None)

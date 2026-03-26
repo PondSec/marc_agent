@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent.models import SessionState, ToolCallRecord, WorkspaceSnapshot
+from agent.models import FileChangeRecord, SessionState, ToolCallRecord, WorkspaceSnapshot
 from agent.planner import Planner
 from agent.prompts import decision_prompt
 from llm.schemas import AgentActionType, TaskIntent
@@ -23,6 +23,44 @@ class CreateDraftLLM(BrokenLLM):
         if self.calls == 1:
             return "tic_tac_toe.py"
         return "print('tic tac toe')\n"
+
+
+class ModelFirstCreateLLM(BrokenLLM):
+    def __init__(self):
+        self.analysis_prompts: list[str] = []
+
+    def generate_json(self, prompt, *args, **kwargs):
+        self.analysis_prompts.append(prompt)
+        return {
+            "summary": "Create a Python Tic Tac Toe implementation.",
+            "intent": "create",
+            "requires_repo_context": True,
+            "should_create_files": True,
+            "deliverable": "New implementation",
+            "search_terms": ["tic tac toe"],
+            "target_paths": [],
+            "relevant_extensions": [".py"],
+            "direct_response": None,
+        }
+
+
+class ContextAwareFollowUpLLM(BrokenLLM):
+    def __init__(self):
+        self.analysis_prompts: list[str] = []
+
+    def generate_json(self, prompt, *args, **kwargs):
+        self.analysis_prompts.append(prompt)
+        return {
+            "summary": "Modify the recently created Tic Tac Toe implementation.",
+            "intent": "modify",
+            "requires_repo_context": True,
+            "should_create_files": False,
+            "deliverable": "Updated implementation",
+            "search_terms": [],
+            "target_paths": ["tic_tac_toe.py"],
+            "relevant_extensions": [".py"],
+            "direct_response": None,
+        }
 
 
 def build_snapshot(tmp_path) -> WorkspaceSnapshot:
@@ -104,6 +142,79 @@ def test_create_request_with_summary_suffix_still_classifies_as_create(tmp_path)
     assert "programmiere" not in analysis.search_terms
     assert "mich" not in analysis.search_terms
     assert "zusammenfassung" not in analysis.search_terms
+
+
+def test_analyze_task_prefers_model_for_free_form_create_prompt(tmp_path):
+    llm = ModelFirstCreateLLM()
+    planner = Planner(llm, "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=0,
+        language_counts={},
+        top_directories=[],
+        important_files=[],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=[],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Empty workspace.",
+    )
+
+    analysis = planner.analyze_task("bau mir ein python tic tac toe", snapshot)
+
+    assert analysis.intent == TaskIntent.CREATE
+    assert llm.analysis_prompts
+
+
+def test_analyze_task_uses_recent_thread_context_for_follow_up(tmp_path):
+    llm = ContextAwareFollowUpLLM()
+    planner = Planner(llm, "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["tic_tac_toe.py"],
+        focus_files=["tic_tac_toe.py"],
+        file_briefs={"tic_tac_toe.py": "Tic Tac Toe game"},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["tic_tac_toe.py"],
+        repo_map=["tic_tac_toe.py"],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python game file.",
+    )
+    session = SessionState(
+        task="mach das anders",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    session.append_message("user", "programmiere bitte ein python tic tac toe")
+    session.append_message("assistant", "Ich habe tic_tac_toe.py erstellt.")
+    session.append_message("user", "mach das anders")
+    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="created"))
+
+    analysis = planner.analyze_task(session.task, snapshot, session=session)
+
+    assert analysis.intent == TaskIntent.MODIFY
+    assert analysis.target_paths == ["tic_tac_toe.py"]
+    assert "programmiere bitte ein python tic tac toe" in llm.analysis_prompts[0]
+    assert "tic_tac_toe.py" in llm.analysis_prompts[0]
 
 
 def test_fallback_create_flow_reads_manifest_before_searching_prompt_words(tmp_path):
@@ -247,6 +358,49 @@ def test_empty_workspace_programmiere_request_drafts_file_after_inspect(tmp_path
 
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "tic_tac_toe.py"
+
+
+def test_follow_up_modify_request_reads_recent_changed_file_first(tmp_path):
+    (tmp_path / "tic_tac_toe.py").write_text("def main():\n    pass\n", encoding="utf-8")
+    llm = ContextAwareFollowUpLLM()
+    planner = Planner(llm, "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["tic_tac_toe.py"],
+        focus_files=["tic_tac_toe.py"],
+        file_briefs={"tic_tac_toe.py": "Tic Tac Toe game"},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["tic_tac_toe.py"],
+        repo_map=["tic_tac_toe.py"],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python game file.",
+    )
+    session = SessionState(
+        task="mach das anders",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    session.append_message("user", "programmiere bitte ein python tic tac toe")
+    session.append_message("assistant", "Ich habe tic_tac_toe.py erstellt.")
+    session.append_message("user", "mach das anders")
+    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="created"))
+    session.task_analysis = planner.analyze_task(session.task, snapshot, session=session)
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "read_file"
     assert decision.tool_args["path"] == "tic_tac_toe.py"
 
 
