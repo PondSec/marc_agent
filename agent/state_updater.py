@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from agent.semantic_defaults import (
     looks_like_problem_report,
     looks_like_scope_narrowing_request,
     looks_like_validation_request,
+    normalize_text,
 )
 from agent.task_schema import TaskArtifact
 from agent.task_state import EvidenceItem, TaskState
@@ -121,7 +123,11 @@ class TaskStateUpdater:
             if create_state is not None:
                 return create_state
 
-        if is_follow_up and self._should_create_follow_up_artifact(request):
+        follow_up_creates_distinct_artifact = (
+            is_follow_up and self._should_create_follow_up_artifact(request, existing_artifacts=target_artifacts)
+        )
+
+        if follow_up_creates_distinct_artifact:
             return self._follow_up_create_state(
                 request,
                 previous_root=previous_root or previous_goal or request,
@@ -263,23 +269,45 @@ class TaskStateUpdater:
             ambiguity_level = "high"
         elif target_artifacts:
             active_goal = previous_goal or request
-            next_action = previous_next_action if previous_next_action in {
-                "inspect",
-                "search",
-                "create",
-                "modify",
-                "debug",
-                "test",
-                "explain",
-                "plan",
-            } else "inspect"
-            current_verification_target = current_verification_target or "Keep the change aligned with the active goal and verify the most relevant path afterwards."
-            execution_outline = [
-                "Inspect the active artifact and continue from the current task state.",
-                "Perform the next smallest safe step and verify it.",
-            ]
-            confidence = 0.68 if has_follow_up_reference(request) and len(artifact_paths) == 1 else 0.62 if len(artifact_paths) == 1 else 0.48
-            ambiguity_level = "low" if len(artifact_paths) == 1 else "medium"
+            if is_follow_up:
+                relation = "refine" if previous_root else relation
+                active_goal = f"Extend the active implementation around {previous_goal or previous_root or request} with the latest compatible change."
+                next_action = self._continuation_next_action(
+                    previous_next_action=previous_next_action,
+                    artifact_paths=artifact_paths,
+                    follow_up_creates_distinct_artifact=follow_up_creates_distinct_artifact,
+                )
+                current_output_expectation = (
+                    "Extend the active implementation with the requested follow-up change without drifting to a new unrelated artifact."
+                )
+                current_verification_target = (
+                    "Update the active artifact in place and rerun the most relevant validation for the current task."
+                )
+                execution_outline = [
+                    "Inspect the active artifact and preserve the current implementation medium and entrypoint.",
+                    "Apply the smallest focused follow-up change to the active implementation.",
+                    "Verify the updated behavior on the active task path afterwards.",
+                ]
+                confidence = 0.82 if len(artifact_paths) == 1 else 0.7
+                ambiguity_level = "low" if len(artifact_paths) == 1 else "medium"
+            else:
+                next_action = previous_next_action if previous_next_action in {
+                    "inspect",
+                    "search",
+                    "create",
+                    "modify",
+                    "debug",
+                    "test",
+                    "explain",
+                    "plan",
+                } else "inspect"
+                current_verification_target = current_verification_target or "Keep the change aligned with the active goal and verify the most relevant path afterwards."
+                execution_outline = [
+                    "Inspect the active artifact and continue from the current task state.",
+                    "Perform the next smallest safe step and verify it.",
+                ]
+                confidence = 0.68 if has_follow_up_reference(request) and len(artifact_paths) == 1 else 0.62 if len(artifact_paths) == 1 else 0.48
+                ambiguity_level = "low" if len(artifact_paths) == 1 else "medium"
         else:
             active_goal = previous_goal or request
             next_action = "search"
@@ -484,8 +512,92 @@ class TaskStateUpdater:
         normalized = str(value or "").strip().lower()
         return mapping.get(normalized, "")
 
-    def _should_create_follow_up_artifact(self, request: str) -> bool:
-        return is_clear_low_risk_build_request(request) or looks_like_additive_request(request)
+    def _continuation_next_action(
+        self,
+        *,
+        previous_next_action: str,
+        artifact_paths: list[str],
+        follow_up_creates_distinct_artifact: bool,
+    ) -> str:
+        if follow_up_creates_distinct_artifact:
+            return "create"
+        if artifact_paths:
+            if previous_next_action in {"debug", "test", "explain", "plan"}:
+                return previous_next_action
+            return "modify"
+        return "inspect"
+
+    def _should_create_follow_up_artifact(
+        self,
+        request: str,
+        *,
+        existing_artifacts: list[TaskArtifact],
+    ) -> bool:
+        if not existing_artifacts:
+            return is_clear_low_risk_build_request(request) or looks_like_additive_request(request)
+        return self._requests_distinct_follow_up_artifact(request, existing_artifacts=existing_artifacts)
+
+    def _requests_distinct_follow_up_artifact(
+        self,
+        request: str,
+        *,
+        existing_artifacts: list[TaskArtifact],
+    ) -> bool:
+        normalized = normalize_text(request)
+        if not normalized:
+            return False
+
+        explicit_path = bool(
+            re.search(
+                r"[\w./-]+\.(py|js|ts|tsx|jsx|json|md|html|css|sh|toml|ya?ml|go|rs|java|kt|rb)\b",
+                request,
+                flags=re.IGNORECASE,
+            )
+        )
+        if explicit_path:
+            return True
+
+        requested_extension = infer_requested_extension(request)
+        existing_extensions = {
+            Path(str(item.path or item.name or "")).suffix.lower()
+            for item in existing_artifacts
+            if Path(str(item.path or item.name or "")).suffix
+        }
+        if requested_extension is not None:
+            if requested_extension not in existing_extensions:
+                return True
+            if requested_extension in {".html", ".css"} and existing_extensions & {".js", ".jsx", ".ts", ".tsx"}:
+                return True
+
+        explicit_surface_request = any(
+            marker in normalized
+            for marker in (
+                "datei",
+                "file",
+                "seite",
+                "page",
+                "komponente",
+                "component",
+                "stylesheet",
+                "template",
+            )
+        )
+        explicit_new_surface = any(
+            marker in normalized
+            for marker in (
+                "neu",
+                "new",
+                "separate",
+                "separat",
+                "extra",
+                "additional",
+                "zusatz",
+                "zusätzlich",
+                "zweite",
+                "second",
+            )
+        )
+        return explicit_surface_request and explicit_new_surface
 
     def _filter_artifacts_for_scope(
         self,

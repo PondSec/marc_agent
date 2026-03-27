@@ -135,6 +135,7 @@ def task_state_update_prompt(
         "- For scope corrections or rollbacks, narrow or revert only the necessary part of the prior work.",
         "- Update constraints and assumptions explicitly.",
         "- Keep root_goal stable across refinements unless the user clearly starts a new task.",
+        "- If a compatible active artifact already exists and the user is extending its behavior, prefer modify over create unless the user clearly asks for a distinct new artifact or file surface.",
         "- next_action and next_best_action should be the single best next move, not a full route tree.",
         "- Preserve the execution order: inspect current state and active artifacts, gather evidence, act in the smallest sensible step, then verify against verification_target.",
         "- Ask clarification only if acting now would likely hit the wrong artifact or cause destructive behavior.",
@@ -418,6 +419,48 @@ def generate_content_retry_prompt(
     else:
         sections.append("Create the file from scratch. Return the full new file content only.")
     sections.append("Do not add markdown fences or explanations.")
+    return "\n\n".join(sections)
+
+
+def generate_content_continuation_prompt(
+    route: RouterOutput,
+    session: SessionState | None = None,
+    *,
+    path: str,
+    partial_content: str,
+    current_content: str | None = None,
+) -> str:
+    sections = [
+        "Finish the full file content for exactly one file.",
+        "A previous slow generation already produced a partial draft. Use that progress instead of starting over blindly.",
+        f"User goal: {_trim_text(route.user_goal, 240)}",
+        f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
+        f"Task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
+        f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}",
+        f"Target path: {path}",
+        f"Search hints: {_format_list(route.search_terms[:6])}",
+    ]
+    if session is not None:
+        sections.extend(
+            [
+                f"Diagnostic context: {_diagnostic_context(session)}",
+                f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
+            ]
+        )
+    if current_content is not None:
+        sections.extend(
+            [
+                "Current file content:",
+                current_content,
+            ]
+        )
+    sections.extend(
+        [
+            "Partial draft from the previous attempt:",
+            partial_content,
+            "Return the complete final file content only. Preserve correct parts of the partial draft, finish the missing parts, and do not add markdown fences or explanations.",
+        ]
+    )
     return "\n\n".join(sections)
 
 

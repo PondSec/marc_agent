@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import time
@@ -9,12 +10,15 @@ from agent.models import SessionState, WorkspaceSnapshot
 from agent.prompts import (
     choose_path_prompt,
     final_response_prompt,
+    generate_content_continuation_prompt,
     generate_content_prompt,
     generate_content_retry_prompt,
 )
 from agent.router import IntentRouter
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
+from agent.verification import ValidationPlanner
+from llm.ollama_client import OllamaGenerationError
 from llm.provider import LLMProvider
 from llm.schemas import (
     AgentActionType,
@@ -28,6 +32,23 @@ from runtime.logger import AgentLogger
 
 
 WRITE_INTENTS = {RouteIntent.CREATE, RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.DELETE}
+
+
+@dataclass(slots=True)
+class GenerationIssue:
+    reason: str
+    timeout_like: bool
+    context_pressure_likely: bool
+    partial_text: str = ""
+    had_progress: bool = False
+    characters: int = 0
+
+
+@dataclass(slots=True)
+class GenerationRecoveryAttempt:
+    strategy: str
+    prompt_kind: str
+    model_name: str | None = None
 
 
 class Planner:
@@ -58,6 +79,7 @@ class Planner:
             num_ctx=max(int(getattr(llm_config, "router_num_ctx", self._llm_num_ctx(2048))), 1024),
         )
         self.decision_policy = ExecutionDecisionPolicy(logger=logger)
+        self.validation_planner = ValidationPlanner()
 
     def update_task_state(
         self,
@@ -191,6 +213,14 @@ class Planner:
             )
 
         if session.changed_files:
+            if (
+                session.validation_status == "failed"
+                and session.task_state is not None
+                and session.task_state.execution_strategy == "debug_repair"
+            ):
+                repair_decision = self.execute_action_from_plan(route, session)
+                if repair_decision.action_type != AgentActionType.FINAL or session.stop_reason:
+                    return repair_decision
             command = self._pick_validation_command(session)
             if command is not None:
                 return self._validation_decision(
@@ -542,6 +572,11 @@ class Planner:
             return None
         content = self._generate_file_content(route, session, path=path)
         if not content:
+            self._record_generation_blocker(
+                session,
+                "No reliable content could be generated for the routed artifact.",
+                stop_reason="generation_failed",
+            )
             return self._final_decision(
                 "The new artifact could not be generated from the routed goal.",
                 "Ich konnte noch keinen belastbaren Inhalt fuer die neue Datei erzeugen.",
@@ -576,11 +611,21 @@ class Planner:
             current_content=current_content,
         )
         if not content:
+            self._record_generation_blocker(
+                session,
+                f"No reliable update content could be generated for {target}.",
+                stop_reason="generation_failed",
+            )
             return self._final_decision(
                 "The update content could not be generated from the routed goal.",
                 "Ich konnte noch keine belastbare Aktualisierung fuer die Zieldatei erzeugen.",
             )
         if content.strip() == current_content.strip():
+            self._record_generation_blocker(
+                session,
+                f"The routed update for {target} did not produce a real file change.",
+                stop_reason="no_effective_change",
+            )
             return self._final_decision(
                 "The routed update does not change the current file content.",
                 "Ich habe keine belastbare inhaltliche Aenderung fuer die Zieldatei ableiten koennen.",
@@ -619,7 +664,7 @@ class Planner:
         command = self._next_diagnostic_command(session)
         if command is not None and not self._command_already_ran(session, command):
             return AgentDecision(
-                thought_summary="Reproduce the issue with the most relevant recent validation or terminal command before editing.",
+                thought_summary="Reproduce the issue with the strongest available runtime or validation command before editing.",
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="run_tests",
                 tool_args={"command": command, "cwd": ".", "timeout": 120},
@@ -663,6 +708,15 @@ class Planner:
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return None
+        fallback_plan = self.validation_planner.build_plan(
+            session.task,
+            snapshot,
+            changed_files=[item.path for item in session.changed_files],
+            session=session,
+        )
+        for item in fallback_plan:
+            if item.command not in passed:
+                return item.command
         for command in snapshot.likely_commands:
             if command and command not in passed:
                 return command
@@ -714,16 +768,31 @@ class Planner:
             command = pick_failed(session.follow_up_context.validation_runs)
             if command:
                 return command
+        for item in self.validation_planner.build_diagnostic_plan(session):
+            command = str(item.command or "").strip()
+            if command:
+                return command
+        if session.follow_up_context is not None:
             for item in reversed(session.follow_up_context.recent_commands):
                 command = str(item or "").strip()
-                if command:
+                if command and self.validation_planner.command_scope(command) == "runtime":
                     return command
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return None
+        fallback_plan = self.validation_planner.build_plan(
+            session.task,
+            snapshot,
+            changed_files=[],
+            session=session,
+        )
+        for item in fallback_plan:
+            command = str(item.command or "").strip()
+            if command and item.verification_scope == "runtime":
+                return command
         for item in snapshot.likely_commands:
             command = str(item or "").strip()
-            if command:
+            if command and self.validation_planner.command_scope(command) == "runtime":
                 return command
         return None
 
@@ -738,10 +807,12 @@ class Planner:
         )
 
     def _diagnosis_attempted_without_findings(self, session: SessionState) -> bool:
-        return any(
-            item.tool_name in {"run_tests", "run_shell"} and item.success
-            for item in session.tool_calls
-        ) and not session.diagnostics
+        successful_runtime_checks = {
+            run.command
+            for run in session.validation_runs
+            if run.verification_scope == "runtime" and run.status == "passed"
+        }
+        return bool(successful_runtime_checks) and not session.diagnostics
 
     def _missing_issue_evidence_response(self, route: RouterOutput, session: SessionState) -> str:
         follow_up = session.follow_up_context
@@ -751,7 +822,9 @@ class Planner:
         ]
         if previous_task:
             lines.append(f"Vorheriger Task: {previous_task}")
-        if follow_up and follow_up.recent_commands:
+        if session.validation_runs:
+            lines.append(f"Gepruefter Befehl: {session.validation_runs[-1].command}")
+        elif follow_up and follow_up.recent_commands:
             lines.append(f"Gepruefter Befehl: {follow_up.recent_commands[-1]}")
         lines.extend(
             [
@@ -829,6 +902,10 @@ class Planner:
         return None
 
     def _choose_create_path(self, route: RouterOutput, session: SessionState) -> str:
+        follow_up_override = self._follow_up_create_path_override(route, session)
+        if follow_up_override:
+            self._log("path_generation_skipped", path=follow_up_override, reason="active_artifact_follow_up")
+            return follow_up_override
         for candidate in route.entities.target_paths:
             if candidate:
                 return candidate
@@ -843,8 +920,10 @@ class Planner:
             self._log("path_generation_started", target_name=route.entities.target_name)
             response = self.llm.generate(
                 choose_path_prompt(route, session),
+                model=self._lightweight_generation_model_name(),
                 timeout=max(self._llm_timeout(20), 20),
-                num_ctx=2048,
+                total_timeout=max(self._llm_timeout(45), 45),
+                num_ctx=1536,
                 retries=0,
             )
             path = self._sanitize_generated_path(response, self._preferred_extension(route))
@@ -857,6 +936,40 @@ class Planner:
         self._log("path_generation_finished", path=path, source="default")
         return path
 
+    def _follow_up_create_path_override(self, route: RouterOutput, session: SessionState) -> str | None:
+        task_state = session.task_state
+        if task_state is None or route.entities.target_paths:
+            return None
+
+        primary_targets = [
+            artifact
+            for artifact in task_state.target_artifacts
+            if artifact.role == "primary_target"
+        ]
+        has_concrete_new_target = any(
+            artifact.path or str(artifact.kind or "").startswith(".")
+            for artifact in primary_targets
+        )
+        if has_concrete_new_target:
+            return None
+
+        preferred_extension = self._preferred_extension(route)
+        candidate_paths = [
+            candidate
+            for candidate in self._candidate_paths(route, session)
+            if Path(candidate).suffix
+        ]
+        if len(candidate_paths) != 1:
+            return None
+
+        candidate = candidate_paths[0]
+        candidate_extension = Path(candidate).suffix
+        if preferred_extension not in {"", ".txt"} and candidate_extension != preferred_extension:
+            return None
+        if task_state.goal_relation not in {"continue", "refine"}:
+            return None
+        return candidate
+
     def _generate_file_content(
         self,
         route: RouterOutput,
@@ -864,16 +977,22 @@ class Planner:
         *,
         path: str,
         current_content: str | None = None,
-        ) -> str | None:
+    ) -> str | None:
+        prompt = generate_content_prompt(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
         try:
-            self._log("content_generation_started", path=path, update=current_content is not None)
+            self._log(
+                "content_generation_started",
+                path=path,
+                update=current_content is not None,
+                model=self._primary_generation_model_name(),
+            )
             content = self.llm.generate(
-                generate_content_prompt(
-                    route,
-                    session,
-                    path=path,
-                    current_content=current_content,
-                ),
+                prompt,
                 timeout=max(self._llm_timeout(75), 75),
                 total_timeout=max(self._llm_timeout(210), 210),
                 num_ctx=4096,
@@ -885,13 +1004,27 @@ class Planner:
                 ),
             )
         except Exception as exc:
-            self._log("content_generation_error", error=str(exc), path=path)
+            issue = self._assess_generation_issue(
+                exc,
+                prompt=prompt,
+                current_content=current_content,
+            )
+            self._log(
+                "content_generation_error",
+                error=str(exc),
+                path=path,
+                reason=issue.reason,
+                had_progress=issue.had_progress,
+                partial_characters=issue.characters,
+                context_pressure=issue.context_pressure_likely,
+            )
             retried = self._retry_content_generation(
                 route,
                 session=session,
                 path=path,
                 current_content=current_content,
                 cause=exc,
+                prompt=prompt,
             )
             if retried is not None:
                 self._log(
@@ -930,40 +1063,54 @@ class Planner:
         path: str,
         current_content: str | None = None,
         cause: Exception | None = None,
+        prompt: str,
     ) -> str | None:
-        timeout_like = self._is_timeout_error(cause)
-        attempts: list[tuple[str | None, str]] = [(None, "compact_same_model")]
-        fallback_model = self._fallback_generation_model_name()
-        if fallback_model:
-            attempts.append((fallback_model, "compact_fallback_model"))
+        issue = self._assess_generation_issue(
+            cause,
+            prompt=prompt,
+            current_content=current_content,
+        )
+        attempts = self._content_generation_recovery_attempts(issue)
+        if not attempts:
+            return None
 
-        for model_name, strategy in attempts:
+        for attempt in attempts:
+            retry_prompt = self._content_generation_prompt_for_attempt(
+                attempt,
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                prompt=prompt,
+                partial_text=issue.partial_text,
+            )
+            timeout_seconds, total_timeout_seconds, num_ctx = self._content_generation_runtime_for_attempt(
+                attempt,
+                issue,
+            )
             try:
-                base_timeout = 75 if strategy == "compact_same_model" and timeout_like else 60 if timeout_like else 45
-                overall_timeout = max(base_timeout * 3, 180 if timeout_like else 120)
                 self._log(
                     "content_generation_retry_started",
                     path=path,
-                    strategy=strategy,
-                    model=model_name or getattr(getattr(self.llm, "config", None), "model_name", None),
+                    strategy=attempt.strategy,
+                    model=attempt.model_name or self._primary_generation_model_name(),
+                    reason=issue.reason,
+                    had_progress=issue.had_progress,
+                    partial_characters=issue.characters,
+                    context_pressure=issue.context_pressure_likely,
                 )
                 text = self.llm.generate(
-                    generate_content_retry_prompt(
-                        route,
-                        session,
-                        path=path,
-                        current_content=current_content,
-                    ),
-                    model=model_name,
-                    timeout=max(self._llm_timeout(base_timeout), base_timeout),
-                    total_timeout=max(self._llm_timeout(overall_timeout), overall_timeout),
-                    num_ctx=2048,
+                    retry_prompt,
+                    model=attempt.model_name,
+                    timeout=timeout_seconds,
+                    total_timeout=total_timeout_seconds,
+                    num_ctx=num_ctx,
                     retries=0,
                     progress_callback=self._progress_logger(
                         "content_generation_progress",
                         path=path,
                         update=current_content is not None,
-                        strategy=strategy,
+                        strategy=attempt.strategy,
                     ),
                 )
                 cleaned = self._strip_code_fences(text).strip()
@@ -971,18 +1118,158 @@ class Planner:
                     self._log(
                         "content_generation_retry_finished",
                         path=path,
-                        strategy=strategy,
+                        strategy=attempt.strategy,
                         characters=len(cleaned),
                     )
                     return cleaned
             except Exception as exc:
+                retry_issue = self._assess_generation_issue(
+                    exc,
+                    prompt=retry_prompt,
+                    current_content=current_content,
+                )
                 self._log(
                     "content_generation_retry_error",
                     path=path,
-                    strategy=strategy,
+                    strategy=attempt.strategy,
                     error=str(exc),
+                    reason=retry_issue.reason,
+                    had_progress=retry_issue.had_progress,
+                    partial_characters=retry_issue.characters,
                 )
         return None
+
+    def _assess_generation_issue(
+        self,
+        exc: Exception | None,
+        *,
+        prompt: str,
+        current_content: str | None = None,
+    ) -> GenerationIssue:
+        partial_text = self._strip_code_fences(str(getattr(exc, "partial_text", "") or "")).strip()
+        characters = int(getattr(exc, "characters", len(partial_text)) or len(partial_text))
+        had_progress = bool(getattr(exc, "progress_seen", False)) or bool(partial_text) or characters > 0
+        timeout_like = bool(getattr(exc, "timed_out", False)) or self._is_timeout_error(exc)
+        reason = str(getattr(exc, "reason", "") or "").strip()
+        if not reason:
+            reason = "timeout" if timeout_like else "runtime_error"
+        return GenerationIssue(
+            reason=reason,
+            timeout_like=timeout_like,
+            context_pressure_likely=self._context_pressure_likely(
+                prompt=prompt,
+                current_content=current_content,
+                exc=exc,
+            ),
+            partial_text=partial_text,
+            had_progress=had_progress,
+            characters=characters,
+        )
+
+    def _context_pressure_likely(
+        self,
+        *,
+        prompt: str,
+        current_content: str | None,
+        exc: Exception | None,
+    ) -> bool:
+        lowered = str(exc or "").lower()
+        context_markers = (
+            "context",
+            "token",
+            "num_ctx",
+            "prompt too long",
+            "input too long",
+            "out of memory",
+            "kv cache",
+        )
+        if any(marker in lowered for marker in context_markers):
+            return True
+        if len(prompt) >= 12_000:
+            return True
+        if current_content is not None and len(current_content) >= 6_000:
+            return True
+        return False
+
+    def _content_generation_recovery_attempts(
+        self,
+        issue: GenerationIssue,
+    ) -> list[GenerationRecoveryAttempt]:
+        attempts: list[GenerationRecoveryAttempt] = []
+        fallback_model = self._lightweight_generation_model_name()
+
+        if issue.partial_text:
+            attempts.append(GenerationRecoveryAttempt("resume_same_model", "resume"))
+        elif issue.context_pressure_likely:
+            attempts.append(GenerationRecoveryAttempt("compact_same_model", "compact"))
+        elif issue.reason == "startup_timeout" or (issue.timeout_like and not fallback_model):
+            attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
+        elif not issue.timeout_like:
+            return attempts
+
+        if fallback_model:
+            if issue.partial_text:
+                attempts.append(
+                    GenerationRecoveryAttempt("resume_fallback_model", "resume", fallback_model)
+                )
+            elif issue.context_pressure_likely:
+                attempts.append(
+                    GenerationRecoveryAttempt("compact_fallback_model", "compact", fallback_model)
+                )
+            elif issue.timeout_like:
+                attempts.append(GenerationRecoveryAttempt("fallback_model", "full", fallback_model))
+        return attempts
+
+    def _content_generation_prompt_for_attempt(
+        self,
+        attempt: GenerationRecoveryAttempt,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        prompt: str,
+        partial_text: str,
+    ) -> str:
+        if attempt.prompt_kind == "resume":
+            return generate_content_continuation_prompt(
+                route,
+                session,
+                path=path,
+                partial_content=partial_text,
+                current_content=current_content,
+            )
+        if attempt.prompt_kind == "compact":
+            return generate_content_retry_prompt(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+            )
+        return prompt
+
+    def _content_generation_runtime_for_attempt(
+        self,
+        attempt: GenerationRecoveryAttempt,
+        issue: GenerationIssue,
+    ) -> tuple[int, int, int]:
+        if attempt.prompt_kind == "resume":
+            base_timeout = 60 if issue.timeout_like else 45
+            total_timeout = 180 if issue.timeout_like else 120
+            num_ctx = 3072 if attempt.model_name is None else 2048
+        elif attempt.prompt_kind == "compact":
+            base_timeout = 60 if issue.timeout_like else 45
+            total_timeout = 180 if issue.timeout_like else 120
+            num_ctx = 2048
+        else:
+            base_timeout = 75 if issue.timeout_like else 60
+            total_timeout = 210 if issue.timeout_like else 150
+            num_ctx = 4096 if attempt.model_name is None else 3072
+        return (
+            max(self._llm_timeout(base_timeout), base_timeout),
+            max(self._llm_timeout(total_timeout), total_timeout),
+            num_ctx,
+        )
 
     def _current_file_content(self, session: SessionState, path: str) -> str | None:
         target = Path(session.workspace_root, path)
@@ -1037,14 +1324,18 @@ class Planner:
             return route.direct_response
         if route.intent == RouteIntent.PLAN:
             return self._render_plan_response(route)
+        prompt = final_response_prompt(route, session)
         try:
-            self._log("final_response_generation_started")
+            self._log(
+                "final_response_generation_started",
+                model=self._lightweight_generation_model_name() or self._primary_generation_model_name(),
+            )
             response = self.llm.generate(
-                final_response_prompt(route, session),
-                model=self._fallback_generation_model_name(),
+                prompt,
+                model=self._lightweight_generation_model_name(),
                 timeout=max(self._llm_timeout(20), 20),
                 total_timeout=max(self._llm_timeout(60), 60),
-                num_ctx=1536,
+                num_ctx=1024,
                 retries=0,
                 progress_callback=self._progress_logger("final_response_generation_progress"),
             ).strip()
@@ -1052,8 +1343,21 @@ class Planner:
                 self._log("final_response_generation_finished", characters=len(response))
                 return self._strip_code_fences(response).strip()
         except Exception as exc:
-            self._log("final_response_generation_error", error=str(exc))
-        return self._deterministic_final_response(route, session)
+            issue = self._assess_generation_issue(exc, prompt=prompt)
+            self._log(
+                "final_response_generation_error",
+                error=str(exc),
+                reason=issue.reason,
+                had_progress=issue.had_progress,
+                partial_characters=issue.characters,
+            )
+        deterministic = self._deterministic_final_response(route, session)
+        self._log(
+            "final_response_generation_finished",
+            characters=len(deterministic),
+            source="deterministic",
+        )
+        return deterministic
 
     def _final_decision(
         self,
@@ -1068,6 +1372,22 @@ class Planner:
             expected_outcome="Return a user-facing response.",
             final_response=final_response,
         )
+
+    def _record_generation_blocker(
+        self,
+        session: SessionState,
+        message: str,
+        *,
+        stop_reason: str,
+    ) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        if text not in session.blockers:
+            session.blockers.append(text)
+            session.blockers = session.blockers[-10:]
+        session.last_error = text
+        session.stop_reason = stop_reason
 
     def _read_paths(self, session: SessionState) -> list[str]:
         return [
@@ -1531,7 +1851,14 @@ class Planner:
         configured = getattr(getattr(self.llm, "config", None), "ollama_num_ctx", minimum)
         return max(int(configured), minimum)
 
-    def _fallback_generation_model_name(self) -> str | None:
+    def _primary_generation_model_name(self) -> str | None:
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return None
+        candidate = str(getattr(config, "model_name", "") or "").strip()
+        return candidate or None
+
+    def _lightweight_generation_model_name(self) -> str | None:
         config = getattr(self.llm, "config", None)
         if config is None:
             return None
@@ -1542,6 +1869,8 @@ class Planner:
         return candidate
 
     def _is_timeout_error(self, exc: Exception | None) -> bool:
+        if isinstance(exc, OllamaGenerationError):
+            return exc.timed_out
         return exc is not None and "timed out" in str(exc).lower()
 
     def _session_language(self, session: SessionState) -> str:

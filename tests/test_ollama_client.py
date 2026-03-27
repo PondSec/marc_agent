@@ -4,8 +4,10 @@ import json
 import socket
 from urllib import request
 
+import pytest
+
 from config.settings import AppConfig
-from llm.ollama_client import OllamaClient
+from llm.ollama_client import OllamaClient, OllamaGenerationError
 
 
 class FakeResponse:
@@ -137,6 +139,7 @@ def test_ollama_client_aggregates_streamed_generate_chunks(monkeypatch, tmp_path
 def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypatch, tmp_path):
     config = AppConfig(workspace_root=str(tmp_path), llm_timeout=6)
     client = OllamaClient(config)
+    progress_events: list[dict] = []
 
     def fake_urlopen(req: request.Request, timeout):
         payload = json.loads(req.data.decode("utf-8"))
@@ -157,6 +160,62 @@ def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypa
         FakeMonotonic([0.0, 4.0, 5.0, 9.0, 10.0]),
     )
 
-    result = client.generate("say hello", timeout=6, total_timeout=20)
+    result = client.generate(
+        "say hello",
+        timeout=6,
+        total_timeout=20,
+        retries=0,
+        progress_callback=progress_events.append,
+    )
 
     assert result == "hello"
+    assert [event["type"] for event in progress_events] == ["chunk", "heartbeat", "chunk"]
+
+
+def test_ollama_client_uses_longer_initial_response_timeout_for_slow_local_models(monkeypatch, tmp_path):
+    captured: list[int] = []
+    config = AppConfig(workspace_root=str(tmp_path), llm_timeout=25)
+    client = OllamaClient(config)
+
+    def fake_urlopen(req: request.Request, timeout):
+        del req
+        captured.append(timeout)
+        return FakeResponse({"response": "ok"})
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    result = client.generate("slow first token", timeout=25, total_timeout=210, retries=0)
+
+    assert result == "ok"
+    assert captured[0] > 25
+
+
+def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progress(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), llm_timeout=6, llm_request_retries=0)
+    client = OllamaClient(config)
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "hel", "done": False}) + "\n").encode("utf-8"),
+                socket.timeout("still generating"),
+                socket.timeout("still generating"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 1.0, 2.0, 5.0, 9.5]),
+    )
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate("say hello", timeout=6, total_timeout=20, retries=0)
+
+    error = excinfo.value
+    assert error.reason == "inactivity_timeout"
+    assert error.partial_text == "hel"
+    assert error.characters == 3
+    assert error.progress_seen is True

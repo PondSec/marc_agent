@@ -59,6 +59,7 @@ class ValidationCommand(StrictModel):
     command: str
     cwd: str = "."
     kind: str = "check"
+    verification_scope: Literal["syntax", "static", "runtime"] = "static"
     source: str = "heuristic"
     priority: int = 100
     reason: str | None = None
@@ -69,6 +70,7 @@ class ValidationRunRecord(StrictModel):
     command: str
     cwd: str = "."
     kind: str | None = None
+    verification_scope: Literal["syntax", "static", "runtime"] = "static"
     status: Literal["passed", "failed", "blocked", "timeout"]
     exit_code: int | None = None
     risk_level: str | None = None

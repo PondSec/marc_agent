@@ -205,6 +205,49 @@ def test_reporter_marks_partial_unvalidated_changes_honestly(tmp_path):
     assert "Geaendert: app/auth.py." in response
 
 
+def test_reporter_explains_missing_functional_validation_even_if_static_checks_passed(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="fix tic tac toe bug",
+        workspace_root=str(tmp_path),
+        status="partial",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="passed",
+        stop_reason="functional_validation_missing",
+        task_state=TaskState(
+            latest_user_turn="fix tic tac toe bug",
+            root_goal="Build a Tic Tac Toe game in Python.",
+            active_goal="Diagnose and fix the broken input handling.",
+            goal_relation="report_problem",
+            output_expectation="Diagnose the bug, apply the smallest safe fix, and rerun the interaction path.",
+            open_problem="Moves are always rejected.",
+            verification_target="Reproduce the interactive failure and rerun it after the fix.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.82,
+            next_action="debug",
+            execution_outline=["Read the script", "Reproduce the issue", "Fix and rerun it"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="modify"))
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(session)
+
+    assert "functional reproduction or smoke test is still missing" in response
+
+
 def test_reporter_localizes_machine_summary_fallback_to_english(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

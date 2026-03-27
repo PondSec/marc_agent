@@ -145,7 +145,7 @@ def _infer_user_intent(
     evidence_kinds = {item.kind for item in evidence}
     if goal_relation in {"correct", "rollback_request", "scope_change"}:
         return "correct"
-    if next_best_action == "debug" or open_problem or evidence_kinds & {"diagnostic", "test", "log", "command"}:
+    if next_best_action == "debug" or open_problem or evidence_kinds & {"diagnostic", "test", "log"}:
         return "repair"
     if _contains_any(text, ("refactor", "cleanup", "clean up", "cleaner", "maintain", "readability", "modular")):
         return "refactor"
@@ -219,7 +219,7 @@ def _infer_execution_strategy(
         or next_best_action == "debug"
         or goal_relation == "report_problem"
         or open_problem is not None
-        or evidence_kinds & {"diagnostic", "test", "log", "command"}
+        or evidence_kinds & {"diagnostic", "test", "log"}
     ):
         return "debug_repair"
     if current_user_intent == "refactor" or _contains_any(

@@ -15,18 +15,34 @@ from agent.models import (
     WorkspaceSnapshot,
 )
 from agent.planner import Planner
+from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
+from config.settings import AppConfig
+from llm.ollama_client import OllamaGenerationError
 from llm.schemas import AgentActionType, RouteIntent
+from runtime.logger import AgentLogger
 
 
 class ScriptedLLM:
-    def __init__(self, json_payloads=None, text_payloads=None, generate_fail_times: int = 0, generate_fail_message: str = "timed out"):
+    def __init__(
+        self,
+        json_payloads=None,
+        text_payloads=None,
+        generate_fail_times: int = 0,
+        generate_fail_message: str = "timed out",
+        generate_side_effects=None,
+        progress_events=None,
+        config: AppConfig | None = None,
+    ):
         self.json_payloads = list(json_payloads or [])
         self.text_payloads = list(text_payloads or [])
         self.generate_calls: list[dict] = []
         self.generate_json_calls: list[dict] = []
         self.generate_fail_times = generate_fail_times
         self.generate_fail_message = generate_fail_message
+        self.generate_side_effects = list(generate_side_effects or [])
+        self.progress_events = list(progress_events or [])
+        self.config = config or AppConfig(workspace_root=".")
 
     def generate_json(self, *args, **kwargs):
         self.generate_json_calls.append({"args": args, "kwargs": kwargs})
@@ -36,6 +52,16 @@ class ScriptedLLM:
 
     def generate(self, *args, **kwargs):
         self.generate_calls.append({"args": args, "kwargs": kwargs})
+        callback = kwargs.get("progress_callback")
+        if self.progress_events:
+            for event in self.progress_events.pop(0):
+                if callback is not None:
+                    callback(dict(event))
+        if self.generate_side_effects:
+            effect = self.generate_side_effects.pop(0)
+            if isinstance(effect, Exception):
+                raise effect
+            return effect
         if self.generate_fail_times > 0:
             self.generate_fail_times -= 1
             raise RuntimeError(self.generate_fail_message)
@@ -363,6 +389,61 @@ def test_planner_generates_write_after_update_target_is_read(tmp_path):
     assert "updated" in decision.tool_args["content"]
 
 
+def test_planner_marks_generation_failure_honestly_before_any_validation(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("print('old version')\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested update.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "run_validation",
+                        "reason": "Validate the changed code.",
+                    },
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_fail_times=5,
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="bau noch ein menü dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, goal_relation="refine")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert decision.tool_name is None
+    assert session.blockers == ["No reliable update content could be generated for app.py."]
+    assert session.stop_reason == "generation_failed"
+    assert session.validation_status == "not_run"
+    assert session.changed_files == []
+
+
 def test_planner_reads_follow_up_target_before_diagnosing_vague_bug_report(tmp_path):
     target = tmp_path / "app" / "main.py"
     target.parent.mkdir()
@@ -497,6 +578,171 @@ def test_planner_reruns_last_failing_command_for_debug_follow_up(tmp_path):
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "run_tests"
     assert decision.tool_args["command"] == "python -m pytest"
+
+
+def test_planner_prefers_python_smoke_reproduction_over_prior_syntax_only_check(tmp_path):
+    target = tmp_path / "tic_tac_toe.py"
+    target.write_text("choice = input('move: ')\nprint(choice)\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="debug",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "diagnose_issue",
+                        "reason": "Reproduce the reported issue before editing.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "update_artifact",
+                        "reason": "Apply the focused fix.",
+                    },
+                ],
+                target_paths=["tic_tac_toe.py"],
+                target_name="tic_tac_toe.py",
+            )
+        ]
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="man kann das spiel nicht vernünftig spielen, bitte fixen",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 1,
+                "language_counts": {"python": 1},
+                "important_files": ["tic_tac_toe.py"],
+                "focus_files": ["tic_tac_toe.py"],
+                "project_labels": ["python"],
+            }
+        ),
+        follow_up_context=FollowUpContext(
+            previous_task="schreib bitte in python ein Tic tac toe spiel",
+            target_paths=["tic_tac_toe.py"],
+            changed_files=["tic_tac_toe.py"],
+            read_files=["tic_tac_toe.py"],
+            recent_commands=['internal:python_syntax:["tic_tac_toe.py"]'],
+        ),
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        goal_relation="report_problem",
+        open_problem="The terminal board output and move parsing are broken.",
+        verification_target="Reproduce the failing interactive path, then fix and rerun it.",
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "tic_tac_toe.py"},
+            success=True,
+            summary="Read tic_tac_toe.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"].startswith("internal:python_cli_smoke:")
+
+
+def test_planner_reenters_debug_repair_after_failed_runtime_validation(tmp_path):
+    target = tmp_path / "tic_tac_toe.py"
+    target.write_text("print('broken')\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="debug",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "diagnose_issue",
+                        "reason": "Use the failing runtime evidence.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "update_artifact",
+                        "reason": "Apply the focused fix.",
+                    },
+                ],
+                target_paths=["tic_tac_toe.py"],
+                target_name="tic_tac_toe.py",
+            )
+        ],
+        text_payloads=["print('fixed')\n"],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="fix the tic tac toe bug",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 1,
+                "language_counts": {"python": 1},
+                "important_files": ["tic_tac_toe.py"],
+                "focus_files": ["tic_tac_toe.py"],
+                "project_labels": ["python"],
+            }
+        ),
+        validation_status="failed",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        goal_relation="report_problem",
+        open_problem="Moves are always rejected.",
+        verification_target="Reproduce the bug, fix it, and rerun the interactive path.",
+    )
+    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="write"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:python_cli_smoke:["tic_tac_toe.py"]',
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            summary="Validation command exited with 1.",
+            excerpt="EOFError",
+        )
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "tic_tac_toe.py"},
+            success=True,
+            summary="Read tic_tac_toe.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+    session.diagnostics.append(
+        DiagnosticRecord(
+            source="run_tests",
+            category="command_failure",
+            summary="EOFError while replaying the interactive path",
+            tool_name="run_tests",
+            command='internal:python_cli_smoke:["tic_tac_toe.py"]',
+            file_hints=["tic_tac_toe.py"],
+            excerpt="EOFError",
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "tic_tac_toe.py"
+    assert "fixed" in decision.tool_args["content"]
 
 
 def test_planner_includes_diagnostics_in_update_prompt_for_debug_follow_up(tmp_path):
@@ -789,6 +1035,89 @@ def test_planner_uses_search_terms_for_general_default_filename(tmp_path):
     assert decision.tool_args["path"] == "kanban_board.py"
 
 
+def test_planner_reuses_active_artifact_instead_of_junk_follow_up_filename(tmp_path):
+    target = tmp_path / "tic_tac_toe.py"
+    target.write_text("print('old version')\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="create",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "create_artifact",
+                        "reason": "Create the routed follow-up artifact.",
+                    }
+                ],
+                target_name="du aber men habe",
+                repo_context_needed=False,
+            )
+        ],
+        text_payloads=["print('new version')\n"],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="kannst du jetzt machen das ich aber ein menü habe mit 2 modis einmal gegen computer und einmal 2 spieler modus",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="ich möchte ein Tic tac Toe spiel in python haben",
+            target_paths=["tic_tac_toe.py"],
+            changed_files=["tic_tac_toe.py"],
+            read_files=["tic_tac_toe.py"],
+        ),
+        candidate_files=["tic_tac_toe.py"],
+    )
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Build a Tic Tac Toe game in Python.",
+        active_goal="Extend the active Tic Tac Toe implementation with the latest follow-up change.",
+        goal_relation="refine",
+        output_expectation="Extend the active implementation in place.",
+        verification_target="Update the active artifact and rerun the most relevant validation.",
+        target_artifacts=[
+            TaskArtifact(
+                path=None,
+                name="du aber men habe",
+                kind="artifact",
+                role="primary_target",
+                confidence=0.62,
+            )
+        ],
+        active_artifacts=[
+            TaskArtifact(
+                path="tic_tac_toe.py",
+                name="tic_tac_toe.py",
+                kind="file",
+                role="active_context",
+                confidence=0.9,
+            )
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.78,
+        next_action="create",
+        execution_outline=["Inspect active artifact", "Apply follow-up change", "Verify result"],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    session.router_result = planner.validate_router_output(payload)
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "tic_tac_toe.py"
+    assert "du_aber" not in decision.tool_args["path"]
+
+
 def test_planner_uses_tic_tac_toe_template_when_generation_times_out(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -845,7 +1174,7 @@ def test_planner_uses_tic_tac_toe_template_when_generation_times_out(tmp_path):
     assert "Computer waehlt Feld" in decision.tool_args["content"]
 
 
-def test_planner_retries_with_compact_prompt_before_template_fallback(tmp_path):
+def test_planner_avoids_compact_retry_when_context_is_not_the_likely_issue(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
             route_payload(
@@ -861,8 +1190,15 @@ def test_planner_retries_with_compact_prompt_before_template_fallback(tmp_path):
                 target_name="app.py",
             )
         ],
-        text_payloads=["print('gui version')\n"],
-        generate_fail_times=1,
+        generate_side_effects=[
+            OllamaGenerationError("timed out", reason="startup_timeout"),
+            "print('gui version')\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
     )
     payload = llm.json_payloads[0]
     planner = Planner(llm, "")
@@ -893,9 +1229,231 @@ def test_planner_retries_with_compact_prompt_before_template_fallback(tmp_path):
     assert decision.tool_args["content"] == "print('gui version')"
     assert len(llm.generate_calls) == 2
     assert llm.generate_calls[1]["kwargs"]["retries"] == 0
+    assert llm.generate_calls[1]["kwargs"]["model"] is None
     assert llm.generate_calls[1]["kwargs"]["timeout"] >= 75
-    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 180
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 210
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] <= 4096
+    assert "Produce the full file content for exactly one file." not in llm.generate_calls[1]["args"][0]
+    assert "Validated route:" in llm.generate_calls[1]["args"][0]
+
+
+def test_planner_uses_compact_retry_only_when_context_pressure_is_plausible(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested UI update.",
+                    }
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_side_effects=[
+            OllamaGenerationError("context window exceeded", reason="provider_error"),
+            "print('gui version')\n",
+        ],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Bau eine GUI dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "app.py"
+    target.write_text("x" * 7000, encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[1]["kwargs"]["model"] is None
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 2048
+    assert "Produce the full file content for exactly one file." in llm.generate_calls[1]["args"][0]
+
+
+def test_planner_preserves_partial_progress_before_switching_models(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested UI update.",
+                    }
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion",
+                reason="total_timeout",
+                partial_text="print('gui",
+                characters=10,
+            ),
+            "print('gui version')\n",
+        ],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Bau eine GUI dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "app.py"
+    target.write_text("print('terminal version')\n", encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_args["content"] == "print('gui version')"
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[1]["kwargs"]["model"] is None
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[1]["args"][0]
+    assert "print('gui" in llm.generate_calls[1]["args"][0]
+
+
+def test_planner_only_uses_fallback_model_after_same_model_recovery_fails(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested UI update.",
+                    }
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion",
+                reason="total_timeout",
+                partial_text="print('gui",
+                characters=10,
+            ),
+            OllamaGenerationError(
+                "timed out waiting for model completion",
+                reason="total_timeout",
+                partial_text="print('gui vers",
+                characters=15,
+            ),
+            "print('gui version')\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Bau eine GUI dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "app.py"
+    target.write_text("print('terminal version')\n", encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_args["content"] == "print('gui version')"
+    assert len(llm.generate_calls) == 3
+    assert llm.generate_calls[1]["kwargs"]["model"] is None
+    assert llm.generate_calls[2]["kwargs"]["model"] == "qwen2.5-coder:14b"
+
+
+def test_planner_emits_progress_events_for_long_content_generation(tmp_path):
+    logger = AgentLogger(tmp_path, "planner-progress")
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="create",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "create_artifact",
+                        "reason": "Create the requested standalone script.",
+                    }
+                ],
+                target_name="hello.py",
+                repo_context_needed=False,
+            )
+        ],
+        text_payloads=["print('hello')\n"],
+        progress_events=[
+            [
+                {"type": "heartbeat", "elapsed": 12.0, "idle_for": 4.0, "characters": 0},
+                {"type": "chunk", "elapsed": 13.0, "characters": 20},
+            ]
+        ],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "", logger=logger)
+    session = SessionState(
+        task="Schreib mir hello.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    logs = (tmp_path / "planner-progress.jsonl").read_text(encoding="utf-8")
+    assert "content_generation_progress" in logs
+    assert "content_generation_started" in logs
+    assert "content_generation_finished" in logs
 
 
 def test_planner_updates_tic_tac_toe_to_play_against_computer_on_timeout(tmp_path):
@@ -1027,8 +1585,9 @@ def test_planner_stops_recreating_file_after_successful_mutation(tmp_path):
 
     decision = planner.decide_next_action(session.task, session)
 
-    assert decision.action_type == AgentActionType.FINAL
-    assert decision.final_response == "Fertig."
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"].startswith("internal:python_cli_smoke:")
 
 
 def test_planner_runs_validation_after_changes(tmp_path):

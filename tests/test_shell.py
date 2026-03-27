@@ -54,3 +54,29 @@ def test_shell_internal_validation_handles_python_and_html_defaults(tmp_path):
 
     assert python_result["success"] is True
     assert html_result["success"] is True
+
+
+def test_shell_internal_python_cli_smoke_runs_interactive_script(tmp_path):
+    (tmp_path / "tic_tac_toe.py").write_text(
+        (
+            "choice = input('move: ')\n"
+            "print(f'you chose {choice}')\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command=f'internal:python_cli_smoke:{json.dumps(["tic_tac_toe.py"])}',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "you chose 1" in result["stdout"]

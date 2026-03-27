@@ -344,6 +344,7 @@ class AgentCore:
             task,
             snapshot,
             changed_files=[item.path for item in session.changed_files],
+            session=session,
         )
         session.verification_commands = [item.command for item in session.validation_plan]
         if not session.completion_criteria:
@@ -573,6 +574,11 @@ class AgentCore:
             command=command_text,
             cwd=str(decision.tool_args.get("cwd", ".")),
             kind=plan_item.kind if plan_item else "check",
+            verification_scope=(
+                self.validation_planner.command_scope(plan_item)
+                if plan_item is not None
+                else self.validation_planner.command_scope(command_text)
+            ),
             status=status,
             exit_code=result.data.get("exit_code"),
             risk_level=result.risk_level,
@@ -625,6 +631,7 @@ class AgentCore:
                 session.task,
                 session.workspace_snapshot,
                 changed_files=[item.path for item in session.changed_files],
+                session=session,
             )
             if fallback_plan:
                 session.validation_plan = fallback_plan
@@ -634,6 +641,8 @@ class AgentCore:
 
     def _resolve_final_status(self, session: SessionState, *, final_action: bool = False) -> str:
         if session.stop_reason == "user_cancelled" or session.stop_requested:
+            return "partial"
+        if self._debug_repair_incomplete(session):
             return "partial"
         if session.blockers or session.validation_status in {"failed", "blocked"}:
             return "partial"
@@ -648,6 +657,14 @@ class AgentCore:
     def _derive_stop_reason(self, session: SessionState) -> str:
         if session.blockers:
             return "blocked"
+        if self._runtime_verification_missing(session):
+            return "functional_validation_missing"
+        if self._reproduction_missing(session):
+            return "reproduction_missing"
+        if self._analysis_incomplete(session):
+            return "analysis_incomplete"
+        if self._repair_incomplete(session):
+            return "repair_incomplete"
         if session.changed_files and session.validation_status == "passed":
             return "validated"
         if session.changed_files and session.validation_status == "not_run":
@@ -674,6 +691,41 @@ class AgentCore:
             "helper_dir": str(self.config.helper_dir_path),
             "report_dir": str(self.config.report_dir_path),
         }
+
+    def _debug_repair_incomplete(self, session: SessionState) -> bool:
+        if session.task_state is None or session.task_state.execution_strategy != "debug_repair":
+            return False
+        if session.changed_files:
+            return self._runtime_verification_missing(session)
+        return self._reproduction_missing(session) or self._analysis_incomplete(session) or self._repair_incomplete(session)
+
+    def _runtime_verification_missing(self, session: SessionState) -> bool:
+        if not session.changed_files:
+            return False
+        if not self.validation_planner.runtime_verification_required(session):
+            return False
+        return not self.validation_planner.has_runtime_success(session)
+
+    def _reproduction_missing(self, session: SessionState) -> bool:
+        if session.changed_files:
+            return False
+        if not self.validation_planner.runtime_verification_required(session):
+            return False
+        return not self.validation_planner.has_runtime_attempt(session, current_generation_only=False)
+
+    def _analysis_incomplete(self, session: SessionState) -> bool:
+        if session.changed_files:
+            return False
+        if session.task_state is None or session.task_state.execution_strategy != "debug_repair":
+            return False
+        return self.validation_planner.has_runtime_attempt(session, current_generation_only=False) and not session.diagnostics
+
+    def _repair_incomplete(self, session: SessionState) -> bool:
+        if session.changed_files:
+            return False
+        if session.task_state is None or session.task_state.execution_strategy != "debug_repair":
+            return False
+        return bool(session.diagnostics)
 
     def _unique(self, values: Iterable[str]) -> list[str]:
         seen: set[str] = set()

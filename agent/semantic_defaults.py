@@ -291,6 +291,36 @@ def normalize_text(text: str) -> str:
     return " ".join(normalized.split())
 
 
+def _text_tokens(normalized: str) -> list[str]:
+    return [token for token in re.split(r"[^a-z0-9_äöüß]+", normalized) if token]
+
+
+def _contains_term(
+    normalized: str,
+    tokens: list[str],
+    terms: tuple[str, ...],
+    *,
+    prefix: bool = False,
+) -> bool:
+    for term in terms:
+        if " " in term:
+            if term in normalized:
+                return True
+            continue
+        if prefix:
+            if any(token.startswith(term) for token in tokens):
+                return True
+            continue
+        if term in tokens:
+            return True
+    return False
+
+
+def _contains_implementation_noun(normalized: str) -> bool:
+    tokens = _text_tokens(normalized)
+    return _contains_term(normalized, tokens, _IMPLEMENTATION_NOUNS)
+
+
 def infer_requested_extension(*texts: str | None) -> str | None:
     normalized = " ".join(normalize_text(text or "") for text in texts if text)
     for extension, hints in _EXTENSION_HINTS:
@@ -315,7 +345,12 @@ def infer_scope_tokens(*texts: str | None) -> list[str]:
 
 
 def infer_artifact_name_hint(*texts: str | None) -> str | None:
-    tokens = infer_scope_tokens(*texts)
+    normalized = " ".join(normalize_text(text or "") for text in texts if text)
+    if not normalized:
+        return None
+    if infer_requested_extension(normalized) is None and not _contains_implementation_noun(normalized):
+        return None
+    tokens = infer_scope_tokens(normalized)
     if not tokens:
         return None
     return " ".join(tokens[:4])
@@ -325,8 +360,9 @@ def is_clear_low_risk_build_request(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
-    has_create_signal = any(signal in normalized for signal in _CREATE_SIGNALS)
-    has_delivery_signal = any(noun in normalized for noun in _IMPLEMENTATION_NOUNS)
+    tokens = _text_tokens(normalized)
+    has_create_signal = _contains_term(normalized, tokens, _CREATE_SIGNALS, prefix=True)
+    has_delivery_signal = _contains_implementation_noun(normalized)
     has_medium_signal = infer_requested_extension(normalized) is not None
     has_named_scope = bool(infer_scope_tokens(normalized))
     return has_create_signal and (has_delivery_signal or has_medium_signal) and has_named_scope
@@ -336,12 +372,17 @@ def has_follow_up_reference(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
+    tokens = _text_tokens(normalized)
     score = 0
-    if any(token in normalized for token in _FOLLOW_UP_REFERENCE_TOKENS):
+    if _contains_term(normalized, tokens, _FOLLOW_UP_REFERENCE_TOKENS):
         score += 1
-    if any(token in normalized for token in ("mach weiter", "build on", "continue with", "als naechstes", "als nächstes")):
+    if _contains_term(
+        normalized,
+        tokens,
+        ("mach weiter", "build on", "continue with", "als naechstes", "als nächstes"),
+    ):
         score += 1
-    if any(token in normalized for token in _ADDITIVE_REQUEST_TOKENS):
+    if _contains_term(normalized, tokens, _ADDITIVE_REQUEST_TOKENS, prefix=True):
         score += 1
     return score >= 2
 
@@ -350,8 +391,9 @@ def looks_like_additive_request(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
-    has_add_signal = any(token in normalized for token in _ADDITIVE_REQUEST_TOKENS)
-    has_artifact_signal = any(token in normalized for token in _IMPLEMENTATION_NOUNS) or infer_requested_extension(normalized) is not None
+    tokens = _text_tokens(normalized)
+    has_add_signal = _contains_term(normalized, tokens, _ADDITIVE_REQUEST_TOKENS, prefix=True)
+    has_artifact_signal = _contains_implementation_noun(normalized) or infer_requested_extension(normalized) is not None
     return has_add_signal and has_artifact_signal
 
 
@@ -425,9 +467,14 @@ def is_structural_follow_up_request(
         or ({requested_extension, *artifact_extensions} <= _WEB_SURFACE_EXTENSIONS)
     )
 
+    tokens = _text_tokens(normalized)
+    explicit_reference = _contains_term(normalized, tokens, _FOLLOW_UP_REFERENCE_TOKENS)
+
     follow_up_signals = 0
     if has_follow_up_reference(text):
         follow_up_signals += 2
+    elif explicit_reference and (previous_goal or artifact_paths):
+        follow_up_signals += 1
     if shared_scope:
         follow_up_signals += 1
     if medium_compatible and (previous_goal or artifact_paths):

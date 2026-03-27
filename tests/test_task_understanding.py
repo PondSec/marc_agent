@@ -757,6 +757,89 @@ def test_task_state_timeout_fallback_treats_html_follow_up_as_continuation_creat
     assert '"chosen_intent": "create"' in logs
 
 
+def test_task_state_timeout_fallback_treats_tic_tac_toe_menu_follow_up_as_refinement_update(tmp_path):
+    logger = AgentLogger(tmp_path, "task-state-timeout-tictactoe-menu")
+    updater = TaskStateUpdater(ScriptedLLM(), logger=logger)
+    session = SessionState(
+        task="kannst du jetzt machen das ich aber ein menü habe mit 2 modis einmal gegen computer und einmal 2 spieler modus",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="ich möchte ein Tic tac Toe spiel in python haben",
+            previous_root_goal="Build a Tic Tac Toe game in Python.",
+            previous_active_goal="Create the first playable Tic Tac Toe implementation.",
+            previous_next_action="create",
+            previous_requested_outcome="Create a small runnable implementation with a conventional default artifact and minimal scope.",
+            target_paths=["tic_tac_toe.py"],
+            changed_files=["tic_tac_toe.py"],
+            read_files=["tic_tac_toe.py"],
+            recent_commands=['internal:python_syntax:["tic_tac_toe.py"]'],
+        ),
+        candidate_files=["tic_tac_toe.py"],
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy(logger=logger).build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.root_goal == "Build a Tic Tac Toe game in Python."
+    assert task_state.goal_relation == "refine"
+    assert task_state.next_action == "modify"
+    assert [artifact.path for artifact in task_state.target_artifacts[:1]] == ["tic_tac_toe.py"]
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths == ["tic_tac_toe.py"]
+    assert route.entities.target_name == "tic_tac_toe.py"
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+
+    logs = (tmp_path / "task-state-timeout-tictactoe-menu.jsonl").read_text(encoding="utf-8")
+    assert "task_state_fallback" in logs
+    assert '"goal_relation": "refine"' in logs
+    assert '"chosen_intent": "update"' in logs
+
+
+@pytest.mark.parametrize("path", ["snake.js", "tic_tac_toe.py"])
+def test_task_state_timeout_fallback_treats_generic_feature_extension_as_modify(tmp_path, path: str):
+    updater = TaskStateUpdater(ScriptedLLM())
+    session = SessionState(
+        task="füge noch einen modus hinzu",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task=f"build {path}",
+            previous_root_goal=f"Build the first playable version in {path}.",
+            previous_active_goal=f"Create the initial implementation in {path}.",
+            previous_next_action="create",
+            previous_requested_outcome="Create the initial playable version.",
+            target_paths=[path],
+            changed_files=[path],
+            read_files=[path],
+        ),
+        candidate_files=[path],
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.goal_relation == "refine"
+    assert task_state.next_action == "modify"
+    assert [artifact.path for artifact in task_state.target_artifacts[:1]] == [path]
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths == [path]
+
+
 def test_task_state_timeout_fallback_treats_hardening_follow_up_as_targeted_update(tmp_path):
     logger = AgentLogger(tmp_path, "task-state-timeout-hardening")
     updater = TaskStateUpdater(ScriptedLLM(), logger=logger)

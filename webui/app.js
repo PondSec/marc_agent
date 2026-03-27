@@ -1,4 +1,5 @@
 const STORAGE_KEY = "marc_a1.workspace_ui.v3";
+const CHAT_SCROLL_BOTTOM_THRESHOLD = 24;
 const COMMIT_AND_PUSH_PROMPT =
   "Bitte pruefe den aktuellen Git-Status in diesem Workspace, erstelle einen kleinen sinnvollen Commit mit einer kurzen passenden Message und pushe den aktuellen Branch zu origin. Wenn es nichts zu committen gibt oder der Push scheitert, erklaere kurz den Grund im Chat.";
 
@@ -35,6 +36,10 @@ const state = {
     workspacePath: "",
     toast: null,
     toastTimer: null,
+    chatScroll: {
+      stickToBottom: true,
+      distanceFromBottom: 0,
+    },
   },
 };
 
@@ -57,6 +62,7 @@ function bindEvents() {
   document.addEventListener("input", handleInput);
   document.addEventListener("change", handleChange);
   document.addEventListener("keydown", handleKeydown);
+  document.addEventListener("scroll", handleScroll, true);
   window.addEventListener("popstate", handlePopState);
 }
 
@@ -165,6 +171,7 @@ async function openSession(sessionId, { updateHistory = true } = {}) {
   }
 
   disconnectStream();
+  resetChatScrollState();
   state.ui.sessionLoading = true;
   state.activeSessionId = sessionId;
   renderApp();
@@ -213,6 +220,7 @@ function clearActiveSession() {
   state.activeSessionId = null;
   state.activeSession = null;
   state.logs = [];
+  resetChatScrollState();
   disconnectStream();
   syncHistory(null);
 }
@@ -393,6 +401,17 @@ function disconnectStream() {
     state.stream.close();
     state.stream = null;
   }
+}
+
+function handleScroll(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+  if (!target.classList.contains("chat-stage")) {
+    return;
+  }
+  syncChatScrollState(target);
 }
 
 function handleClick(event) {
@@ -618,6 +637,7 @@ function renderApp() {
     return;
   }
   const uiSnapshot = captureUiSnapshot();
+  captureChatScrollState();
   root.innerHTML = `
     <div class="shell">
       <aside class="sidebar">
@@ -635,6 +655,10 @@ function renderApp() {
   `;
   syncComposerControls();
   restoreUiSnapshot(uiSnapshot);
+  restoreChatScrollState();
+  window.requestAnimationFrame(() => {
+    restoreChatScrollState();
+  });
 }
 
 function renderSidebar() {
@@ -1187,7 +1211,11 @@ function restoreUiSnapshot(snapshot) {
   }
 
   if (typeof target.focus === "function") {
-    target.focus();
+    try {
+      target.focus({ preventScroll: true });
+    } catch (error) {
+      target.focus();
+    }
   }
 
   if (
@@ -1211,6 +1239,54 @@ function syncTextArea(id, value) {
     target.value = value;
   }
   autosizeTextarea(target);
+}
+
+function resetChatScrollState() {
+  state.ui.chatScroll = {
+    stickToBottom: true,
+    distanceFromBottom: 0,
+  };
+}
+
+function captureChatScrollState() {
+  const container = document.querySelector(".chat-stage");
+  if (!(container instanceof HTMLElement)) {
+    return;
+  }
+  syncChatScrollState(container);
+}
+
+function restoreChatScrollState() {
+  const container = document.querySelector(".chat-stage");
+  if (!(container instanceof HTMLElement)) {
+    return;
+  }
+
+  const chatScroll = state.ui.chatScroll || {
+    stickToBottom: true,
+    distanceFromBottom: 0,
+  };
+  if (chatScroll.stickToBottom) {
+    container.scrollTop = container.scrollHeight;
+    return;
+  }
+
+  const nextDistance = Math.max(0, Number(chatScroll.distanceFromBottom) || 0);
+  container.scrollTop = Math.max(
+    0,
+    container.scrollHeight - container.clientHeight - nextDistance,
+  );
+}
+
+function syncChatScrollState(container) {
+  const distanceFromBottom = Math.max(
+    0,
+    container.scrollHeight - container.scrollTop - container.clientHeight,
+  );
+  state.ui.chatScroll = {
+    stickToBottom: distanceFromBottom <= CHAT_SCROLL_BOTTOM_THRESHOLD,
+    distanceFromBottom,
+  };
 }
 
 function autosizeTextarea(textarea) {
@@ -2042,10 +2118,11 @@ function describeAgentProgressActivity(event, payload) {
       ? `Ich entwerfe gerade den Inhalt fuer ${shortenPath(path, 56)}.`
       : "Ich entwerfe gerade den Dateiinhalt.";
   }
+  if (event === "content_generation_progress") {
+    return describeStreamingModelProgress("content", payload);
+  }
   if (event === "content_generation_retry_started") {
-    return path
-      ? `Der erste Versuch war zu langsam. Ich probiere ${shortenPath(path, 56)} mit weniger Kontext erneut.`
-      : "Der erste Versuch war zu langsam. Ich probiere es mit weniger Kontext erneut.";
+    return describeContentGenerationRetry(path, payload);
   }
   if (event === "content_generation_fallback_started") {
     return path
@@ -2069,6 +2146,9 @@ function describeAgentProgressActivity(event, payload) {
   }
   if (event === "final_response_generation_started") {
     return "Ich formuliere gerade die Antwort.";
+  }
+  if (event === "final_response_generation_progress") {
+    return describeStreamingModelProgress("final_response", payload);
   }
 
   return "";
@@ -2177,6 +2257,60 @@ function describeToolActivity(payload, options = {}) {
   }
 
   return genericSummary || "Ich arbeite gerade am naechsten Schritt.";
+}
+
+function describeStreamingModelProgress(kind, payload) {
+  const progressType = String(payload?.type || "").trim();
+  const path = extractPathFromPayload(payload || {});
+
+  if (progressType === "heartbeat") {
+    if (kind === "content") {
+      return path
+        ? `Das Modell arbeitet weiter an ${shortenPath(path, 56)}.`
+        : "Das Modell arbeitet weiter am Dateiinhalt.";
+    }
+    return "Ich formuliere die Antwort noch, aber das Modell arbeitet weiter.";
+  }
+
+  if (progressType === "chunk") {
+    if (kind === "content") {
+      return path
+        ? `Ich erhalte weiter Inhalt fuer ${shortenPath(path, 56)}.`
+        : "Ich erhalte weiter Dateiinhalt.";
+    }
+    return "Ich erhalte weiter Text fuer die Antwort.";
+  }
+
+  return "";
+}
+
+function describeContentGenerationRetry(path, payload) {
+  const strategy = String(payload?.strategy || "").trim();
+
+  if (strategy === "resume_same_model") {
+    return path
+      ? `Ich setze den begonnenen Entwurf fuer ${shortenPath(path, 56)} mit dem bisherigen Fortschritt fort.`
+      : "Ich setze den begonnenen Entwurf mit dem bisherigen Fortschritt fort.";
+  }
+  if (strategy === "resume_fallback_model") {
+    return path
+      ? `Ich setze den begonnenen Entwurf fuer ${shortenPath(path, 56)} mit einem kleineren Modell fort.`
+      : "Ich setze den begonnenen Entwurf mit einem kleineren Modell fort.";
+  }
+  if (strategy === "fallback_model") {
+    return path
+      ? `Der erste Lauf blieb stecken. Ich probiere ${shortenPath(path, 56)} mit einem kleineren Modell erneut.`
+      : "Der erste Lauf blieb stecken. Ich probiere es mit einem kleineren Modell erneut.";
+  }
+  if (strategy === "compact_fallback_model") {
+    return path
+      ? `Ich probiere ${shortenPath(path, 56)} mit weniger Kontext und einem kleineren Modell erneut.`
+      : "Ich probiere es mit weniger Kontext und einem kleineren Modell erneut.";
+  }
+
+  return path
+    ? `Der erste Versuch war zu langsam. Ich probiere ${shortenPath(path, 56)} mit weniger Kontext erneut.`
+    : "Der erste Versuch war zu langsam. Ich probiere es mit weniger Kontext erneut.";
 }
 
 function extractPathFromPayload(payload) {

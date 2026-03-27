@@ -182,6 +182,12 @@ class SessionReporter:
 
     def _validation_sentence(self, session: SessionState, report: SessionReport) -> str:
         language = self._session_language(session)
+        if session.stop_reason == "functional_validation_missing":
+            return self._localized_text(
+                language,
+                de="Validierung: nur statische Checks wurden bestaetigt, ein funktionaler Repro- oder Smoke-Test fehlt noch.",
+                en="Validation: only static checks were confirmed, and a functional reproduction or smoke test is still missing.",
+            )
         if session.validation_status == "passed":
             if report.validation:
                 latest = report.validation[-1]

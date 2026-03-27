@@ -88,9 +88,47 @@ def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypat
     )
 
     commands = [item.command for item in plan]
+    assert any(command.startswith("internal:python_cli_smoke:") for command in commands)
     assert any(command.startswith("internal:python_syntax:") for command in commands)
     assert any(command.startswith("internal:html_refs:") for command in commands)
     assert any(command.startswith("node --check") for command in commands)
+
+
+def test_validation_planner_prefers_runtime_smoke_for_small_python_entry_artifact():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["tic_tac_toe.py"],
+        focus_files=["tic_tac_toe.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python starter script.",
+    )
+
+    plan = planner.build_plan(
+        "fix the interactive bug in the existing python script",
+        snapshot,
+        changed_files=["tic_tac_toe.py"],
+    )
+
+    assert plan[0].command.startswith("internal:python_cli_smoke:")
+    assert plan[0].verification_scope == "runtime"
+    syntax_checks = [item for item in plan if item.command.startswith("internal:python_syntax:")]
+    assert syntax_checks
+    assert syntax_checks[0].required is False
 
 
 def test_validation_planner_does_not_mark_unchecked_changes_as_passed():
