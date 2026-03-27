@@ -2262,8 +2262,37 @@ function describeToolActivity(payload, options = {}) {
 function describeStreamingModelProgress(kind, payload) {
   const progressType = String(payload?.type || "").trim();
   const path = extractPathFromPayload(payload || {});
+  const model = shorten(String(payload?.model || "").trim(), 28);
+
+  if (progressType === "status") {
+    const stage = String(payload?.stage || "").trim();
+    if (stage === "request_started") {
+      if (kind === "content") {
+        return path
+          ? `Ich starte ${model || "das Modell"} fuer ${shortenPath(path, 56)}.`
+          : `Ich starte ${model || "das Modell"} fuer den Dateiinhalt.`;
+      }
+      return `Ich starte ${model || "das Modell"} fuer die Antwort.`;
+    }
+    if (stage === "startup_timeout_warning") {
+      if (kind === "content") {
+        return path
+          ? `Ich warte noch auf den ersten Stream von ${model || "dem Modell"} fuer ${shortenPath(path, 56)}.`
+          : `Ich warte noch auf den ersten Stream von ${model || "dem Modell"}.`;
+      }
+      return `Ich warte noch auf den ersten Stream von ${model || "dem Modell"} fuer die Antwort.`;
+    }
+  }
 
   if (progressType === "heartbeat") {
+    if (payload?.phase === "waiting_for_start") {
+      if (kind === "content") {
+        return path
+          ? `Das Modell startet noch fuer ${shortenPath(path, 56)}. Ich warte auf den ersten Output.`
+          : "Das Modell startet noch. Ich warte auf den ersten Output.";
+      }
+      return "Das Modell startet noch. Ich warte auf den ersten Antwort-Output.";
+    }
     if (kind === "content") {
       return path
         ? `Das Modell arbeitet weiter an ${shortenPath(path, 56)}.`

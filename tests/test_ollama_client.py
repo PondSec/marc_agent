@@ -169,7 +169,7 @@ def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypa
     )
 
     assert result == "hello"
-    assert [event["type"] for event in progress_events] == ["chunk", "heartbeat", "chunk"]
+    assert [event["type"] for event in progress_events] == ["status", "chunk", "heartbeat", "chunk"]
 
 
 def test_ollama_client_uses_longer_initial_response_timeout_for_slow_local_models(monkeypatch, tmp_path):
@@ -219,3 +219,51 @@ def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progres
     assert error.partial_text == "hel"
     assert error.characters == 3
     assert error.progress_seen is True
+
+
+def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3-coder:30b",
+        llm_timeout=20,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    progress_events: list[dict] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 12.0, 24.0, 36.0, 48.0, 60.0, 72.0]),
+    )
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate(
+            "generate html",
+            timeout=20,
+            total_timeout=120,
+            retries=0,
+            progress_callback=progress_events.append,
+        )
+
+    error = excinfo.value
+    assert error.reason == "startup_timeout"
+    assert error.progress_seen is False
+    assert error.retryable is False
+    assert progress_events[0]["stage"] == "request_started"
+    assert any(event.get("phase") == "waiting_for_start" for event in progress_events if event.get("type") == "heartbeat")
+    assert any(event.get("stage") == "startup_timeout_warning" for event in progress_events if event.get("type") == "status")

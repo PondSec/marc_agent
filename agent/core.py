@@ -535,6 +535,8 @@ class AgentCore:
             )[:24]
 
         if decision.tool_name in WRITE_TOOLS and result.success:
+            if session.validation_status == "failed":
+                session.repair_attempts += 1
             session.edit_generation += 1
             session.validation_status = "not_run"
             session.last_error = None
@@ -546,7 +548,6 @@ class AgentCore:
             self._record_validation_run(session, decision, result)
             session.validation_status = self.validation_planner.rollup_status(session)
             if session.validation_status == "failed":
-                session.repair_attempts += 1
                 session.last_error = self._build_output_excerpt(result.data) or result.message
             elif session.validation_status == "passed":
                 session.repair_attempts = 0
@@ -559,8 +560,13 @@ class AgentCore:
 
     def _record_validation_run(self, session: SessionState, decision, result) -> None:
         command_text = result.data.get("command") or decision.tool_args.get("command", "")
+        command_identity = self.validation_planner.command_identity(command_text)
         plan_item = next(
-            (item for item in session.validation_plan if item.command == command_text),
+            (
+                item
+                for item in session.validation_plan
+                if self.validation_planner.command_identity(item.command) == command_identity
+            ),
             None,
         )
         status = "passed"
@@ -622,9 +628,9 @@ class AgentCore:
                     session.helper_artifacts.append(change.path)
 
     def _pick_validation_command(self, session: SessionState) -> ValidationCommand | None:
-        command = self.validation_planner.next_command(session)
-        if command is not None:
-            return command
+        for item in self.validation_planner.pending_commands(session):
+            if self.validation_planner.can_repeat_command(session, item.command):
+                return item
 
         if session.workspace_snapshot:
             fallback_plan = self.validation_planner.build_plan(
@@ -636,13 +642,17 @@ class AgentCore:
             if fallback_plan:
                 session.validation_plan = fallback_plan
                 session.verification_commands = [item.command for item in fallback_plan]
-                return self.validation_planner.next_command(session)
+                for item in self.validation_planner.pending_commands(session):
+                    if self.validation_planner.can_repeat_command(session, item.command):
+                        return item
         return None
 
     def _resolve_final_status(self, session: SessionState, *, final_action: bool = False) -> str:
         if session.stop_reason == "user_cancelled" or session.stop_requested:
             return "partial"
         if self._debug_repair_incomplete(session):
+            return "partial"
+        if self._web_functional_validation_missing(session):
             return "partial"
         if session.blockers or session.validation_status in {"failed", "blocked"}:
             return "partial"
@@ -658,6 +668,8 @@ class AgentCore:
         if session.blockers:
             return "blocked"
         if self._runtime_verification_missing(session):
+            return "functional_validation_missing"
+        if self._web_functional_validation_missing(session):
             return "functional_validation_missing"
         if self._reproduction_missing(session):
             return "reproduction_missing"
@@ -703,6 +715,15 @@ class AgentCore:
         if not session.changed_files:
             return False
         if not self.validation_planner.runtime_verification_required(session):
+            return False
+        return not self.validation_planner.has_runtime_success(session)
+
+    def _web_functional_validation_missing(self, session: SessionState) -> bool:
+        if not session.changed_files:
+            return False
+        if not self.validation_planner.web_functional_verification_required(session):
+            return False
+        if not self.validation_planner.has_structural_web_success(session):
             return False
         return not self.validation_planner.has_runtime_success(session)
 

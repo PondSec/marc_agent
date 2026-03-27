@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
@@ -80,3 +81,40 @@ def test_shell_internal_python_cli_smoke_runs_interactive_script(tmp_path):
 
     assert result["success"] is True
     assert "you chose 1" in result["stdout"]
+
+
+def test_shell_structural_web_validation_checks_dom_refs_and_js(monkeypatch, tmp_path):
+    (tmp_path / "snake.html").write_text(
+        (
+            "<html><body>"
+            "<nav id='menu'><button>Start</button></nav>"
+            "<div id='highscore'>Highscore</div>"
+            "<script src='snake.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "snake.js").write_text("const best = localStorage.getItem('highscore');\n", encoding="utf-8")
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    monkeypatch.setattr("tools.shell.shutil.which", lambda name: "/usr/bin/node" if name == "node" else None)
+    monkeypatch.setattr(
+        "tools.shell.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr=""),
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_artifact:[{"path":"snake.html","expected_features":["menu","highscore"]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "Structural web checks only" in result["stdout"]
+    assert "expected features: menu, highscore" in result["stdout"]

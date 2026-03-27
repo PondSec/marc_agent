@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent.models import SessionReport, SessionState
+from agent.verification import ValidationPlanner
 from config.settings import AppConfig
 
 
 class SessionReporter:
     def __init__(self, config: AppConfig):
         self.config = config
+        self.validation_planner = ValidationPlanner()
 
     def build_report(self, session: SessionState) -> SessionReport:
         self._require_task_state(session)
@@ -119,7 +121,7 @@ class SessionReporter:
 
     def _lead_message(self, session: SessionState, draft_response: str | None) -> str:
         cleaned = self._clean_text(draft_response)
-        if cleaned and not self._looks_like_machine_summary(cleaned):
+        if cleaned and not self._looks_like_machine_summary(cleaned) and not self._conflicts_with_session(cleaned, session):
             return cleaned
         language = self._session_language(session)
 
@@ -182,7 +184,18 @@ class SessionReporter:
 
     def _validation_sentence(self, session: SessionState, report: SessionReport) -> str:
         language = self._session_language(session)
+        strongest_scope = self.validation_planner.strongest_passed_scope(
+            session,
+            current_generation_only=False,
+        )
+        strongest_run = self._latest_run_for_scope(report, strongest_scope)
         if session.stop_reason == "functional_validation_missing":
+            if strongest_scope == "structural":
+                return self._localized_text(
+                    language,
+                    de="Validierung: strukturelle Web-Checks wurden bestaetigt, aber ein funktionaler Browser- oder Runtime-Smoke-Test fehlt noch.",
+                    en="Validation: structural web checks were confirmed, but a functional browser or runtime smoke test is still missing.",
+                )
             return self._localized_text(
                 language,
                 de="Validierung: nur statische Checks wurden bestaetigt, ein funktionaler Repro- oder Smoke-Test fehlt noch.",
@@ -190,6 +203,30 @@ class SessionReporter:
             )
         if session.validation_status == "passed":
             if report.validation:
+                if strongest_scope == "runtime":
+                    return self._localized_text(
+                        language,
+                        de=f"Validierung: funktionaler Check bestanden ({(strongest_run or report.validation[-1]).command}).",
+                        en=f"Validation: functional check passed ({(strongest_run or report.validation[-1]).command}).",
+                    )
+                if strongest_scope == "structural":
+                    return self._localized_text(
+                        language,
+                        de=f"Validierung: strukturelle Web-Checks bestanden ({(strongest_run or report.validation[-1]).command}); funktionaler Smoke-Test fehlt noch.",
+                        en=f"Validation: structural web checks passed ({(strongest_run or report.validation[-1]).command}); a functional smoke test is still missing.",
+                    )
+                if strongest_scope == "static":
+                    return self._localized_text(
+                        language,
+                        de=f"Validierung: statische Checks bestanden ({(strongest_run or report.validation[-1]).command}).",
+                        en=f"Validation: static checks passed ({(strongest_run or report.validation[-1]).command}).",
+                    )
+                if strongest_scope == "syntax":
+                    return self._localized_text(
+                        language,
+                        de=f"Validierung: Syntax-Checks bestanden ({(strongest_run or report.validation[-1]).command}).",
+                        en=f"Validation: syntax checks passed ({(strongest_run or report.validation[-1]).command}).",
+                    )
                 latest = report.validation[-1]
                 return self._localized_text(
                     language,
@@ -259,6 +296,15 @@ class SessionReporter:
             return True
         return sum(marker in lowered for marker in telemetry_markers) >= 2
 
+    def _conflicts_with_session(self, text: str, session: SessionState) -> bool:
+        lowered = str(text or "").lower()
+        validation_claim_markers = ("validiert", "validated", "validation: passed", "clean validated")
+        if session.stop_reason == "functional_validation_missing" and any(marker in lowered for marker in validation_claim_markers):
+            return True
+        if session.status == "partial" and any(marker in lowered for marker in validation_claim_markers):
+            return True
+        return False
+
     def _looks_like_greeting(self, task: str) -> bool:
         normalized = " ".join(str(task or "").lower().split()).strip("!?., ")
         if not normalized:
@@ -308,6 +354,14 @@ class SessionReporter:
         if not visible:
             return fallback
         return ", ".join(visible)
+
+    def _latest_run_for_scope(self, report: SessionReport, scope: str | None):
+        if scope is None:
+            return None
+        for item in reversed(report.validation):
+            if item.status == "passed" and item.verification_scope == scope:
+                return item
+        return None
 
     def _session_language(self, session: SessionState) -> str:
         task_state = session.task_state

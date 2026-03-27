@@ -745,6 +745,209 @@ def test_planner_reenters_debug_repair_after_failed_runtime_validation(tmp_path)
     assert "fixed" in decision.tool_args["content"]
 
 
+def test_planner_failed_web_validation_triggers_read_then_repair_for_new_artifact(tmp_path):
+    target = tmp_path / "snake_game.html"
+    target.write_text("<html><body><h1>Snake</h1></body></html>\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="create",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "create_artifact",
+                        "reason": "Create the requested standalone HTML game.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "run_validation",
+                        "reason": "Validate the generated artifact.",
+                    },
+                ],
+                target_paths=["snake_game.html"],
+                target_name="snake_game.html",
+                repo_context_needed=False,
+            )
+        ],
+        text_payloads=[
+            "<html><body><canvas id='game'></canvas><script>startGame();</script></body></html>\n",
+        ],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="bitte programmiere ein Snake Spiel in HTML",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command='internal:web_artifact:[{"path":"snake_game.html","expected_features":[]}]',
+                verification_scope="structural",
+            )
+        ],
+        verification_commands=['internal:web_artifact:[{"path":"snake_game.html","expected_features":[]}]'],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.changed_files.append(FileChangeRecord(path="snake_game.html", operation="create"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"snake_game.html","expected_features":[]}]',
+            kind="check",
+            verification_scope="structural",
+            status="failed",
+            edit_generation=1,
+            iteration=2,
+            summary="Structural web validation failed.",
+            excerpt="snake_game.html: missing expected web features",
+        )
+    )
+
+    first_decision = planner.decide_next_action(session.task, session)
+
+    assert first_decision.action_type == AgentActionType.CALL_TOOL
+    assert first_decision.tool_name == "read_file"
+    assert first_decision.tool_args["path"] == "snake_game.html"
+
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=3,
+            tool_name="read_file",
+            tool_args={"path": "snake_game.html"},
+            success=True,
+            summary="Read snake_game.html.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    second_decision = planner.decide_next_action(session.task, session)
+
+    assert second_decision.action_type == AgentActionType.CALL_TOOL
+    assert second_decision.tool_name == "write_file"
+    assert second_decision.tool_args["path"] == "snake_game.html"
+    assert second_decision.tool_args["content"]
+
+
+def test_planner_does_not_repeat_identical_validation_without_progress(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere app/main.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        edit_generation=1,
+        validation_plan=[ValidationCommand(command="python -m pytest", kind="test")],
+        verification_commands=["python -m pytest"],
+    )
+    session.changed_files.append(FileChangeRecord(path="app/main.py", operation="write"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            iteration=4,
+            summary="Validation command exited with 1.",
+        )
+    )
+
+    assert planner._pick_validation_command(session) is None
+
+
+def test_planner_allows_same_validation_after_new_context(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere app/main.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        edit_generation=1,
+        validation_plan=[ValidationCommand(command="python -m pytest", kind="test")],
+        verification_commands=["python -m pytest"],
+    )
+    session.changed_files.append(FileChangeRecord(path="app/main.py", operation="write"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            iteration=4,
+            summary="Validation command exited with 1.",
+        )
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=5,
+            tool_name="read_file",
+            tool_args={"path": "app/main.py"},
+            success=True,
+            summary="Read app/main.py.",
+            output_excerpt="print('broken')\n",
+        )
+    )
+
+    assert planner._pick_validation_command(session) == "python -m pytest"
+
+
+def test_planner_blocks_instead_of_reverifying_when_failed_validation_has_no_repair_target(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "run_validation",
+                        "reason": "Validate the changed artifact.",
+                    },
+                ],
+                target_paths=["broken.txt"],
+                target_name="broken.txt",
+                repo_context_needed=False,
+            )
+        ]
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="aktualisiere broken.txt",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="custom validate broken.txt",
+                verification_scope="static",
+            )
+        ],
+        verification_commands=["custom validate broken.txt"],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.changed_files.append(FileChangeRecord(path="broken.txt", operation="write"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="custom validate broken.txt",
+            kind="check",
+            verification_scope="static",
+            status="failed",
+            edit_generation=1,
+            iteration=2,
+            summary="Validation command exited with 1.",
+            excerpt="broken.txt is invalid",
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert session.blockers
+    assert "repairable target" in session.blockers[-1]
+
+
 def test_planner_includes_diagnostics_in_update_prompt_for_debug_follow_up(tmp_path):
     target = tmp_path / "app" / "main.py"
     target.parent.mkdir()
@@ -1191,7 +1394,7 @@ def test_planner_avoids_compact_retry_when_context_is_not_the_likely_issue(tmp_p
             )
         ],
         generate_side_effects=[
-            OllamaGenerationError("timed out", reason="startup_timeout"),
+            OllamaGenerationError("timed out", reason="startup_timeout", retryable=False),
             "print('gui version')\n",
         ],
         config=AppConfig(
@@ -1229,7 +1432,7 @@ def test_planner_avoids_compact_retry_when_context_is_not_the_likely_issue(tmp_p
     assert decision.tool_args["content"] == "print('gui version')"
     assert len(llm.generate_calls) == 2
     assert llm.generate_calls[1]["kwargs"]["retries"] == 0
-    assert llm.generate_calls[1]["kwargs"]["model"] is None
+    assert llm.generate_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
     assert llm.generate_calls[1]["kwargs"]["timeout"] >= 75
     assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 210
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] <= 4096
@@ -1287,6 +1490,57 @@ def test_planner_uses_compact_retry_only_when_context_pressure_is_plausible(tmp_
     assert llm.generate_calls[1]["kwargs"]["model"] is None
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 2048
     assert "Produce the full file content for exactly one file." in llm.generate_calls[1]["args"][0]
+
+
+def test_planner_uses_lightweight_model_first_for_small_web_follow_up_updates(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Extend the existing web artifact in place.",
+                    }
+                ],
+                target_paths=["snake.html"],
+                target_name="snake.html",
+            )
+        ],
+        text_payloads=["<html><body><div id='menu'></div><div id='highscore'></div></body></html>\n"],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Baue ein Menü und einen Highscore dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "snake.html"
+    target.write_text("<html><body><canvas id='game'></canvas></body></html>\n", encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "snake.html"},
+            success=True,
+            summary="Read snake.html.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
 
 
 def test_planner_preserves_partial_progress_before_switching_models(tmp_path):
@@ -1433,6 +1687,8 @@ def test_planner_emits_progress_events_for_long_content_generation(tmp_path):
         text_payloads=["print('hello')\n"],
         progress_events=[
             [
+                {"type": "status", "stage": "request_started", "model": "qwen3-coder:30b"},
+                {"type": "heartbeat", "phase": "waiting_for_start", "elapsed": 9.0, "idle_for": 9.0, "characters": 0},
                 {"type": "heartbeat", "elapsed": 12.0, "idle_for": 4.0, "characters": 0},
                 {"type": "chunk", "elapsed": 13.0, "characters": 20},
             ]
@@ -1454,6 +1710,8 @@ def test_planner_emits_progress_events_for_long_content_generation(tmp_path):
     assert "content_generation_progress" in logs
     assert "content_generation_started" in logs
     assert "content_generation_finished" in logs
+    assert "waiting_for_start" in logs
+    assert "request_started" in logs
 
 
 def test_planner_updates_tic_tac_toe_to_play_against_computer_on_timeout(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -111,6 +112,11 @@ class OllamaClient:
         effective_model = str(model or self.config.model_name)
         inactivity_timeout = max(int(timeout or self.config.llm_timeout), 1)
         overall_timeout = max(int(total_timeout or max(inactivity_timeout * 3, inactivity_timeout + 90)), inactivity_timeout)
+        startup_timeout = self._startup_stream_timeout(
+            model_name=effective_model,
+            inactivity_timeout=inactivity_timeout,
+            total_timeout=overall_timeout,
+        )
         effective_retries = self.config.llm_request_retries if retries is None else max(int(retries), 0)
         payload: dict[str, Any] = {
             "model": effective_model,
@@ -139,16 +145,27 @@ class OllamaClient:
         last_exception: Exception | None = None
         for attempt in range(effective_retries + 1):
             attempt_started_at = time.monotonic()
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "type": "status",
+                        "stage": "request_started",
+                        "attempt": attempt + 1,
+                        "model": effective_model,
+                        "startup_timeout": startup_timeout,
+                        "inactivity_timeout": inactivity_timeout,
+                        "total_timeout": overall_timeout,
+                    }
+                )
             try:
                 with request.urlopen(
                     req,
-                    timeout=self._initial_response_timeout(
-                        inactivity_timeout=inactivity_timeout,
-                        total_timeout=overall_timeout,
-                    ),
+                    timeout=self._initial_response_timeout(startup_timeout=startup_timeout),
                 ) as response:
                     return self._read_generate_response(
                         response,
+                        model_name=effective_model,
+                        startup_timeout=startup_timeout,
                         inactivity_timeout=inactivity_timeout,
                         total_timeout=overall_timeout,
                         progress_callback=progress_callback,
@@ -161,6 +178,7 @@ class OllamaClient:
                     exc,
                     target=target,
                     started_at=attempt_started_at,
+                    startup_timeout=startup_timeout,
                 )
                 if isinstance(normalized, OllamaGenerationError) and not normalized.retryable:
                     raise normalized
@@ -185,6 +203,8 @@ class OllamaClient:
         self,
         response,
         *,
+        model_name: str,
+        startup_timeout: int,
         inactivity_timeout: int,
         total_timeout: int,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -200,6 +220,7 @@ class OllamaClient:
         streamed_parts: list[str] = []
         total_characters = 0
         activity_count = 0
+        startup_warning_sent = False
 
         while True:
             try:
@@ -207,21 +228,61 @@ class OllamaClient:
             except socket.timeout as exc:
                 now = time.monotonic()
                 idle_for = now - last_activity_at
+                elapsed = now - started_at
+                if activity_count <= 0 and not streamed_parts:
+                    if progress_callback is not None and not startup_warning_sent and elapsed >= max(startup_timeout - 10.0, startup_timeout * 0.75):
+                        progress_callback(
+                            {
+                                "type": "status",
+                                "stage": "startup_timeout_warning",
+                                "model": model_name,
+                                "elapsed": round(elapsed, 1),
+                                "startup_timeout": startup_timeout,
+                                "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
+                            }
+                        )
+                        startup_warning_sent = True
+                    if elapsed >= startup_timeout:
+                        raise OllamaGenerationError(
+                            f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
+                            reason="startup_timeout",
+                            elapsed=round(elapsed, 1),
+                            idle_for=round(idle_for, 1),
+                            characters=total_characters,
+                            activity_count=activity_count,
+                            partial_text="".join(streamed_parts),
+                            retryable=False,
+                        ) from exc
+                    if progress_callback is not None and now - last_heartbeat_at >= min(10.0, max(startup_timeout / 4.0, 4.0)):
+                        progress_callback(
+                            {
+                                "type": "heartbeat",
+                                "phase": "waiting_for_start",
+                                "model": model_name,
+                                "elapsed": round(elapsed, 1),
+                                "idle_for": round(idle_for, 1),
+                                "characters": total_characters,
+                                "startup_timeout": startup_timeout,
+                                "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
+                            }
+                        )
+                        last_heartbeat_at = now
+                    continue
                 if idle_for >= inactivity_timeout:
                     raise OllamaGenerationError(
                         f"timed out waiting for model progress after {idle_for:.1f} seconds",
                         reason="inactivity_timeout",
-                        elapsed=round(now - started_at, 1),
+                        elapsed=round(elapsed, 1),
                         idle_for=round(idle_for, 1),
                         characters=total_characters,
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
                     ) from exc
-                if now - started_at >= total_timeout:
+                if elapsed >= total_timeout:
                     raise OllamaGenerationError(
-                        f"timed out waiting for model completion after {now - started_at:.1f} seconds",
+                        f"timed out waiting for model completion after {elapsed:.1f} seconds",
                         reason="total_timeout",
-                        elapsed=round(now - started_at, 1),
+                        elapsed=round(elapsed, 1),
                         idle_for=round(idle_for, 1),
                         characters=total_characters,
                         activity_count=activity_count,
@@ -231,15 +292,28 @@ class OllamaClient:
                     progress_callback(
                         {
                             "type": "heartbeat",
-                            "elapsed": round(now - started_at, 1),
+                            "elapsed": round(elapsed, 1),
                             "idle_for": round(idle_for, 1),
                             "characters": total_characters,
+                            "model": model_name,
                         }
                     )
                     last_heartbeat_at = now
                 continue
 
             if not raw_line:
+                if activity_count <= 0 and not streamed_parts:
+                    elapsed = round(time.monotonic() - started_at, 1)
+                    raise OllamaGenerationError(
+                        f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
+                        reason="startup_timeout",
+                        elapsed=elapsed,
+                        idle_for=elapsed,
+                        characters=total_characters,
+                        activity_count=activity_count,
+                        partial_text="".join(streamed_parts),
+                        retryable=False,
+                    )
                 break
 
             last_activity_at = time.monotonic()
@@ -271,6 +345,7 @@ class OllamaClient:
                             "type": "chunk",
                             "elapsed": round(last_activity_at - started_at, 1),
                             "characters": total_characters,
+                            "model": model_name,
                         }
                     )
             if payload.get("done") is True:
@@ -278,6 +353,19 @@ class OllamaClient:
 
         if streamed_parts:
             return "".join(streamed_parts).strip()
+
+        if not hasattr(response, "read"):
+            elapsed = round(time.monotonic() - started_at, 1)
+            raise OllamaGenerationError(
+                f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
+                reason="startup_timeout",
+                elapsed=elapsed,
+                idle_for=elapsed,
+                characters=total_characters,
+                activity_count=activity_count,
+                partial_text="".join(streamed_parts),
+                retryable=False,
+            )
 
         raw = response.read().decode("utf-8")
         data = json.loads(raw)
@@ -411,15 +499,40 @@ class OllamaClient:
     @staticmethod
     def _initial_response_timeout(
         *,
+        startup_timeout: int,
+    ) -> int:
+        return max(int(startup_timeout), 1)
+
+    @staticmethod
+    def _startup_stream_timeout(
+        *,
+        model_name: str,
         inactivity_timeout: int,
         total_timeout: int,
     ) -> int:
-        # First token latency on slow local models is often much longer than the
-        # steady-state inactivity window once streaming has started.
-        return max(
-            inactivity_timeout,
-            min(total_timeout, max(inactivity_timeout + 20, 30)),
-        )
+        parameter_hint = OllamaClient._parameter_size_hint(model_name)
+        extra_buffer = 20
+        minimum_floor = 30
+        if parameter_hint >= 24:
+            extra_buffer = 35
+            minimum_floor = 70
+        elif parameter_hint >= 14:
+            extra_buffer = 28
+            minimum_floor = 55
+        elif parameter_hint >= 7:
+            extra_buffer = 20
+            minimum_floor = 40
+        return int(min(total_timeout, max(inactivity_timeout + extra_buffer, minimum_floor)))
+
+    @staticmethod
+    def _parameter_size_hint(model_name: str) -> float:
+        match = re.search(r"(\d+(?:\.\d+)?)\s*b\b", str(model_name or "").lower())
+        if not match:
+            return 0.0
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return 0.0
 
     def _normalize_generation_exception(
         self,
@@ -427,6 +540,7 @@ class OllamaClient:
         *,
         target: str,
         started_at: float,
+        startup_timeout: int,
     ) -> Exception:
         if isinstance(exc, OllamaGenerationError):
             return exc
@@ -437,6 +551,7 @@ class OllamaClient:
                     f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
                     reason="startup_timeout",
                     elapsed=elapsed,
+                    retryable=elapsed < max(startup_timeout * 0.45, 12.0),
                 )
             return OllamaClientError(f"Could not reach Ollama at {target}: {exc}")
         if isinstance(exc, (TimeoutError, socket.timeout)):
@@ -445,6 +560,7 @@ class OllamaClient:
                 f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
                 reason="startup_timeout",
                 elapsed=elapsed,
+                retryable=elapsed < max(startup_timeout * 0.45, 12.0),
             )
         if isinstance(exc, OllamaClientError) and self._is_timeout_like(exc):
             elapsed = round(time.monotonic() - started_at, 1)
@@ -452,5 +568,6 @@ class OllamaClient:
                 str(exc),
                 reason="startup_timeout",
                 elapsed=elapsed,
+                retryable=elapsed < max(startup_timeout * 0.45, 12.0),
             )
         return exc

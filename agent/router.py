@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from pydantic import ValidationError
@@ -54,6 +55,7 @@ class IntentRouter:
                 retries=0,
                 timeout=self.timeout,
                 num_ctx=self.num_ctx,
+                progress_callback=self._progress_logger("router_generation_progress"),
             )
             return self.validate_router_output(payload)
         except ValidationError as exc:
@@ -112,6 +114,7 @@ class IntentRouter:
                 retries=0,
                 timeout=max(self.timeout, 16),
                 num_ctx=self.num_ctx,
+                progress_callback=self._progress_logger("router_generation_progress"),
             )
             route = self.validate_router_output(repaired)
             self._log("router_repair_succeeded", router_result=route.model_dump())
@@ -140,6 +143,7 @@ class IntentRouter:
                 retries=0,
                 timeout=max(self.timeout + 8, 26),
                 num_ctx=min(self.num_ctx, 2048),
+                progress_callback=self._progress_logger("router_generation_progress"),
             )
             route = self.validate_router_output(payload)
             self._log("router_retry_succeeded", router_result=route.model_dump())
@@ -877,3 +881,23 @@ class IntentRouter:
         if self.logger is None:
             return
         self.logger.log_event(event, **payload)
+
+    def _progress_logger(self, event: str):
+        if self.logger is None:
+            return None
+        last_emitted = {"heartbeat": 0.0, "chunk": 0.0}
+
+        def callback(payload: dict[str, object]) -> None:
+            kind = str(payload.get("type") or "").strip()
+            now = time.monotonic()
+            if kind == "heartbeat":
+                if now - last_emitted["heartbeat"] < 8.0:
+                    return
+                last_emitted["heartbeat"] = now
+            elif kind == "chunk":
+                if now - last_emitted["chunk"] < 2.0:
+                    return
+                last_emitted["chunk"] = now
+            self._log(event, **payload)
+
+        return callback

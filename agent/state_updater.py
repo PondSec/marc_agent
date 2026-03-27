@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ class TaskStateUpdater:
                 retries=0,
                 timeout=self.timeout,
                 num_ctx=self.num_ctx,
+                progress_callback=self._progress_logger("task_state_generation_progress"),
             )
             state = TaskState.model_validate(payload)
             self._log("task_state_updated", task_state=state.model_dump())
@@ -753,3 +755,23 @@ class TaskStateUpdater:
         if self.logger is None:
             return
         self.logger.log_event(event, **payload)
+
+    def _progress_logger(self, event: str):
+        if self.logger is None:
+            return None
+        last_emitted = {"heartbeat": 0.0, "chunk": 0.0}
+
+        def callback(payload: dict[str, object]) -> None:
+            kind = str(payload.get("type") or "").strip()
+            now = time.monotonic()
+            if kind == "heartbeat":
+                if now - last_emitted["heartbeat"] < 8.0:
+                    return
+                last_emitted["heartbeat"] = now
+            elif kind == "chunk":
+                if now - last_emitted["chunk"] < 2.0:
+                    return
+                last_emitted["chunk"] = now
+            self._log(event, **payload)
+
+        return callback

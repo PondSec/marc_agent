@@ -5,10 +5,19 @@ import shlex
 import shutil
 from pathlib import Path
 
-from agent.models import SessionState, ValidationCommand, WorkspaceSnapshot
+from agent.models import SessionState, ValidationCommand, ValidationRunRecord, WorkspaceSnapshot
 
 
 class ValidationPlanner:
+    WEB_FEATURE_KEYWORDS = {
+        "menu": ("menu", "menue", "menü", "navigation", "nav"),
+        "highscore": ("highscore", "high score", "scoreboard", "leaderboard", "best score", "bestenliste"),
+        "score": ("score", "punkte", "punktestand", "scoreboard"),
+        "start_controls": ("start", "play", "pause", "resume", "restart", "reset"),
+        "dialog": ("dialog", "modal", "popup", "overlay"),
+        "canvas": ("canvas", "spielfeld", "game board", "board"),
+        "settings": ("settings", "options", "config", "einstellungen"),
+    }
     DEFAULT_KIND_ORDER = {
         "test": 10,
         "lint": 20,
@@ -46,7 +55,7 @@ class ValidationPlanner:
             for item in snapshot.likely_commands
         ]
         if changed_paths and not any(self.command_scope(command) == "runtime" for command in commands):
-            commands.extend(self._default_commands(snapshot, changed_paths))
+            commands.extend(self._default_commands(snapshot, changed_paths, task=task))
         synthesized = self._synthesized_runtime_commands(
             snapshot,
             changed_paths,
@@ -93,11 +102,15 @@ class ValidationPlanner:
             return []
 
         passed = {
-            run.command
+            self.command_identity(run.command)
             for run in session.validation_runs
             if run.edit_generation == session.edit_generation and run.status == "passed"
         }
-        return [command for command in required_commands if command.command not in passed]
+        return [
+            command
+            for command in required_commands
+            if self.command_identity(command.command) not in passed
+        ]
 
     def next_command(self, session: SessionState) -> ValidationCommand | None:
         pending = self.pending_commands(session)
@@ -145,7 +158,7 @@ class ValidationPlanner:
 
     def command_scope(self, command: ValidationCommand | str, *, kind: str | None = None) -> str:
         if isinstance(command, ValidationCommand):
-            if command.verification_scope in {"syntax", "runtime"}:
+            if command.verification_scope in {"syntax", "structural", "runtime"}:
                 return command.verification_scope
             kind = command.kind
             text = command.command
@@ -158,6 +171,8 @@ class ValidationPlanner:
             return "runtime"
         if lowered.startswith("internal:python_syntax:"):
             return "syntax"
+        if lowered.startswith("internal:web_artifact:"):
+            return "structural"
         if lowered.startswith("internal:html_refs:"):
             return "static"
         if normalized_kind == "test":
@@ -203,6 +218,128 @@ class ValidationPlanner:
             for run in self._runtime_runs(session, current_generation_only=current_generation_only)
         )
 
+    def strongest_passed_scope(
+        self,
+        session: SessionState,
+        *,
+        current_generation_only: bool = True,
+    ) -> str | None:
+        ranking = {"syntax": 1, "static": 2, "structural": 3, "runtime": 4}
+        strongest: str | None = None
+        for run in self._runtime_runs(session, current_generation_only=current_generation_only):
+            if run.status != "passed":
+                continue
+            if strongest is None or ranking.get(run.verification_scope, 0) > ranking.get(strongest, 0):
+                strongest = run.verification_scope
+        return strongest
+
+    def web_functional_verification_required(self, session: SessionState) -> bool:
+        changed_paths = [item.path for item in session.changed_files]
+        html_files = [path for path in changed_paths if Path(path).suffix.lower() == ".html"]
+        if not html_files:
+            return False
+        if len(changed_paths) > 4:
+            return False
+        if session.workspace_snapshot is not None and session.workspace_snapshot.file_count > 40:
+            runtime_commands = [
+                command
+                for command in session.validation_plan
+                if command.verification_scope == "runtime"
+            ]
+            if runtime_commands:
+                return True
+            return False
+        return True
+
+    def has_structural_web_success(
+        self,
+        session: SessionState,
+        *,
+        current_generation_only: bool = True,
+    ) -> bool:
+        return any(
+            run.status == "passed" and run.verification_scope == "structural"
+            for run in self._runtime_runs(session, current_generation_only=current_generation_only)
+        )
+
+    def latest_failed_run(
+        self,
+        session: SessionState,
+        *,
+        current_generation_only: bool = True,
+        command: str | None = None,
+    ) -> ValidationRunRecord | None:
+        normalized_command = str(command or "").strip()
+        for run in reversed(self._runtime_runs(session, current_generation_only=current_generation_only)):
+            if run.status not in {"failed", "timeout", "blocked"}:
+                continue
+            if normalized_command and self.command_identity(run.command) != self.command_identity(normalized_command):
+                continue
+            return run
+        return None
+
+    def can_repeat_command(
+        self,
+        session: SessionState,
+        command: str,
+        *,
+        current_generation_only: bool = True,
+    ) -> bool:
+        normalized = self.command_identity(command)
+        if not normalized:
+            return False
+        failed_run = self.latest_failed_run(
+            session,
+            current_generation_only=current_generation_only,
+            command=normalized,
+        )
+        if failed_run is None:
+            return True
+        if failed_run.edit_generation != session.edit_generation:
+            return True
+
+        failed_iteration = int(failed_run.iteration or 0)
+        if any(
+            int(getattr(item, "iteration", 0) or 0) > failed_iteration
+            for item in session.diagnostics
+        ):
+            return True
+
+        for item in session.tool_calls:
+            iteration = int(getattr(item, "iteration", 0) or 0)
+            if iteration <= failed_iteration:
+                continue
+            if item.tool_name in {"run_tests", "run_shell"}:
+                current_command = self.command_identity(item.tool_args.get("command") or "")
+                if current_command == normalized:
+                    continue
+            return True
+
+        for run in self._runtime_runs(session, current_generation_only=current_generation_only):
+            iteration = int(getattr(run, "iteration", 0) or 0)
+            if iteration <= failed_iteration:
+                continue
+            if self.command_identity(run.command) != normalized:
+                return True
+        return False
+
+    def command_identity(self, command: ValidationCommand | str) -> str:
+        text = command.command if isinstance(command, ValidationCommand) else command
+        normalized = " ".join(str(text or "").strip().split())
+        if not normalized.startswith("internal:"):
+            return normalized
+
+        prefix, _, payload = normalized.partition(":")
+        kind, _, raw_json = payload.partition(":")
+        if not kind:
+            return normalized
+        try:
+            decoded = json.loads(raw_json or "[]")
+        except json.JSONDecodeError:
+            return normalized
+        compact = json.dumps(decoded, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return f"{prefix}:{kind}:{compact}"
+
     def _relevant_kinds(
         self,
         task: str,
@@ -225,7 +362,7 @@ class ValidationPlanner:
 
         for path in changed_files:
             suffix = Path(path).suffix.lower()
-            if suffix in {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt"}:
+            if suffix in {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".html"}:
                 kinds.add("test")
             if suffix in {".ts", ".tsx"}:
                 kinds.add("typecheck")
@@ -245,6 +382,8 @@ class ValidationPlanner:
         self,
         snapshot: WorkspaceSnapshot,
         changed_files: list[str],
+        *,
+        task: str,
     ) -> list[ValidationCommand]:
         unique_paths = self._unique_paths(changed_files)
         if not unique_paths:
@@ -277,6 +416,20 @@ class ValidationPlanner:
             )
 
         if html_files:
+            html_targets = [
+                {"path": path, "expected_features": self._expected_web_features(task)}
+                for path in html_files
+            ]
+            commands.append(
+                ValidationCommand(
+                    command=f"internal:web_artifact:{json.dumps(html_targets)}",
+                    kind="check",
+                    verification_scope="structural",
+                    source="default",
+                    priority=18,
+                    reason="Run structural HTML/JavaScript smoke checks for the changed web artifact.",
+                )
+            )
             commands.append(
                 ValidationCommand(
                     command=f"internal:html_refs:{json.dumps(html_files)}",
@@ -323,7 +476,7 @@ class ValidationPlanner:
             return commands
         return [
             command.model_copy(update={"required": False})
-            if command.source == "default" and command.verification_scope in {"syntax", "static"}
+            if command.source == "default" and command.verification_scope in {"syntax", "static", "structural"}
             else command
             for command in commands
         ]
@@ -433,3 +586,11 @@ class ValidationPlanner:
                 continue
             unique.append(text)
         return unique
+
+    def _expected_web_features(self, task: str) -> list[str]:
+        lowered = " ".join(str(task or "").lower().split())
+        expected: list[str] = []
+        for feature, markers in self.WEB_FEATURE_KEYWORDS.items():
+            if any(marker in lowered for marker in markers):
+                expected.append(feature)
+        return expected

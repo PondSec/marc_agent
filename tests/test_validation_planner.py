@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 
 from agent.models import FileChangeRecord, SessionState, ValidationCommand, ValidationRunRecord, WorkspaceSnapshot
@@ -90,6 +91,7 @@ def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypat
     commands = [item.command for item in plan]
     assert any(command.startswith("internal:python_cli_smoke:") for command in commands)
     assert any(command.startswith("internal:python_syntax:") for command in commands)
+    assert any(command.startswith("internal:web_artifact:") for command in commands)
     assert any(command.startswith("internal:html_refs:") for command in commands)
     assert any(command.startswith("node --check") for command in commands)
 
@@ -143,3 +145,42 @@ def test_validation_planner_does_not_mark_unchecked_changes_as_passed():
     session.changed_files.append(FileChangeRecord(path="game.py", operation="create"))
 
     assert planner.rollup_status(session) == "not_run"
+
+
+def test_validation_planner_adds_structural_web_checks_with_expected_features():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"html": 1, "javascript": 1},
+        top_directories=[],
+        important_files=["snake.html", "snake.js"],
+        focus_files=["snake.html"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small standalone web artifact.",
+    )
+
+    plan = planner.build_plan(
+        "Baue ein Menü und einen Highscore dazu",
+        snapshot,
+        changed_files=["snake.html", "snake.js"],
+    )
+
+    structural = next(item for item in plan if item.command.startswith("internal:web_artifact:"))
+    payload = json.loads(structural.command.partition("internal:web_artifact:")[2])
+
+    assert structural.verification_scope == "structural"
+    assert payload[0]["path"] == "snake.html"
+    assert "menu" in payload[0]["expected_features"]
+    assert "highscore" in payload[0]["expected_features"]

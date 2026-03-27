@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent.models import FileChangeRecord, SessionState, ToolCallRecord
+from agent.models import FileChangeRecord, SessionState, ToolCallRecord, ValidationRunRecord
 from agent.planner import Planner
 from agent.reporting import SessionReporter
 from agent.task_state import TaskState
@@ -246,6 +246,110 @@ def test_reporter_explains_missing_functional_validation_even_if_static_checks_p
     response = reporter.render_final_response(session)
 
     assert "functional reproduction or smoke test is still missing" in response
+
+
+def test_reporter_describes_structural_web_checks_more_honestly(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="Add a menu and highscore to snake.html",
+        workspace_root=str(tmp_path),
+        status="partial",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="passed",
+        stop_reason="functional_validation_missing",
+        task_state=TaskState(
+            latest_user_turn="Add a menu and highscore to snake.html",
+            root_goal="Extend the small standalone web artifact.",
+            active_goal="Update snake.html in place and check the result honestly.",
+            goal_relation="refine",
+            output_expectation="Apply the requested web follow-up and report the actual validation level.",
+            open_problem=None,
+            verification_target="Run the strongest available web validation without overstating coverage.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.85,
+            next_action="modify",
+            execution_outline=["Read snake.html", "Update the artifact", "Run web checks"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="snake.html", operation="modify"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"snake.html","expected_features":["menu","highscore"]}]',
+            verification_scope="structural",
+            status="passed",
+        )
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(session)
+
+    assert "structural web checks were confirmed" in response
+    assert "functional browser or runtime smoke test is still missing" in response
+
+
+def test_reporter_ignores_overconfident_draft_when_validation_is_only_structural(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="Add a menu to snake.html",
+        workspace_root=str(tmp_path),
+        status="partial",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="passed",
+        stop_reason="functional_validation_missing",
+        task_state=TaskState(
+            latest_user_turn="Add a menu to snake.html",
+            root_goal="Extend the small standalone web artifact.",
+            active_goal="Update snake.html in place and report the validation limits honestly.",
+            goal_relation="refine",
+            output_expectation="A concise user-facing summary that does not overclaim validation.",
+            open_problem=None,
+            verification_target="Report the strongest confirmed validation level without implying full runtime verification.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.85,
+            next_action="modify",
+            execution_outline=["Read snake.html", "Update the artifact", "Summarize honestly"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="snake.html", operation="modify"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"snake.html","expected_features":["menu"]}]',
+            verification_scope="structural",
+            status="passed",
+        )
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(
+        session,
+        draft_response="I implemented the task and validated it.",
+    )
+
+    assert "cannot claim a clean validated completion yet" in response
 
 
 def test_reporter_localizes_machine_summary_fallback_to_english(tmp_path):

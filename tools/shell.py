@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import py_compile
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -65,6 +68,8 @@ class ShellTools:
             return self._run_python_syntax_validation(command, working_dir, relative_paths)
         if kind == "python_cli_smoke":
             return self._run_python_cli_smoke_validation(command, working_dir, relative_paths)
+        if kind == "web_artifact":
+            return self._run_web_artifact_validation(command, working_dir, relative_paths)
         if kind == "html_refs":
             return self._run_html_reference_validation(command, working_dir, relative_paths)
         return {
@@ -246,6 +251,93 @@ class ShellTools:
             "command": command,
         }
 
+    def _run_web_artifact_validation(self, command: str, working_dir: Path, payload_items: list) -> dict:
+        failures: list[str] = []
+        summaries: list[str] = []
+        checked = 0
+        node_binary = shutil.which("node")
+
+        for item in payload_items:
+            descriptor = item if isinstance(item, dict) else {"path": item}
+            relative_path = str(descriptor.get("path") or "").strip()
+            expected_features = [
+                str(feature or "").strip()
+                for feature in descriptor.get("expected_features", [])
+                if str(feature or "").strip()
+            ]
+            if not relative_path:
+                continue
+            target = self.workspace.resolve_path(working_dir / relative_path)
+            if not target.exists():
+                failures.append(f"Missing HTML file: {relative_path}")
+                continue
+
+            parser = _HTMLArtifactParser()
+            parser.feed(target.read_text(encoding="utf-8"))
+            checked += 1
+
+            missing_refs: list[str] = []
+            script_texts: list[tuple[str, str]] = []
+            for reference in parser.references:
+                resolved = (target.parent / reference).resolve()
+                if not resolved.exists():
+                    missing_refs.append(reference)
+                    continue
+                if Path(reference).suffix.lower() in {".js", ".mjs", ".cjs"}:
+                    script_texts.append((reference, resolved.read_text(encoding="utf-8")))
+
+            if missing_refs:
+                failures.extend(f"{relative_path} -> {reference}" for reference in missing_refs)
+                continue
+
+            script_texts.extend(
+                (f"{relative_path}#inline-script-{index + 1}", content)
+                for index, content in enumerate(parser.inline_scripts)
+            )
+            syntax_failures = self._javascript_syntax_failures(script_texts, node_binary=node_binary)
+            failures.extend(f"{relative_path}: {message}" for message in syntax_failures)
+
+            token_space = parser.token_space
+            missing_features = [
+                feature
+                for feature in expected_features
+                if not self._web_feature_present(feature, token_space)
+            ]
+            if missing_features:
+                failures.append(
+                    f"{relative_path}: missing expected web features ({', '.join(missing_features)})"
+                )
+
+            dom_markers = parser.structural_markers
+            js_summary = (
+                f"JS parsed: {len(script_texts)} source(s)"
+                if node_binary
+                else f"JS parse skipped: node unavailable ({len(script_texts)} source(s))"
+            )
+            feature_summary = ", ".join(expected_features) if expected_features else "none inferred"
+            marker_summary = ", ".join(dom_markers[:5]) if dom_markers else "no obvious interactive markers"
+            summaries.append(
+                f"{relative_path}: refs ok; {js_summary}; expected features: {feature_summary}; markers: {marker_summary}."
+            )
+
+        success = not failures and checked > 0
+        notes = "Structural web checks only; no browser/runtime smoke test was executed."
+        stdout_parts = [part for part in summaries if part]
+        stdout_parts.append(notes)
+        return {
+            "success": success,
+            "message": (
+                "Structural web validation passed."
+                if success
+                else "Structural web validation failed."
+            ),
+            "risk_level": "low",
+            "stdout": "\n".join(stdout_parts).strip(),
+            "stderr": "\n".join(failures),
+            "exit_code": 0 if success else 1,
+            "command": command,
+        }
+
     def _default_python_smoke_input(self, target: Path) -> str:
         try:
             content = target.read_text(encoding="utf-8")
@@ -277,6 +369,71 @@ class ShellTools:
         line_count = min(max(input_calls + 4, 9), len(seed_values))
         return "\n".join(seed_values[:line_count]) + "\n"
 
+    def _javascript_syntax_failures(
+        self,
+        script_texts: list[tuple[str, str]],
+        *,
+        node_binary: str | None,
+    ) -> list[str]:
+        if not script_texts or not node_binary:
+            return []
+
+        failures: list[str] = []
+        for label, content in script_texts:
+            temp_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    suffix=".js",
+                    delete=False,
+                ) as handle:
+                    handle.write(content)
+                    temp_path = handle.name
+                completed = subprocess.run(
+                    [node_binary, "--check", temp_path],
+                    text=True,
+                    capture_output=True,
+                    timeout=min(max(int(self.config.shell_timeout), 1), 8),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                failures.append(f"{label}: JavaScript syntax check timed out.")
+                continue
+            finally:
+                if temp_path:
+                    Path(temp_path).unlink(missing_ok=True)
+
+            if completed.returncode != 0:
+                message = completed.stderr.strip() or completed.stdout.strip() or "JavaScript parse failed."
+                failures.append(f"{label}: {message}")
+        return failures
+
+    def _web_feature_present(self, feature: str, token_space: str) -> bool:
+        normalized = str(feature or "").strip().lower()
+        if not normalized:
+            return True
+        keyword_groups = {
+            "menu": (" menu ", " nav ", " navigation ", " menue ", " menü "),
+            "highscore": (
+                " highscore ",
+                " high score ",
+                " scoreboard ",
+                " leaderboard ",
+                " best score ",
+                " bestenliste ",
+            ),
+            "score": (" score ", " punkte ", " punktestand ", " scoreboard "),
+            "start_controls": (" start ", " play ", " pause ", " resume ", " restart ", " reset "),
+            "dialog": (" dialog ", " modal ", " popup ", " overlay "),
+            "canvas": (" canvas ", " spielfeld ", " board ", " game board "),
+            "settings": (" settings ", " options ", " config ", " einstellungen "),
+        }
+        markers = keyword_groups.get(normalized)
+        if markers is None:
+            return f" {normalized} " in token_space
+        return any(marker in token_space for marker in markers)
+
 
 class _HTMLReferenceParser(HTMLParser):
     def __init__(self) -> None:
@@ -296,3 +453,73 @@ class _HTMLReferenceParser(HTMLParser):
             if not cleaned or cleaned.startswith(("http://", "https://", "data:", "mailto:", "javascript:", "#")):
                 continue
             self.references.append(cleaned)
+
+
+class _HTMLArtifactParser(_HTMLReferenceParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inline_scripts: list[str] = []
+        self.visible_text: list[str] = []
+        self.ids: list[str] = []
+        self.classes: list[str] = []
+        self.tags: list[str] = []
+        self.structural_markers: list[str] = []
+        self._script_buffer: list[str] = []
+        self._inside_script = False
+
+    def reset_refs(self) -> None:
+        super().reset_refs()
+        self.inline_scripts = []
+        self.visible_text = []
+        self.ids = []
+        self.classes = []
+        self.tags = []
+        self.structural_markers = []
+        self._script_buffer = []
+        self._inside_script = False
+
+    @property
+    def token_space(self) -> str:
+        parts = self.tags + self.ids + self.classes + self.visible_text + self.inline_scripts
+        normalized = " ".join(parts).lower()
+        normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+        return f" {normalized} "
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attrs_dict = {str(key): str(value) for key, value in attrs if value}
+        self.tags.append(tag)
+        if attrs_dict.get("id"):
+            self.ids.append(attrs_dict["id"])
+        if attrs_dict.get("class"):
+            self.classes.extend(attrs_dict["class"].split())
+
+        interactive_tags = {"button", "canvas", "dialog", "form", "input", "menu", "select"}
+        if tag in interactive_tags and tag not in self.structural_markers:
+            self.structural_markers.append(tag)
+        if any(key.startswith("on") for key in attrs_dict):
+            if "dom-events" not in self.structural_markers:
+                self.structural_markers.append("dom-events")
+
+        if tag == "script" and not attrs_dict.get("src"):
+            self._inside_script = True
+            self._script_buffer = []
+        super().handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._inside_script:
+            script_text = "".join(self._script_buffer).strip()
+            if script_text:
+                self.inline_scripts.append(script_text)
+                if "inline-script" not in self.structural_markers:
+                    self.structural_markers.append("inline-script")
+            self._inside_script = False
+            self._script_buffer = []
+
+    def handle_data(self, data: str) -> None:
+        text = str(data or "")
+        if self._inside_script:
+            self._script_buffer.append(text)
+            return
+        cleaned = " ".join(text.split()).strip()
+        if cleaned:
+            self.visible_text.append(cleaned)

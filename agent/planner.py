@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
 import time
@@ -25,6 +26,7 @@ from llm.schemas import (
     AgentDecision,
     PlanningResponse,
     RouteActionName,
+    RouteActionStep,
     RouteIntent,
     RouterOutput,
 )
@@ -42,6 +44,7 @@ class GenerationIssue:
     partial_text: str = ""
     had_progress: bool = False
     characters: int = 0
+    retryable: bool = True
 
 
 @dataclass(slots=True)
@@ -213,13 +216,9 @@ class Planner:
             )
 
         if session.changed_files:
-            if (
-                session.validation_status == "failed"
-                and session.task_state is not None
-                and session.task_state.execution_strategy == "debug_repair"
-            ):
-                repair_decision = self.execute_action_from_plan(route, session)
-                if repair_decision.action_type != AgentActionType.FINAL or session.stop_reason:
+            if session.validation_status == "failed":
+                repair_decision = self._repair_after_failed_validation(route, session)
+                if repair_decision is not None:
                     return repair_decision
             command = self._pick_validation_command(session)
             if command is not None:
@@ -454,6 +453,12 @@ class Planner:
         route = session.router_result
         if route is not None and route.direct_response and not session.tool_calls:
             return route.direct_response
+        if session.changed_files and self._functional_validation_missing(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die Aufgabe umgesetzt, aber nur statische oder strukturelle Checks bestaetigt und noch keinen funktionalen Abschluss erreicht.",
+                en="I implemented the task, but only static or structural checks were confirmed and I do not have a functional sign-off yet.",
+            )
         if session.changed_files and session.validation_status == "passed":
             return self._localized_text(
                 language,
@@ -510,7 +515,15 @@ class Planner:
                         en=f"Changed: {', '.join(changed)}.",
                     )
                 )
-            if session.validation_status == "passed":
+            if self._functional_validation_missing(session):
+                lines.append(
+                    self._localized_text(
+                        language,
+                        de="Validierung: nur statische oder strukturelle Checks wurden bestaetigt; ein funktionaler Smoke-Test fehlt noch.",
+                        en="Validation: only static or structural checks were confirmed; a functional smoke test is still missing.",
+                    )
+                )
+            elif session.validation_status == "passed":
                 lines.append(self._localized_text(language, de="Validierung: bestanden.", en="Validation: passed."))
             elif session.validation_status == "failed":
                 lines.append(self._localized_text(language, de="Validierung: fehlgeschlagen.", en="Validation: failed."))
@@ -679,6 +692,171 @@ class Planner:
             )
         return None
 
+    def _repair_after_failed_validation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> AgentDecision | None:
+        failed_run = self.validation_planner.latest_failed_run(
+            session,
+            current_generation_only=False,
+        )
+        if failed_run is None:
+            return None
+
+        repair_route = self._repair_route_after_failed_validation(route, session, failed_run)
+        if repair_route is not None:
+            repair_decision = self.execute_action_from_plan(repair_route, session)
+            if repair_decision.action_type != AgentActionType.FINAL or session.stop_reason:
+                return repair_decision
+
+        command = self._pick_validation_command(session)
+        if command is not None:
+            return self._validation_decision(
+                "Only rerun validation when there is new evidence, a different command, or a completed repair step.",
+                command,
+            )
+
+        blocker = self._validation_repair_blocker_message(failed_run)
+        if blocker not in session.blockers:
+            session.blockers.append(blocker)
+            session.blockers = session.blockers[-10:]
+        session.last_error = blocker
+        session.stop_reason = "repair_blocked_after_validation_failure"
+        return self._final_decision(
+            "The failed validation cannot be rerun safely without a repairable target or new evidence.",
+            self._validation_repair_blocked_response(route, session, failed_run),
+        )
+
+    def _repair_route_after_failed_validation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        failed_run,
+    ) -> RouterOutput | None:
+        task_state = session.task_state
+        if task_state is not None and task_state.execution_strategy == "debug_repair":
+            return route
+
+        target = self._repair_target_after_failed_validation(route, session, failed_run)
+        if target is None:
+            return None
+
+        target_name = Path(target).name
+        action_plan = [
+            RouteActionStep(
+                step=1,
+                action=RouteActionName.READ_RELEVANT_FILES,
+                reason="Inspect the changed artifact again after the failed validation before repairing it.",
+            ),
+            RouteActionStep(
+                step=2,
+                action=RouteActionName.UPDATE_ARTIFACT,
+                reason="Repair the changed artifact using the failed validation evidence.",
+            ),
+            RouteActionStep(
+                step=3,
+                action=RouteActionName.RUN_VALIDATION,
+                reason="Rerun the validation after the repair step.",
+            ),
+            RouteActionStep(
+                step=4,
+                action=RouteActionName.SUMMARIZE_RESULT,
+                reason="Report the repair result and remaining validation state honestly.",
+            ),
+        ]
+        return route.model_copy(
+            update={
+                "intent": RouteIntent.UPDATE,
+                "requested_outcome": (
+                    f"Repair {target_name} so the failed validation passes while preserving the original requested outcome."
+                ),
+                "entities": route.entities.model_copy(
+                    update={
+                        "target_name": target_name,
+                        "target_paths": [target],
+                    }
+                ),
+                "action_plan": action_plan,
+            }
+        )
+
+    def _repair_target_after_failed_validation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        failed_run,
+    ) -> str | None:
+        candidates: list[str] = []
+        candidates.extend(self._paths_from_internal_validation_command(str(failed_run.command or "")))
+        for item in reversed(session.diagnostics):
+            candidates.extend(item.file_hints)
+        candidates.extend(route.entities.target_paths)
+        candidates.extend(item.path for item in reversed(session.changed_files))
+        candidates.extend(session.candidate_files)
+        for candidate in self._unique_paths(candidates):
+            absolute = Path(session.workspace_root, candidate)
+            if absolute.exists() and absolute.is_file():
+                return candidate
+        return None
+
+    def _paths_from_internal_validation_command(self, command: str) -> list[str]:
+        text = str(command or "").strip()
+        if not text.startswith("internal:"):
+            return []
+        _, _, payload = text.partition(":")
+        _, _, raw_json = payload.partition(":")
+        try:
+            data = json.loads(raw_json or "[]")
+        except Exception:
+            return []
+
+        values = data if isinstance(data, list) else [data]
+        paths: list[str] = []
+        for item in values:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    paths.append(cleaned)
+            elif isinstance(item, dict):
+                cleaned = str(item.get("path") or "").strip()
+                if cleaned:
+                    paths.append(cleaned)
+        return self._unique_paths(paths)
+
+    def _validation_repair_blocker_message(self, failed_run) -> str:
+        command = str(getattr(failed_run, "command", "") or "").strip() or "the last validation command"
+        return (
+            f"Validation failed for {command}, and I do not have a repairable target or new evidence that would justify rerunning the same check."
+        )
+
+    def _validation_repair_blocked_response(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        failed_run,
+    ) -> str:
+        language = self._session_language(session)
+        command = str(getattr(failed_run, "command", "") or "").strip() or "the last validation command"
+        target = self._repair_target_after_failed_validation(route, session, failed_run)
+        if language == "de":
+            lines = [
+                "Ich habe den fehlgeschlagenen Validierungsschritt als Reparaturausloeser behandelt und keinen sinnlosen Verify-Loop gestartet.",
+                f"Fehlgeschlagener Check: {command}.",
+            ]
+            if target:
+                lines.append(f"Betroffenes Artefakt: {target}.")
+            lines.append("Mir fehlt aber entweder ein reparierbares Ziel oder neue Evidenz fuer einen sicheren weiteren Schritt.")
+            return "\n".join(lines)
+        lines = [
+            "I treated the failed validation as a repair trigger and did not start a useless verify loop.",
+            f"Failed check: {command}.",
+        ]
+        if target:
+            lines.append(f"Affected artifact: {target}.")
+        lines.append("I still lack either a repairable target or new evidence for a safe next step.")
+        return "\n".join(lines)
+
     def _validation_decision(
         self,
         thought_summary: str,
@@ -695,15 +873,17 @@ class Planner:
 
     def _pick_validation_command(self, session: SessionState) -> str | None:
         passed = {
-            run.command
+            self.validation_planner.command_identity(run.command)
             for run in session.validation_runs
             if run.edit_generation == session.edit_generation and run.status == "passed"
         }
         for item in session.validation_plan:
-            if item.command not in passed:
+            identity = self.validation_planner.command_identity(item.command)
+            if identity not in passed and self.validation_planner.can_repeat_command(session, item.command):
                 return item.command
         for command in session.verification_commands:
-            if command and command not in passed:
+            identity = self.validation_planner.command_identity(command)
+            if command and identity not in passed and self.validation_planner.can_repeat_command(session, command):
                 return command
         snapshot = session.workspace_snapshot
         if snapshot is None:
@@ -715,10 +895,12 @@ class Planner:
             session=session,
         )
         for item in fallback_plan:
-            if item.command not in passed:
+            identity = self.validation_planner.command_identity(item.command)
+            if identity not in passed and self.validation_planner.can_repeat_command(session, item.command):
                 return item.command
         for command in snapshot.likely_commands:
-            if command and command not in passed:
+            identity = self.validation_planner.command_identity(command)
+            if command and identity not in passed and self.validation_planner.can_repeat_command(session, command):
                 return command
         return None
 
@@ -984,15 +1166,22 @@ class Planner:
             path=path,
             current_content=current_content,
         )
+        model_name = self._content_generation_model_name(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
         try:
             self._log(
                 "content_generation_started",
                 path=path,
                 update=current_content is not None,
-                model=self._primary_generation_model_name(),
+                model=model_name or self._primary_generation_model_name(),
             )
             content = self.llm.generate(
                 prompt,
+                model=model_name,
                 timeout=max(self._llm_timeout(75), 75),
                 total_timeout=max(self._llm_timeout(210), 210),
                 num_ctx=4096,
@@ -1164,6 +1353,7 @@ class Planner:
             partial_text=partial_text,
             had_progress=had_progress,
             characters=characters,
+            retryable=bool(getattr(exc, "retryable", True)),
         )
 
     def _context_pressure_likely(
@@ -1202,7 +1392,10 @@ class Planner:
             attempts.append(GenerationRecoveryAttempt("resume_same_model", "resume"))
         elif issue.context_pressure_likely:
             attempts.append(GenerationRecoveryAttempt("compact_same_model", "compact"))
-        elif issue.reason == "startup_timeout" or (issue.timeout_like and not fallback_model):
+        elif issue.reason == "startup_timeout":
+            if issue.retryable and not issue.had_progress:
+                attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
+        elif issue.timeout_like and not fallback_model:
             attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
         elif not issue.timeout_like:
             return attempts
@@ -1867,6 +2060,37 @@ class Planner:
         if not candidate or candidate == primary:
             return None
         return candidate
+
+    def _content_generation_model_name(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+    ) -> str | None:
+        del session
+        lightweight = self._lightweight_generation_model_name()
+        if lightweight is None or current_content is None:
+            return None
+        if route.intent != RouteIntent.UPDATE:
+            return None
+        if len(current_content) > 5_000:
+            return None
+        suffix = Path(path).suffix.lower()
+        if suffix not in {".html", ".css", ".js", ".jsx", ".mjs", ".cjs", ".md", ".json", ".toml", ".yaml", ".yml"}:
+            return None
+        target_paths = [item for item in route.entities.target_paths if item]
+        if target_paths and len(target_paths) > 1:
+            return None
+        return lightweight
+
+    def _functional_validation_missing(self, session: SessionState) -> bool:
+        if session.changed_files and self.validation_planner.runtime_verification_required(session):
+            return not self.validation_planner.has_runtime_success(session)
+        if session.changed_files and self.validation_planner.web_functional_verification_required(session):
+            return not self.validation_planner.has_runtime_success(session)
+        return False
 
     def _is_timeout_error(self, exc: Exception | None) -> bool:
         if isinstance(exc, OllamaGenerationError):
