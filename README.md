@@ -278,7 +278,7 @@ Minimal:
 python main.py
 ```
 
-Beim ersten Start installiert M.A.R.C A1 fehlende Runtime-Pakete aus `requirements-runtime.txt` und startet danach direkt die Web-App.
+Beim Serverstart prueft M.A.R.C A1 jetzt immer zuerst die komplette Runtime-Anforderungsliste aus `requirements-runtime.txt`. Fehlende oder unpassende Python-Pakete werden automatisch installiert, danach startet die Web-App direkt weiter.
 
 Auf Windows prueft der Startpfad jetzt zusaetzlich, ob Ollama vorhanden ist. Wenn `ollama` fehlt, versucht M.A.R.C A1 die offizielle Windows-Installation automatisch anzustossen und wartet danach auf die lokale API unter `OLLAMA_HOST`. Sobald der Server steht, werden die empfohlenen Modelle serverseitig angestossen und ihr Download-Status ist in der Web-GUI sichtbar.
 

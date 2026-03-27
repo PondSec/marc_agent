@@ -57,17 +57,27 @@ def test_display_path_for_log_falls_back_to_absolute_outside_project_root(tmp_pa
     assert display == external_path.as_posix()
 
 
+def test_read_requirement_specs_expands_nested_requirement_files(tmp_path):
+    nested = tmp_path / "base-runtime.txt"
+    nested.write_text("fastapi>=0.115,<1\n", encoding="utf-8")
+    requirements = tmp_path / "requirements-runtime.txt"
+    requirements.write_text(
+        "-r base-runtime.txt\nuvicorn>=0.30,<1\n",
+        encoding="utf-8",
+    )
+
+    specs = bootstrap_runtime._read_requirement_specs(requirements)
+
+    assert specs == ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+
+
 def test_ensure_runtime_dependencies_falls_back_to_runtime_venv(monkeypatch, tmp_path):
     requirements = tmp_path / "requirements-runtime.txt"
     requirements.write_text("fastapi>=0.1\n", encoding="utf-8")
 
     run_calls: list[list[str]] = []
     activated: list[Path] = []
-    state = {"checks": 0}
-
-    def fake_modules_available(modules):
-        state["checks"] += 1
-        return state["checks"] >= 2
+    state = {"active_runtime": False}
 
     def fake_run(command, *, capture_output=False):
         run_calls.append(command)
@@ -85,8 +95,18 @@ def test_ensure_runtime_dependencies_falls_back_to_runtime_venv(monkeypatch, tmp
 
     def fake_activate(venv_dir):
         activated.append(venv_dir)
+        state["active_runtime"] = True
 
-    monkeypatch.setattr(bootstrap_runtime, "_modules_available", fake_modules_available)
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_runtime_requirements_satisfied",
+        lambda requirements_path, modules: state["active_runtime"],
+    )
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_unsatisfied_runtime_requirements",
+        lambda requirements_path: ["fastapi>=0.1"],
+    )
     monkeypatch.setattr(bootstrap_runtime, "_ensure_pip", lambda: None)
     monkeypatch.setattr(bootstrap_runtime, "_run_command", fake_run)
     monkeypatch.setattr(bootstrap_runtime, "_ensure_runtime_venv", fake_ensure_runtime_venv)
@@ -94,8 +114,8 @@ def test_ensure_runtime_dependencies_falls_back_to_runtime_venv(monkeypatch, tmp
     monkeypatch.setattr(bootstrap_runtime, "__file__", str(tmp_path / "bootstrap_runtime.py"))
     monkeypatch.setattr(
         bootstrap_runtime,
-        "_modules_available_in_interpreter",
-        lambda python, modules: False,
+        "_runtime_requirements_satisfied_in_interpreter",
+        lambda python, requirements_path, modules: False,
     )
 
     ensure_runtime_dependencies(requirements_file=str(requirements.relative_to(tmp_path)))
@@ -106,6 +126,8 @@ def test_ensure_runtime_dependencies_falls_back_to_runtime_venv(monkeypatch, tmp
 
 
 def test_ensure_runtime_dependencies_reuses_existing_runtime_venv(monkeypatch, tmp_path):
+    requirements = tmp_path / "requirements-runtime.txt"
+    requirements.write_text("fastapi>=0.1\n", encoding="utf-8")
     runtime_venv = runtime_venv_path(tmp_path)
     runtime_python = runtime_python_path(runtime_venv)
     runtime_python.parent.mkdir(parents=True, exist_ok=True)
@@ -113,11 +135,15 @@ def test_ensure_runtime_dependencies_reuses_existing_runtime_venv(monkeypatch, t
     activated: list[Path] = []
 
     monkeypatch.setattr(bootstrap_runtime, "__file__", str(tmp_path / "bootstrap_runtime.py"))
-    monkeypatch.setattr(bootstrap_runtime, "_modules_available", lambda modules: False if not activated else True)
     monkeypatch.setattr(
         bootstrap_runtime,
-        "_modules_available_in_interpreter",
-        lambda python, modules: str(python) == str(runtime_python),
+        "_runtime_requirements_satisfied",
+        lambda requirements_path, modules: False if not activated else True,
+    )
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_runtime_requirements_satisfied_in_interpreter",
+        lambda python, requirements_path, modules: str(python) == str(runtime_python),
     )
     monkeypatch.setattr(
         bootstrap_runtime,
@@ -135,6 +161,56 @@ def test_ensure_runtime_dependencies_reuses_existing_runtime_venv(monkeypatch, t
     ensure_runtime_dependencies(requirements_file="requirements-runtime.txt")
 
     assert activated == [runtime_venv]
+
+
+def test_ensure_runtime_dependencies_installs_missing_requirement_even_when_core_modules_exist(
+    monkeypatch,
+    tmp_path,
+):
+    requirements = tmp_path / "requirements-runtime.txt"
+    requirements.write_text("argon2-cffi>=23.1,<24\n", encoding="utf-8")
+
+    state = {"installed": False}
+    run_calls: list[list[str]] = []
+
+    def fake_version(name: str) -> str:
+        normalized = name.lower()
+        if normalized == "argon2-cffi":
+            if state["installed"]:
+                return "23.1.0"
+            raise bootstrap_runtime.importlib_metadata.PackageNotFoundError
+        return "1.0"
+
+    def fake_run(command, *, capture_output=False):
+        run_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(bootstrap_runtime, "__file__", str(tmp_path / "bootstrap_runtime.py"))
+    monkeypatch.setattr(bootstrap_runtime, "_modules_available", lambda modules: True)
+    monkeypatch.setattr(bootstrap_runtime.importlib_metadata, "version", fake_version)
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_runtime_requirements_satisfied_in_interpreter",
+        lambda python, requirements_path, modules: False,
+    )
+    monkeypatch.setattr(bootstrap_runtime, "_ensure_pip", lambda: None)
+    monkeypatch.setattr(bootstrap_runtime, "_run_command", fake_run)
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_refresh_current_import_paths",
+        lambda: state.__setitem__("installed", True),
+    )
+    monkeypatch.setattr(
+        bootstrap_runtime,
+        "_ensure_runtime_venv",
+        lambda venv_dir: (_ for _ in ()).throw(
+            AssertionError("runtime venv should not be needed when current install succeeds")
+        ),
+    )
+
+    ensure_runtime_dependencies(requirements_file="requirements-runtime.txt")
+
+    assert any(command[:4] == [bootstrap_runtime.sys.executable, "-m", "pip", "install"] for command in run_calls)
 
 
 def test_ensure_ollama_runtime_installs_and_starts_ollama_on_windows(monkeypatch, tmp_path):

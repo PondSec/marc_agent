@@ -4,13 +4,16 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
+import shlex
 import site
 import subprocess
 import sys
 import sysconfig
 import time
 from contextlib import suppress
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from urllib import error, request
 
@@ -32,25 +35,30 @@ def ensure_runtime_dependencies(
     requirements_file: str = "requirements-runtime.txt",
     modules: tuple[str, ...] = RUNTIME_MODULES,
 ) -> None:
-    if _modules_available(modules):
-        return
-
     project_root = Path(__file__).resolve().parent
-    existing_runtime_venv = runtime_venv_path(project_root)
-    existing_runtime_python = runtime_python_path(existing_runtime_venv)
-    if existing_runtime_python.exists() and _modules_available_in_interpreter(
-        existing_runtime_python,
-        modules,
-    ):
-        _activate_runtime_venv(existing_runtime_venv)
-        if _modules_available(modules):
-            return
-
     requirements_path = project_root / requirements_file
     if not requirements_path.exists():
         raise RuntimeError(f"Missing requirements file: {requirements_path}")
 
-    print("[M.A.R.C A1] Fehlende Python-Abhaengigkeiten erkannt.")
+    if _runtime_requirements_satisfied(requirements_path, modules):
+        return
+
+    existing_runtime_venv = runtime_venv_path(project_root)
+    existing_runtime_python = runtime_python_path(existing_runtime_venv)
+    if existing_runtime_python.exists() and _runtime_requirements_satisfied_in_interpreter(
+        existing_runtime_python,
+        requirements_path,
+        modules,
+    ):
+        _activate_runtime_venv(existing_runtime_venv)
+        if _runtime_requirements_satisfied(requirements_path, modules):
+            return
+
+    missing_requirements = _unsatisfied_runtime_requirements(requirements_path)
+    print(
+        "[M.A.R.C A1] Fehlende oder unpassende Python-Abhaengigkeiten erkannt: "
+        f"{_summarize_requirement_list(missing_requirements)}"
+    )
     print(f"[M.A.R.C A1] Installiere Runtime-Pakete aus {requirements_path.name} ...")
 
     _ensure_pip()
@@ -58,10 +66,11 @@ def ensure_runtime_dependencies(
     current_install = _run_command(current_command, capture_output=True)
     if current_install.returncode == 0:
         _refresh_current_import_paths()
-        if _modules_available(modules):
+        if _runtime_requirements_satisfied(requirements_path, modules):
             return
         print(
-            "[M.A.R.C A1] Pakete wurden installiert, sind im aktuellen Interpreter aber noch nicht sichtbar."
+            "[M.A.R.C A1] Pakete wurden geprueft oder installiert, "
+            "sind im aktuellen Interpreter aber noch nicht vollstaendig sichtbar."
         )
     else:
         _print_command_output(current_install)
@@ -78,7 +87,11 @@ def ensure_runtime_dependencies(
 
     runtime_venv_dir = existing_runtime_venv
     runtime_python = _ensure_runtime_venv(runtime_venv_dir)
-    if not _modules_available_in_interpreter(runtime_python, modules):
+    if not _runtime_requirements_satisfied_in_interpreter(
+        runtime_python,
+        requirements_path,
+        modules,
+    ):
         print(
             "[M.A.R.C A1] Installiere Runtime-Pakete in "
             f"{_display_path_for_log(runtime_venv_dir, project_root)} ..."
@@ -98,7 +111,7 @@ def ensure_runtime_dependencies(
             )
 
     _activate_runtime_venv(runtime_venv_dir)
-    if not _modules_available(modules):
+    if not _runtime_requirements_satisfied(requirements_path, modules):
         raise RuntimeError(
             "Die Runtime-Abhaengigkeiten wurden installiert, sind aber noch nicht importierbar."
         )
@@ -183,6 +196,132 @@ def _modules_available(modules: tuple[str, ...]) -> bool:
     return all(importlib.util.find_spec(module) is not None for module in modules)
 
 
+def _runtime_requirements_satisfied(
+    requirements_path: Path,
+    modules: tuple[str, ...],
+) -> bool:
+    return not _unsatisfied_runtime_requirements(requirements_path) and _modules_available(
+        modules
+    )
+
+
+def _runtime_requirements_satisfied_in_interpreter(
+    python_executable: str | Path,
+    requirements_path: Path,
+    modules: tuple[str, ...],
+) -> bool:
+    code = """
+import importlib.util
+import json
+import re
+import shlex
+import sys
+from importlib import metadata as importlib_metadata
+from pathlib import Path
+
+with_packaging = False
+Requirement = None
+with_version = None
+try:
+    from packaging.requirements import Requirement as _Requirement
+    from packaging.version import Version as _Version
+    Requirement = _Requirement
+    with_version = _Version
+    with_packaging = True
+except Exception:
+    try:
+        from pip._vendor.packaging.requirements import Requirement as _Requirement
+        from pip._vendor.packaging.version import Version as _Version
+        Requirement = _Requirement
+        with_version = _Version
+        with_packaging = True
+    except Exception:
+        with_packaging = False
+
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+")
+
+
+def normalize_name(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+def strip_comment(line):
+    if " #" in line:
+        return line.split(" #", 1)[0].rstrip()
+    return line
+
+
+def read_specs(path, seen=None):
+    seen = seen or set()
+    resolved = path.resolve()
+    if resolved in seen:
+        return []
+    seen.add(resolved)
+    specs = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = strip_comment(raw_line.strip())
+        if not line or line.startswith("#"):
+            continue
+        parts = shlex.split(line, comments=False, posix=True)
+        if not parts:
+            continue
+        head = parts[0]
+        if head in {"-r", "--requirement"} and len(parts) >= 2:
+            specs.extend(read_specs((path.parent / parts[1]).resolve(), seen))
+            continue
+        if head.startswith("-r") and len(head) > 2:
+            specs.extend(read_specs((path.parent / head[2:]).resolve(), seen))
+            continue
+        if head.startswith("--requirement="):
+            specs.extend(read_specs((path.parent / head.split("=", 1)[1]).resolve(), seen))
+            continue
+        if head.startswith("-"):
+            continue
+        specs.append(line)
+    return specs
+
+
+def requirement_satisfied(spec):
+    if with_packaging:
+        requirement = Requirement(spec)
+        if requirement.marker and not requirement.marker.evaluate():
+            return True
+        try:
+            installed_version = importlib_metadata.version(requirement.name)
+        except importlib_metadata.PackageNotFoundError:
+            return False
+        if requirement.specifier:
+            return requirement.specifier.contains(installed_version, prereleases=True)
+        return True
+
+    match = NAME_PATTERN.match(spec)
+    if not match:
+        return False
+    name = normalize_name(match.group(0))
+    try:
+        importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+requirements_path = Path(sys.argv[1])
+modules = json.loads(sys.argv[2])
+ok = all(importlib.util.find_spec(module) is not None for module in modules)
+if ok:
+    for requirement_spec in read_specs(requirements_path):
+        if not requirement_satisfied(requirement_spec):
+            ok = False
+            break
+print(json.dumps(ok))
+""".strip()
+    completed = _run_command(
+        [str(python_executable), "-c", code, str(requirements_path), json.dumps(list(modules))],
+        capture_output=True,
+    )
+    return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+
 def _modules_available_in_interpreter(
     python_executable: str | Path,
     modules: tuple[str, ...],
@@ -197,6 +336,117 @@ def _modules_available_in_interpreter(
         capture_output=True,
     )
     return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+
+def _unsatisfied_runtime_requirements(requirements_path: Path) -> list[str]:
+    unsatisfied: list[str] = []
+    for requirement_spec in _read_requirement_specs(requirements_path):
+        if not _requirement_spec_satisfied(requirement_spec):
+            unsatisfied.append(requirement_spec)
+    return unsatisfied
+
+
+def _summarize_requirement_list(requirements: list[str]) -> str:
+    if not requirements:
+        return "Importpfade oder Laufzeitmodule sind unvollstaendig"
+    preview = ", ".join(requirements[:4])
+    if len(requirements) > 4:
+        preview += ", ..."
+    return preview
+
+
+def _read_requirement_specs(
+    requirements_path: Path,
+    seen_paths: set[Path] | None = None,
+) -> list[str]:
+    resolved_path = requirements_path.resolve()
+    seen = seen_paths or set()
+    if resolved_path in seen:
+        return []
+    seen.add(resolved_path)
+
+    specs: list[str] = []
+    for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = _strip_requirement_comment(raw_line.strip())
+        if not line or line.startswith("#"):
+            continue
+        parts = shlex.split(line, comments=False, posix=True)
+        if not parts:
+            continue
+        head = parts[0]
+        if head in {"-r", "--requirement"} and len(parts) >= 2:
+            nested = (requirements_path.parent / parts[1]).resolve()
+            specs.extend(_read_requirement_specs(nested, seen))
+            continue
+        if head.startswith("-r") and len(head) > 2:
+            nested = (requirements_path.parent / head[2:]).resolve()
+            specs.extend(_read_requirement_specs(nested, seen))
+            continue
+        if head.startswith("--requirement="):
+            nested = (requirements_path.parent / head.split("=", 1)[1]).resolve()
+            specs.extend(_read_requirement_specs(nested, seen))
+            continue
+        if head.startswith("-"):
+            continue
+        specs.append(line)
+    return specs
+
+
+def _strip_requirement_comment(line: str) -> str:
+    if " #" in line:
+        return line.split(" #", 1)[0].rstrip()
+    return line
+
+
+def _requirement_spec_satisfied(requirement_spec: str) -> bool:
+    requirement = _parse_requirement_spec(requirement_spec)
+    if requirement is None:
+        return False
+    if requirement.get("marker_skipped"):
+        return True
+
+    try:
+        installed_version = importlib_metadata.version(requirement["name"])
+    except importlib_metadata.PackageNotFoundError:
+        return False
+
+    specifier = requirement.get("specifier")
+    if specifier is None:
+        return True
+    if "packaging_requirement" in requirement:
+        return specifier.contains(installed_version, prereleases=True)
+    return True
+
+
+def _parse_requirement_spec(requirement_spec: str) -> dict[str, object] | None:
+    with suppress(Exception):
+        from packaging.requirements import Requirement
+
+        parsed = Requirement(requirement_spec)
+        if parsed.marker and not parsed.marker.evaluate():
+            return {"name": parsed.name, "marker_skipped": True}
+        return {
+            "name": parsed.name,
+            "specifier": parsed.specifier,
+            "packaging_requirement": parsed,
+        }
+
+    with suppress(Exception):
+        from pip._vendor.packaging.requirements import Requirement
+
+        parsed = Requirement(requirement_spec)
+        if parsed.marker and not parsed.marker.evaluate():
+            return {"name": parsed.name, "marker_skipped": True}
+        return {
+            "name": parsed.name,
+            "specifier": parsed.specifier,
+            "packaging_requirement": parsed,
+        }
+
+    match = re.match(r"^(?P<name>[A-Za-z0-9_.-]+)", requirement_spec)
+    if not match:
+        return None
+    return {"name": match.group("name"), "specifier": None}
 
 
 def _ensure_pip() -> None:
