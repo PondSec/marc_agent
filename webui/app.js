@@ -83,9 +83,9 @@ const state = {
   },
   ui: {
     booting: true,
+    page: "workspace",
     sessionLoading: false,
     workspaceModalOpen: false,
-    settingsModalOpen: false,
     workspaceMode: "create",
     editingWorkspaceId: null,
     workspaceName: "",
@@ -349,9 +349,9 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
   state.activeSessionId = preserveRoute ? state.activeSessionId : null;
   state.activeSession = null;
   state.selectedWorkspaceId = null;
+  state.ui.page = preserveRoute ? state.ui.page : "workspace";
   state.ui.sessionLoading = false;
   state.ui.workspaceModalOpen = false;
-  state.ui.settingsModalOpen = false;
   resetChatScrollState();
   if (!preserveRoute) {
     syncHistory(null);
@@ -918,8 +918,8 @@ function handleClick(event) {
     return;
   }
 
-  if (action === "open-settings-modal") {
-    openSettingsModal();
+  if (action === "open-settings-page") {
+    openSettingsPage();
     return;
   }
 
@@ -943,8 +943,8 @@ function handleClick(event) {
     return;
   }
 
-  if (action === "close-settings-modal") {
-    closeSettingsModal();
+  if (action === "close-settings-page") {
+    closeSettingsPage();
     return;
   }
 
@@ -1123,8 +1123,9 @@ function handleKeydown(event) {
       closeWorkspaceModal();
       return;
     }
-    if (state.ui.settingsModalOpen) {
-      closeSettingsModal();
+    if (state.ui.page === "settings") {
+      closeSettingsPage();
+      return;
     }
     if (!state.auth.authenticated) {
       state.auth.error = "";
@@ -1166,8 +1167,9 @@ function openWorkspaceModal(mode, workspaceId = null) {
   renderApp();
 }
 
-function openSettingsModal() {
-  state.ui.settingsModalOpen = true;
+function openSettingsPage() {
+  state.ui.page = "settings";
+  syncHistory({ page: "settings" });
   renderApp();
   refreshModelCatalog({ silent: true });
 }
@@ -1179,8 +1181,9 @@ function closeWorkspaceModal() {
   renderApp();
 }
 
-function closeSettingsModal() {
-  state.ui.settingsModalOpen = false;
+function closeSettingsPage() {
+  state.ui.page = "workspace";
+  syncHistory({ page: "workspace", replace: true });
   renderApp();
 }
 
@@ -1237,28 +1240,40 @@ function renderApp() {
     return;
   }
   const uiSnapshot = captureUiSnapshot();
-  captureChatScrollState();
-  root.innerHTML = `
-    <div class="shell">
-      <aside class="sidebar">
-        ${renderSidebar()}
-      </aside>
-      <main class="workspace-shell">
-        ${renderTopBar()}
-        ${renderChatContainer()}
-        ${renderChatInput()}
-      </main>
-    </div>
-    ${renderWorkspaceModal()}
-    ${renderSettingsModal()}
-    ${renderToast()}
-  `;
-  syncComposerControls();
+  const settingsPage = state.ui.page === "settings";
+  if (!settingsPage) {
+    captureChatScrollState();
+  }
+  root.innerHTML = settingsPage
+    ? `
+        ${renderSettingsPage()}
+        ${renderWorkspaceModal()}
+        ${renderToast()}
+      `
+    : `
+        <div class="shell">
+          <aside class="sidebar">
+            ${renderSidebar()}
+          </aside>
+          <main class="workspace-shell">
+            ${renderTopBar()}
+            ${renderChatContainer()}
+            ${renderChatInput()}
+          </main>
+        </div>
+        ${renderWorkspaceModal()}
+        ${renderToast()}
+      `;
+  if (!settingsPage) {
+    syncComposerControls();
+  }
   restoreUiSnapshot(uiSnapshot);
-  restoreChatScrollState();
-  window.requestAnimationFrame(() => {
+  if (!settingsPage) {
     restoreChatScrollState();
-  });
+    window.requestAnimationFrame(() => {
+      restoreChatScrollState();
+    });
+  }
 }
 
 function renderSetupShell() {
@@ -1901,7 +1916,7 @@ function renderSidebarFooter(activeRuns) {
   if (!state.auth.user) {
     return `
       <div class="sidebar-footer">
-        <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-modal">
+        <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-page">
           Einstellungen
         </button>
       </div>
@@ -1915,7 +1930,7 @@ function renderSidebarFooter(activeRuns) {
         <span>${escapeHtml(activeRuns ? `${activeRuns} aktive Laeufe` : "Bereit")}</span>
       </div>
       <div class="sidebar-footer-actions">
-        <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-modal">
+        <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-page">
           Einstellungen
         </button>
         <button class="button-ghost sidebar-footer-button" type="button" data-action="logout">
@@ -2232,7 +2247,7 @@ function renderTopBar() {
           <button
             class="icon-button top-bar-icon"
             type="button"
-            data-action="open-settings-modal"
+            data-action="open-settings-page"
             aria-label="Einstellungen"
             title="Agent- und Laufzeitoptionen"
           >
@@ -2781,7 +2796,7 @@ function renderChatInput() {
             ${renderMetaChip(state.composer.modelName || "Standardmodell", "muted")}
             ${renderMetaChip(labelForAccessMode(state.composer.accessMode), "muted")}
             ${renderMetaChip(currentExecutionProfileLabel(), "muted")}
-            <button class="button-ghost composer-options-button" type="button" data-action="open-settings-modal">
+            <button class="button-ghost composer-options-button" type="button" data-action="open-settings-page">
               Optionen
             </button>
           </div>
@@ -2818,75 +2833,190 @@ function renderThoughtStrip(thought) {
   `;
 }
 
-function renderSettingsModal() {
-  if (!state.ui.settingsModalOpen) {
-    return "";
-  }
-
+function renderSettingsPage() {
+  const config = state.config || {};
+  const currentWorkspace = workspaceForSession(state.activeSession) || selectedWorkspace();
+  const installedModels = Array.isArray(state.models?.installed_models) ? state.models.installed_models : [];
   return `
-    <div class="modal-backdrop" data-action="close-settings-modal"></div>
-    <div class="modal-layer">
-      <section class="modal-card">
-        <header class="modal-head">
-          <div>
-            <p class="modal-kicker">Laufzeit</p>
-            <h3>Agent-Einstellungen</h3>
+    <main class="settings-page">
+      <div class="settings-page-inner">
+        <header class="settings-page-header">
+          <div class="settings-page-headline">
+            <button class="button-ghost settings-back-button" type="button" data-action="close-settings-page">
+              <span>Zurueck zur Konsole</span>
+            </button>
+            <div class="settings-page-copy">
+              <p class="panel-kicker">Einstellungen</p>
+              <h1 class="settings-page-title">System und Laufzeit</h1>
+              <p class="settings-page-subtitle">
+                Alle aktuell verfuegbaren Einstellungen sind hier gebuendelt: Agent-Laufverhalten, Modelle,
+                Projektverwaltung und die wichtigsten Runtime-Werte.
+              </p>
+            </div>
           </div>
-          <button class="icon-button modal-close" type="button" data-action="close-settings-modal" aria-label="Schliessen">
-            <span class="modal-close-glyph" aria-hidden="true">X</span>
-          </button>
+          <div class="settings-page-actions">
+            <button class="button-secondary" type="button" data-action="open-workspace-modal">
+              Projekt anlegen
+            </button>
+            <button class="button-ghost" type="button" data-action="ensure-models">
+              Modelle aktualisieren
+            </button>
+          </div>
         </header>
-        <div class="modal-body settings-form">
-          <label class="modal-field">
-            <span>Agent</span>
-            <select id="agentProfileSelect">
-              ${renderAgentProfileOptions()}
-            </select>
-          </label>
-          <label class="modal-field">
-            <span>Zugriffsmodus</span>
-            <select id="accessModeSelect">
-              ${renderAccessModeOptions()}
-            </select>
-          </label>
-          <label class="modal-field">
-            <span>Modell</span>
-            <select id="modelNameSelect">
-              ${renderModelOptions()}
-            </select>
-            <small>${escapeHtml(modelFieldHelperText())}</small>
-          </label>
-          <label class="modal-field">
-            <span>Ausfuehrungsprofil</span>
-            <select id="executionProfileSelect">
-              ${renderExecutionProfileOptions()}
-            </select>
-          </label>
-          <label class="settings-toggle">
-            <span>
-              <strong>Trockenlauf</strong>
-              <small>Werkzeuge nur simulieren, ohne Dateien zu veraendern</small>
-            </span>
-            <input id="dryRunToggle" type="checkbox"${state.composer.dryRun ? " checked" : ""} />
-          </label>
-          <section class="model-panel">
-            <div class="model-panel-head">
-              <div>
-                <strong>Empfohlene Modelle</strong>
-                <small>Die App haelt lokale Modelle fuer staerkere Coding- und Agent-Aufgaben verfuegbar.</small>
-              </div>
-              <button class="button-ghost model-panel-action" type="button" data-action="ensure-models">
-                Jetzt aktualisieren
-              </button>
-            </div>
-            <div class="model-list">
-              ${renderRecommendedModels()}
-            </div>
-          </section>
+        <div class="settings-page-chips">
+          ${renderMetaChip(currentWorkspace?.name || "Kein Projekt", "muted")}
+          ${renderMetaChip(state.composer.modelName || config.model_name || "Standardmodell", "muted")}
+          ${renderMetaChip(labelForAccessMode(state.composer.accessMode), "muted")}
+          ${renderMetaChip(currentExecutionProfileLabel(), "muted")}
         </div>
-      </section>
-    </div>
+        <div class="settings-layout">
+          <div class="settings-stack">
+            <section class="surface-panel settings-page-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Agent</p>
+                  <h3>Ausfuehrung</h3>
+                </div>
+                ${renderStatusBadge(state.composer.dryRun ? "Trockenlauf" : "Aktiv", state.composer.dryRun ? "warning" : "muted", {
+                  compact: true,
+                })}
+              </div>
+              <p class="settings-panel-copy">
+                Diese Werte gelten fuer neue Agentenlaeufe, Antworten und Folgeauftraege im Chat.
+              </p>
+              <div class="settings-form-grid">
+                <label class="settings-field">
+                  <span>Agent</span>
+                  <select id="agentProfileSelect">
+                    ${renderAgentProfileOptions()}
+                  </select>
+                </label>
+                <label class="settings-field">
+                  <span>Zugriffsmodus</span>
+                  <select id="accessModeSelect">
+                    ${renderAccessModeOptions()}
+                  </select>
+                </label>
+                <label class="settings-field">
+                  <span>Modell</span>
+                  <select id="modelNameSelect">
+                    ${renderModelOptions()}
+                  </select>
+                  <small>${escapeHtml(modelFieldHelperText())}</small>
+                </label>
+                <label class="settings-field">
+                  <span>Ausfuehrungsprofil</span>
+                  <select id="executionProfileSelect">
+                    ${renderExecutionProfileOptions()}
+                  </select>
+                </label>
+              </div>
+              <label class="settings-toggle settings-toggle-row">
+                <span>
+                  <strong>Trockenlauf</strong>
+                  <small>Werkzeuge nur simulieren, ohne Dateien zu veraendern</small>
+                </span>
+                <input id="dryRunToggle" type="checkbox"${state.composer.dryRun ? " checked" : ""} />
+              </label>
+            </section>
+
+            <section class="surface-panel settings-page-panel">
+              <div class="settings-panel-head">
+                <div>
+                  <p class="panel-kicker">Modelle</p>
+                  <h3>Lokale Modellverwaltung</h3>
+                </div>
+                <button class="button-ghost model-panel-action" type="button" data-action="ensure-models">
+                  Jetzt aktualisieren
+                </button>
+              </div>
+              <p class="settings-panel-copy">
+                Empfohlene Coding- und Router-Modelle werden hier sichtbar und koennen direkt angestossen werden.
+              </p>
+              ${
+                installedModels.length
+                  ? `
+                    <div class="settings-chip-row">
+                      ${installedModels.map((item) => renderMetaChip(item.name, "muted")).join("")}
+                    </div>
+                  `
+                  : `<div class="inline-note">Noch keine lokalen Modelle gefunden.</div>`
+              }
+              <div class="model-list">
+                ${renderRecommendedModels()}
+              </div>
+            </section>
+
+            <section class="surface-panel settings-page-panel">
+              <div class="settings-panel-head">
+                <div>
+                  <p class="panel-kicker">Projekte</p>
+                  <h3>Projektverwaltung</h3>
+                </div>
+                <button class="button-secondary" type="button" data-action="open-workspace-modal">
+                  Projekt anlegen
+                </button>
+              </div>
+              <p class="settings-panel-copy">
+                Hier verwaltest du alle verbundenen Projektordner, die in der Konsole links auftauchen.
+              </p>
+              ${renderWorkspaceList()}
+            </section>
+          </div>
+
+          <div class="settings-stack">
+            ${renderIdentityPanel()}
+            <section class="surface-panel settings-page-panel">
+              <div class="settings-panel-head">
+                <div>
+                  <p class="panel-kicker">Runtime</p>
+                  <h3>Systemwerte</h3>
+                </div>
+                ${renderStatusBadge(config.model_name ? "Geladen" : "Ohne Config", config.model_name ? "success" : "warning", {
+                  compact: true,
+                })}
+              </div>
+              <p class="settings-panel-copy">
+                Diese Werte kommen direkt aus der aktuellen Server-Konfiguration. Sie sind hier sichtbar, auch wenn
+                nicht jeder Eintrag in der Web-Oberflaeche direkt bearbeitet werden kann.
+              </p>
+              <div class="settings-info-grid">
+                ${renderSettingsInfoCard("Ollama Host", config.ollama_host || "-", "Endpoint fuer lokale Modelle")}
+                ${renderSettingsInfoCard("Standardmodell", config.preferred_model_name || config.model_name || "-", "Aktueller Standard fuer neue Laeufe")}
+                ${renderSettingsInfoCard("Router-Modell", config.router_preferred_model_name || "-", "Routing und schnellere Vorentscheidungen")}
+                ${renderSettingsInfoCard("Default Zugriff", labelForAccessMode(config.access_mode || state.composer.accessMode), "Serverseitiger Standardmodus")}
+                ${renderSettingsInfoCard("Netzwerk", formatBooleanSetting(config.allow_network), "Externe Netzwerkzugriffe")}
+                ${renderSettingsInfoCard("Gefaehrliche Befehle", formatBooleanSetting(config.allow_dangerous_commands), "Shell mit erweitertem Risiko")}
+                ${renderSettingsInfoCard("Warmup beim Start", formatBooleanSetting(config.warmup_models_on_startup), "Modelle beim Boot vorladen")}
+                ${renderSettingsInfoCard("Pfad-Scope", config.path_scope || "-", "Systemweit oder projektbezogen")}
+                ${renderSettingsInfoCard("Workspace Root", config.workspace_root || "-", "Basisverzeichnis der Runtime")}
+                ${renderSettingsInfoCard("State Root", config.state_root || "-", "Sessions, Logs und Reports")}
+                ${renderSettingsInfoCard("Cookie Secure", formatBooleanSetting(config.auth_cookie_secure), "HTTPS-Schutz fuer Auth-Cookies")}
+                ${renderSettingsInfoCard("Public Base URL", config.public_base_url || "Nicht gesetzt", "Optional fuer Reverse Proxy / externe URL")}
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </main>
   `;
+}
+
+function renderSettingsInfoCard(label, value, hint = "") {
+  return `
+    <article class="settings-info-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value || "-"))}</strong>
+      ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
+    </article>
+  `;
+}
+
+function formatBooleanSetting(value) {
+  if (typeof value !== "boolean") {
+    return "Nicht gesetzt";
+  }
+  return value ? "Ja" : "Nein";
 }
 
 function renderWorkspaceModal() {
@@ -4390,13 +4520,51 @@ function loginRetryAfterSeconds() {
 }
 
 function hydrateRouteFromLocation() {
-  const url = new URL(window.location.href);
-  state.activeSessionId = url.searchParams.get("session");
+  const route = parseUiRoute(window.location.href);
+  state.activeSessionId = route.sessionId;
+  state.ui.page = route.page;
 }
 
-function syncHistory(sessionId) {
-  const url = sessionId ? `/?session=${encodeURIComponent(sessionId)}` : "/";
-  window.history.pushState({}, "", url);
+function syncHistory(sessionIdOrOptions = {}) {
+  let sessionId = state.activeSessionId;
+  let page = state.ui.page || "workspace";
+  let replace = false;
+
+  if (typeof sessionIdOrOptions === "string" || sessionIdOrOptions === null) {
+    sessionId = sessionIdOrOptions;
+  } else if (sessionIdOrOptions && typeof sessionIdOrOptions === "object") {
+    if ("sessionId" in sessionIdOrOptions) {
+      sessionId = sessionIdOrOptions.sessionId;
+    }
+    if ("page" in sessionIdOrOptions) {
+      page = sessionIdOrOptions.page;
+    }
+    replace = Boolean(sessionIdOrOptions.replace);
+  }
+
+  const url = buildUiRoute({ sessionId, page });
+  window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+}
+
+function parseUiRoute(value) {
+  const url = new URL(value, "http://localhost");
+  const page = url.searchParams.get("view") === "settings" ? "settings" : "workspace";
+  return {
+    page,
+    sessionId: url.searchParams.get("session"),
+  };
+}
+
+function buildUiRoute({ sessionId = null, page = "workspace" } = {}) {
+  const params = new URLSearchParams();
+  if (sessionId) {
+    params.set("session", sessionId);
+  }
+  if (page === "settings") {
+    params.set("view", "settings");
+  }
+  const query = params.toString();
+  return query ? `/?${query}` : "/";
 }
 
 function applyStoredPreferences() {
@@ -5251,12 +5419,14 @@ function icon(name) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildActivityClusters,
+    buildUiRoute,
     buildPhaseSteps,
     buildSessionOverview,
     buildValidationSnapshot,
     createRefreshController,
     describeLogRecord,
     messageDisplayState,
+    parseUiRoute,
     shouldStartRefresh,
     updateRefreshBackoff,
     phaseStepKey,

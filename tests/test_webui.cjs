@@ -3,10 +3,12 @@ const assert = require("node:assert/strict");
 
 const {
   buildActivityClusters,
+  buildUiRoute,
   buildPhaseSteps,
   buildSessionOverview,
   buildValidationSnapshot,
   createRefreshController,
+  parseUiRoute,
   renderRichText,
   sanitizeAssistantMessageContent,
   sessionBadgeText,
@@ -199,4 +201,18 @@ test("updateRefreshBackoff vergroessert ruhige Polling-Intervalle und setzt sie 
   updateRefreshBackoff(controller, { changed: true, now: 25_000 });
   assert.equal(controller.currentIntervalMs, 4000);
   assert.equal(controller.nextDueAt, 29_000);
+});
+
+test("parseUiRoute erkennt Settings-Ansicht und Session aus der URL", () => {
+  const route = parseUiRoute("http://localhost/?session=abc123&view=settings");
+
+  assert.equal(route.page, "settings");
+  assert.equal(route.sessionId, "abc123");
+});
+
+test("buildUiRoute baut Workspace- und Settings-URLs stabil auf", () => {
+  assert.equal(buildUiRoute({}), "/");
+  assert.equal(buildUiRoute({ sessionId: "abc123" }), "/?session=abc123");
+  assert.equal(buildUiRoute({ page: "settings" }), "/?view=settings");
+  assert.equal(buildUiRoute({ sessionId: "abc123", page: "settings" }), "/?session=abc123&view=settings");
 });

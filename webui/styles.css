@@ -1908,6 +1908,7 @@ pre {
   .thread-single {
     width: 100%;
   }
+
 }
 
 @media (max-width: 960px) {
@@ -1951,6 +1952,7 @@ pre {
   .phase-track {
     grid-template-columns: 1fr;
   }
+
 }
 
 @media (max-width: 720px) {
@@ -2074,6 +2076,169 @@ body {
 
 .workspace-shell {
   background: #1d1e22;
+}
+
+.settings-page {
+  min-height: 100vh;
+  padding: 32px;
+  background: #1d1e22;
+}
+
+.settings-page-inner {
+  width: min(100%, 1220px);
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+}
+
+.settings-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #303238;
+}
+
+.settings-page-headline,
+.settings-page-copy,
+.settings-page-panel,
+.settings-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-page-headline {
+  min-width: 0;
+}
+
+.settings-back-button {
+  justify-self: start;
+  min-height: 34px;
+}
+
+.settings-page-title {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 760;
+  letter-spacing: -0.04em;
+}
+
+.settings-page-subtitle,
+.settings-panel-copy {
+  margin: 0;
+  max-width: 78ch;
+  color: var(--text-secondary);
+  line-height: 1.65;
+}
+
+.settings-page-actions,
+.settings-panel-head,
+.settings-page-chips,
+.settings-chip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-page-actions {
+  justify-content: flex-end;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.95fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.settings-page-panel {
+  padding: 18px 20px;
+  background: #23252a;
+}
+
+.settings-form-grid,
+.settings-info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-field {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-field span,
+.settings-field small {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.settings-field select,
+.settings-field input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid #393c45;
+  border-radius: 10px;
+  background: #2a2c31;
+  color: var(--text);
+}
+
+.settings-toggle-row {
+  padding: 14px 16px;
+  border: 1px solid #393c45;
+  border-radius: 12px;
+  background: #2a2c31;
+}
+
+.settings-info-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid #383b43;
+  border-radius: 10px;
+  background: #2a2c31;
+}
+
+.settings-info-card span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.settings-info-card strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.settings-info-card small {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-page .workspace-list {
+  gap: 10px;
+}
+
+.settings-page .workspace-button {
+  background: #2a2c31;
+}
+
+.settings-page .workspace-item.active .workspace-button {
+  background: #32353c;
+}
+
+.settings-page .security-panel {
+  background: #23252a;
 }
 
 .button-secondary,
@@ -3159,6 +3324,21 @@ body {
   .worklog-highlight-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .settings-page {
+    padding: 24px 20px;
+  }
+
+  .settings-page-header,
+  .settings-page-actions,
+  .settings-panel-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 720px) {
@@ -3206,5 +3386,18 @@ body {
 
   .send-button {
     align-self: flex-end;
+  }
+
+  .settings-page {
+    padding: 18px 16px;
+  }
+
+  .settings-page-title {
+    font-size: 24px;
+  }
+
+  .settings-form-grid,
+  .settings-info-grid {
+    grid-template-columns: 1fr;
   }
 }
