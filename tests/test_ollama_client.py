@@ -265,6 +265,11 @@ def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monke
     assert error.reason == "startup_timeout"
     assert error.progress_seen is False
     assert error.retryable is False
+    assert error.model_name == "qwen3-coder:30b"
+    assert error.backend_identifier == "ollama"
+    assert error.startup_timeout_seconds is not None
+    assert error.total_timeout_seconds == 120
+    assert error.first_output_received is False
     assert progress_events[0]["stage"] == "request_started"
     assert any(event.get("stage") == "waiting_for_first_chunk" for event in progress_events if event.get("type") == "status")
     assert any(event.get("phase") == "waiting_for_start" for event in progress_events if event.get("type") == "heartbeat")

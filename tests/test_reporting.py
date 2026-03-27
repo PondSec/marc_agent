@@ -251,6 +251,65 @@ def test_reporter_describes_model_start_failure_more_precisely(tmp_path):
     assert "Repeated model start failure" in response
 
 
+def test_reporter_marks_degraded_starter_scaffold_honestly(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="Bitte erstelle ein HTML starter scaffold",
+        workspace_root=str(tmp_path),
+        status="completed",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="Bitte erstelle ein HTML starter scaffold",
+            root_goal="Create a starter HTML artifact.",
+            active_goal="Create a minimal starter HTML artifact.",
+            goal_relation="new_task",
+            output_expectation="A minimal starter scaffold.",
+            open_problem=None,
+            verification_target="Create the starter scaffold honestly.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.88,
+            next_action="create",
+            execution_outline=["Create the starter scaffold"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="index.html", operation="create"))
+    session.runtime_executions.append(
+        {
+            "operation_name": "content_generation",
+            "task_class": "content_generation",
+            "final_state": "degraded_success",
+            "capability_tier": "tier_d",
+            "recovery_strategy": "starter_scaffold",
+            "degraded": True,
+            "honest_blocked": False,
+            "artifact_bytes_generated": 128,
+            "validation_possible": True,
+            "summary": "Artifact generation degraded to a minimal starter scaffold after repeated startup failures.",
+            "attempts": [],
+        }
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(session)
+
+    assert "Starter-Grundgeruest" in response
+    assert "keine vollstaendige" in response
+    assert session.report.runtime_executions
+
+
 def test_reporter_explains_missing_functional_validation_even_if_static_checks_passed(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

@@ -140,6 +140,7 @@ class TaskManager:
             session.changed_files = []
             session.executed_commands = []
             session.notes = []
+            session.runtime_executions = []
             session.report = None
             session.stop_requested = False
             session.access_mode = config.access_mode

@@ -26,6 +26,7 @@ class SessionReporter:
             blockers=session.blockers[-10:],
             helper_artifacts=session.helper_artifacts[-10:],
             notes=session.notes[-20:],
+            runtime_executions=session.runtime_executions[-12:],
         )
         target = self.config.report_dir_path / f"{session.id}.json"
         final_report = report.model_copy(update={"report_path": str(target)})
@@ -54,6 +55,9 @@ class SessionReporter:
                 )
             )
             details.append(self._validation_sentence(session, report))
+            degraded_note = self._degraded_execution_note(session)
+            if degraded_note:
+                details.append(degraded_note)
         else:
             inspected_files = self._inspected_files(session)
             if inspected_files:
@@ -79,6 +83,9 @@ class SessionReporter:
 
         if blocker_text:
             details.append(self._localized_text(language, de=f"Blocker: {blocker_text}.", en=f"Blocker: {blocker_text}."))
+            startup_note = self._startup_failure_note(session)
+            if startup_note:
+                details.append(startup_note)
         elif session.stop_reason in {"no_effective_change", "repair_blocked_after_validation_failure"} and repair_summary:
             details.append(
                 self._localized_text(
@@ -124,6 +131,8 @@ class SessionReporter:
     def _summary(self, session: SessionState) -> str:
         if session.status == "completed" and session.validation_status == "passed":
             return "Task completed with validated changes."
+        if self._latest_runtime_execution(session, operation_name="content_generation", final_state="degraded_success") is not None:
+            return "Task completed with a degraded but honest runtime recovery path."
         if session.status == "partial" and session.changed_files:
             return "Task ended with changes that still need follow-up or stronger validation."
         if session.status == "partial":
@@ -208,6 +217,60 @@ class SessionReporter:
             de="Ich habe den Workspace untersucht, aber noch kein sauberes Abschlussergebnis erreicht.",
             en="I inspected the workspace, but I have not reached a clean final outcome yet.",
         )
+
+    def _degraded_execution_note(self, session: SessionState) -> str | None:
+        execution = self._latest_runtime_execution(session, operation_name="content_generation", final_state="degraded_success")
+        if execution is None:
+            return None
+        strategy = str(execution.get("recovery_strategy") or "").strip()
+        language = self._session_language(session)
+        if strategy == "starter_scaffold":
+            return self._localized_text(
+                language,
+                de="Ausfuehrung: Ich habe nur ein minimales Starter-Grundgeruest erzeugt, keine vollstaendige frei generierte Implementierung.",
+                en="Execution: I only produced a minimal starter scaffold, not a full free-form generated implementation.",
+            )
+        if strategy == "deterministic_template":
+            return self._localized_text(
+                language,
+                de="Ausfuehrung: Ich habe einen deterministischen Vorlagen-Fallback genutzt, keine vollstaendige frei generierte Implementierung.",
+                en="Execution: I used a deterministic template fallback, not a full free-form generated implementation.",
+            )
+        if str(execution.get("capability_tier") or "").strip() == "tier_c":
+            return self._localized_text(
+                language,
+                de="Ausfuehrung: Ich habe nur eine minimal tragfaehige Generation erzeugt.",
+                en="Execution: I produced only a minimally viable generation.",
+            )
+        return None
+
+    def _startup_failure_note(self, session: SessionState) -> str | None:
+        if session.stop_reason != "model_start_failed":
+            return None
+        execution = self._latest_runtime_execution(session, operation_name="content_generation")
+        if execution is None:
+            return None
+        language = self._session_language(session)
+        return self._localized_text(
+            language,
+            de="Verstehen und Planung waren abgeschlossen, aber die eigentliche Generierung lieferte vor dem Start-Timeout keinen ersten Output.",
+            en="Understanding and planning completed, but the actual generation produced no first output before the startup timeout.",
+        )
+
+    def _latest_runtime_execution(
+        self,
+        session: SessionState,
+        *,
+        operation_name: str | None = None,
+        final_state: str | None = None,
+    ) -> dict | None:
+        for item in reversed(session.runtime_executions):
+            if operation_name and str(item.get("operation_name") or "").strip() != operation_name:
+                continue
+            if final_state and str(item.get("final_state") or "").strip() != final_state:
+                continue
+            return item
+        return None
 
     def _validation_sentence(self, session: SessionState, report: SessionReport) -> str:
         language = self._session_language(session)

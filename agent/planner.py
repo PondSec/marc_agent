@@ -27,6 +27,15 @@ from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 from llm.ollama_client import OllamaGenerationError
 from llm.provider import LLMProvider
+from llm.runtime_resilience import (
+    ExecutionAttemptRecord,
+    ExecutionFailure,
+    ExecutionRecoveryPolicy,
+    build_execution_run_record,
+    classify_execution_failure,
+    estimate_context_pressure,
+    invoke_model,
+)
 from llm.schemas import (
     AgentActionType,
     AgentDecision,
@@ -51,56 +60,20 @@ WRITE_TOOL_NAMES = {
 TARGETED_REPAIR_STRATEGY = "validation_targeted"
 ESCALATED_REPAIR_STRATEGY = "validation_escalated"
 
-
-@dataclass(slots=True)
-class GenerationIssue:
-    reason: str
-    timeout_like: bool
-    context_pressure_likely: bool
-    partial_text: str = ""
-    had_progress: bool = False
-    characters: int = 0
-    retryable: bool = True
-
-    @property
-    def no_start_failure(self) -> bool:
-        return (
-            self.reason == "startup_timeout"
-            and not self.had_progress
-            and self.characters <= 0
-            and not self.partial_text
-        )
-
-    @property
-    def classification(self) -> str:
-        if self.no_start_failure:
-            return "no_start_failure"
-        if self.had_progress or self.characters > 0 or self.partial_text:
-            return "generation_failed_after_progress"
-        if self.reason == "startup_timeout":
-            return "startup_timeout"
-        return "generation_failed"
-
-
 @dataclass(slots=True)
 class GenerationRecoveryAttempt:
     strategy: str
     prompt_kind: str
     model_name: str | None = None
-
-
-@dataclass(slots=True)
-class GenerationAttemptRecord:
-    strategy: str
-    prompt_kind: str
-    model_name: str | None
-    issue: GenerationIssue
+    capability_tier: str = "tier_a"
 
 
 @dataclass(slots=True)
 class GenerationRetryResult:
     content: str | None = None
-    attempts: list[GenerationAttemptRecord] = field(default_factory=list)
+    attempts: list[ExecutionAttemptRecord] = field(default_factory=list)
+    capability_tier: str | None = None
+    recovery_strategy: str | None = None
 
 
 @dataclass(slots=True)
@@ -109,7 +82,7 @@ class ContentGenerationFailure:
     failure_class: str
     blocker_message: str
     user_message: str
-    attempts: list[GenerationAttemptRecord] = field(default_factory=list)
+    attempts: list[ExecutionAttemptRecord] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -1544,23 +1517,77 @@ class Planner:
             path = self._default_new_path(route)
             self._log("path_generation_skipped", path=path, reason="empty_workspace_fast_path")
             return path
-        try:
-            self._log("path_generation_started", target_name=route.entities.target_name)
-            response = self.llm.generate(
-                choose_path_prompt(route, session),
+        prompt = choose_path_prompt(route, session)
+        self._log("path_generation_started", target_name=route.entities.target_name)
+        outcome = invoke_model(
+            lambda progress: self.llm.generate(
+                prompt,
                 model=self._lightweight_generation_model_name(),
                 timeout=max(self._llm_timeout(20), 20),
                 total_timeout=max(self._llm_timeout(45), 45),
                 num_ctx=1536,
                 retries=0,
-            )
-            path = self._sanitize_generated_path(response, self._preferred_extension(route))
+                progress_callback=progress,
+            ),
+            operation_name="path_generation",
+            task_class="path_generation",
+            attempt_number=1,
+            capability_tier="tier_b" if self._lightweight_generation_model_name() else "tier_a",
+            recovery_strategy="path_generation",
+            prompt_variant="compact",
+            model_identifier=self._lightweight_generation_model_name() or self._primary_generation_model_name(),
+            backend_identifier=self._backend_identifier(),
+            inactivity_timeout_seconds=max(self._llm_timeout(20), 20),
+            total_timeout_seconds=max(self._llm_timeout(45), 45),
+            context_pressure_estimate=estimate_context_pressure(prompt_chars=len(prompt)),
+        )
+        if outcome.exception is None:
+            path = self._sanitize_generated_path(str(outcome.value or ""), self._preferred_extension(route))
             if path:
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="path_generation",
+                        task_class="path_generation",
+                        final_state="completed",
+                        capability_tier="tier_b" if self._lightweight_generation_model_name() else "tier_a",
+                        recovery_strategy="path_generation",
+                        degraded=bool(self._lightweight_generation_model_name()),
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="The target path was generated by the model runtime.",
+                        attempts=[outcome.attempt],
+                    ),
+                )
                 self._log("path_generation_finished", path=path)
                 return path
-        except Exception as exc:
-            self._log("path_generation_error", error=str(exc), route=route.model_dump())
+        else:
+            self._log(
+                "path_generation_error",
+                error=str(outcome.exception),
+                route=route.model_dump(),
+                failure=outcome.attempt.failure.to_dict()
+                if outcome.attempt.failure is not None
+                else None,
+            )
         path = self._default_new_path(route)
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="path_generation",
+                task_class="path_generation",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=False,
+                summary="The target path fell back to the deterministic default because model generation did not finish cleanly.",
+                attempts=[outcome.attempt],
+            ),
+        )
         self._log("path_generation_finished", path=path, source="default")
         return path
 
@@ -1623,143 +1650,209 @@ class Planner:
             current_content=current_content,
         )
         effective_model = model_name or self._primary_generation_model_name()
-        try:
-            self._log(
-                "content_generation_started",
-                path=path,
-                update=current_content is not None,
-                model=effective_model,
-            )
-            content = self.llm.generate(
+        timeout_seconds = max(self._llm_timeout(75), 75)
+        total_timeout_seconds = max(self._llm_timeout(210), 210)
+        context_pressure = self._context_pressure_estimate(
+            prompt=prompt,
+            current_content=current_content,
+            exc=None,
+        )
+        primary_tier = "tier_b" if model_name and model_name != self._primary_generation_model_name() else "tier_a"
+        primary_strategy = "planned_fast_model" if primary_tier == "tier_b" else "primary_model"
+        attempts: list[ExecutionAttemptRecord] = []
+
+        self._log(
+            "content_generation_started",
+            path=path,
+            update=current_content is not None,
+            model=effective_model,
+            capability_tier=primary_tier,
+        )
+        outcome = invoke_model(
+            lambda progress: self.llm.generate(
                 prompt,
                 model=model_name,
-                timeout=max(self._llm_timeout(75), 75),
-                total_timeout=max(self._llm_timeout(210), 210),
+                timeout=timeout_seconds,
+                total_timeout=total_timeout_seconds,
                 num_ctx=4096,
                 retries=0,
-                progress_callback=self._progress_logger(
-                    "content_generation_progress",
-                    path=path,
-                    update=current_content is not None,
-                ),
-            )
-        except Exception as exc:
-            issue = self._assess_generation_issue(
-                exc,
-                prompt=prompt,
-                current_content=current_content,
-            )
-            primary_attempt = GenerationAttemptRecord(
-                "primary_model",
-                "full",
-                effective_model,
-                issue,
-            )
-            self._log(
-                "content_generation_error",
-                error=str(exc),
+                progress_callback=progress,
+            ),
+            operation_name="content_generation",
+            task_class="content_generation",
+            attempt_number=1,
+            capability_tier=primary_tier,
+            recovery_strategy=primary_strategy,
+            prompt_variant="full",
+            model_identifier=effective_model,
+            backend_identifier=self._backend_identifier(),
+            inactivity_timeout_seconds=timeout_seconds,
+            total_timeout_seconds=total_timeout_seconds,
+            context_pressure_estimate=context_pressure,
+            event_callback=self._progress_logger(
+                "content_generation_progress",
                 path=path,
-                reason=issue.reason,
-                had_progress=issue.had_progress,
-                partial_characters=issue.characters,
-                context_pressure=issue.context_pressure_likely,
-                failure_class=issue.classification,
-            )
-            retry_result = self._retry_content_generation(
-                route,
-                session=session,
-                path=path,
-                current_content=current_content,
-                cause=exc,
-                prompt=prompt,
-                repair_context=repair_context,
-                repair_strategy=repair_strategy,
-            )
-            attempts = [primary_attempt, *retry_result.attempts]
-            if retry_result.content is not None:
+                update=current_content is not None,
+            ),
+        )
+        attempts.append(outcome.attempt)
+        if outcome.exception is None:
+            cleaned = self._strip_code_fences(str(outcome.value or "")).strip()
+            if cleaned:
                 self._log(
                     "content_generation_finished",
                     path=path,
-                    characters=len(retry_result.content),
+                    characters=len(cleaned),
                     update=current_content is not None,
-                    source="retry",
                 )
-                return ContentGenerationResult(
-                    content=retry_result.content,
-                    source="retry",
-                )
-            if self._startup_failure_exhausted(attempts):
-                recovery = self._no_start_recovery_content(
-                    route,
+                self._append_runtime_execution(
                     session,
-                    path=path,
-                    current_content=current_content,
-                    attempts=attempts,
+                    build_execution_run_record(
+                        operation_name="content_generation",
+                        task_class="content_generation",
+                        final_state="completed",
+                        capability_tier=primary_tier,
+                        recovery_strategy=primary_strategy,
+                        degraded=primary_tier != "tier_a",
+                        honest_blocked=False,
+                        artifact_bytes_generated=len(cleaned),
+                        validation_possible=bool(cleaned),
+                        summary="Artifact generation completed on the selected model tier.",
+                        attempts=attempts,
+                    ),
                 )
-                if recovery is not None:
-                    return recovery
-                self._log(
-                    "content_generation_recovery_unavailable",
-                    path=path,
-                    reason="startup_failure_exhausted",
-                    failure_class="startup_failure_exhausted",
-                )
-            else:
-                fallback = self._template_fallback_content(
-                    route,
-                    session,
-                    path=path,
-                    current_content=current_content,
-                )
-                if fallback is not None:
-                    self._log("content_generation_fallback_started", path=path, source="template")
-                    self._log("content_generation_fallback_finished", path=path, source="template")
-                    return ContentGenerationResult(
-                        content=fallback,
-                        source="template",
-                    )
-            return ContentGenerationResult(
-                source="failed",
-                failure=self._build_content_generation_failure(
-                    route,
-                    session,
-                    path=path,
-                    current_content=current_content,
-                    repair_context=repair_context,
+                return ContentGenerationResult(content=cleaned)
+            attempts[-1] = self._empty_response_attempt(
+                base_attempt=outcome.attempt,
+                context_pressure=context_pressure,
+            )
+        else:
+            issue = outcome.attempt.failure
+            self._log(
+                "content_generation_error",
+                error=str(outcome.exception),
+                path=path,
+                reason=issue.reason if issue is not None else "runtime_error",
+                had_progress=issue.had_progress if issue is not None else False,
+                partial_characters=issue.characters if issue is not None else 0,
+                context_pressure=issue.context_pressure_estimate if issue is not None else context_pressure,
+                failure_class=issue.classification if issue is not None else "generation_failed",
+            )
+
+        issue = attempts[-1].failure
+        retry_result = self._retry_content_generation(
+            route,
+            session=session,
+            path=path,
+            current_content=current_content,
+            cause=issue,
+            prompt=prompt,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
+            prior_attempts=attempts,
+        )
+        attempts.extend(retry_result.attempts)
+        if retry_result.content is not None:
+            self._log(
+                "content_generation_finished",
+                path=path,
+                characters=len(retry_result.content),
+                update=current_content is not None,
+                source=retry_result.recovery_strategy or "retry",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="completed",
+                    capability_tier=retry_result.capability_tier or "tier_b",
+                    recovery_strategy=retry_result.recovery_strategy or "retry_content_generation",
+                    degraded=(retry_result.capability_tier or "tier_b") != "tier_a",
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(retry_result.content),
+                    validation_possible=bool(retry_result.content),
+                    summary="Artifact generation recovered after a runtime startup or stall issue.",
                     attempts=attempts,
                 ),
             )
-        cleaned = self._strip_code_fences(content).strip()
-        self._log(
-            "content_generation_finished",
-            path=path,
-            characters=len(cleaned),
-            update=current_content is not None,
-        )
-        if cleaned:
-            return ContentGenerationResult(content=cleaned)
-        return ContentGenerationResult(
-            source="failed",
-            failure=self._build_content_generation_failure(
+            return ContentGenerationResult(
+                content=retry_result.content,
+                source="retry",
+            )
+        if self._startup_failure_exhausted(attempts):
+            recovery = self._no_start_recovery_content(
                 route,
                 session,
                 path=path,
                 current_content=current_content,
-                repair_context=repair_context,
-                attempts=[
-                    GenerationAttemptRecord(
-                        "primary_model",
-                        "full",
-                        effective_model,
-                        GenerationIssue(
-                            reason="empty_response",
-                            timeout_like=False,
-                            context_pressure_likely=False,
-                            retryable=False,
-                        ),
-                    )
-                ],
+                attempts=attempts,
+            )
+            if recovery is not None:
+                return recovery
+            self._log(
+                "content_generation_recovery_unavailable",
+                path=path,
+                reason="startup_failure_exhausted",
+                failure_class="startup_failure_exhausted",
+            )
+        else:
+            fallback = self._template_fallback_content(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+            )
+            if fallback is not None:
+                self._log("content_generation_fallback_started", path=path, source="template")
+                self._log("content_generation_fallback_finished", path=path, source="template")
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="content_generation",
+                        task_class="content_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_template",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=len(fallback),
+                        validation_possible=bool(fallback),
+                        summary="Artifact generation used a deterministic template fallback after backend execution instability.",
+                        attempts=attempts,
+                    ),
+                )
+                return ContentGenerationResult(
+                    content=fallback,
+                    source="template",
+                )
+        failure = self._build_content_generation_failure(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            attempts=attempts,
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="content_generation",
+                task_class="content_generation",
+                final_state="blocked",
+                capability_tier="tier_e",
+                recovery_strategy="honest_block",
+                degraded=False,
+                honest_blocked=True,
+                artifact_bytes_generated=0,
+                validation_possible=False,
+                summary=failure.blocker_message,
+                attempts=attempts,
             ),
+        )
+        return ContentGenerationResult(
+            source="failed",
+            failure=failure,
         )
 
     def _retry_content_generation(
@@ -1769,13 +1862,14 @@ class Planner:
         *,
         path: str,
         current_content: str | None = None,
-        cause: Exception | None = None,
+        cause: ExecutionFailure | None = None,
         prompt: str,
         repair_context: ValidationFailureEvidence | None = None,
         repair_strategy: str | None = None,
+        prior_attempts: list[ExecutionAttemptRecord] | None = None,
     ) -> GenerationRetryResult:
-        issue = self._assess_generation_issue(
-            cause,
+        issue = cause or self._assess_generation_issue(
+            None,
             prompt=prompt,
             current_content=current_content,
         )
@@ -1783,7 +1877,7 @@ class Planner:
         if not attempts:
             return GenerationRetryResult()
 
-        retry_attempts: list[GenerationAttemptRecord] = []
+        retry_attempts: list[ExecutionAttemptRecord] = []
         for attempt in attempts:
             retry_prompt = self._content_generation_prompt_for_attempt(
                 attempt,
@@ -1800,33 +1894,53 @@ class Planner:
                 attempt,
                 issue,
             )
-            try:
-                self._log(
-                    "content_generation_retry_started",
-                    path=path,
-                    strategy=attempt.strategy,
-                    model=attempt.model_name or self._primary_generation_model_name(),
-                    reason=issue.reason,
-                    had_progress=issue.had_progress,
-                    partial_characters=issue.characters,
-                    context_pressure=issue.context_pressure_likely,
-                    failure_class=issue.classification,
-                )
-                text = self.llm.generate(
+            self._log(
+                "content_generation_retry_started",
+                path=path,
+                strategy=attempt.strategy,
+                model=attempt.model_name or self._primary_generation_model_name(),
+                reason=issue.reason,
+                had_progress=issue.had_progress,
+                partial_characters=issue.characters,
+                context_pressure=issue.context_pressure_estimate,
+                failure_class=issue.classification,
+                capability_tier=attempt.capability_tier,
+            )
+            outcome = invoke_model(
+                lambda progress: self.llm.generate(
                     retry_prompt,
                     model=attempt.model_name,
                     timeout=timeout_seconds,
                     total_timeout=total_timeout_seconds,
                     num_ctx=num_ctx,
                     retries=0,
-                    progress_callback=self._progress_logger(
-                        "content_generation_progress",
-                        path=path,
-                        update=current_content is not None,
-                        strategy=attempt.strategy,
-                    ),
-                )
-                cleaned = self._strip_code_fences(text).strip()
+                    progress_callback=progress,
+                ),
+                operation_name="content_generation",
+                task_class="content_generation",
+                attempt_number=len(prior_attempts or []) + len(retry_attempts) + 1,
+                capability_tier=attempt.capability_tier,
+                recovery_strategy=attempt.strategy,
+                prompt_variant=attempt.prompt_kind,
+                model_identifier=attempt.model_name or self._primary_generation_model_name(),
+                backend_identifier=self._backend_identifier(),
+                inactivity_timeout_seconds=timeout_seconds,
+                total_timeout_seconds=total_timeout_seconds,
+                context_pressure_estimate=self._context_pressure_estimate(
+                    prompt=retry_prompt,
+                    current_content=current_content,
+                    exc=None,
+                ),
+                event_callback=self._progress_logger(
+                    "content_generation_progress",
+                    path=path,
+                    update=current_content is not None,
+                    strategy=attempt.strategy,
+                ),
+            )
+            retry_attempts.append(outcome.attempt)
+            if outcome.exception is None:
+                cleaned = self._strip_code_fences(str(outcome.value or "")).strip()
                 if cleaned:
                     self._log(
                         "content_generation_retry_finished",
@@ -1837,55 +1951,29 @@ class Planner:
                     return GenerationRetryResult(
                         content=cleaned,
                         attempts=retry_attempts,
+                        capability_tier=attempt.capability_tier,
+                        recovery_strategy=attempt.strategy,
                     )
-                empty_issue = GenerationIssue(
-                    reason="empty_response",
-                    timeout_like=False,
-                    context_pressure_likely=False,
-                    retryable=False,
+                retry_attempts[-1] = self._empty_response_attempt(
+                    base_attempt=outcome.attempt,
+                    context_pressure=self._context_pressure_estimate(
+                        prompt=retry_prompt,
+                        current_content=current_content,
+                        exc=None,
+                    ),
                 )
-                retry_attempts.append(
-                    GenerationAttemptRecord(
-                        attempt.strategy,
-                        attempt.prompt_kind,
-                        attempt.model_name or self._primary_generation_model_name(),
-                        empty_issue,
-                    )
-                )
-                self._log(
-                    "content_generation_retry_error",
-                    path=path,
-                    strategy=attempt.strategy,
-                    error="empty model response",
-                    reason=empty_issue.reason,
-                    had_progress=empty_issue.had_progress,
-                    partial_characters=empty_issue.characters,
-                    failure_class=empty_issue.classification,
-                )
-            except Exception as exc:
-                retry_issue = self._assess_generation_issue(
-                    exc,
-                    prompt=retry_prompt,
-                    current_content=current_content,
-                )
-                retry_attempts.append(
-                    GenerationAttemptRecord(
-                        attempt.strategy,
-                        attempt.prompt_kind,
-                        attempt.model_name or self._primary_generation_model_name(),
-                        retry_issue,
-                    )
-                )
-                self._log(
-                    "content_generation_retry_error",
-                    path=path,
-                    strategy=attempt.strategy,
-                    error=str(exc),
-                    reason=retry_issue.reason,
-                    had_progress=retry_issue.had_progress,
-                    partial_characters=retry_issue.characters,
-                    failure_class=retry_issue.classification,
-                )
+            retry_issue = retry_attempts[-1].failure
+            self._log(
+                "content_generation_retry_error",
+                path=path,
+                strategy=attempt.strategy,
+                error=str(outcome.exception or "empty model response"),
+                reason=retry_issue.reason if retry_issue is not None else "runtime_error",
+                had_progress=retry_issue.had_progress if retry_issue is not None else False,
+                partial_characters=retry_issue.characters if retry_issue is not None else 0,
+                failure_class=retry_issue.classification if retry_issue is not None else "generation_failed",
+                capability_tier=attempt.capability_tier,
+            )
         return GenerationRetryResult(attempts=retry_attempts)
 
     def _assess_generation_issue(
@@ -1894,83 +1982,168 @@ class Planner:
         *,
         prompt: str,
         current_content: str | None = None,
-    ) -> GenerationIssue:
-        partial_text = self._strip_code_fences(str(getattr(exc, "partial_text", "") or "")).strip()
-        characters = int(getattr(exc, "characters", len(partial_text)) or len(partial_text))
-        had_progress = bool(getattr(exc, "progress_seen", False)) or bool(partial_text) or characters > 0
-        timeout_like = bool(getattr(exc, "timed_out", False)) or self._is_timeout_error(exc)
-        reason = str(getattr(exc, "reason", "") or "").strip()
-        if not reason:
-            reason = "timeout" if timeout_like else "runtime_error"
-        return GenerationIssue(
-            reason=reason,
-            timeout_like=timeout_like,
-            context_pressure_likely=self._context_pressure_likely(
+    ) -> ExecutionFailure:
+        synthetic_attempt = ExecutionAttemptRecord(
+            operation_name="content_generation",
+            task_class="content_generation",
+            attempt_number=0,
+            capability_tier="tier_a",
+            recovery_strategy="assessment_only",
+            prompt_variant="full",
+            model_identifier=self._primary_generation_model_name(),
+            backend_identifier=self._backend_identifier(),
+        )
+        return classify_execution_failure(
+            exc or RuntimeError("generation runtime error"),
+            attempt=synthetic_attempt,
+            context_pressure_estimate=self._context_pressure_estimate(
                 prompt=prompt,
                 current_content=current_content,
                 exc=exc,
             ),
-            partial_text=partial_text,
-            had_progress=had_progress,
-            characters=characters,
-            retryable=bool(getattr(exc, "retryable", True)),
+            elapsed_seconds=getattr(exc, "elapsed", None),
         )
 
-    def _context_pressure_likely(
+    def _context_pressure_estimate(
         self,
         *,
         prompt: str,
         current_content: str | None,
         exc: Exception | None,
-    ) -> bool:
-        lowered = str(exc or "").lower()
-        context_markers = (
-            "context",
-            "token",
-            "num_ctx",
-            "prompt too long",
-            "input too long",
-            "out of memory",
-            "kv cache",
+    ) -> str:
+        return estimate_context_pressure(
+            prompt_chars=len(prompt),
+            current_content_chars=len(current_content or ""),
+            error_text=str(exc or ""),
         )
-        if any(marker in lowered for marker in context_markers):
-            return True
-        if len(prompt) >= 12_000:
-            return True
-        if current_content is not None and len(current_content) >= 6_000:
-            return True
-        return False
+
+    def _empty_response_attempt(
+        self,
+        *,
+        base_attempt: ExecutionAttemptRecord,
+        context_pressure: str,
+    ) -> ExecutionAttemptRecord:
+        failure = ExecutionFailure(
+            failure_class="empty_response",
+            state="failed_backend_unavailable",
+            had_progress=False,
+            first_output_received=False,
+            startup_timeout_seconds=base_attempt.startup_timeout_seconds,
+            inactivity_timeout_seconds=base_attempt.inactivity_timeout_seconds,
+            total_timeout_seconds=base_attempt.total_timeout_seconds,
+            elapsed_seconds=base_attempt.elapsed_seconds,
+            model_identifier=base_attempt.model_identifier,
+            backend_identifier=base_attempt.backend_identifier,
+            context_pressure_estimate=context_pressure,
+            retryable=False,
+            recommended_recovery_strategy="reduce_request_complexity",
+            raw_reason="empty_response",
+            detail="Model returned an empty response.",
+        )
+        return ExecutionAttemptRecord(
+            operation_name=base_attempt.operation_name,
+            task_class=base_attempt.task_class,
+            attempt_number=base_attempt.attempt_number,
+            capability_tier=base_attempt.capability_tier,
+            recovery_strategy=base_attempt.recovery_strategy,
+            prompt_variant=base_attempt.prompt_variant,
+            model_identifier=base_attempt.model_identifier,
+            backend_identifier=base_attempt.backend_identifier,
+            state=failure.state,
+            startup_timeout_seconds=base_attempt.startup_timeout_seconds,
+            inactivity_timeout_seconds=base_attempt.inactivity_timeout_seconds,
+            total_timeout_seconds=base_attempt.total_timeout_seconds,
+            elapsed_seconds=base_attempt.elapsed_seconds,
+            had_progress=False,
+            first_output_received=False,
+            output_characters=0,
+            activity_count=base_attempt.activity_count,
+            failure=failure,
+        )
+
+    def _normalize_generation_strategy_name(
+        self,
+        strategy: str,
+        *,
+        prompt_kind: str,
+        model_name: str | None,
+    ) -> str:
+        normalized = str(strategy or "").strip()
+        if normalized == "resume_after_progress":
+            return "resume_fallback_model" if model_name else "resume_same_model"
+        if normalized == "switch_to_faster_model":
+            if prompt_kind == "compact":
+                return "compact_fallback_model"
+            return "fallback_model"
+        if normalized == "reduce_request_complexity":
+            return "compact_fallback_model" if model_name else "compact_same_model"
+        if normalized == "minimal_viable_generation":
+            return "compact_fallback_model" if model_name else "compact_same_model"
+        if normalized == "retry_same_backend":
+            return "retry_same_model"
+        return normalized or "retry_same_model"
 
     def _content_generation_recovery_attempts(
         self,
-        issue: GenerationIssue,
+        issue: ExecutionFailure,
     ) -> list[GenerationRecoveryAttempt]:
+        policy = ExecutionRecoveryPolicy(
+            task_class="content_generation",
+            allow_same_backend_retry=True,
+            allow_smaller_faster_model=bool(self._lightweight_generation_model_name()),
+            allow_resume_after_progress=True,
+            allow_reduce_request_complexity=True,
+            allow_deterministic_fallback=False,
+            max_same_backend_retries=1,
+            max_total_attempts=4,
+        )
+        decisions = policy.plan_recovery(
+            issue,
+            primary_model=self._primary_generation_model_name(),
+            faster_model=self._lightweight_generation_model_name(),
+            history=[],
+        )
         attempts: list[GenerationRecoveryAttempt] = []
-        fallback_model = self._lightweight_generation_model_name()
-
-        if issue.partial_text:
-            attempts.append(GenerationRecoveryAttempt("resume_same_model", "resume"))
-        elif issue.context_pressure_likely:
-            attempts.append(GenerationRecoveryAttempt("compact_same_model", "compact"))
-        elif issue.no_start_failure:
-            if issue.retryable:
-                attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
-        elif issue.timeout_like and not fallback_model:
-            attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
-        elif not issue.timeout_like:
-            return attempts
-
-        if fallback_model:
-            if issue.partial_text:
-                attempts.append(
-                    GenerationRecoveryAttempt("resume_fallback_model", "resume", fallback_model)
+        for decision in decisions:
+            self._log(
+                "content_generation_recovery_option",
+                strategy=decision.candidate.strategy,
+                capability_tier=decision.candidate.capability_tier,
+                prompt_variant=decision.candidate.prompt_variant,
+                model=decision.candidate.model_identifier,
+                accepted=decision.accepted,
+                reason=decision.reason,
+            )
+            if not decision.accepted or decision.candidate.local_only:
+                continue
+            prompt_kind = "full"
+            if decision.candidate.prompt_variant == "resume":
+                prompt_kind = "resume"
+            elif decision.candidate.prompt_variant in {"compact", "minimal"}:
+                prompt_kind = "compact"
+            candidate_model_name = decision.candidate.model_identifier
+            if (
+                decision.candidate.strategy in {
+                    "retry_same_backend",
+                    "resume_after_progress",
+                    "reduce_request_complexity",
+                    "minimal_viable_generation",
+                }
+                and candidate_model_name == self._primary_generation_model_name()
+            ):
+                candidate_model_name = None
+            attempts.append(
+                GenerationRecoveryAttempt(
+                    strategy=self._normalize_generation_strategy_name(
+                        decision.candidate.strategy,
+                        prompt_kind=prompt_kind,
+                        model_name=candidate_model_name,
+                    ),
+                    prompt_kind=prompt_kind,
+                    model_name=candidate_model_name,
+                    capability_tier=decision.candidate.capability_tier,
                 )
-            elif issue.context_pressure_likely:
-                attempts.append(
-                    GenerationRecoveryAttempt("compact_fallback_model", "compact", fallback_model)
-                )
-            elif issue.timeout_like:
-                attempts.append(GenerationRecoveryAttempt("fallback_model", "full", fallback_model))
+            )
         return attempts
 
     def _content_generation_prompt_for_attempt(
@@ -2010,7 +2183,7 @@ class Planner:
     def _content_generation_runtime_for_attempt(
         self,
         attempt: GenerationRecoveryAttempt,
-        issue: GenerationIssue,
+        issue: ExecutionFailure,
     ) -> tuple[int, int, int]:
         if attempt.prompt_kind == "resume":
             base_timeout = 60 if issue.timeout_like else 45
@@ -2032,29 +2205,32 @@ class Planner:
 
     def _startup_failure_exhausted(
         self,
-        attempts: list[GenerationAttemptRecord],
+        attempts: list[ExecutionAttemptRecord],
     ) -> bool:
-        issues = [attempt.issue for attempt in attempts]
+        issues = [attempt.failure for attempt in attempts if attempt.failure is not None]
         return len(issues) >= 2 and all(issue.no_start_failure for issue in issues)
 
     def _attempts_have_progress(
         self,
-        attempts: list[GenerationAttemptRecord],
+        attempts: list[ExecutionAttemptRecord],
     ) -> bool:
         return any(
-            attempt.issue.had_progress
-            or attempt.issue.characters > 0
-            or bool(attempt.issue.partial_text)
+            attempt.failure is not None
+            and (
+                attempt.failure.had_progress
+                or attempt.failure.characters > 0
+                or bool(attempt.failure.partial_text)
+            )
             for attempt in attempts
         )
 
     def _generation_models_summary(
         self,
-        attempts: list[GenerationAttemptRecord],
+        attempts: list[ExecutionAttemptRecord],
     ) -> str:
         models: list[str] = []
         for attempt in attempts:
-            model_name = str(attempt.model_name or "").strip()
+            model_name = str(attempt.model_identifier or "").strip()
             if model_name and model_name not in models:
                 models.append(model_name)
         return ", ".join(models[:3])
@@ -2067,7 +2243,7 @@ class Planner:
         path: str,
         current_content: str | None,
         repair_context: ValidationFailureEvidence | None,
-        attempts: list[GenerationAttemptRecord],
+        attempts: list[ExecutionAttemptRecord],
     ) -> ContentGenerationFailure:
         del route
         language = self._session_language(session)
@@ -2172,7 +2348,7 @@ class Planner:
         *,
         path: str,
         current_content: str | None,
-        attempts: list[GenerationAttemptRecord],
+        attempts: list[ExecutionAttemptRecord],
     ) -> ContentGenerationResult | None:
         template = self._template_fallback_content(
             route,
@@ -2195,6 +2371,22 @@ class Planner:
                 path=path,
                 strategy="deterministic_template",
                 source="template",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="degraded_success",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_template",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(template),
+                    validation_possible=bool(template),
+                    summary="Artifact generation degraded to a deterministic template after repeated startup failures.",
+                    attempts=attempts,
+                ),
             )
             return ContentGenerationResult(
                 content=template,
@@ -2223,6 +2415,22 @@ class Planner:
             path=path,
             strategy="starter_scaffold",
             source="starter_scaffold",
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="content_generation",
+                task_class="content_generation",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="starter_scaffold",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=len(scaffold),
+                validation_possible=bool(scaffold),
+                summary="Artifact generation degraded to a minimal starter scaffold after repeated startup failures.",
+                attempts=attempts,
+            ),
         )
         return ContentGenerationResult(
             content=scaffold,
@@ -2416,37 +2624,85 @@ class Planner:
         if route.intent == RouteIntent.PLAN:
             return self._render_plan_response(route)
         prompt = final_response_prompt(route, session)
-        try:
-            self._log(
-                "final_response_generation_started",
-                model=self._lightweight_generation_model_name() or self._primary_generation_model_name(),
-            )
-            response = self.llm.generate(
+        model_name = self._lightweight_generation_model_name()
+        self._log(
+            "final_response_generation_started",
+            model=model_name or self._primary_generation_model_name(),
+        )
+        outcome = invoke_model(
+            lambda progress: self.llm.generate(
                 prompt,
-                model=self._lightweight_generation_model_name(),
+                model=model_name,
                 timeout=max(self._llm_timeout(20), 20),
                 total_timeout=max(self._llm_timeout(60), 60),
                 num_ctx=1024,
                 retries=0,
-                progress_callback=self._progress_logger("final_response_generation_progress"),
-            ).strip()
+                progress_callback=progress,
+            ),
+            operation_name="final_response_generation",
+            task_class="final_response_generation",
+            attempt_number=1,
+            capability_tier="tier_b" if model_name else "tier_a",
+            recovery_strategy="final_response_generation",
+            prompt_variant="compact",
+            model_identifier=model_name or self._primary_generation_model_name(),
+            backend_identifier=self._backend_identifier(),
+            inactivity_timeout_seconds=max(self._llm_timeout(20), 20),
+            total_timeout_seconds=max(self._llm_timeout(60), 60),
+            context_pressure_estimate=estimate_context_pressure(prompt_chars=len(prompt)),
+            event_callback=self._progress_logger("final_response_generation_progress"),
+        )
+        if outcome.exception is None:
+            response = self._strip_code_fences(str(outcome.value or "")).strip()
             if response:
                 self._log("final_response_generation_finished", characters=len(response))
-                return self._strip_code_fences(response).strip()
-        except Exception as exc:
-            issue = self._assess_generation_issue(exc, prompt=prompt)
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="final_response_generation",
+                        task_class="final_response_generation",
+                        final_state="completed",
+                        capability_tier="tier_b" if model_name else "tier_a",
+                        recovery_strategy="final_response_generation",
+                        degraded=bool(model_name),
+                        honest_blocked=False,
+                        artifact_bytes_generated=len(response),
+                        validation_possible=False,
+                        summary="Final user response was generated by the model runtime.",
+                        attempts=[outcome.attempt],
+                    ),
+                )
+                return response
+        else:
+            issue = outcome.attempt.failure
             self._log(
                 "final_response_generation_error",
-                error=str(exc),
-                reason=issue.reason,
-                had_progress=issue.had_progress,
-                partial_characters=issue.characters,
+                error=str(outcome.exception),
+                reason=issue.reason if issue is not None else "runtime_error",
+                had_progress=issue.had_progress if issue is not None else False,
+                partial_characters=issue.characters if issue is not None else 0,
             )
         deterministic = self._deterministic_final_response(route, session)
         self._log(
             "final_response_generation_finished",
             characters=len(deterministic),
             source="deterministic",
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="final_response_generation",
+                task_class="final_response_generation",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=len(deterministic),
+                validation_possible=False,
+                summary="Final user response used the deterministic fallback because the backend generation step did not complete cleanly.",
+                attempts=[outcome.attempt],
+            ),
         )
         return deterministic
 
@@ -2486,6 +2742,12 @@ class Planner:
             failure_class=failure_class or stop_reason,
             message=text,
         )
+
+    def _append_runtime_execution(self, session: SessionState | None, record: dict[str, object]) -> None:
+        if session is None:
+            return
+        session.runtime_executions.append(dict(record))
+        session.runtime_executions = session.runtime_executions[-20:]
 
     def _read_paths(self, session: SessionState) -> list[str]:
         return [
@@ -2955,6 +3217,9 @@ class Planner:
             return None
         candidate = str(getattr(config, "model_name", "") or "").strip()
         return candidate or None
+
+    def _backend_identifier(self) -> str:
+        return "ollama"
 
     def _lightweight_generation_model_name(self) -> str | None:
         config = getattr(self.llm, "config", None)

@@ -6,10 +6,13 @@ const {
   buildPhaseSteps,
   buildSessionOverview,
   buildValidationSnapshot,
+  createRefreshController,
   renderRichText,
   sanitizeAssistantMessageContent,
   sessionBadgeText,
   sessionStatusTone,
+  shouldStartRefresh,
+  updateRefreshBackoff,
 } = require("../webui/app.js");
 
 function makeSession(overrides = {}) {
@@ -158,4 +161,42 @@ test("renderRichText rendert grundlegende Markdown-Struktur fuer den Thread", ()
   assert.match(html, /<ul class="rich-list">/);
   assert.match(html, /<code>snake_game\.html<\/code>/);
   assert.match(html, /<pre><code>&lt;main&gt;Hallo&lt;\/main&gt;<\/code><\/pre>/);
+});
+
+test("shouldStartRefresh dedupliziert inflight und respektiert Mindestabstaende", () => {
+  const controller = createRefreshController({
+    baseIntervalMs: 8000,
+    maxIntervalMs: 30000,
+    minGapMs: 1200,
+  });
+
+  assert.equal(shouldStartRefresh(controller, { now: 1_000 }), true);
+  controller.lastStartedAt = 1_500;
+  assert.equal(shouldStartRefresh(controller, { now: 2_000 }), false);
+  controller.inflight = Promise.resolve([]);
+  assert.equal(shouldStartRefresh(controller, { now: 5_000 }), false);
+  controller.inflight = null;
+  controller.nextDueAt = 7_000;
+  assert.equal(shouldStartRefresh(controller, { now: 6_500 }), false);
+  assert.equal(shouldStartRefresh(controller, { now: 6_500, force: true }), true);
+});
+
+test("updateRefreshBackoff vergroessert ruhige Polling-Intervalle und setzt sie bei Aenderungen zurueck", () => {
+  const controller = createRefreshController({
+    baseIntervalMs: 4000,
+    maxIntervalMs: 30000,
+    minGapMs: 1200,
+  });
+
+  updateRefreshBackoff(controller, { changed: false, now: 10_000 });
+  assert.equal(controller.currentIntervalMs, 6000);
+  assert.equal(controller.nextDueAt, 16_000);
+
+  updateRefreshBackoff(controller, { changed: false, now: 16_000 });
+  assert.equal(controller.currentIntervalMs, 9000);
+  assert.equal(controller.nextDueAt, 25_000);
+
+  updateRefreshBackoff(controller, { changed: true, now: 25_000 });
+  assert.equal(controller.currentIntervalMs, 4000);
+  assert.equal(controller.nextDueAt, 29_000);
 });

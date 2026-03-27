@@ -160,6 +160,7 @@ class SessionReport(StrictModel):
     blockers: list[str] = Field(default_factory=list)
     helper_artifacts: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    runtime_executions: list[dict[str, Any]] = Field(default_factory=list)
     report_path: str | None = None
 
 
@@ -259,6 +260,7 @@ class SessionState(StrictModel):
     executed_commands: list[str] = Field(default_factory=list)
     diagnostics: list[DiagnosticRecord] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    runtime_executions: list[dict[str, Any]] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     follow_up_context: FollowUpContext | None = None
     messages: list[ChatMessage] = Field(default_factory=list)

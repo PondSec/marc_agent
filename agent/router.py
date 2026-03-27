@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import time
 from typing import Any
 
 from pydantic import ValidationError
@@ -9,6 +8,12 @@ from pydantic import ValidationError
 from agent.models import SessionState, WorkspaceSnapshot
 from agent.prompts import router_prompt, router_repair_prompt, router_system_prompt
 from llm.provider import LLMProvider
+from llm.runtime_resilience import (
+    ExecutionRecoveryPolicy,
+    build_execution_run_record,
+    estimate_context_pressure,
+    invoke_model,
+)
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
 
@@ -47,31 +52,73 @@ class IntentRouter:
             self._log("router_fast_path", router_result=fast_path.model_dump())
             return fast_path
         payload: dict[str, Any] | None = None
-        try:
-            payload = self.llm.generate_json(
-                router_prompt(user_input, snapshot, session=session),
+        prompt = router_prompt(user_input, snapshot, session=session)
+        context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
+        primary_model = self._primary_model_name()
+        attempts = []
+        outcome = invoke_model(
+            lambda progress: self.llm.generate_json(
+                prompt,
                 system=router_system_prompt(),
-                model=self.model_name,
+                model=primary_model,
                 retries=0,
                 timeout=self.timeout,
                 num_ctx=self.num_ctx,
-                progress_callback=self._progress_logger("router_generation_progress"),
-            )
-            return self.validate_router_output(payload)
+                progress_callback=progress,
+            ),
+            operation_name="router_generation",
+            task_class="router_generation",
+            attempt_number=1,
+            capability_tier="tier_a",
+            recovery_strategy="primary_model_generation",
+            prompt_variant="full",
+            model_identifier=primary_model,
+            backend_identifier="ollama",
+            inactivity_timeout_seconds=self.timeout,
+            total_timeout_seconds=max(self.timeout + 18, self.timeout * 2),
+            context_pressure_estimate=context_pressure,
+            event_callback=self._progress_logger("router_generation_progress"),
+        )
+        attempts.append(outcome.attempt)
+        try:
+            if outcome.exception is None:
+                payload = outcome.value
+                route = self.validate_router_output(payload)
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="router_generation",
+                        task_class="router_generation",
+                        final_state="completed",
+                        capability_tier="tier_a",
+                        recovery_strategy="primary_model_generation",
+                        degraded=False,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="Route generation completed on the primary tier.",
+                        attempts=attempts,
+                    ),
+                )
+                return route
         except ValidationError as exc:
             self._log(
                 "router_validation_failed",
                 raw_router_output=payload or {},
                 errors=exc.errors(),
             )
-            repaired = self._repair_invalid_output(payload or {}, exc.errors())
+            repaired = self._repair_invalid_output(payload or {}, exc.errors(), session=session)
             if repaired is not None:
                 return repaired
-        except Exception as exc:
+        if outcome.exception is not None:
+            exc = outcome.exception
             self._log(
                 "router_error",
                 raw_router_output=payload or {},
                 error=str(exc),
+                failure=outcome.attempt.failure.to_dict()
+                if outcome.attempt.failure is not None
+                else None,
             )
             if self._is_timeout_error(exc):
                 fast_timeout_route = self._emergency_route(
@@ -80,15 +127,98 @@ class IntentRouter:
                     session=session,
                 )
                 if fast_timeout_route is not None and fast_timeout_route.intent == RouteIntent.CREATE:
+                    self._append_runtime_execution(
+                        session,
+                        build_execution_run_record(
+                            operation_name="router_generation",
+                            task_class="router_generation",
+                            final_state="degraded_success",
+                            capability_tier="tier_d",
+                            recovery_strategy="deterministic_fallback",
+                            degraded=True,
+                            honest_blocked=False,
+                            artifact_bytes_generated=0,
+                            validation_possible=False,
+                            summary="The router used the deterministic emergency route after a startup-time runtime issue.",
+                            attempts=attempts,
+                        ),
+                    )
                     self._log(
                         "router_timeout_fast_fallback",
                         router_result=fast_timeout_route.model_dump(),
                     )
                     return fast_timeout_route
-                retried = self._retry_after_timeout(user_input)
+            failure = outcome.attempt.failure
+            policy = ExecutionRecoveryPolicy(
+                task_class="router_generation",
+                allow_same_backend_retry=True,
+                allow_reduce_request_complexity=True,
+                allow_deterministic_fallback=True,
+                max_same_backend_retries=1,
+                max_total_attempts=3,
+            )
+            decisions = policy.plan_recovery(
+                failure,
+                primary_model=primary_model,
+                faster_model=None,
+                history=attempts,
+            ) if failure is not None else []
+            for decision in decisions:
+                self._log(
+                    "router_recovery_option",
+                    strategy=decision.candidate.strategy,
+                    capability_tier=decision.candidate.capability_tier,
+                    prompt_variant=decision.candidate.prompt_variant,
+                    accepted=decision.accepted,
+                    reason=decision.reason,
+                )
+                if not decision.accepted:
+                    continue
+                if decision.candidate.local_only:
+                    break
+                retried = self._retry_after_timeout(
+                    user_input,
+                    session=session,
+                    strategy=decision.candidate.strategy,
+                    capability_tier=decision.candidate.capability_tier,
+                )
                 if retried is not None:
-                    return retried
+                    route, retry_attempts = retried
+                    attempts.extend(retry_attempts)
+                    self._append_runtime_execution(
+                        session,
+                        build_execution_run_record(
+                            operation_name="router_generation",
+                            task_class="router_generation",
+                            final_state="completed",
+                            capability_tier=decision.candidate.capability_tier,
+                            recovery_strategy=decision.candidate.strategy,
+                            degraded=decision.candidate.capability_tier != "tier_a",
+                            honest_blocked=False,
+                            artifact_bytes_generated=0,
+                            validation_possible=False,
+                            summary="Route generation recovered after a runtime startup issue.",
+                            attempts=attempts,
+                        ),
+                    )
+                    return route
         fallback = self._fallback_route(user_input, snapshot=snapshot, session=session)
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="router_generation",
+                task_class="router_generation",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=False,
+                summary="The router fell back to deterministic route heuristics.",
+                attempts=attempts,
+            ),
+        )
         self._log("router_fallback", router_result=fallback.model_dump())
         return fallback
 
@@ -105,18 +235,53 @@ class IntentRouter:
         self,
         invalid_payload: dict[str, Any],
         errors: list[dict[str, Any]],
+        *,
+        session: SessionState | None = None,
     ) -> RouterOutput | None:
         try:
-            repaired = self.llm.generate_json(
-                router_repair_prompt(invalid_payload, errors),
-                system=router_system_prompt(),
-                model=self.model_name,
-                retries=0,
-                timeout=max(self.timeout, 16),
-                num_ctx=self.num_ctx,
-                progress_callback=self._progress_logger("router_generation_progress"),
+            repair_prompt = router_repair_prompt(invalid_payload, errors)
+            outcome = invoke_model(
+                lambda progress: self.llm.generate_json(
+                    repair_prompt,
+                    system=router_system_prompt(),
+                    model=self._primary_model_name(),
+                    retries=0,
+                    timeout=max(self.timeout, 16),
+                    num_ctx=self.num_ctx,
+                    progress_callback=progress,
+                ),
+                operation_name="router_repair_generation",
+                task_class="router_generation",
+                attempt_number=1,
+                capability_tier="tier_c",
+                recovery_strategy="repair_invalid_router_output",
+                prompt_variant="repair",
+                model_identifier=self._primary_model_name(),
+                backend_identifier="ollama",
+                inactivity_timeout_seconds=max(self.timeout, 16),
+                total_timeout_seconds=max(self.timeout + 18, 32),
+                context_pressure_estimate=estimate_context_pressure(prompt_chars=len(repair_prompt)),
+                event_callback=self._progress_logger("router_generation_progress"),
             )
-            route = self.validate_router_output(repaired)
+            if outcome.exception is not None:
+                raise outcome.exception
+            route = self.validate_router_output(outcome.value)
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="router_repair_generation",
+                    task_class="router_generation",
+                    final_state="completed",
+                    capability_tier="tier_c",
+                    recovery_strategy="repair_invalid_router_output",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=False,
+                    summary="The router repaired invalid structured output with a constrained follow-up generation.",
+                    attempts=[outcome.attempt],
+                ),
+            )
             self._log("router_repair_succeeded", router_result=route.model_dump())
             return route
         except Exception as exc:
@@ -128,26 +293,50 @@ class IntentRouter:
             )
             return None
 
-    def _retry_after_timeout(self, user_input: str) -> RouterOutput | None:
+    def _retry_after_timeout(
+        self,
+        user_input: str,
+        *,
+        session: SessionState | None = None,
+        strategy: str = "minimal_prompt_after_timeout",
+        capability_tier: str = "tier_c",
+    ) -> tuple[RouterOutput, list[Any]] | None:
         self._log(
             "router_retry_started",
-            strategy="minimal_prompt_after_timeout",
+            strategy=strategy,
             retry_timeout=max(self.timeout + 8, 26),
             retry_num_ctx=min(self.num_ctx, 2048),
         )
         try:
-            payload = self.llm.generate_json(
-                router_prompt(user_input, None, session=None),
-                system=router_system_prompt(),
-                model=self.model_name,
-                retries=0,
-                timeout=max(self.timeout + 8, 26),
-                num_ctx=min(self.num_ctx, 2048),
-                progress_callback=self._progress_logger("router_generation_progress"),
+            retry_prompt = router_prompt(user_input, None, session=None)
+            outcome = invoke_model(
+                lambda progress: self.llm.generate_json(
+                    retry_prompt,
+                    system=router_system_prompt(),
+                    model=self._primary_model_name(),
+                    retries=0,
+                    timeout=max(self.timeout + 8, 26),
+                    num_ctx=min(self.num_ctx, 2048),
+                    progress_callback=progress,
+                ),
+                operation_name="router_generation",
+                task_class="router_generation",
+                attempt_number=1,
+                capability_tier=capability_tier,
+                recovery_strategy=strategy,
+                prompt_variant="compact",
+                model_identifier=self._primary_model_name(),
+                backend_identifier="ollama",
+                inactivity_timeout_seconds=max(self.timeout + 8, 26),
+                total_timeout_seconds=max(self.timeout + 30, 52),
+                context_pressure_estimate=estimate_context_pressure(prompt_chars=len(retry_prompt)),
+                event_callback=self._progress_logger("router_generation_progress"),
             )
-            route = self.validate_router_output(payload)
+            if outcome.exception is not None:
+                raise outcome.exception
+            route = self.validate_router_output(outcome.value)
             self._log("router_retry_succeeded", router_result=route.model_dump())
-            return route
+            return route, [outcome.attempt]
         except Exception as exc:
             self._log("router_retry_failed", error=str(exc))
             return None
@@ -877,6 +1066,21 @@ class IntentRouter:
             terms.append(token)
         return terms[:4]
 
+    def _append_runtime_execution(self, session: SessionState | None, record: dict[str, Any]) -> None:
+        if session is None:
+            return
+        session.runtime_executions.append(record)
+        session.runtime_executions = session.runtime_executions[-20:]
+
+    def _primary_model_name(self) -> str | None:
+        candidate = str(self.model_name or "").strip()
+        if candidate:
+            return candidate
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return None
+        return str(getattr(config, "router_model_name", "") or getattr(config, "model_name", "") or "").strip() or None
+
     def _log(self, event: str, **payload: Any) -> None:
         if self.logger is None:
             return
@@ -885,19 +1089,8 @@ class IntentRouter:
     def _progress_logger(self, event: str):
         if self.logger is None:
             return None
-        last_emitted = {"heartbeat": 0.0, "chunk": 0.0}
 
         def callback(payload: dict[str, object]) -> None:
-            kind = str(payload.get("type") or "").strip()
-            now = time.monotonic()
-            if kind == "heartbeat":
-                if now - last_emitted["heartbeat"] < 8.0:
-                    return
-                last_emitted["heartbeat"] = now
-            elif kind == "chunk":
-                if now - last_emitted["chunk"] < 2.0:
-                    return
-                last_emitted["chunk"] = now
             self._log(event, **payload)
 
         return callback

@@ -27,6 +27,12 @@ class OllamaGenerationError(OllamaClientError):
         activity_count: int = 0,
         partial_text: str = "",
         retryable: bool = True,
+        model_name: str | None = None,
+        backend_identifier: str = "ollama",
+        startup_timeout_seconds: int | None = None,
+        inactivity_timeout_seconds: int | None = None,
+        total_timeout_seconds: int | None = None,
+        first_output_received: bool | None = None,
     ):
         super().__init__(message)
         self.reason = reason
@@ -36,6 +42,28 @@ class OllamaGenerationError(OllamaClientError):
         self.activity_count = max(int(activity_count), 0)
         self.partial_text = str(partial_text or "")
         self.retryable = bool(retryable)
+        self.model_name = str(model_name or "").strip() or None
+        self.backend_identifier = str(backend_identifier or "ollama").strip() or "ollama"
+        self.startup_timeout_seconds = (
+            max(int(startup_timeout_seconds), 1)
+            if startup_timeout_seconds is not None
+            else None
+        )
+        self.inactivity_timeout_seconds = (
+            max(int(inactivity_timeout_seconds), 1)
+            if inactivity_timeout_seconds is not None
+            else None
+        )
+        self.total_timeout_seconds = (
+            max(int(total_timeout_seconds), 1)
+            if total_timeout_seconds is not None
+            else None
+        )
+        self.first_output_received = (
+            bool(first_output_received)
+            if first_output_received is not None
+            else bool(self.partial_text) or self.characters > 0
+        )
 
     @property
     def timed_out(self) -> bool:
@@ -176,13 +204,28 @@ class OllamaClient:
                     )
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code in {429, 503, 504}:
+                    raise OllamaGenerationError(
+                        f"Ollama HTTP {exc.code}: {detail}",
+                        reason="backend_overloaded",
+                        elapsed=round(time.monotonic() - attempt_started_at, 1),
+                        retryable=True,
+                        model_name=effective_model,
+                        backend_identifier="ollama",
+                        startup_timeout_seconds=startup_timeout,
+                        inactivity_timeout_seconds=inactivity_timeout,
+                        total_timeout_seconds=overall_timeout,
+                    ) from exc
                 raise OllamaClientError(f"Ollama HTTP {exc.code}: {detail}") from exc
             except (error.URLError, TimeoutError, socket.timeout, OllamaClientError) as exc:
                 normalized = self._normalize_generation_exception(
                     exc,
                     target=target,
                     started_at=attempt_started_at,
+                    model_name=effective_model,
                     startup_timeout=startup_timeout,
+                    inactivity_timeout=inactivity_timeout,
+                    total_timeout=overall_timeout,
                 )
                 if isinstance(normalized, OllamaGenerationError) and not normalized.retryable:
                     raise normalized
@@ -268,6 +311,12 @@ class OllamaClient:
                             activity_count=activity_count,
                             partial_text="".join(streamed_parts),
                             retryable=False,
+                            model_name=model_name,
+                            backend_identifier="ollama",
+                            startup_timeout_seconds=startup_timeout,
+                            inactivity_timeout_seconds=inactivity_timeout,
+                            total_timeout_seconds=total_timeout,
+                            first_output_received=False,
                         ) from exc
                     if progress_callback is not None and now - last_heartbeat_at >= min(10.0, max(startup_timeout / 4.0, 4.0)):
                         progress_callback(
@@ -293,6 +342,12 @@ class OllamaClient:
                         characters=total_characters,
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
+                        model_name=model_name,
+                        backend_identifier="ollama",
+                        startup_timeout_seconds=startup_timeout,
+                        inactivity_timeout_seconds=inactivity_timeout,
+                        total_timeout_seconds=total_timeout,
+                        first_output_received=bool(streamed_parts),
                     ) from exc
                 if elapsed >= total_timeout:
                     raise OllamaGenerationError(
@@ -303,6 +358,12 @@ class OllamaClient:
                         characters=total_characters,
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
+                        model_name=model_name,
+                        backend_identifier="ollama",
+                        startup_timeout_seconds=startup_timeout,
+                        inactivity_timeout_seconds=inactivity_timeout,
+                        total_timeout_seconds=total_timeout,
+                        first_output_received=bool(streamed_parts),
                     ) from exc
                 if progress_callback is not None and now - last_heartbeat_at >= min(10.0, inactivity_timeout):
                     progress_callback(
@@ -329,6 +390,12 @@ class OllamaClient:
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
                         retryable=False,
+                        model_name=model_name,
+                        backend_identifier="ollama",
+                        startup_timeout_seconds=startup_timeout,
+                        inactivity_timeout_seconds=inactivity_timeout,
+                        total_timeout_seconds=total_timeout,
+                        first_output_received=False,
                     )
                 break
 
@@ -349,6 +416,12 @@ class OllamaClient:
                     activity_count=activity_count,
                     partial_text="".join(streamed_parts),
                     retryable=False,
+                    model_name=model_name,
+                    backend_identifier="ollama",
+                    startup_timeout_seconds=startup_timeout,
+                    inactivity_timeout_seconds=inactivity_timeout,
+                    total_timeout_seconds=total_timeout,
+                    first_output_received=bool(streamed_parts),
                 )
             chunk = payload.get("response")
             if chunk:
@@ -381,6 +454,12 @@ class OllamaClient:
                 activity_count=activity_count,
                 partial_text="".join(streamed_parts),
                 retryable=False,
+                model_name=model_name,
+                backend_identifier="ollama",
+                startup_timeout_seconds=startup_timeout,
+                inactivity_timeout_seconds=inactivity_timeout,
+                total_timeout_seconds=total_timeout,
+                first_output_received=False,
             )
 
         raw = response.read().decode("utf-8")
@@ -556,7 +635,10 @@ class OllamaClient:
         *,
         target: str,
         started_at: float,
+        model_name: str,
         startup_timeout: int,
+        inactivity_timeout: int,
+        total_timeout: int,
     ) -> Exception:
         if isinstance(exc, OllamaGenerationError):
             return exc
@@ -568,8 +650,26 @@ class OllamaClient:
                     reason="startup_timeout",
                     elapsed=elapsed,
                     retryable=elapsed < max(startup_timeout * 0.45, 12.0),
+                    model_name=model_name,
+                    backend_identifier="ollama",
+                    startup_timeout_seconds=startup_timeout,
+                    inactivity_timeout_seconds=inactivity_timeout,
+                    total_timeout_seconds=total_timeout,
+                    first_output_received=False,
                 )
-            return OllamaClientError(f"Could not reach Ollama at {target}: {exc}")
+            elapsed = round(time.monotonic() - started_at, 1)
+            return OllamaGenerationError(
+                f"Could not reach Ollama at {target}: {exc}",
+                reason="backend_unavailable",
+                elapsed=elapsed,
+                retryable=True,
+                model_name=model_name,
+                backend_identifier="ollama",
+                startup_timeout_seconds=startup_timeout,
+                inactivity_timeout_seconds=inactivity_timeout,
+                total_timeout_seconds=total_timeout,
+                first_output_received=False,
+            )
         if isinstance(exc, (TimeoutError, socket.timeout)):
             elapsed = round(time.monotonic() - started_at, 1)
             return OllamaGenerationError(
@@ -577,6 +677,12 @@ class OllamaClient:
                 reason="startup_timeout",
                 elapsed=elapsed,
                 retryable=elapsed < max(startup_timeout * 0.45, 12.0),
+                model_name=model_name,
+                backend_identifier="ollama",
+                startup_timeout_seconds=startup_timeout,
+                inactivity_timeout_seconds=inactivity_timeout,
+                total_timeout_seconds=total_timeout,
+                first_output_received=False,
             )
         if isinstance(exc, OllamaClientError) and self._is_timeout_like(exc):
             elapsed = round(time.monotonic() - started_at, 1)
@@ -585,5 +691,11 @@ class OllamaClient:
                 reason="startup_timeout",
                 elapsed=elapsed,
                 retryable=elapsed < max(startup_timeout * 0.45, 12.0),
+                model_name=model_name,
+                backend_identifier="ollama",
+                startup_timeout_seconds=startup_timeout,
+                inactivity_timeout_seconds=inactivity_timeout,
+                total_timeout_seconds=total_timeout,
+                first_output_received=False,
             )
         return exc

@@ -24,6 +24,12 @@ from agent.semantic_defaults import (
 from agent.task_schema import TaskArtifact
 from agent.task_state import EvidenceItem, TaskState
 from llm.provider import LLMProvider
+from llm.runtime_resilience import (
+    ExecutionRecoveryPolicy,
+    build_execution_run_record,
+    estimate_context_pressure,
+    invoke_model,
+)
 from runtime.logger import AgentLogger
 
 
@@ -53,24 +59,168 @@ class TaskStateUpdater:
         session=None,
     ) -> TaskState:
         payload: dict[str, Any] | None = None
-        try:
-            payload = self.llm.generate_json(
-                task_state_update_prompt(user_input, snapshot=snapshot, session=session),
+        prompt = task_state_update_prompt(user_input, snapshot=snapshot, session=session)
+        context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
+        primary_model = self._primary_model_name()
+        faster_model = self._faster_model_name(primary_model)
+        policy = ExecutionRecoveryPolicy(
+            task_class="task_state_generation",
+            allow_same_backend_retry=True,
+            allow_smaller_faster_model=bool(faster_model),
+            allow_deterministic_fallback=True,
+            max_same_backend_retries=1,
+            max_total_attempts=3,
+        )
+        attempts = []
+        outcome = invoke_model(
+            lambda progress: self.llm.generate_json(
+                prompt,
                 system=task_state_system_prompt(),
-                model=self.model_name,
+                model=primary_model,
                 retries=0,
                 timeout=self.timeout,
                 num_ctx=self.num_ctx,
-                progress_callback=self._progress_logger("task_state_generation_progress"),
-            )
+                progress_callback=progress,
+            ),
+            operation_name="task_state_generation",
+            task_class="task_state_generation",
+            attempt_number=1,
+            capability_tier="tier_a",
+            recovery_strategy="primary_model_generation",
+            prompt_variant="full",
+            model_identifier=primary_model,
+            backend_identifier=self._backend_identifier(),
+            inactivity_timeout_seconds=self.timeout,
+            total_timeout_seconds=max(self.timeout * 2, self.timeout + 20),
+            context_pressure_estimate=context_pressure,
+            event_callback=self._progress_logger("task_state_generation_progress"),
+        )
+        attempts.append(outcome.attempt)
+        if outcome.exception is None:
+            payload = outcome.value
             state = TaskState.model_validate(payload)
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="task_state_generation",
+                    task_class="task_state_generation",
+                    final_state="completed",
+                    capability_tier="tier_a",
+                    recovery_strategy="primary_model_generation",
+                    degraded=False,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=False,
+                    summary="Task understanding completed on the primary generation tier.",
+                    attempts=attempts,
+                ),
+            )
             self._log("task_state_updated", task_state=state.model_dump())
             return state
-        except Exception as exc:
-            self._log("task_state_fallback", error=str(exc), payload=payload or {})
-            state = self._fallback_state(user_input, snapshot=snapshot, session=session)
-            self._log("task_state_updated", task_state=state.model_dump(), source="fallback")
-            return state
+
+        failure = outcome.attempt.failure
+        self._log(
+            "task_state_generation_error",
+            error=str(outcome.exception),
+            failure=failure.to_dict() if failure is not None else None,
+        )
+        decisions = policy.plan_recovery(
+            failure,
+            primary_model=primary_model,
+            faster_model=faster_model,
+            history=attempts,
+        ) if failure is not None else []
+        for decision in decisions:
+            self._log(
+                "task_state_recovery_option",
+                strategy=decision.candidate.strategy,
+                capability_tier=decision.candidate.capability_tier,
+                prompt_variant=decision.candidate.prompt_variant,
+                model=decision.candidate.model_identifier,
+                accepted=decision.accepted,
+                reason=decision.reason,
+            )
+            if not decision.accepted:
+                continue
+            if decision.candidate.local_only:
+                break
+            retry_timeout = self.timeout if decision.candidate.prompt_variant == "full" else max(12, min(self.timeout, 18))
+            retry_num_ctx = self.num_ctx if decision.candidate.prompt_variant == "full" else min(self.num_ctx, 2048)
+            retry_outcome = invoke_model(
+                lambda progress, model_name=decision.candidate.model_identifier: self.llm.generate_json(
+                    prompt,
+                    system=task_state_system_prompt(),
+                    model=model_name,
+                    retries=0,
+                    timeout=retry_timeout,
+                    num_ctx=retry_num_ctx,
+                    progress_callback=progress,
+                ),
+                operation_name="task_state_generation",
+                task_class="task_state_generation",
+                attempt_number=len(attempts) + 1,
+                capability_tier=decision.candidate.capability_tier,
+                recovery_strategy=decision.candidate.strategy,
+                prompt_variant=decision.candidate.prompt_variant,
+                model_identifier=decision.candidate.model_identifier,
+                backend_identifier=self._backend_identifier(),
+                inactivity_timeout_seconds=retry_timeout,
+                total_timeout_seconds=max(retry_timeout * 2, retry_timeout + 20),
+                context_pressure_estimate=context_pressure,
+                event_callback=self._progress_logger("task_state_generation_progress"),
+            )
+            attempts.append(retry_outcome.attempt)
+            if retry_outcome.exception is None:
+                payload = retry_outcome.value
+                state = TaskState.model_validate(payload)
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="completed",
+                        capability_tier=decision.candidate.capability_tier,
+                        recovery_strategy=decision.candidate.strategy,
+                        degraded=decision.candidate.capability_tier != "tier_a",
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="Task understanding recovered after a runtime startup issue.",
+                        attempts=attempts,
+                    ),
+                )
+                self._log("task_state_updated", task_state=state.model_dump(), source="recovered_model")
+                return state
+            self._log(
+                "task_state_generation_retry_error",
+                error=str(retry_outcome.exception),
+                failure=retry_outcome.attempt.failure.to_dict()
+                if retry_outcome.attempt.failure is not None
+                else None,
+            )
+
+        self._log("task_state_fallback", error=str(outcome.exception), payload=payload or {})
+        state = self._fallback_state(user_input, snapshot=snapshot, session=session)
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="task_state_generation",
+                task_class="task_state_generation",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=False,
+                summary=(
+                    "Task understanding succeeded through the deterministic fallback after the backend could not start cleanly."
+                ),
+                attempts=attempts,
+            ),
+        )
+        self._log("task_state_updated", task_state=state.model_dump(), source="fallback")
+        return state
 
     def _fallback_state(self, user_input: str, *, snapshot=None, session=None) -> TaskState:
         request = str(user_input or "").strip() or "Unclear request"
@@ -755,6 +905,34 @@ class TaskStateUpdater:
         if self.logger is None:
             return
         self.logger.log_event(event, **payload)
+
+    def _append_runtime_execution(self, session, record: dict[str, Any]) -> None:
+        if session is None:
+            return
+        session.runtime_executions.append(record)
+        session.runtime_executions = session.runtime_executions[-20:]
+
+    def _primary_model_name(self) -> str | None:
+        candidate = str(self.model_name or "").strip()
+        if candidate:
+            return candidate
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return None
+        return str(getattr(config, "router_model_name", "") or getattr(config, "model_name", "") or "").strip() or None
+
+    def _faster_model_name(self, primary_model: str | None) -> str | None:
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return None
+        router_model = str(getattr(config, "router_model_name", "") or "").strip() or None
+        primary = str(primary_model or "").strip() or None
+        if router_model and router_model != primary:
+            return router_model
+        return None
+
+    def _backend_identifier(self) -> str:
+        return "ollama"
 
     def _progress_logger(self, event: str):
         if self.logger is None:

@@ -5,6 +5,13 @@ const COMMIT_AND_PUSH_PROMPT =
 let sessionRefreshHandle = null;
 let modelRefreshHandle = null;
 let authTickerHandle = null;
+let scheduledSessionRefreshHandle = null;
+let scheduledModelRefreshHandle = null;
+
+const refreshControllers = {
+  sessions: createRefreshController({ baseIntervalMs: 8000, maxIntervalMs: 30000, minGapMs: 1200 }),
+  models: createRefreshController({ baseIntervalMs: 4000, maxIntervalMs: 30000, minGapMs: 1800 }),
+};
 
 const state = {
   config: null,
@@ -108,6 +115,81 @@ async function initializeApp() {
   await boot();
 }
 
+function createRefreshController({ baseIntervalMs, maxIntervalMs, minGapMs }) {
+  return {
+    baseIntervalMs,
+    currentIntervalMs: baseIntervalMs,
+    maxIntervalMs,
+    minGapMs,
+    lastStartedAt: 0,
+    lastCompletedAt: 0,
+    nextDueAt: 0,
+    inflight: null,
+  };
+}
+
+function shouldStartRefresh(controller, { force = false, now = Date.now() } = {}) {
+  if (!controller) {
+    return true;
+  }
+  if (force) {
+    return true;
+  }
+  if (controller.inflight) {
+    return false;
+  }
+  if (controller.nextDueAt && now < controller.nextDueAt) {
+    return false;
+  }
+  if (controller.lastStartedAt && now - controller.lastStartedAt < controller.minGapMs) {
+    return false;
+  }
+  return true;
+}
+
+function updateRefreshBackoff(controller, { changed = false, errored = false, now = Date.now() } = {}) {
+  if (!controller) {
+    return;
+  }
+  if (changed) {
+    controller.currentIntervalMs = controller.baseIntervalMs;
+  } else if (errored) {
+    controller.currentIntervalMs = Math.min(
+      controller.maxIntervalMs,
+      Math.max(controller.currentIntervalMs, controller.baseIntervalMs) * 2,
+    );
+  } else {
+    controller.currentIntervalMs = Math.min(
+      controller.maxIntervalMs,
+      Math.round(Math.max(controller.currentIntervalMs, controller.baseIntervalMs) * 1.5),
+    );
+  }
+  controller.lastCompletedAt = now;
+  controller.nextDueAt = now + controller.currentIntervalMs;
+}
+
+function scheduleSessionRefresh({ delayMs = 1200, force = false, source = "stream" } = {}) {
+  if (scheduledSessionRefreshHandle) {
+    window.clearTimeout(scheduledSessionRefreshHandle);
+    scheduledSessionRefreshHandle = null;
+  }
+  scheduledSessionRefreshHandle = window.setTimeout(() => {
+    scheduledSessionRefreshHandle = null;
+    refreshSessions({ force, source }).catch(() => {});
+  }, delayMs);
+}
+
+function scheduleModelRefresh({ delayMs = 1800, force = false, source = "poll" } = {}) {
+  if (scheduledModelRefreshHandle) {
+    window.clearTimeout(scheduledModelRefreshHandle);
+    scheduledModelRefreshHandle = null;
+  }
+  scheduledModelRefreshHandle = window.setTimeout(() => {
+    scheduledModelRefreshHandle = null;
+    refreshModelCatalog({ force, silent: true, source }).catch(() => {});
+  }, delayMs);
+}
+
 function bindEvents() {
   document.addEventListener("click", handleClick);
   document.addEventListener("submit", handleSubmit);
@@ -201,14 +283,14 @@ function ensureBackgroundPolling() {
   if (!sessionRefreshHandle) {
     sessionRefreshHandle = window.setInterval(() => {
       if (state.auth.authenticated) {
-        refreshSessions().catch(() => {});
+        refreshSessions({ source: "poll" }).catch(() => {});
       }
     }, 8000);
   }
   if (!modelRefreshHandle) {
     modelRefreshHandle = window.setInterval(() => {
       if (state.auth.authenticated) {
-        refreshModelCatalog({ silent: true }).catch(() => {});
+        refreshModelCatalog({ silent: true, source: "poll" }).catch(() => {});
       }
     }, 4000);
   }
@@ -315,40 +397,80 @@ async function refreshWorkspaces() {
   }
 }
 
-async function refreshSessions() {
+async function refreshSessions({ force = false, source = "manual" } = {}) {
   if (!state.auth.authenticated) {
     state.sessions = [];
     return;
   }
-  const previousActiveSessionId = state.activeSessionId;
-  const nextSessions = await fetchJSON("/api/sessions");
-  const changed = hasCollectionChanged(state.sessions, nextSessions);
-  state.sessions = nextSessions;
+  const controller = refreshControllers.sessions;
   if (
-    state.activeSessionId &&
-    !state.sessions.some((session) => session.id === state.activeSessionId)
+    source === "poll" &&
+    state.stream &&
+    state.activeSession &&
+    ["queued", "running"].includes(state.activeSession.status)
   ) {
-    disconnectStream();
-    state.activeSessionId = null;
-    state.activeSession = null;
-    state.logs = [];
+    updateRefreshBackoff(controller, { changed: false });
+    return state.sessions;
   }
-  if (changed || previousActiveSessionId !== state.activeSessionId) {
-    renderApp();
+  if (!shouldStartRefresh(controller, { force })) {
+    return controller.inflight || state.sessions;
   }
+  const previousActiveSessionId = state.activeSessionId;
+  controller.lastStartedAt = Date.now();
+  controller.inflight = fetchJSON("/api/sessions")
+    .then((nextSessions) => {
+      const changed = hasCollectionChanged(state.sessions, nextSessions);
+      state.sessions = nextSessions;
+      if (
+        state.activeSessionId &&
+        !state.sessions.some((session) => session.id === state.activeSessionId)
+      ) {
+        disconnectStream();
+        state.activeSessionId = null;
+        state.activeSession = null;
+        state.logs = [];
+      }
+      if (changed || previousActiveSessionId !== state.activeSessionId) {
+        renderApp();
+      }
+      updateRefreshBackoff(controller, { changed });
+      return state.sessions;
+    })
+    .catch((error) => {
+      updateRefreshBackoff(controller, { errored: true });
+      throw error;
+    })
+    .finally(() => {
+      controller.inflight = null;
+    });
+  return controller.inflight;
 }
 
-async function refreshModelCatalog({ silent = false } = {}) {
+async function refreshModelCatalog({ silent = false, force = false, source = "manual" } = {}) {
   if (!state.auth.authenticated) {
     return;
   }
+  const controller = refreshControllers.models;
+  if (source === "poll" && !shouldStartRefresh(controller, { force })) {
+    return controller.inflight || state.models;
+  }
   try {
-    const catalog = await fetchJSON("/api/models");
-    const changed = applyModelCatalog(catalog);
-    if (changed) {
-      renderApp();
-    }
+    controller.lastStartedAt = Date.now();
+    controller.inflight = fetchJSON("/api/models")
+      .then((catalog) => {
+        const changed = applyModelCatalog(catalog);
+        if (changed) {
+          renderApp();
+        }
+        updateRefreshBackoff(controller, { changed });
+        return state.models;
+      })
+      .finally(() => {
+        controller.inflight = null;
+      });
+    await controller.inflight;
   } catch (error) {
+    updateRefreshBackoff(controller, { errored: true });
     if (!silent) {
       showToast(`Modelle konnten nicht geladen werden: ${error.message}`, "error");
     }
@@ -709,7 +831,7 @@ function connectStream(sessionId) {
     }
     state.activeSession = session;
     renderApp();
-    refreshSessions();
+    scheduleSessionRefresh({ delayMs: 1200, source: "stream" });
   });
 
   stream.addEventListener("log", (event) => {
@@ -720,12 +842,13 @@ function connectStream(sessionId) {
 
   stream.addEventListener("done", () => {
     disconnectStream();
-    refreshSessions();
+    refreshSessions({ force: true, source: "stream-done" }).catch(() => {});
     renderApp();
   });
 
   stream.onerror = () => {
     disconnectStream();
+    scheduleSessionRefresh({ delayMs: 1500, source: "stream-error" });
     renderApp();
   };
 }
@@ -4870,33 +4993,33 @@ function describeToolActivity(payload, options = {}) {
 function describeStreamingModelProgress(kind, payload) {
   const progressType = String(payload?.type || "").trim();
   const path = extractPathFromPayload(payload || {});
-  const model = shorten(String(payload?.model || "").trim(), 28);
+  const tier = capabilityTierLabel(payload?.capability_tier);
 
   if (progressType === "status") {
     const stage = String(payload?.stage || "").trim();
     if (stage === "request_started") {
       if (kind === "content") {
         return path
-          ? `Modellstart fuer ${shortenPath(path, 56)}`
-          : `Modellstart fuer den Dateiinhalt`;
+          ? `Modellstart fuer ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+          : `Modellstart fuer den Dateiinhalt${tier ? ` (${tier})` : ""}`;
       }
-      return "Modellstart fuer die Antwort";
+      return `Modellstart fuer die Antwort${tier ? ` (${tier})` : ""}`;
     }
     if (stage === "waiting_for_first_chunk") {
       if (kind === "content") {
         return path
-          ? `Wartet auf ersten Chunk fuer ${shortenPath(path, 56)}`
-          : "Wartet auf den ersten Chunk";
+          ? `Wartet auf ersten Chunk fuer ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+          : `Wartet auf den ersten Chunk${tier ? ` (${tier})` : ""}`;
       }
-      return "Wartet auf den ersten Antwort-Chunk";
+      return `Wartet auf den ersten Antwort-Chunk${tier ? ` (${tier})` : ""}`;
     }
     if (stage === "startup_timeout_warning") {
       if (kind === "content") {
         return path
-          ? `Wartet auf ersten Output fuer ${shortenPath(path, 56)}`
-          : "Wartet auf ersten Inhalt";
+          ? `Wartet auf ersten Output fuer ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+          : `Wartet auf ersten Inhalt${tier ? ` (${tier})` : ""}`;
       }
-      return "Wartet auf ersten Antwort-Output";
+      return `Wartet auf ersten Antwort-Output${tier ? ` (${tier})` : ""}`;
     }
   }
 
@@ -4904,26 +5027,26 @@ function describeStreamingModelProgress(kind, payload) {
     if (payload?.phase === "waiting_for_start") {
       if (kind === "content") {
         return path
-          ? `Modell startet noch fuer ${shortenPath(path, 56)}`
-          : "Modell startet noch";
+          ? `Modell startet noch fuer ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+          : `Modell startet noch${tier ? ` (${tier})` : ""}`;
       }
-      return "Modell startet noch fuer die Antwort";
+      return `Modell startet noch fuer die Antwort${tier ? ` (${tier})` : ""}`;
     }
     if (kind === "content") {
       return path
-        ? `Inhalt wird weiter generiert fuer ${shortenPath(path, 56)}`
-        : "Dateiinhalt wird weiter generiert";
+        ? `Inhalt wird weiter generiert fuer ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+        : `Dateiinhalt wird weiter generiert${tier ? ` (${tier})` : ""}`;
     }
-    return "Antworttext wird weiter generiert";
+    return `Antworttext wird weiter generiert${tier ? ` (${tier})` : ""}`;
   }
 
   if (progressType === "chunk") {
     if (kind === "content") {
       return path
-        ? `Streamt weiter fuer ${shortenPath(path, 56)}`
-        : "Inhalt streamt weiter";
+        ? `Streamt weiter fuer ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+        : `Inhalt streamt weiter${tier ? ` (${tier})` : ""}`;
     }
-    return "Antwort streamt weiter";
+    return `Antwort streamt weiter${tier ? ` (${tier})` : ""}`;
   }
 
   return "";
@@ -4931,41 +5054,42 @@ function describeStreamingModelProgress(kind, payload) {
 
 function describeContentGenerationRetry(path, payload) {
   const strategy = String(payload?.strategy || "").trim();
+  const tier = capabilityTierLabel(payload?.capability_tier);
 
   if (strategy === "resume_same_model") {
     return path
-      ? `Wird mit vorhandenem Fortschritt fortgesetzt: ${shortenPath(path, 56)}`
-      : "Wird mit vorhandenem Fortschritt fortgesetzt";
+      ? `Wird mit vorhandenem Fortschritt fortgesetzt: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+      : `Wird mit vorhandenem Fortschritt fortgesetzt${tier ? ` (${tier})` : ""}`;
   }
   if (strategy === "resume_fallback_model") {
     return path
-      ? `Fortsetzung mit kleinerem Modell: ${shortenPath(path, 56)}`
-      : "Fortsetzung mit kleinerem Modell";
+      ? `Fortsetzung mit kleinerem Modell: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+      : `Fortsetzung mit kleinerem Modell${tier ? ` (${tier})` : ""}`;
   }
   if (strategy === "fallback_model") {
     return path
-      ? `Retry mit kleinerem Modell: ${shortenPath(path, 56)}`
-      : "Retry mit kleinerem Modell";
+      ? `Retry mit kleinerem Modell: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+      : `Retry mit kleinerem Modell${tier ? ` (${tier})` : ""}`;
   }
   if (strategy === "compact_fallback_model") {
     return path
-      ? `Kompakter Retry: ${shortenPath(path, 56)}`
-      : "Kompakter Retry mit weniger Kontext";
+      ? `Kompakter Retry: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+      : `Kompakter Retry mit weniger Kontext${tier ? ` (${tier})` : ""}`;
   }
   if (strategy === "starter_scaffold") {
     return path
-      ? `Lokales Starter-Grundgeruest: ${shortenPath(path, 56)}`
-      : "Lokales Starter-Grundgeruest";
+      ? `Lokales Starter-Grundgeruest: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+      : `Lokales Starter-Grundgeruest${tier ? ` (${tier})` : ""}`;
   }
   if (strategy === "deterministic_template") {
     return path
-      ? `Deterministische Vorlage: ${shortenPath(path, 56)}`
-      : "Deterministische Vorlage";
+      ? `Deterministische Vorlage: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+      : `Deterministische Vorlage${tier ? ` (${tier})` : ""}`;
   }
 
   return path
-    ? `Retry mit reduziertem Kontext: ${shortenPath(path, 56)}`
-    : "Retry mit reduziertem Kontext";
+    ? `Retry mit reduziertem Kontext: ${shortenPath(path, 56)}${tier ? ` (${tier})` : ""}`
+    : `Retry mit reduziertem Kontext${tier ? ` (${tier})` : ""}`;
 }
 
 function describeContentGenerationRetryError(path, payload) {
@@ -5064,6 +5188,19 @@ function normalizeProgressText(text) {
   return `${shortened}.`;
 }
 
+function capabilityTierLabel(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "tier_a") return "Tier A";
+  if (normalized === "tier_b") return "Tier B";
+  if (normalized === "tier_c") return "Tier C";
+  if (normalized === "tier_d") return "Tier D";
+  if (normalized === "tier_e") return "Tier E";
+  return "";
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -5117,8 +5254,11 @@ if (typeof module !== "undefined" && module.exports) {
     buildPhaseSteps,
     buildSessionOverview,
     buildValidationSnapshot,
+    createRefreshController,
     describeLogRecord,
     messageDisplayState,
+    shouldStartRefresh,
+    updateRefreshBackoff,
     phaseStepKey,
     renderRichText,
     sanitizeAssistantMessageContent,
