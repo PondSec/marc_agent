@@ -20,6 +20,34 @@ const state = {
   activeSession: null,
   selectedWorkspaceId: null,
   stream: null,
+  setup: {
+    checked: false,
+    required: false,
+    submitting: false,
+    seeded: false,
+    step: 1,
+    reason: "",
+    envPath: "",
+    hasEnvFile: false,
+    passwordPolicy: null,
+    installedModels: [],
+    recommendedModels: [],
+    form: {
+      adminDisplayName: "",
+      adminEmail: "",
+      adminPassword: "",
+      adminPasswordConfirm: "",
+      initialWorkspaceName: "",
+      initialWorkspacePath: "",
+      ollamaHost: "",
+      modelName: "",
+      routerModelName: "",
+      accessMode: "approval",
+      authCookieSecure: false,
+      publicBaseUrl: "",
+    },
+    error: "",
+  },
   auth: {
     checked: false,
     authenticated: false,
@@ -92,6 +120,11 @@ function bindEvents() {
 
 async function boot() {
   try {
+    await refreshSetupState();
+    if (state.setup.required) {
+      clearApplicationState({ preserveAuthInputs: true, preserveRoute: true });
+      return;
+    }
     await refreshAuthState();
     if (!state.auth.authenticated) {
       clearApplicationState({ preserveAuthInputs: true, preserveRoute: true });
@@ -102,6 +135,49 @@ async function boot() {
     state.ui.booting = false;
     renderApp();
     ensureBackgroundPolling();
+  }
+}
+
+async function refreshSetupState({ silent = false } = {}) {
+  try {
+    const payload = await fetchJSON("/api/setup/status");
+    applySetupState(payload);
+  } catch (error) {
+    if (!silent) {
+      showToast(`Setup-Status konnte nicht geladen werden: ${error.message}`, "error");
+    }
+    throw error;
+  }
+}
+
+function applySetupState(payload) {
+  state.setup.checked = true;
+  state.setup.required = Boolean(payload?.required);
+  state.setup.reason = String(payload?.reason || "");
+  state.setup.envPath = String(payload?.env_path || "");
+  state.setup.hasEnvFile = Boolean(payload?.has_env_file);
+  state.setup.passwordPolicy = payload?.password_policy || null;
+  state.setup.installedModels = Array.isArray(payload?.installed_ollama_models)
+    ? payload.installed_ollama_models
+    : [];
+  state.setup.recommendedModels = Array.isArray(payload?.recommended_models)
+    ? payload.recommended_models
+    : [];
+
+  if (!state.setup.seeded && payload?.defaults) {
+    state.setup.form.adminDisplayName = "Administrator";
+    state.setup.form.initialWorkspaceName = payload.defaults.initial_workspace_name || "";
+    state.setup.form.initialWorkspacePath = payload.defaults.initial_workspace_path || "";
+    state.setup.form.ollamaHost = payload.defaults.ollama_host || "";
+    state.setup.form.modelName = payload.defaults.model_name || "";
+    state.setup.form.routerModelName = payload.defaults.router_model_name || payload.defaults.model_name || "";
+    state.setup.form.accessMode = payload.defaults.access_mode || "approval";
+    state.setup.form.authCookieSecure = Boolean(payload.defaults.auth_cookie_secure);
+    state.setup.form.publicBaseUrl = payload.defaults.public_base_url || "";
+    state.setup.seeded = true;
+  }
+  if (!state.setup.required) {
+    state.setup.error = "";
   }
 }
 
@@ -538,6 +614,50 @@ async function submitLogin() {
   }
 }
 
+async function submitSetup() {
+  state.setup.submitting = true;
+  state.setup.error = "";
+  renderApp();
+
+  try {
+    const payload = await fetchJSON("/api/setup/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        admin_display_name: state.setup.form.adminDisplayName.trim(),
+        admin_email: state.setup.form.adminEmail.trim(),
+        admin_password: state.setup.form.adminPassword,
+        admin_password_confirm: state.setup.form.adminPasswordConfirm,
+        initial_workspace_name: state.setup.form.initialWorkspaceName.trim(),
+        initial_workspace_path: state.setup.form.initialWorkspacePath.trim(),
+        ollama_host: state.setup.form.ollamaHost.trim(),
+        model_name: state.setup.form.modelName.trim(),
+        router_model_name: state.setup.form.routerModelName.trim() || null,
+        access_mode: state.setup.form.accessMode,
+        auth_cookie_secure: state.setup.form.authCookieSecure,
+        public_base_url: state.setup.form.publicBaseUrl.trim() || null,
+      }),
+    });
+    state.setup.required = false;
+    state.setup.error = "";
+    state.ui.booting = true;
+    applyAuthState(payload?.auth || {});
+    renderApp();
+    await loadAuthenticatedApplication();
+    if (payload?.workspace?.id) {
+      state.selectedWorkspaceId = payload.workspace.id;
+      persistPreferences();
+    }
+    showToast("Setup abgeschlossen. Die Konsole ist jetzt bereit.", "success");
+  } catch (error) {
+    state.setup.error = error.message || "Setup konnte nicht abgeschlossen werden.";
+  } finally {
+    state.setup.submitting = false;
+    state.ui.booting = false;
+    renderApp();
+  }
+}
+
 async function logoutUser() {
   try {
     await fetchJSON("/api/auth/logout", { method: "POST" });
@@ -717,10 +837,33 @@ function handleClick(event) {
 
   if (action === "clear-active-session") {
     startNewChat(state.selectedWorkspaceId);
+    return;
+  }
+
+  if (action === "setup-prev") {
+    state.setup.step = Math.max(1, state.setup.step - 1);
+    renderApp();
+    return;
+  }
+
+  if (action === "setup-next") {
+    state.setup.step = Math.min(3, state.setup.step + 1);
+    renderApp();
+    return;
+  }
+
+  if (action === "setup-step") {
+    state.setup.step = Math.min(3, Math.max(1, Number(target.dataset.step) || 1));
+    renderApp();
   }
 }
 
 function handleSubmit(event) {
+  if (event.target.id === "setupForm") {
+    event.preventDefault();
+    submitSetup();
+    return;
+  }
   if (event.target.id === "loginForm") {
     event.preventDefault();
     submitLogin();
@@ -743,6 +886,46 @@ function handleInput(event) {
     state.auth.error = "";
     return;
   }
+  if (event.target.id === "setupAdminDisplayNameInput") {
+    state.setup.form.adminDisplayName = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupAdminEmailInput") {
+    state.setup.form.adminEmail = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupAdminPasswordInput") {
+    state.setup.form.adminPassword = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupAdminPasswordConfirmInput") {
+    state.setup.form.adminPasswordConfirm = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupWorkspaceNameInput") {
+    state.setup.form.initialWorkspaceName = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupWorkspacePathInput") {
+    state.setup.form.initialWorkspacePath = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupOllamaHostInput") {
+    state.setup.form.ollamaHost = event.target.value;
+    state.setup.error = "";
+    return;
+  }
+  if (event.target.id === "setupPublicBaseUrlInput") {
+    state.setup.form.publicBaseUrl = event.target.value;
+    state.setup.error = "";
+    return;
+  }
   if (event.target.id === "composerInput") {
     state.composer.prompt = event.target.value;
     autosizeTextarea(event.target);
@@ -758,7 +941,22 @@ function handleInput(event) {
 }
 
 function handleChange(event) {
-  if (event.target.id === "agentProfileSelect") {
+  if (event.target.id === "setupModelNameSelect") {
+    state.setup.form.modelName = event.target.value;
+    if (!state.setup.form.routerModelName) {
+      state.setup.form.routerModelName = event.target.value;
+    }
+    state.setup.error = "";
+  } else if (event.target.id === "setupRouterModelNameSelect") {
+    state.setup.form.routerModelName = event.target.value;
+    state.setup.error = "";
+  } else if (event.target.id === "setupAccessModeSelect") {
+    state.setup.form.accessMode = event.target.value;
+    state.setup.error = "";
+  } else if (event.target.id === "setupAuthCookieSecureToggle") {
+    state.setup.form.authCookieSecure = event.target.checked;
+    state.setup.error = "";
+  } else if (event.target.id === "agentProfileSelect") {
     state.composer.agentProfile = event.target.value;
   } else if (event.target.id === "accessModeSelect") {
     state.composer.accessMode = event.target.value;
@@ -781,6 +979,16 @@ function handleKeydown(event) {
       submitPrompt();
       return;
     }
+    if (event.target.id === "setupAdminPasswordConfirmInput" || event.target.id === "setupWorkspacePathInput") {
+      event.preventDefault();
+      if (state.setup.step < 3) {
+        state.setup.step += 1;
+        renderApp();
+      } else {
+        submitSetup();
+      }
+      return;
+    }
     if (event.target.id === "loginTotpInput" || event.target.id === "loginPasswordInput") {
       event.preventDefault();
       submitLogin();
@@ -797,6 +1005,7 @@ function handleKeydown(event) {
     }
     if (!state.auth.authenticated) {
       state.auth.error = "";
+      state.setup.error = "";
       renderApp();
     }
   }
@@ -890,6 +1099,13 @@ function renderApp() {
   if (!root) {
     return;
   }
+  if (!state.setup.checked || state.setup.required) {
+    root.innerHTML = `
+      ${renderSetupShell()}
+      ${renderToast()}
+    `;
+    return;
+  }
   if (!state.auth.checked || !state.auth.authenticated) {
     root.innerHTML = `
       ${renderAuthShell()}
@@ -920,6 +1136,332 @@ function renderApp() {
   window.requestAnimationFrame(() => {
     restoreChatScrollState();
   });
+}
+
+function renderSetupShell() {
+  const loading = !state.setup.checked || state.ui.booting;
+  const tone = state.setup.error ? "danger" : loading ? "running" : "warning";
+  const step = Math.min(Math.max(Number(state.setup.step) || 1, 1), 3);
+  const submitLabel = state.setup.submitting ? "Konfiguration wird eingerichtet..." : "Setup abschliessen";
+  const copy = loading
+    ? "Die Runtime prueft gerade, ob bereits eine betriebsbereite Konfiguration vorhanden ist."
+    : "Der Assistent richtet die Web-Konsole, die lokale Runtime und den ersten Administrator in einem Durchgang ein. Die Laufzeitkonfiguration wird als .env gespeichert, dein Passwort nur gehasht in der Auth-Datenbank.";
+
+  return `
+    <div class="auth-shell">
+      <div class="auth-shell-inner">
+        <section class="auth-hero surface-panel">
+          <div class="brand-panel auth-brand-panel">
+            <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
+            <div class="brand-copy">
+              <p class="brand-title">M.A.R.C A1</p>
+              <p class="brand-subtitle">Gefuehrter Setup-Assistent fuer die lokale Agent-Runtime</p>
+            </div>
+          </div>
+          <div class="auth-copy">
+            <p class="panel-kicker">Erststart</p>
+            <h1>In wenigen Schritten startklar</h1>
+            <p>${escapeHtml(copy)}</p>
+          </div>
+          <div class="auth-feature-list">
+            ${renderAuthFeature("Keine Handarbeit", "Die .env, der erste Admin und das erste Projekt werden direkt aus der Web-Oberflaeche angelegt.")}
+            ${renderAuthFeature("Sichere Defaults", "Der Assistent erzeugt automatisch einen starken Secret Key und speichert Passwoerter nicht im Klartext in der .env.")}
+            ${renderAuthFeature("Ollama im Blick", "Host, Standardmodell und Router-Modell werden sauber vorbelegt und koennen spaeter weiter angepasst werden.")}
+            ${renderAuthFeature("Im selben Stil", "Der Setup-Flow nutzt bewusst dieselbe Oberflaechenlogik wie der restliche Workspace statt einer separaten Fremdoberflaeche.")}
+          </div>
+        </section>
+        <section class="auth-card surface-panel setup-card">
+          <div class="auth-card-head">
+            <div>
+              <p class="panel-kicker">Setup</p>
+              <h2>${escapeHtml(loading ? "Assistent wird vorbereitet" : "Basis konfigurieren")}</h2>
+            </div>
+            ${renderStatusBadge(loading ? "Wird vorbereitet" : `Schritt ${step} / 3`, tone, {
+              compact: true,
+              live: loading || state.setup.submitting,
+            })}
+          </div>
+          <p class="auth-card-copy">
+            ${escapeHtml(
+              state.setup.reason
+                ? setupReasonCopy(state.setup.reason)
+                : "Der Assistent sammelt nur die Angaben, die fuer einen sicheren und direkt nutzbaren Start wirklich benoetigt werden.",
+            )}
+          </p>
+          ${renderSetupStatusPanel(tone, loading)}
+          ${renderSetupStepTabs(step)}
+          <form id="setupForm" class="auth-form setup-form">
+            ${renderSetupStep(step, loading)}
+            <div class="auth-meta-row setup-meta-row">
+              <span class="auth-meta-copy">
+                .env-Ziel: ${escapeHtml(state.setup.envPath || ".env")}
+              </span>
+              <span class="auth-meta-copy">
+                Mindestlaenge Passwort: ${escapeHtml(String(state.setup.passwordPolicy?.min_length || 14))} Zeichen
+              </span>
+              <span class="auth-meta-copy">
+                ${escapeHtml(state.setup.hasEnvFile ? "Vorhandene .env wird gezielt ergaenzt." : "Eine neue .env wird automatisch erzeugt.")}
+              </span>
+            </div>
+            <div class="setup-actions">
+              <button
+                class="button-secondary"
+                type="button"
+                data-action="setup-prev"
+                ${loading || state.setup.submitting || step === 1 ? "disabled" : ""}
+              >
+                Zurueck
+              </button>
+              ${
+                step < 3
+                  ? `
+                    <button
+                      class="button-primary"
+                      type="button"
+                      data-action="setup-next"
+                      ${loading || state.setup.submitting ? "disabled" : ""}
+                    >
+                      Weiter
+                    </button>
+                  `
+                  : `
+                    <button
+                      class="button-primary"
+                      type="submit"
+                      ${loading || state.setup.submitting ? "disabled" : ""}
+                    >
+                      ${escapeHtml(submitLabel)}
+                    </button>
+                  `
+              }
+            </div>
+          </form>
+        </section>
+      </div>
+    </div>
+  `;
+}
+
+function renderSetupStatusPanel(tone, loading) {
+  const message = loading
+    ? "Pruefe vorhandene Konfiguration, Sicherheitskontext und Modell-Status."
+    : state.setup.error
+      ? state.setup.error
+      : "Nach dem Abschluss wird die Konfiguration gespeichert, der erste Admin erzeugt und der erste Projektordner direkt eingebunden.";
+  const heading = loading
+    ? "Initialisierung"
+    : state.setup.error
+      ? "Setup braucht Aufmerksamkeit"
+      : "Bereit fuer die Einrichtung";
+
+  return `
+    <div class="auth-status tone-${escapeHtml(tone)}" aria-live="polite">
+      <strong>${escapeHtml(heading)}</strong>
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
+}
+
+function renderSetupStepTabs(activeStep) {
+  return `
+    <div class="setup-step-tabs">
+      ${renderSetupStepTab(1, "Runtime", "Ollama, Modell und Zugriff", activeStep)}
+      ${renderSetupStepTab(2, "Admin", "Sicherer Erstzugang", activeStep)}
+      ${renderSetupStepTab(3, "Projekt", "Erstes verbundenes Projekt", activeStep)}
+    </div>
+  `;
+}
+
+function renderSetupStepTab(step, title, copy, activeStep) {
+  const active = step === activeStep;
+  return `
+    <button
+      class="setup-step-tab ${active ? "active" : ""}"
+      type="button"
+      data-action="setup-step"
+      data-step="${step}"
+      ${state.setup.submitting ? "disabled" : ""}
+    >
+      <span class="setup-step-index">${step}</span>
+      <span class="setup-step-copy">
+        <strong>${escapeHtml(title)}</strong>
+        <small>${escapeHtml(copy)}</small>
+      </span>
+    </button>
+  `;
+}
+
+function renderSetupStep(step, loading) {
+  if (step === 1) {
+    return `
+      <div class="setup-section">
+        <label class="auth-field" for="setupOllamaHostInput">
+          <span>Ollama-Host</span>
+          <input
+            id="setupOllamaHostInput"
+            type="text"
+            value="${escapeAttribute(state.setup.form.ollamaHost)}"
+            placeholder="http://127.0.0.1:11434"
+            ${loading ? "disabled" : ""}
+            required
+          />
+        </label>
+        <label class="auth-field" for="setupModelNameSelect">
+          <span>Standardmodell</span>
+          <select id="setupModelNameSelect" ${loading ? "disabled" : ""}>
+            ${renderSetupModelOptions(state.setup.form.modelName)}
+          </select>
+        </label>
+        <label class="auth-field" for="setupRouterModelNameSelect">
+          <span>Router-Modell</span>
+          <select id="setupRouterModelNameSelect" ${loading ? "disabled" : ""}>
+            ${renderSetupModelOptions(state.setup.form.routerModelName || state.setup.form.modelName)}
+          </select>
+        </label>
+        <label class="auth-field" for="setupAccessModeSelect">
+          <span>Standard-Zugriffsmodus</span>
+          <select id="setupAccessModeSelect" ${loading ? "disabled" : ""}>
+            <option value="safe"${state.setup.form.accessMode === "safe" ? " selected" : ""}>Nur Lesen</option>
+            <option value="approval"${state.setup.form.accessMode === "approval" ? " selected" : ""}>Mit Freigabe</option>
+            <option value="full"${state.setup.form.accessMode === "full" ? " selected" : ""}>Voller Zugriff</option>
+          </select>
+        </label>
+        <label class="settings-toggle setup-toggle">
+          <span>
+            <strong>Sichere Cookies nur ueber HTTPS</strong>
+            <small>Fuer lokales HTTP oft deaktiviert, fuer Reverse Proxy oder HTTPS empfohlen.</small>
+          </span>
+          <input id="setupAuthCookieSecureToggle" type="checkbox"${state.setup.form.authCookieSecure ? " checked" : ""}${loading ? " disabled" : ""} />
+        </label>
+      </div>
+    `;
+  }
+
+  if (step === 2) {
+    return `
+      <div class="setup-section">
+        <label class="auth-field" for="setupAdminDisplayNameInput">
+          <span>Anzeigename</span>
+          <input
+            id="setupAdminDisplayNameInput"
+            type="text"
+            value="${escapeAttribute(state.setup.form.adminDisplayName)}"
+            placeholder="Administrator"
+            ${loading ? "disabled" : ""}
+            required
+          />
+        </label>
+        <label class="auth-field" for="setupAdminEmailInput">
+          <span>E-Mail-Adresse</span>
+          <input
+            id="setupAdminEmailInput"
+            type="email"
+            inputmode="email"
+            autocomplete="username"
+            value="${escapeAttribute(state.setup.form.adminEmail)}"
+            placeholder="operator@example.com"
+            ${loading ? "disabled" : ""}
+            required
+          />
+        </label>
+        <label class="auth-field" for="setupAdminPasswordInput">
+          <span>Passwort</span>
+          <input
+            id="setupAdminPasswordInput"
+            type="password"
+            autocomplete="new-password"
+            value="${escapeAttribute(state.setup.form.adminPassword)}"
+            placeholder="Ein starkes Passwort"
+            ${loading ? "disabled" : ""}
+            required
+          />
+        </label>
+        <label class="auth-field" for="setupAdminPasswordConfirmInput">
+          <span>Passwort wiederholen</span>
+          <input
+            id="setupAdminPasswordConfirmInput"
+            type="password"
+            autocomplete="new-password"
+            value="${escapeAttribute(state.setup.form.adminPasswordConfirm)}"
+            placeholder="Zur Kontrolle erneut eingeben"
+            ${loading ? "disabled" : ""}
+            required
+          />
+        </label>
+        <div class="setup-summary">
+          <strong>Wichtig zu wissen</strong>
+          <p>Das Passwort wird nicht im Klartext in der .env abgelegt. Es wird nur serverseitig gehasht in der Auth-Datenbank gespeichert.</p>
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="setup-section">
+      <label class="auth-field" for="setupWorkspaceNameInput">
+        <span>Projektname</span>
+        <input
+          id="setupWorkspaceNameInput"
+          type="text"
+          value="${escapeAttribute(state.setup.form.initialWorkspaceName)}"
+          placeholder="z. B. agent_ai"
+          ${loading ? "disabled" : ""}
+          required
+        />
+      </label>
+      <label class="auth-field" for="setupWorkspacePathInput">
+        <span>Projektordner</span>
+        <input
+          id="setupWorkspacePathInput"
+          type="text"
+          value="${escapeAttribute(state.setup.form.initialWorkspacePath)}"
+          placeholder="/Users/.../projekt"
+          ${loading ? "disabled" : ""}
+          required
+        />
+      </label>
+      <label class="auth-field" for="setupPublicBaseUrlInput">
+        <span>Oeffentliche Basis-URL</span>
+        <input
+          id="setupPublicBaseUrlInput"
+          type="text"
+          value="${escapeAttribute(state.setup.form.publicBaseUrl)}"
+          placeholder="Optional, z. B. https://agent.local"
+          ${loading ? "disabled" : ""}
+        />
+      </label>
+      <div class="setup-summary">
+        <strong>Was beim Abschluss passiert</strong>
+        <p>Die Runtime schreibt die .env, erzeugt den ersten Admin, legt den Projektordner an falls noetig und meldet dich direkt in der Konsole an.</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderSetupModelOptions(selectedValue) {
+  return setupModelCandidates()
+    .map((name) => `<option value="${escapeAttribute(name)}"${name === selectedValue ? " selected" : ""}>${escapeHtml(name)}</option>`)
+    .join("");
+}
+
+function setupModelCandidates() {
+  const values = [
+    state.setup.form.modelName,
+    state.setup.form.routerModelName,
+    ...(state.setup.installedModels || []).map((item) => item?.name),
+    ...(state.setup.recommendedModels || []).map((item) => item?.name),
+  ];
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function setupReasonCopy(reason) {
+  if (reason === "missing_auth_secret_key") {
+    return "Es wurde noch kein dauerhafter Security-Secret-Key eingerichtet. Der Assistent erzeugt ihn fuer dich und speichert ihn in der .env.";
+  }
+  if (reason === "missing_initial_admin") {
+    return "Es existiert noch kein Administrator fuer die Web-Konsole. Richte jetzt den ersten sicheren Zugang ein.";
+  }
+  return "Die Runtime braucht noch eine Ersteinrichtung, bevor die normale Konsole freigeschaltet werden kann.";
 }
 
 function renderAuthShell() {

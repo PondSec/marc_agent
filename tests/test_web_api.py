@@ -28,6 +28,18 @@ def build_test_config(root, **overrides) -> AppConfig:
     )
 
 
+def build_incomplete_setup_config(root, **overrides) -> AppConfig:
+    return AppConfig(
+        workspace_root=str(root),
+        ollama_host="http://127.0.0.1:9",
+        auth_secret_key=None,
+        auth_initial_admin_email=None,
+        auth_initial_admin_password=None,
+        auth_cookie_secure=False,
+        **overrides,
+    )
+
+
 def current_csrf_token(client: TestClient) -> str:
     return client.cookies.get("__Host-marc_csrf") or client.cookies.get("marc_csrf") or ""
 
@@ -93,6 +105,75 @@ def test_workspaces_api_does_not_auto_add_base_workspace(tmp_path):
 
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_first_run_setup_status_is_available_when_config_is_incomplete(tmp_path):
+    config = build_incomplete_setup_config(tmp_path)
+    app = create_app(config)
+    client = TestClient(app, base_url=TEST_ORIGIN)
+
+    response = client.get("/api/setup/status")
+    blocked_response = client.get("/api/workspaces")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["required"] is True
+    assert payload["reason"] == "missing_auth_secret_key"
+    assert payload["defaults"]["initial_workspace_path"] == str(tmp_path.resolve())
+    assert payload["env_path"] == str((tmp_path / ".env").resolve())
+    assert current_csrf_token(client)
+    assert blocked_response.status_code == 503
+
+
+def test_setup_completion_creates_env_admin_and_workspace(tmp_path):
+    config = build_incomplete_setup_config(tmp_path)
+    app = create_app(config)
+    client = TestClient(app, base_url=TEST_ORIGIN)
+
+    setup_status = client.get("/api/setup/status")
+    assert setup_status.status_code == 200
+    apply_csrf_headers(client)
+
+    workspace_root = tmp_path / "demo-project"
+    response = client.post(
+        "/api/setup/complete",
+        json={
+            "admin_display_name": "Setup Admin",
+            "admin_email": TEST_ADMIN_EMAIL,
+            "admin_password": TEST_ADMIN_PASSWORD,
+            "admin_password_confirm": TEST_ADMIN_PASSWORD,
+            "initial_workspace_name": "Demo Project",
+            "initial_workspace_path": str(workspace_root),
+            "ollama_host": "http://127.0.0.1:11434",
+            "model_name": "qwen3-coder:30b",
+            "router_model_name": "qwen2.5-coder:14b",
+            "access_mode": "approval",
+            "auth_cookie_secure": True,
+            "public_base_url": "https://testserver",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["auth"]["authenticated"] is True
+    assert payload["workspace"]["name"] == "Demo Project"
+    assert payload["workspace"]["path"] == str(workspace_root.resolve())
+    assert workspace_root.exists()
+
+    env_path = tmp_path / ".env"
+    env_text = env_path.read_text(encoding="utf-8")
+    assert "AUTH_SECRET_KEY=" in env_text
+    assert "MODEL_NAME=qwen3-coder:30b" in env_text
+    assert "ROUTER_MODEL_NAME=qwen2.5-coder:14b" in env_text
+    assert TEST_ADMIN_PASSWORD not in env_text
+
+    session_response = client.get("/api/auth/session")
+    assert session_response.status_code == 200
+    assert session_response.json()["authenticated"] is True
+
+    workspaces_response = client.get("/api/workspaces")
+    assert workspaces_response.status_code == 200
+    assert workspaces_response.json()[0]["name"] == "Demo Project"
 
 
 def test_new_chat_requires_explicit_workspace_selection(tmp_path):

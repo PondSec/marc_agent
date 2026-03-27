@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,9 +13,11 @@ from fastapi.staticfiles import StaticFiles
 
 from config.settings import AGENT_NAME, AppConfig
 from llm.ollama_client import OllamaClient
-from server.auth_schemas import AuthStatusResponse, LoginRequest
-from server.auth_service import AuthService
+from server.auth_schemas import AuthStatusResponse, LoginRequest, PasswordPolicyResponse
+from server.auth_service import AuthBootstrapError, AuthService
 from server.model_manager import ModelManager
+from server.setup_schemas import SetupCompleteRequest, SetupCompleteResponse, SetupStatusResponse
+from server.setup_service import SetupService
 from server.security import configure_security
 from server.schemas import (
     HealthResponse,
@@ -37,45 +39,84 @@ from server.task_manager import (
 )
 
 
+@dataclass(slots=True)
+class RuntimeBundle:
+    config: AppConfig
+    task_manager: TaskManager
+    model_manager: ModelManager
+    auth_service: AuthService | None
+    setup_service: SetupService
+    setup_required: bool = False
+    setup_reason: str | None = None
+
+
 def create_app(base_config: AppConfig | None = None) -> FastAPI:
-    config = base_config or AppConfig.from_sources()
-    config = _with_available_models(config)
-    config.ensure_state_dirs()
-    task_manager = TaskManager(config)
-    model_manager = ModelManager(config)
-    auth_service = AuthService(config) if config.auth_enabled else None
-    if auth_service is not None:
-        auth_service.bootstrap_initial_admin()
+    runtime = {"bundle": _build_runtime(base_config or AppConfig.from_sources())}
     static_dir = Path(__file__).resolve().parent.parent / "webui"
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if auth_service is not None:
+        bundle = current_runtime()
+        if bundle.auth_service is not None:
             await asyncio.to_thread(
-                auth_service.store.purge_expired_sessions,
+                bundle.auth_service.store.purge_expired_sessions,
                 datetime.now(timezone.utc),
             )
-        await asyncio.to_thread(model_manager.ensure_recommended)
-        if config.warmup_models_on_startup:
-            asyncio.create_task(asyncio.to_thread(model_manager.warmup_preferred_models))
+        if not bundle.setup_required:
+            await asyncio.to_thread(bundle.model_manager.ensure_recommended)
+            if bundle.config.warmup_models_on_startup:
+                asyncio.create_task(asyncio.to_thread(bundle.model_manager.warmup_preferred_models))
         yield
 
     app = FastAPI(title=f"{AGENT_NAME} Web Console", version="1.0.0", lifespan=lifespan)
-    app.state.task_manager = task_manager
-    app.state.model_manager = model_manager
-    app.state.auth_service = auth_service
-    configure_security(app, config)
+
+    def current_runtime() -> RuntimeBundle:
+        return runtime["bundle"]
+
+    def refresh_runtime(config: AppConfig) -> RuntimeBundle:
+        bundle = _build_runtime(config)
+        runtime["bundle"] = bundle
+        app.state.task_manager = bundle.task_manager
+        app.state.model_manager = bundle.model_manager
+        app.state.auth_service = bundle.auth_service
+        app.state.setup_service = bundle.setup_service
+        app.state.runtime_bundle = bundle
+        return bundle
+
+    refresh_runtime(current_runtime().config)
+    configure_security(app, current_runtime().config)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     async def require_auth(request: Request, response: Response):
-        if auth_service is None:
+        bundle = current_runtime()
+        if bundle.setup_required:
+            raise HTTPException(
+                status_code=503,
+                detail="Der Setup-Assistent muss zuerst abgeschlossen werden.",
+            )
+        if bundle.auth_service is None:
             return None
-        return auth_service.current_user(request, response)
+        return bundle.auth_service.current_user(request, response)
 
     async def require_csrf(request: Request, response: Response):
-        if auth_service is None:
+        bundle = current_runtime()
+        if bundle.setup_required:
+            raise HTTPException(
+                status_code=503,
+                detail="Der Setup-Assistent muss zuerst abgeschlossen werden.",
+            )
+        if bundle.auth_service is None:
             return None
-        auth_service.require_csrf(request, response)
+        bundle.auth_service.require_csrf(request, response)
+        return None
+
+    async def require_setup_csrf(request: Request, response: Response):
+        bundle = current_runtime()
+        if not bundle.setup_required:
+            raise HTTPException(status_code=409, detail="Der Setup-Assistent wurde bereits abgeschlossen.")
+        if bundle.auth_service is None:
+            raise HTTPException(status_code=503, detail="Setup-Schutz konnte nicht initialisiert werden.")
+        bundle.auth_service.require_csrf(request, response)
         return None
 
     @app.get("/", include_in_schema=False)
@@ -91,11 +132,12 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/auth/session", response_model=AuthStatusResponse)
     async def auth_session(request: Request, response: Response) -> AuthStatusResponse:
-        if auth_service is None:
+        bundle = current_runtime()
+        if bundle.auth_service is None:
             raise HTTPException(status_code=404, detail="Authentication is disabled.")
-        context = auth_service.resolve_session(request, response)
-        auth_service.ensure_csrf_cookie(request, response, context)
-        return auth_service.build_auth_status(context)
+        context = bundle.auth_service.resolve_session(request, response)
+        bundle.auth_service.ensure_csrf_cookie(request, response, context)
+        return bundle.auth_service.build_auth_status(context)
 
     @app.post(
         "/api/auth/login",
@@ -107,9 +149,15 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         response: Response,
         payload: LoginRequest,
     ) -> AuthStatusResponse:
-        if auth_service is None:
+        bundle = current_runtime()
+        if bundle.setup_required:
+            raise HTTPException(
+                status_code=503,
+                detail="Der Setup-Assistent muss zuerst abgeschlossen werden.",
+            )
+        if bundle.auth_service is None:
             raise HTTPException(status_code=404, detail="Authentication is disabled.")
-        return auth_service.login(request, response, payload)
+        return bundle.auth_service.login(request, response, payload)
 
     @app.post(
         "/api/auth/logout",
@@ -117,18 +165,110 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def auth_logout(request: Request, response: Response) -> Response:
-        if auth_service is None:
+        bundle = current_runtime()
+        if bundle.auth_service is None:
             return Response(status_code=204)
-        auth_service.logout(request, response)
+        bundle.auth_service.logout(request, response)
         response.status_code = 204
         return response
 
+    @app.get("/api/setup/status", response_model=SetupStatusResponse)
+    async def setup_status(request: Request, response: Response) -> SetupStatusResponse:
+        bundle = current_runtime()
+        if bundle.auth_service is not None:
+            bundle.auth_service.ensure_csrf_cookie(request, response, None)
+        catalog = bundle.model_manager.catalog()
+        return bundle.setup_service.build_status(
+            config=bundle.config,
+            password_policy=(
+                bundle.auth_service.password_policy()
+                if bundle.auth_service is not None
+                else _default_password_policy()
+            ),
+            setup_required=bundle.setup_required,
+            setup_reason=bundle.setup_reason,
+            installed_models=catalog["installed_models"],
+            recommended_models=catalog["recommended_models"],
+        )
+
+    @app.post(
+        "/api/setup/complete",
+        response_model=SetupCompleteResponse,
+        dependencies=[Depends(require_setup_csrf)],
+    )
+    async def complete_setup(
+        request: Request,
+        response: Response,
+        payload: SetupCompleteRequest,
+    ) -> SetupCompleteResponse:
+        bundle = current_runtime()
+        if not bundle.setup_required:
+            raise HTTPException(status_code=409, detail="Der Setup-Assistent wurde bereits abgeschlossen.")
+        if bundle.auth_service is None:
+            raise HTTPException(status_code=503, detail="Der Setup-Modus ist nicht verfuegbar.")
+
+        secure_cookie = bool(payload.auth_cookie_secure)
+        if request.url.scheme != "https" and request.url.hostname not in {"localhost", "127.0.0.1"}:
+            secure_cookie = False
+
+        secret_key = bundle.setup_service.generate_secret_key()
+        next_config = replace(
+            bundle.config,
+            ollama_host=payload.ollama_host,
+            model_name=payload.model_name,
+            router_model_name=payload.router_model_name or payload.model_name,
+            access_mode=payload.access_mode,
+            auth_cookie_secure=secure_cookie,
+            auth_secret_key=secret_key,
+            public_base_url=payload.public_base_url,
+        ).normalized()
+        bundle.setup_service.write_runtime_env(config=next_config, secret_key=secret_key)
+        next_config.ensure_state_dirs()
+        provisional_auth_service = AuthService(next_config)
+
+        try:
+            provisional_auth_service.create_initial_admin(
+                email=payload.admin_email,
+                password=payload.admin_password,
+                display_name=payload.admin_display_name,
+            )
+        except AuthBootstrapError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        bundle = refresh_runtime(next_config)
+        if bundle.auth_service is None:
+            raise HTTPException(status_code=500, detail="Authentication konnte nicht initialisiert werden.")
+
+        workspace = bundle.task_manager.create_workspace(
+            payload.initial_workspace_name,
+            payload.initial_workspace_path,
+        )
+        auth_status = bundle.auth_service.login(
+            request,
+            response,
+            LoginRequest(
+                email=payload.admin_email,
+                password=payload.admin_password,
+                totp_code=None,
+            ),
+        )
+        return SetupCompleteResponse(
+            auth=auth_status,
+            workspace=workspace,
+            env_path=str(bundle.setup_service.env_path),
+        )
+
     @app.get("/api/health", response_model=HealthResponse, dependencies=[Depends(require_auth)])
     async def health() -> HealthResponse:
-        return HealthResponse(ok=True, active_sessions=task_manager.active_sessions())
+        return HealthResponse(ok=True, active_sessions=current_runtime().task_manager.active_sessions())
 
     @app.get("/api/config", dependencies=[Depends(require_auth)])
     async def get_config() -> dict:
+        bundle = current_runtime()
+        config = bundle.config
+        model_manager = bundle.model_manager
         public_config = config.to_public_dict()
         model_catalog = model_manager.catalog()
         installed_models = model_catalog["installed_models"]
@@ -143,7 +283,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/models", response_model=ModelCatalogResponse, dependencies=[Depends(require_auth)])
     async def get_models() -> ModelCatalogResponse:
-        return ModelCatalogResponse.model_validate(model_manager.catalog())
+        return ModelCatalogResponse.model_validate(current_runtime().model_manager.catalog())
 
     @app.post(
         "/api/models/ensure-recommended",
@@ -152,13 +292,14 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def ensure_recommended_models() -> ModelCatalogResponse:
-        return ModelCatalogResponse.model_validate(model_manager.ensure_recommended())
+        return ModelCatalogResponse.model_validate(current_runtime().model_manager.ensure_recommended())
 
     @app.get("/api/workspace/inspect", dependencies=[Depends(require_auth)])
     async def inspect_workspace(
         focus: str | None = Query(default=None),
         workspace_id: str | None = Query(default=None),
     ) -> dict:
+        task_manager = current_runtime().task_manager
         try:
             response = task_manager.inspect_workspace_for(
                 workspace_id=workspace_id,
@@ -172,7 +313,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/workspaces", response_model=list[WorkspaceRecord], dependencies=[Depends(require_auth)])
     async def list_workspaces() -> list[WorkspaceRecord]:
-        return task_manager.list_workspaces()
+        return current_runtime().task_manager.list_workspaces()
 
     @app.post(
         "/api/workspaces",
@@ -181,7 +322,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def create_workspace(request: WorkspaceCreateRequest) -> WorkspaceRecord:
-        return task_manager.create_workspace(request.name, request.path)
+        return current_runtime().task_manager.create_workspace(request.name, request.path)
 
     @app.patch(
         "/api/workspaces/{workspace_id}",
@@ -192,7 +333,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         workspace_id: str,
         request: WorkspaceUpdateRequest,
     ) -> WorkspaceRecord:
-        workspace = task_manager.update_workspace(
+        workspace = current_runtime().task_manager.update_workspace(
             workspace_id,
             name=request.name,
             path=request.path,
@@ -203,17 +344,18 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/sessions", response_model=list[SessionSummary], dependencies=[Depends(require_auth)])
     async def list_sessions(limit: int = Query(default=100, ge=1, le=500)) -> list[SessionSummary]:
-        return task_manager.list_sessions(limit=limit)
+        return current_runtime().task_manager.list_sessions(limit=limit)
 
     @app.get("/api/sessions/{session_id}", dependencies=[Depends(require_auth)])
     async def get_session(session_id: str) -> dict:
-        session = task_manager.get_session(session_id)
+        session = current_runtime().task_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found.")
         return session.model_dump()
 
     @app.get("/api/sessions/{session_id}/logs", dependencies=[Depends(require_auth)])
     async def get_session_logs(session_id: str) -> list[dict]:
+        task_manager = current_runtime().task_manager
         if task_manager.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="Session not found.")
         return [record.model_dump() for record in task_manager.get_logs(session_id)]
@@ -225,6 +367,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def create_task(request: TaskCreateRequest) -> SessionSummary:
+        task_manager = current_runtime().task_manager
         try:
             return task_manager.start_task(
                 request.prompt,
@@ -255,7 +398,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def update_session(session_id: str, request: SessionUpdateRequest) -> dict:
-        session = task_manager.update_session(
+        session = current_runtime().task_manager.update_session(
             session_id,
             archived=request.archived,
             stop_requested=request.stop_requested,
@@ -270,6 +413,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def delete_session(session_id: str) -> Response:
+        task_manager = current_runtime().task_manager
         try:
             deleted = task_manager.delete_session(session_id)
         except SessionBusyError as exc:
@@ -284,6 +428,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def delete_workspace(workspace_id: str) -> Response:
+        task_manager = current_runtime().task_manager
         try:
             deleted = task_manager.delete_workspace(workspace_id)
         except WorkspaceBusyError as exc:
@@ -294,6 +439,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/api/sessions/{session_id}/events", dependencies=[Depends(require_auth)])
     async def stream_session_events(session_id: str) -> StreamingResponse:
+        task_manager = current_runtime().task_manager
         if task_manager.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="Session not found.")
 
@@ -323,6 +469,47 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     return app
 
 
+def _build_runtime(base_config: AppConfig) -> RuntimeBundle:
+    config = _with_available_models(base_config)
+    config.ensure_state_dirs()
+    task_manager = TaskManager(config)
+    model_manager = ModelManager(config)
+    setup_service = SetupService(config.workspace_path / ".env")
+    auth_service: AuthService | None = None
+    setup_required = False
+    setup_reason: str | None = None
+
+    if config.auth_enabled:
+        auth_config = config
+        missing_secret = not config.auth_secret_key
+        if missing_secret:
+            auth_config = replace(config, auth_secret_key=setup_service.generate_secret_key())
+        auth_service = AuthService(auth_config)
+        has_users = auth_service.store.count_users() > 0
+        if missing_secret and not has_users:
+            setup_required = True
+            setup_reason = "missing_auth_secret_key"
+        if not setup_required:
+            try:
+                auth_service.bootstrap_initial_admin()
+            except AuthBootstrapError as exc:
+                if auth_service.store.count_users() == 0:
+                    setup_required = True
+                    setup_reason = _setup_reason_from_exception(exc)
+                else:
+                    raise
+
+    return RuntimeBundle(
+        config=config,
+        task_manager=task_manager,
+        model_manager=model_manager,
+        auth_service=auth_service,
+        setup_service=setup_service,
+        setup_required=setup_required,
+        setup_reason=setup_reason,
+    )
+
+
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -330,6 +517,22 @@ def _sse(event: str, payload: dict) -> str:
 def _fetch_installed_ollama_models(config: AppConfig) -> list[dict]:
     client = OllamaClient(config)
     return client.list_models_safe()
+
+
+def _default_password_policy() -> PasswordPolicyResponse:
+    return PasswordPolicyResponse(
+        min_length=14,
+        blocked_password_examples=["password", "12345678", "changeme"],
+    )
+
+
+def _setup_reason_from_exception(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "secret_key" in text:
+        return "missing_auth_secret_key"
+    if "initial admin credentials" in text:
+        return "missing_initial_admin"
+    return "setup_required"
 
 
 def _with_available_models(config: AppConfig) -> AppConfig:

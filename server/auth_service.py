@@ -148,6 +148,47 @@ class AuthService:
             details={"mfa_enabled": bool(user.totp_secret)},
         )
 
+    def create_initial_admin(
+        self,
+        *,
+        email: str,
+        password: str,
+        display_name: str | None = None,
+        totp_secret: str | None = None,
+    ) -> AuthUserRecord:
+        if not self.config.auth_enabled:
+            raise AuthBootstrapError("Authentication is disabled.")
+        if self.store.count_users() > 0:
+            raise AuthBootstrapError("An initial admin already exists.")
+
+        normalized_email = self.normalize_email(email)
+        display = str(display_name or self.config.auth_initial_admin_name).strip() or self.config.auth_initial_admin_name
+        self.validate_password_policy(
+            password,
+            email=normalized_email,
+            display_name=display,
+        )
+        normalized_totp_secret = self.normalize_totp_secret(totp_secret)
+        now = self.now().isoformat()
+        user = self.store.create_user(
+            user_id=uuid4().hex,
+            email=normalized_email,
+            display_name=display,
+            password_hash=self.password_hasher.hash(password),
+            role="admin",
+            totp_secret=normalized_totp_secret,
+            now=now,
+        )
+        self.store.record_auth_event(
+            event_type="bootstrap_admin",
+            outcome="created",
+            occurred_at=now,
+            email=user.email,
+            user_id=user.id,
+            details={"mfa_enabled": bool(user.totp_secret), "source": "setup_assistant"},
+        )
+        return user
+
     def build_auth_status(
         self,
         context: AuthContext | None = None,
