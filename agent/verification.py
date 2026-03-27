@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 from pathlib import Path
 
-from agent.models import SessionState, ValidationCommand, ValidationRunRecord, WorkspaceSnapshot
+from agent.models import (
+    DiagnosticRecord,
+    SessionState,
+    ValidationCommand,
+    ValidationFailureEvidence,
+    ValidationRunRecord,
+    WorkspaceSnapshot,
+)
+
+
+MUTATION_TOOL_NAMES = {
+    "write_file",
+    "append_file",
+    "create_file",
+    "delete_file",
+    "replace_in_file",
+    "patch_file",
+}
 
 
 class ValidationPlanner:
@@ -28,6 +46,11 @@ class ValidationPlanner:
         "release": 90,
         "deploy": 100,
     }
+    MISSING_WEB_FEATURES_PATTERN = re.compile(
+        r"missing expected web features \((?P<features>[^)]+)\)",
+        re.IGNORECASE,
+    )
+    MISSING_REF_PATTERN = re.compile(r"(?P<path>[\w./\\-]+\.(?:html|htm))\s*->\s*(?P<ref>[^\s]+)")
 
     def build_plan(
         self,
@@ -278,6 +301,76 @@ class ValidationPlanner:
             return run
         return None
 
+    def build_failure_evidence(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+    ) -> ValidationFailureEvidence:
+        artifact_paths = self._artifact_paths_for_failed_run(session, failed_run)
+        diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
+        expected_features = self._expected_features_from_command(failed_run.command)
+        missing_features = self._missing_features_from_failure(failed_run, diagnostics)
+        file_hints = self._unique_paths(
+            [
+                *artifact_paths,
+                *(path for diagnostic in diagnostics for path in diagnostic.file_hints),
+            ]
+        )
+        line_hints = self._unique_line_hints(
+            [line for diagnostic in diagnostics for line in diagnostic.line_hints]
+        )
+        action_hints = self._unique_strings(
+            [hint for diagnostic in diagnostics for hint in diagnostic.action_hints]
+        )
+        summary = str(failed_run.summary or "").strip() or "Validation failed."
+        excerpt = self._failure_excerpt(failed_run, diagnostics)
+        failure_summary = self._failure_summary(
+            failed_run,
+            diagnostics,
+            artifact_paths=artifact_paths,
+            missing_features=missing_features,
+        )
+        repair_requirements = self._repair_requirements(
+            failed_run,
+            diagnostics,
+            artifact_paths=artifact_paths,
+            expected_features=expected_features,
+            missing_features=missing_features,
+        )
+        evidence_signature = json.dumps(
+            {
+                "command": self.command_identity(failed_run.command),
+                "verification_scope": failed_run.verification_scope,
+                "status": failed_run.status,
+                "artifact_paths": artifact_paths,
+                "summary": summary,
+                "excerpt": excerpt,
+                "expected_features": expected_features,
+                "missing_features": missing_features,
+                "file_hints": file_hints,
+                "line_hints": line_hints,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ValidationFailureEvidence(
+            command=failed_run.command,
+            verification_scope=failed_run.verification_scope,
+            status=failed_run.status,
+            artifact_paths=artifact_paths,
+            summary=summary,
+            excerpt=excerpt,
+            failure_summary=failure_summary,
+            expected_features=expected_features,
+            missing_features=missing_features,
+            file_hints=file_hints,
+            line_hints=line_hints,
+            action_hints=action_hints,
+            repair_requirements=repair_requirements,
+            evidence_signature=evidence_signature,
+        )
+
     def can_repeat_command(
         self,
         session: SessionState,
@@ -299,27 +392,11 @@ class ValidationPlanner:
             return True
 
         failed_iteration = int(failed_run.iteration or 0)
-        if any(
-            int(getattr(item, "iteration", 0) or 0) > failed_iteration
-            for item in session.diagnostics
-        ):
-            return True
-
         for item in session.tool_calls:
             iteration = int(getattr(item, "iteration", 0) or 0)
             if iteration <= failed_iteration:
                 continue
-            if item.tool_name in {"run_tests", "run_shell"}:
-                current_command = self.command_identity(item.tool_args.get("command") or "")
-                if current_command == normalized:
-                    continue
-            return True
-
-        for run in self._runtime_runs(session, current_generation_only=current_generation_only):
-            iteration = int(getattr(run, "iteration", 0) or 0)
-            if iteration <= failed_iteration:
-                continue
-            if self.command_identity(run.command) != normalized:
+            if item.tool_name in MUTATION_TOOL_NAMES:
                 return True
         return False
 
@@ -594,3 +671,219 @@ class ValidationPlanner:
             if any(marker in lowered for marker in markers):
                 expected.append(feature)
         return expected
+
+    def _related_diagnostics(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        artifact_paths: list[str],
+    ) -> list[DiagnosticRecord]:
+        related: list[DiagnosticRecord] = []
+        normalized_command = self.command_identity(failed_run.command)
+        artifact_set = set(artifact_paths)
+        for diagnostic in reversed(session.diagnostics):
+            diagnostic_command = self.command_identity(diagnostic.command or "")
+            if diagnostic_command and diagnostic_command == normalized_command:
+                related.append(diagnostic)
+                continue
+            if artifact_set and artifact_set.intersection(diagnostic.file_hints):
+                related.append(diagnostic)
+        return list(reversed(related[-4:]))
+
+    def _artifact_paths_for_failed_run(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+    ) -> list[str]:
+        paths: list[str] = []
+        paths.extend(self._paths_from_validation_command(failed_run.command))
+        if session.active_repair_context is not None:
+            paths.extend(session.active_repair_context.artifact_paths)
+        paths.extend(item.path for item in session.changed_files)
+        return self._unique_paths(paths)
+
+    def _paths_from_validation_command(self, command: str) -> list[str]:
+        _, payload = self._decoded_internal_validation_payload(command)
+        values = payload if isinstance(payload, list) else [payload]
+        paths: list[str] = []
+        for item in values:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    paths.append(cleaned)
+            elif isinstance(item, dict):
+                cleaned = str(item.get("path") or "").strip()
+                if cleaned:
+                    paths.append(cleaned)
+        return self._unique_paths(paths)
+
+    def _expected_features_from_command(self, command: str) -> list[str]:
+        kind, payload = self._decoded_internal_validation_payload(command)
+        if kind != "web_artifact":
+            return []
+        values = payload if isinstance(payload, list) else [payload]
+        features: list[str] = []
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            features.extend(
+                str(feature or "").strip()
+                for feature in item.get("expected_features", [])
+                if str(feature or "").strip()
+            )
+        return self._unique_strings(features)
+
+    def _missing_features_from_failure(
+        self,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord],
+    ) -> list[str]:
+        texts = [
+            str(failed_run.summary or "").strip(),
+            str(failed_run.excerpt or "").strip(),
+        ]
+        texts.extend(str(item.summary or "").strip() for item in diagnostics)
+        texts.extend(str(item.excerpt or "").strip() for item in diagnostics)
+        features: list[str] = []
+        for text in texts:
+            if not text:
+                continue
+            for match in self.MISSING_WEB_FEATURES_PATTERN.finditer(text):
+                raw_features = match.group("features") or ""
+                features.extend(
+                    part.strip()
+                    for part in raw_features.split(",")
+                    if part.strip()
+                )
+        return self._unique_strings(features)
+
+    def _failure_excerpt(
+        self,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord],
+    ) -> str | None:
+        for text in [
+            str(failed_run.excerpt or "").strip(),
+            *(str(item.excerpt or "").strip() for item in diagnostics),
+            *(str(item.summary or "").strip() for item in diagnostics),
+        ]:
+            if text:
+                return text
+        return None
+
+    def _failure_summary(
+        self,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord],
+        *,
+        artifact_paths: list[str],
+        missing_features: list[str],
+    ) -> str:
+        if missing_features:
+            feature_text = ", ".join(missing_features)
+            if artifact_paths:
+                return f"{artifact_paths[0]} is missing validation-required features: {feature_text}."
+            return f"Validation-required features are missing: {feature_text}."
+        excerpt = self._failure_excerpt(failed_run, diagnostics)
+        if excerpt:
+            return excerpt[:240]
+        summary = str(failed_run.summary or "").strip()
+        if summary:
+            return summary[:240]
+        return "Validation failed without a readable summary."
+
+    def _repair_requirements(
+        self,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord],
+        *,
+        artifact_paths: list[str],
+        expected_features: list[str],
+        missing_features: list[str],
+    ) -> list[str]:
+        requirements: list[str] = []
+        scope = failed_run.verification_scope
+        primary_target = artifact_paths[0] if artifact_paths else "the implicated artifact"
+        if scope == "structural":
+            if missing_features:
+                requirements.append(
+                    f"Add or restore the structural features explicitly reported as missing in {primary_target}: {', '.join(missing_features)}."
+                )
+            elif expected_features:
+                requirements.append(
+                    f"Ensure {primary_target} now includes the validation-targeted features: {', '.join(expected_features)}."
+                )
+            if self._failure_mentions_missing_refs(failed_run, diagnostics):
+                requirements.append(
+                    f"Fix broken local references or missing assets reported by the structural validation for {primary_target}."
+                )
+            requirements.append(
+                f"Change {primary_target} in a way that directly addresses the failed structural check, not just formatting."
+            )
+        elif scope == "syntax":
+            requirements.append(
+                f"Fix the syntax error or parse failure reported for {primary_target} before rerunning validation."
+            )
+        elif scope == "runtime":
+            requirements.append(
+                f"Change {primary_target} so the failing runtime or test path can complete successfully."
+            )
+        else:
+            requirements.append(
+                f"Address the static validation failure in {primary_target} using the reported file, line, or reference hints."
+            )
+        requirements.extend(
+            hint
+            for hint in self._unique_strings(
+                [hint for diagnostic in diagnostics for hint in diagnostic.action_hints]
+            )[:2]
+        )
+        requirements.append("Do not stop at an equivalent or formatting-only rewrite.")
+        return self._unique_strings(requirements)
+
+    def _failure_mentions_missing_refs(
+        self,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord],
+    ) -> bool:
+        texts = [
+            str(failed_run.excerpt or "").strip(),
+            str(failed_run.summary or "").strip(),
+        ]
+        texts.extend(str(item.excerpt or "").strip() for item in diagnostics)
+        texts.extend(str(item.summary or "").strip() for item in diagnostics)
+        return any(self.MISSING_REF_PATTERN.search(text) for text in texts if text)
+
+    def _decoded_internal_validation_payload(self, command: str) -> tuple[str | None, object]:
+        normalized = str(command or "").strip()
+        if not normalized.startswith("internal:"):
+            return None, []
+        prefix, _, payload = normalized.partition(":")
+        kind, _, raw_json = payload.partition(":")
+        if prefix != "internal" or not kind:
+            return None, []
+        try:
+            return kind, json.loads(raw_json or "[]")
+        except json.JSONDecodeError:
+            return kind, []
+
+    def _unique_strings(self, values: list[str]) -> list[str]:
+        unique: list[str] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text or text in unique:
+                continue
+            unique.append(text)
+        return unique
+
+    def _unique_line_hints(self, values: list[int]) -> list[int]:
+        unique: list[int] = []
+        for raw in values:
+            try:
+                line = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if line <= 0 or line in unique:
+                continue
+            unique.append(line)
+        return unique

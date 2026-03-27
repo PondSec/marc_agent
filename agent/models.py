@@ -81,6 +81,23 @@ class ValidationRunRecord(StrictModel):
     timestamp: str = Field(default_factory=utc_now)
 
 
+class ValidationFailureEvidence(StrictModel):
+    command: str
+    verification_scope: Literal["syntax", "static", "structural", "runtime"] = "static"
+    status: Literal["failed", "blocked", "timeout"] = "failed"
+    artifact_paths: list[str] = Field(default_factory=list)
+    summary: str
+    excerpt: str | None = None
+    failure_summary: str
+    expected_features: list[str] = Field(default_factory=list)
+    missing_features: list[str] = Field(default_factory=list)
+    file_hints: list[str] = Field(default_factory=list)
+    line_hints: list[int] = Field(default_factory=list)
+    action_hints: list[str] = Field(default_factory=list)
+    repair_requirements: list[str] = Field(default_factory=list)
+    evidence_signature: str | None = None
+
+
 class DiagnosticRecord(StrictModel):
     source: str
     category: str
@@ -93,6 +110,18 @@ class DiagnosticRecord(StrictModel):
     line_hints: list[int] = Field(default_factory=list)
     action_hints: list[str] = Field(default_factory=list)
     excerpt: str | None = None
+    iteration: int | None = None
+    timestamp: str = Field(default_factory=utc_now)
+
+
+class RepairAttemptRecord(StrictModel):
+    artifact_path: str | None = None
+    validation_command: str | None = None
+    verification_scope: Literal["syntax", "static", "structural", "runtime"] | None = None
+    strategy: str
+    result: Literal["mutation_planned", "no_effective_change", "generation_failed", "blocked"]
+    reason: str
+    evidence_signature: str | None = None
     iteration: int | None = None
     timestamp: str = Field(default_factory=utc_now)
 
@@ -220,6 +249,8 @@ class SessionState(StrictModel):
     verification_commands: list[str] = Field(default_factory=list)
     validation_plan: list[ValidationCommand] = Field(default_factory=list)
     validation_runs: list[ValidationRunRecord] = Field(default_factory=list)
+    active_repair_context: ValidationFailureEvidence | None = None
+    repair_history: list[RepairAttemptRecord] = Field(default_factory=list)
     completion_criteria: list[str] = Field(default_factory=list)
     helper_artifacts: list[str] = Field(default_factory=list)
     workspace_snapshot: WorkspaceSnapshot | None = None

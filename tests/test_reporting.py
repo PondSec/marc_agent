@@ -205,6 +205,52 @@ def test_reporter_marks_partial_unvalidated_changes_honestly(tmp_path):
     assert "Geaendert: app/auth.py." in response
 
 
+def test_reporter_describes_model_start_failure_more_precisely(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="Bitte schreibe ein Snake Spiel in HTML",
+        workspace_root=str(tmp_path),
+        status="partial",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="not_run",
+        stop_reason="model_start_failed",
+        task_state=TaskState(
+            latest_user_turn="Bitte schreibe ein Snake Spiel in HTML",
+            root_goal="Create a standalone web artifact.",
+            active_goal="Create the requested standalone HTML artifact.",
+            goal_relation="new_task",
+            output_expectation="Generate the requested file content.",
+            open_problem=None,
+            verification_target="Create the requested artifact honestly.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.8,
+            next_action="create",
+            execution_outline=["Create the artifact"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.blockers.append(
+        "Repeated model start failure for snake.html: qwen3-coder:30b, qwen2.5-coder:14b produced no first chunk, and no safe local recovery path applied."
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(session)
+
+    assert "nicht einmal sauber starten" in response
+    assert "Repeated model start failure" in response
+
+
 def test_reporter_explains_missing_functional_validation_even_if_static_checks_passed(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

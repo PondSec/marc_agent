@@ -2,6 +2,9 @@ const STORAGE_KEY = "marc_a1.workspace_ui.v3";
 const CHAT_SCROLL_BOTTOM_THRESHOLD = 24;
 const COMMIT_AND_PUSH_PROMPT =
   "Bitte pruefe den aktuellen Git-Status in diesem Workspace, erstelle einen kleinen sinnvollen Commit mit einer kurzen passenden Message und pushe den aktuellen Branch zu origin. Wenn es nichts zu committen gibt oder der Push scheitert, erklaere kurz den Grund im Chat.";
+let sessionRefreshHandle = null;
+let modelRefreshHandle = null;
+let authTickerHandle = null;
 
 const state = {
   config: null,
@@ -17,6 +20,24 @@ const state = {
   activeSession: null,
   selectedWorkspaceId: null,
   stream: null,
+  auth: {
+    checked: false,
+    authenticated: false,
+    submitting: false,
+    success: false,
+    handlingExpiry: false,
+    user: null,
+    session: null,
+    passwordPolicy: null,
+    csrfHeaderName: "X-CSRF-Token",
+    login: {
+      email: "",
+      password: "",
+      totpCode: "",
+    },
+    error: "",
+    rateLimitedUntil: null,
+  },
   composer: {
     prompt: "",
     agentProfile: "core",
@@ -43,12 +64,14 @@ const state = {
   },
 };
 
-document.addEventListener("DOMContentLoaded", () => {
-  initializeApp().catch((error) => {
-    console.error(error);
-    showToast(`Initialisierung fehlgeschlagen: ${error.message}`, "error");
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", () => {
+    initializeApp().catch((error) => {
+      console.error(error);
+      showToast(`Initialisierung fehlgeschlagen: ${error.message}`, "error");
+    });
   });
-});
+}
 
 async function initializeApp() {
   hydrateRouteFromLocation();
@@ -59,6 +82,7 @@ async function initializeApp() {
 
 function bindEvents() {
   document.addEventListener("click", handleClick);
+  document.addEventListener("submit", handleSubmit);
   document.addEventListener("input", handleInput);
   document.addEventListener("change", handleChange);
   document.addEventListener("keydown", handleKeydown);
@@ -68,28 +92,123 @@ function bindEvents() {
 
 async function boot() {
   try {
-    state.config = await fetchJSON("/api/config");
-    applyModelCatalog({
-      installed_models: state.config?.installed_ollama_models || [],
-      recommended_models: state.config?.recommended_models || [],
-    });
-    applyStoredPreferences();
-    await Promise.all([refreshWorkspaces(), refreshSessions(), ensureRecommendedModels({ silent: true })]);
-
-    if (state.activeSessionId) {
-      await openSession(state.activeSessionId, { updateHistory: false });
-    } else if (!state.selectedWorkspaceId && state.workspaces.length) {
-      state.selectedWorkspaceId = state.workspaces[0].id;
+    await refreshAuthState();
+    if (!state.auth.authenticated) {
+      clearApplicationState({ preserveAuthInputs: true, preserveRoute: true });
+      return;
     }
+    await loadAuthenticatedApplication();
   } finally {
     state.ui.booting = false;
     renderApp();
-    window.setInterval(() => refreshSessions(), 8000);
-    window.setInterval(() => refreshModelCatalog({ silent: true }), 4000);
+    ensureBackgroundPolling();
+  }
+}
+
+async function loadAuthenticatedApplication() {
+  state.config = await fetchJSON("/api/config");
+  applyModelCatalog({
+    installed_models: state.config?.installed_ollama_models || [],
+    recommended_models: state.config?.recommended_models || [],
+  });
+  applyStoredPreferences();
+  await Promise.all([refreshWorkspaces(), refreshSessions(), ensureRecommendedModels({ silent: true })]);
+
+  if (state.activeSessionId) {
+    await openSession(state.activeSessionId, { updateHistory: false });
+  } else if (!state.selectedWorkspaceId && state.workspaces.length) {
+    state.selectedWorkspaceId = state.workspaces[0].id;
+  }
+}
+
+function ensureBackgroundPolling() {
+  if (!sessionRefreshHandle) {
+    sessionRefreshHandle = window.setInterval(() => {
+      if (state.auth.authenticated) {
+        refreshSessions().catch(() => {});
+      }
+    }, 8000);
+  }
+  if (!modelRefreshHandle) {
+    modelRefreshHandle = window.setInterval(() => {
+      if (state.auth.authenticated) {
+        refreshModelCatalog({ silent: true }).catch(() => {});
+      }
+    }, 4000);
+  }
+  if (!authTickerHandle) {
+    authTickerHandle = window.setInterval(() => {
+      if (state.auth.rateLimitedUntil) {
+        if (Date.now() >= state.auth.rateLimitedUntil) {
+          state.auth.rateLimitedUntil = null;
+          state.auth.error = "";
+        }
+        renderApp();
+      }
+    }, 1000);
+  }
+}
+
+async function refreshAuthState({ silent = false } = {}) {
+  try {
+    const payload = await fetchJSON("/api/auth/session");
+    applyAuthState(payload);
+  } catch (error) {
+    if (!silent) {
+      showToast(`Anmeldestatus konnte nicht geladen werden: ${error.message}`, "error");
+    }
+    throw error;
+  }
+}
+
+function applyAuthState(payload) {
+  state.auth.checked = true;
+  state.auth.authenticated = Boolean(payload?.authenticated);
+  state.auth.user = payload?.user || null;
+  state.auth.session = payload?.session || null;
+  state.auth.passwordPolicy = payload?.password_policy || null;
+  state.auth.csrfHeaderName = payload?.csrf_header_name || "X-CSRF-Token";
+  if (state.auth.authenticated) {
+    state.auth.error = "";
+    state.auth.success = false;
+    state.auth.rateLimitedUntil = null;
+  }
+  if (!state.auth.authenticated) {
+    disconnectStream();
+    state.activeSession = null;
+    state.logs = [];
+  }
+}
+
+function clearApplicationState({ preserveAuthInputs = false, preserveRoute = false } = {}) {
+  disconnectStream();
+  state.config = null;
+  state.health = { ok: false, active_sessions: [] };
+  state.models = { installed_models: [], recommended_models: [] };
+  state.workspaces = [];
+  state.sessions = [];
+  state.logs = [];
+  state.activeSessionId = preserveRoute ? state.activeSessionId : null;
+  state.activeSession = null;
+  state.selectedWorkspaceId = null;
+  state.ui.sessionLoading = false;
+  state.ui.workspaceModalOpen = false;
+  state.ui.settingsModalOpen = false;
+  resetChatScrollState();
+  if (!preserveRoute) {
+    syncHistory(null);
+  }
+  if (!preserveAuthInputs) {
+    state.auth.login.password = "";
+    state.auth.login.totpCode = "";
   }
 }
 
 async function refreshHealth() {
+  if (!state.auth.authenticated) {
+    state.health = { ok: false, active_sessions: [] };
+    return;
+  }
   try {
     state.health = await fetchJSON("/api/health");
   } catch (error) {
@@ -98,6 +217,10 @@ async function refreshHealth() {
 }
 
 async function refreshWorkspaces() {
+  if (!state.auth.authenticated) {
+    state.workspaces = [];
+    return;
+  }
   const previousSelectedWorkspaceId = state.selectedWorkspaceId;
   const nextWorkspaces = await fetchJSON("/api/workspaces");
   const changed = hasCollectionChanged(state.workspaces, nextWorkspaces);
@@ -117,6 +240,10 @@ async function refreshWorkspaces() {
 }
 
 async function refreshSessions() {
+  if (!state.auth.authenticated) {
+    state.sessions = [];
+    return;
+  }
   const previousActiveSessionId = state.activeSessionId;
   const nextSessions = await fetchJSON("/api/sessions");
   const changed = hasCollectionChanged(state.sessions, nextSessions);
@@ -136,6 +263,9 @@ async function refreshSessions() {
 }
 
 async function refreshModelCatalog({ silent = false } = {}) {
+  if (!state.auth.authenticated) {
+    return;
+  }
   try {
     const catalog = await fetchJSON("/api/models");
     const changed = applyModelCatalog(catalog);
@@ -150,6 +280,9 @@ async function refreshModelCatalog({ silent = false } = {}) {
 }
 
 async function ensureRecommendedModels({ silent = false } = {}) {
+  if (!state.auth.authenticated) {
+    return;
+  }
   try {
     const catalog = await fetchJSON("/api/models/ensure-recommended", {
       method: "POST",
@@ -166,7 +299,7 @@ async function ensureRecommendedModels({ silent = false } = {}) {
 }
 
 async function openSession(sessionId, { updateHistory = true } = {}) {
-  if (!sessionId) {
+  if (!sessionId || !state.auth.authenticated) {
     return;
   }
 
@@ -237,7 +370,7 @@ async function submitPrompt({ promptOverride = null, accessModeOverride = null }
     return;
   }
   if (!workspaceId) {
-    showToast("Lege zuerst einen Workspace an oder waehle einen aus.", "error");
+    showToast("Lege zuerst ein Projekt an oder waehle eines aus.", "error");
     openWorkspaceModal("create");
     return;
   }
@@ -312,7 +445,7 @@ async function deleteWorkspace(workspaceId) {
     return;
   }
   if (isWorkspaceBusy(workspaceId)) {
-    showToast("Workspaces mit laufenden Chats koennen noch nicht geloescht werden.", "error");
+    showToast("Projekte mit laufenden Threads koennen noch nicht geloescht werden.", "error");
     return;
   }
 
@@ -320,8 +453,8 @@ async function deleteWorkspace(workspaceId) {
   const chatLabel = sessionCount === 1 ? "1 Chat" : `${sessionCount} Chats`;
   const confirmed = window.confirm(
     sessionCount
-      ? `Workspace "${workspace.name}" und ${chatLabel} aus der Webapp loeschen?\n\nDer Projektordner auf der Platte bleibt erhalten.`
-      : `Workspace "${workspace.name}" aus der Webapp loeschen?\n\nDer Projektordner auf der Platte bleibt erhalten.`,
+      ? `Projekt "${workspace.name}" und ${chatLabel} aus der Webapp loeschen?\n\nDer Projektordner auf der Platte bleibt erhalten.`
+      : `Projekt "${workspace.name}" aus der Webapp loeschen?\n\nDer Projektordner auf der Platte bleibt erhalten.`,
   );
   if (!confirmed) {
     return;
@@ -338,9 +471,9 @@ async function deleteWorkspace(workspaceId) {
     persistPreferences();
     await Promise.all([refreshWorkspaces(), refreshSessions()]);
     renderApp();
-    showToast("Workspace geloescht.");
+    showToast("Projekt geloescht.");
   } catch (error) {
-    showToast(`Workspace konnte nicht geloescht werden: ${error.message}`, "error");
+    showToast(`Projekt konnte nicht geloescht werden: ${error.message}`, "error");
   }
 }
 
@@ -360,6 +493,87 @@ async function stopSession() {
     renderApp();
   } catch (error) {
     showToast(`Session konnte nicht gestoppt werden: ${error.message}`, "error");
+  }
+}
+
+async function submitLogin() {
+  if (loginRetryAfterSeconds() > 0) {
+    renderApp();
+    return;
+  }
+
+  state.auth.submitting = true;
+  state.auth.success = false;
+  state.auth.error = "";
+  renderApp();
+
+  try {
+    const payload = await fetchJSON("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: state.auth.login.email.trim(),
+        password: state.auth.login.password,
+        totp_code: state.auth.login.totpCode.trim() || null,
+      }),
+    });
+    applyAuthState(payload);
+    state.auth.success = true;
+    state.auth.login.password = "";
+    state.auth.login.totpCode = "";
+    state.ui.booting = true;
+    renderApp();
+    await loadAuthenticatedApplication();
+    showToast("Sichere Anmeldung erfolgreich.", "success");
+  } catch (error) {
+    state.auth.success = false;
+    state.auth.error = error.message || "Anmeldung fehlgeschlagen.";
+    if (error.retryAfter > 0) {
+      state.auth.rateLimitedUntil = Date.now() + error.retryAfter * 1000;
+    }
+  } finally {
+    state.auth.submitting = false;
+    state.ui.booting = false;
+    renderApp();
+  }
+}
+
+async function logoutUser() {
+  try {
+    await fetchJSON("/api/auth/logout", { method: "POST" });
+  } catch (error) {
+    showToast(`Abmeldung konnte nicht abgeschlossen werden: ${error.message}`, "error");
+  } finally {
+    clearApplicationState({ preserveAuthInputs: true });
+    state.auth.authenticated = false;
+    state.auth.user = null;
+    state.auth.session = null;
+    state.auth.success = false;
+    state.auth.error = "";
+    state.auth.rateLimitedUntil = null;
+    await refreshAuthState({ silent: true }).catch(() => {});
+    renderApp();
+  }
+}
+
+async function handleUnauthorizedResponse(detail = "Sitzung abgelaufen. Bitte erneut anmelden.") {
+  if (state.auth.handlingExpiry) {
+    return;
+  }
+  state.auth.handlingExpiry = true;
+  clearApplicationState({ preserveAuthInputs: true, preserveRoute: true });
+  state.auth.authenticated = false;
+  state.auth.user = null;
+  state.auth.session = null;
+  state.auth.error = detail;
+  try {
+    await refreshAuthState({ silent: true });
+  } catch (error) {
+    state.auth.checked = true;
+  } finally {
+    state.auth.handlingExpiry = false;
+    renderApp();
+    showToast(detail, "error");
   }
 }
 
@@ -441,6 +655,11 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "logout") {
+    logoutUser();
+    return;
+  }
+
   if (action === "submit-prompt") {
     submitPrompt();
     return;
@@ -501,7 +720,29 @@ function handleClick(event) {
   }
 }
 
+function handleSubmit(event) {
+  if (event.target.id === "loginForm") {
+    event.preventDefault();
+    submitLogin();
+  }
+}
+
 function handleInput(event) {
+  if (event.target.id === "loginEmailInput") {
+    state.auth.login.email = event.target.value;
+    state.auth.error = "";
+    return;
+  }
+  if (event.target.id === "loginPasswordInput") {
+    state.auth.login.password = event.target.value;
+    state.auth.error = "";
+    return;
+  }
+  if (event.target.id === "loginTotpInput") {
+    state.auth.login.totpCode = event.target.value;
+    state.auth.error = "";
+    return;
+  }
   if (event.target.id === "composerInput") {
     state.composer.prompt = event.target.value;
     autosizeTextarea(event.target);
@@ -540,6 +781,11 @@ function handleKeydown(event) {
       submitPrompt();
       return;
     }
+    if (event.target.id === "loginTotpInput" || event.target.id === "loginPasswordInput") {
+      event.preventDefault();
+      submitLogin();
+      return;
+    }
   }
   if (event.key === "Escape") {
     if (state.ui.workspaceModalOpen) {
@@ -549,11 +795,19 @@ function handleKeydown(event) {
     if (state.ui.settingsModalOpen) {
       closeSettingsModal();
     }
+    if (!state.auth.authenticated) {
+      state.auth.error = "";
+      renderApp();
+    }
   }
 }
 
 function handlePopState() {
   hydrateRouteFromLocation();
+  if (!state.auth.authenticated) {
+    renderApp();
+    return;
+  }
   if (state.activeSessionId) {
     openSession(state.activeSessionId, { updateHistory: false });
   } else {
@@ -625,15 +879,22 @@ async function saveWorkspace() {
     state.selectedWorkspaceId = workspace.id;
     persistPreferences();
     closeWorkspaceModal();
-    showToast("Workspace gespeichert.", "success");
+    showToast("Projekt gespeichert.", "success");
   } catch (error) {
-    showToast(`Workspace konnte nicht gespeichert werden: ${error.message}`, "error");
+    showToast(`Projekt konnte nicht gespeichert werden: ${error.message}`, "error");
   }
 }
 
 function renderApp() {
   const root = document.getElementById("app");
   if (!root) {
+    return;
+  }
+  if (!state.auth.checked || !state.auth.authenticated) {
+    root.innerHTML = `
+      ${renderAuthShell()}
+      ${renderToast()}
+    `;
     return;
   }
   const uiSnapshot = captureUiSnapshot();
@@ -661,34 +922,376 @@ function renderApp() {
   });
 }
 
-function renderSidebar() {
-  const workspace = selectedWorkspace();
-  const threadCount = workspace ? sessionsForWorkspace(workspace.id).length : 0;
+function renderAuthShell() {
+  const loading = !state.auth.checked || state.ui.booting;
+  const lockedSeconds = loginRetryAfterSeconds();
+  const tone = lockedSeconds > 0 ? "warning" : state.auth.error ? "danger" : state.auth.success ? "success" : "muted";
+  const heading = loading
+    ? "Sicherheitskontext wird geladen"
+    : lockedSeconds > 0
+      ? "Anmeldung temporaer gedrosselt"
+      : "Sicher anmelden";
+  const copy = loading
+    ? "Sitzung, CSRF-Schutz und Sicherheitsparameter werden vorbereitet."
+    : lockedSeconds > 0
+      ? `Zu viele Fehlversuche erkannt. Bitte in etwa ${lockedSeconds} Sekunden erneut versuchen.`
+      : "Die Konsole ist erst nach erfolgreicher Anmeldung freigeschaltet. Sessions laufen serverseitig, Cookies bleiben HttpOnly und 2FA per TOTP wird unterstuetzt.";
+  const submitLabel = state.auth.submitting
+    ? "Anmeldung wird geprueft..."
+    : lockedSeconds > 0
+      ? "Kurz warten"
+      : "Anmelden";
 
   return `
-    <div class="sidebar-inner">
-      <section class="sidebar-section">
-        <div class="sidebar-section-head">
-          <p class="sidebar-label">Workspaces</p>
+    <div class="auth-shell">
+      <div class="auth-shell-inner">
+        <section class="auth-hero surface-panel">
+          <div class="brand-panel auth-brand-panel">
+            <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
+            <div class="brand-copy">
+              <p class="brand-title">M.A.R.C A1</p>
+              <p class="brand-subtitle">Gesicherte Operator-Konsole fuer lokale Agent-Laufzeiten</p>
+            </div>
+          </div>
+          <div class="auth-copy">
+            <p class="panel-kicker">Security</p>
+            <h1>Produktionsreife Anmeldung fuer die Runtime</h1>
+            <p>
+              Authentifizierung, Session-Verwaltung und API-Zugriffe laufen zentral ueber den Server.
+              Das Frontend speichert keinen Auth-State im Local Storage.
+            </p>
+          </div>
+          <div class="auth-feature-list">
+            ${renderAuthFeature("Argon2id", "Passwoerter werden serverseitig mit moderner, speicherhaerter Hashing-Strategie verarbeitet.")}
+            ${renderAuthFeature("Session-Cookies", "HttpOnly, Secure und SameSite-geschuetzt mit serverseitiger Invalidierung und Idle-Timeout.")}
+            ${renderAuthFeature("CSRF + Origin Checks", "Schreibende Requests brauchen denselben Ursprung und einen gueltigen CSRF-Token.")}
+            ${renderAuthFeature("Abuse-Schutz", "IP- und konto-bezogene Drosselung mit progressivem Backoff gegen Brute Force und Credential Stuffing.")}
+          </div>
+        </section>
+        <section class="auth-card surface-panel">
+          <div class="auth-card-head">
+            <div>
+              <p class="panel-kicker">Login</p>
+              <h2>${escapeHtml(heading)}</h2>
+            </div>
+            ${renderStatusBadge(lockedSeconds > 0 ? "Gedrosselt" : loading ? "Wird vorbereitet" : "Geschuetzt", tone, {
+              compact: true,
+              live: state.auth.submitting || loading,
+            })}
+          </div>
+          <p class="auth-card-copy">${escapeHtml(copy)}</p>
+          ${renderAuthStatusPanel(tone, loading, lockedSeconds)}
+          <form id="loginForm" class="auth-form">
+            <label class="auth-field" for="loginEmailInput">
+              <span>E-Mail-Adresse</span>
+              <input
+                id="loginEmailInput"
+                type="email"
+                inputmode="email"
+                autocomplete="username"
+                value="${escapeAttribute(state.auth.login.email)}"
+                placeholder="operator@example.com"
+                ${loading ? "disabled" : ""}
+                required
+              />
+            </label>
+            <label class="auth-field" for="loginPasswordInput">
+              <span>Passwort</span>
+              <input
+                id="loginPasswordInput"
+                type="password"
+                autocomplete="current-password"
+                value="${escapeAttribute(state.auth.login.password)}"
+                placeholder="Passwort eingeben"
+                ${loading ? "disabled" : ""}
+                required
+              />
+            </label>
+            <label class="auth-field" for="loginTotpInput">
+              <span>Einmalcode</span>
+              <input
+                id="loginTotpInput"
+                type="text"
+                inputmode="numeric"
+                autocomplete="one-time-code"
+                value="${escapeAttribute(state.auth.login.totpCode)}"
+                placeholder="Nur falls 2FA aktiviert ist"
+                ${loading ? "disabled" : ""}
+              />
+            </label>
+            <div class="auth-meta-row">
+              <span class="auth-meta-copy">Mindestens ${escapeHtml(String(state.auth.passwordPolicy?.min_length || 14))} Zeichen. Gleiche Fehlermeldung fuer unbekannte und falsche Zugangsdaten.</span>
+              <span class="auth-meta-copy">2FA via TOTP wird unterstuetzt.</span>
+            </div>
+            <button
+              class="button-primary auth-submit"
+              type="submit"
+              ${loading || state.auth.submitting || lockedSeconds > 0 ? "disabled" : ""}
+            >
+              ${escapeHtml(submitLabel)}
+            </button>
+          </form>
+        </section>
+      </div>
+    </div>
+  `;
+}
+
+function renderAuthFeature(title, copy) {
+  return `
+    <article class="auth-feature">
+      <strong>${escapeHtml(title)}</strong>
+      <p>${escapeHtml(copy)}</p>
+    </article>
+  `;
+}
+
+function renderAuthStatusPanel(tone, loading, lockedSeconds) {
+  const message = loading
+    ? "Initiale Sitzung wird aufgebaut."
+    : lockedSeconds > 0
+      ? `Neue Versuche sind noch ${lockedSeconds} Sekunden gesperrt.`
+      : state.auth.error || (state.auth.success ? "Anmeldung erfolgreich. Konsole wird geladen." : "Die Anmeldung erfolgt ueber denselben Ursprung mit CSRF-Schutz.");
+
+  return `
+    <div class="auth-status tone-${escapeHtml(tone)}" aria-live="polite">
+      <strong>${escapeHtml(loading ? "Initialisierung" : lockedSeconds > 0 ? "Schutz aktiv" : state.auth.error ? "Anmeldung fehlgeschlagen" : state.auth.success ? "Erfolg" : "Bereit")}</strong>
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
+}
+
+function renderSidebar() {
+  const workspace = selectedWorkspace();
+  const activeRuns = state.sessions.filter((session) => isSessionRunning(session)).length;
+  const primaryAction = workspace
+    ? `
+        <button
+          class="sidebar-primary-action"
+          type="button"
+          data-action="new-chat"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+        >
+          ${icon("compose")}
+          <span>Neuer Thread</span>
+        </button>
+      `
+    : `
+        <button class="sidebar-primary-action" type="button" data-action="open-workspace-modal">
+          ${icon("plus")}
+          <span>Projekt anlegen</span>
+        </button>
+      `;
+
+  return `
+    <div class="sidebar-shell">
+      <div class="sidebar-header">
+        <div class="sidebar-brand-row">
+          <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
+          <div class="brand-copy">
+            <p class="brand-title">M.A.R.C A1</p>
+            <p class="brand-subtitle">${escapeHtml(activeRuns ? `${activeRuns} aktive Laeufe` : "Lokale Agentenarbeit")}</p>
+          </div>
+        </div>
+        ${primaryAction}
+      </div>
+      <div class="sidebar-scroll">
+        <section class="sidebar-section sidebar-project-section">
+          <div class="sidebar-section-head">
+            <p class="sidebar-label">Projekte</p>
+            <button
+              class="icon-button"
+              type="button"
+              data-action="open-workspace-modal"
+              aria-label="Projekt anlegen"
+            >
+              ${icon("plus")}
+            </button>
+          </div>
+          ${renderSidebarProjectList()}
+        </section>
+      </div>
+      ${renderSidebarFooter(activeRuns)}
+    </div>
+  `;
+}
+
+function renderSidebarProjectList() {
+  if (!state.workspaces.length) {
+    return `
+      <div class="sidebar-empty sidebar-empty-compact">
+        Noch kein Projekt verbunden. Lege einen lokalen Ordner an, damit Threads und Agentenlaeufe hier erscheinen.
+      </div>
+    `;
+  }
+
+  return `
+    <div class="project-nav-list">
+      ${state.workspaces.map(renderSidebarProject).join("")}
+    </div>
+  `;
+}
+
+function renderSidebarProject(workspace) {
+  const active = workspace.id === activeWorkspaceId();
+  const sessions = sessionsForWorkspace(workspace.id);
+  const activeRuns = sessions.filter((session) => isSessionRunning(session)).length;
+  const disabled = isWorkspaceBusy(workspace.id);
+
+  return `
+    <section class="project-group ${active ? "active" : ""}">
+      <div class="project-group-head">
+        <button
+          class="project-button"
+          type="button"
+          data-action="select-workspace"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+        >
+          <span class="project-button-icon" aria-hidden="true">${icon("folder")}</span>
+          <span class="project-button-copy">
+            <span class="project-button-name">${escapeHtml(workspace.name)}</span>
+            <span class="project-button-path">${escapeHtml(shortenPath(workspace.path, 42))}</span>
+          </span>
+          <span class="project-button-count">${escapeHtml(String(sessions.length))}</span>
+        </button>
+        <div class="project-tools">
           <button
-            class="icon-button"
+            class="workspace-action"
             type="button"
-            data-action="open-workspace-modal"
-            aria-label="Workspace anlegen"
+            data-action="edit-workspace"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt bearbeiten"
           >
-            ${icon("plus")}
+            ${icon("edit")}
+          </button>
+          <button
+            class="workspace-action danger-button"
+            type="button"
+            data-action="delete-workspace"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt loeschen"
+            title="${escapeAttribute(
+              disabled
+                ? "Projekt kann erst geloescht werden, wenn keine Threads mehr laufen."
+                : "Projekt aus der Webapp loeschen",
+            )}"
+            ${disabled ? "disabled" : ""}
+          >
+            ${icon("trash")}
           </button>
         </div>
-        ${renderWorkspaceList()}
-      </section>
-      <section class="sidebar-section">
-        <div class="sidebar-section-head">
-          <p class="sidebar-label">Threads</p>
-          <span class="sidebar-count">${threadCount}</span>
-        </div>
-        ${renderThreadList()}
-      </section>
+      </div>
+      ${
+        active
+          ? `
+            <div class="project-thread-list">
+              <div class="project-group-meta">
+                <span>${escapeHtml(activeRuns ? `${activeRuns} aktiv` : "Bereit")}</span>
+                <span>${escapeHtml(countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`))}</span>
+              </div>
+              ${sessions.length ? sessions.map(renderSidebarThreadItem).join("") : `<div class="sidebar-empty sidebar-empty-compact">In diesem Projekt gibt es noch keinen Thread.</div>`}
+            </div>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
+function renderSidebarThreadItem(session) {
+  const active = session.id === state.activeSessionId;
+  const title = session.title || session.last_message_preview || session.task || "Neuer Thread";
+  const preview = threadPreview(session);
+  const badgeTone = sessionStatusTone(session);
+  const badgeLabel = sessionBadgeText(session);
+
+  return `
+    <button
+      class="thread-nav-item ${active ? "active" : ""}"
+      type="button"
+      data-action="open-session"
+      data-session-id="${escapeHtml(session.id)}"
+    >
+      <span class="thread-nav-main">
+        <span class="thread-nav-title">${escapeHtml(shorten(title, 34))}</span>
+        ${renderStatusBadge(badgeLabel, badgeTone, {
+          compact: true,
+          live: isSessionRunning(session),
+        })}
+      </span>
+      <span class="thread-nav-preview">${escapeHtml(shorten(preview, 108))}</span>
+      <span class="thread-nav-meta">
+        <span>${escapeHtml(formatSessionTimestamp(session.updated_at))}</span>
+        ${
+          session.changed_files?.length
+            ? `<span>${escapeHtml(countLabel(session.changed_files.length, "1 Datei", `${session.changed_files.length} Dateien`))}</span>`
+            : ""
+        }
+      </span>
+    </button>
+  `;
+}
+
+function renderSidebarFooter(activeRuns) {
+  if (!state.auth.user) {
+    return `
+      <div class="sidebar-footer">
+        <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-modal">
+          Einstellungen
+        </button>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="sidebar-footer">
+      <div class="sidebar-footer-copy">
+        <strong>${escapeHtml(state.auth.user.display_name || state.auth.user.email)}</strong>
+        <span>${escapeHtml(activeRuns ? `${activeRuns} aktive Laeufe` : "Bereit")}</span>
+      </div>
+      <div class="sidebar-footer-actions">
+        <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-modal">
+          Einstellungen
+        </button>
+        <button class="button-ghost sidebar-footer-button" type="button" data-action="logout">
+          Abmelden
+        </button>
+      </div>
     </div>
+  `;
+}
+
+function renderIdentityPanel() {
+  if (!state.auth.user) {
+    return "";
+  }
+  const lastLogin = state.auth.user.last_login_at
+    ? `Letzte Anmeldung ${formatSessionTimestamp(state.auth.user.last_login_at)}`
+    : "Erste bekannte Anmeldung";
+  const idleExpires = state.auth.session?.idle_expires_at
+    ? `Idle-Timeout ${formatTime(state.auth.session.idle_expires_at)}`
+    : "Serverseitige Session aktiv";
+
+  return `
+    <section class="surface-panel security-panel">
+      <div class="security-panel-head">
+        <div>
+          <p class="panel-kicker">Operator</p>
+          <h3>${escapeHtml(state.auth.user.display_name || state.auth.user.email)}</h3>
+        </div>
+        ${renderStatusBadge(state.auth.user.mfa_enabled ? "2FA aktiv" : "2FA verfuegbar", state.auth.user.mfa_enabled ? "success" : "warning", {
+          compact: true,
+        })}
+      </div>
+      <p class="security-panel-copy">${escapeHtml(state.auth.user.email)}</p>
+      <div class="security-panel-meta">
+        ${renderMetaChip(lastLogin, "muted")}
+        ${renderMetaChip(idleExpires, "muted")}
+      </div>
+      <button class="button-secondary security-logout" type="button" data-action="logout">
+        Sitzung beenden
+      </button>
+    </section>
   `;
 }
 
@@ -696,7 +1299,7 @@ function renderWorkspaceList() {
   if (!state.workspaces.length) {
     return `
       <div class="sidebar-empty">
-        Noch kein Workspace vorhanden. Lege zuerst links einen Projektordner an.
+        Noch kein Projekt verbunden. Lege zuerst einen lokalen Ordner an, damit Threads, Aktivitaet und Validierung gemeinsam sichtbar werden.
       </div>
     `;
   }
@@ -710,7 +1313,9 @@ function renderWorkspaceList() {
 
 function renderWorkspaceItem(workspace) {
   const active = workspace.id === activeWorkspaceId();
-  const count = sessionsForWorkspace(workspace.id).length;
+  const workspaceSessions = sessionsForWorkspace(workspace.id);
+  const count = workspaceSessions.length;
+  const activeRuns = workspaceSessions.filter((session) => isSessionRunning(session)).length;
   const disabled = isWorkspaceBusy(workspace.id);
 
   return `
@@ -721,8 +1326,20 @@ function renderWorkspaceItem(workspace) {
         data-action="select-workspace"
         data-workspace-id="${escapeHtml(workspace.id)}"
       >
-        <span class="workspace-name">${escapeHtml(workspace.name)}</span>
-        <span class="workspace-badge">${count}</span>
+        <span class="workspace-topline">
+          <span class="workspace-name">${escapeHtml(workspace.name)}</span>
+          <span class="workspace-badge">${count}</span>
+        </span>
+        <span class="workspace-path">${escapeHtml(shortenPath(workspace.path, 58))}</span>
+        <span class="workspace-meta">
+          ${escapeHtml(
+            activeRuns
+              ? `${activeRuns} ${countLabel(activeRuns, "aktiver Agent", "aktive Agenten")}`
+              : count
+                ? `${count} ${countLabel(count, "Thread", "Threads")} im Verlauf`
+                : "Noch kein Verlauf",
+          )}
+        </span>
       </button>
       <div class="workspace-item-actions">
         <button
@@ -730,7 +1347,7 @@ function renderWorkspaceItem(workspace) {
           type="button"
           data-action="edit-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
-          aria-label="Workspace bearbeiten"
+          aria-label="Projekt bearbeiten"
         >
           ${icon("edit")}
         </button>
@@ -739,11 +1356,11 @@ function renderWorkspaceItem(workspace) {
           type="button"
           data-action="delete-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
-          aria-label="Workspace loeschen"
+          aria-label="Projekt loeschen"
           title="${escapeAttribute(
             disabled
-              ? "Workspace kann erst geloescht werden, wenn keine Chats mehr laufen."
-              : "Workspace aus der Webapp loeschen",
+              ? "Projekt kann erst geloescht werden, wenn keine Threads mehr laufen."
+              : "Projekt aus der Webapp loeschen",
           )}"
           ${disabled ? "disabled" : ""}
         >
@@ -759,7 +1376,7 @@ function renderThreadList() {
   if (!workspace) {
     return `
       <div class="sidebar-empty">
-        Waehle einen Workspace aus, damit hier die Threads erscheinen.
+        Waehle ein Projekt aus, damit hier die Threads erscheinen.
       </div>
     `;
   }
@@ -768,7 +1385,7 @@ function renderThreadList() {
   if (!sessions.length) {
     return `
       <div class="sidebar-empty">
-        Noch keine Threads in ${escapeHtml(workspace.name)}. Starte oben einen neuen Chat.
+        In ${escapeHtml(workspace.name)} gibt es noch keinen Thread. Starte rechts einen neuen Lauf.
       </div>
     `;
   }
@@ -783,7 +1400,10 @@ function renderThreadList() {
 function renderThreadItem(session) {
   const active = session.id === state.activeSessionId;
   const title = session.title || session.last_message_preview || session.task || "Neuer Chat";
+  const preview = threadPreview(session);
   const disabled = isSessionRunning(session);
+  const badgeTone = sessionStatusTone(session);
+  const badgeLabel = sessionBadgeText(session);
 
   return `
     <div class="thread-row ${active ? "active" : ""}">
@@ -793,7 +1413,15 @@ function renderThreadItem(session) {
         data-action="open-session"
         data-session-id="${escapeHtml(session.id)}"
       >
-        <span class="thread-title">${escapeHtml(shorten(title, 34))}</span>
+        <span class="thread-meta-row">
+          ${renderStatusBadge(badgeLabel, badgeTone, {
+            compact: true,
+            live: isSessionRunning(session),
+          })}
+          <span class="thread-timestamp">${escapeHtml(formatSessionTimestamp(session.updated_at))}</span>
+        </span>
+        <span class="thread-title">${escapeHtml(shorten(title, 48))}</span>
+        <span class="thread-preview">${escapeHtml(shorten(preview, 112))}</span>
       </button>
       <button
         class="thread-action danger-button"
@@ -868,19 +1496,44 @@ function renderExecutionProfileOptions() {
 function renderTopBar() {
   const workspace = workspaceForSession(state.activeSession) || selectedWorkspace();
   const commitDisabled = !workspace || isSessionRunning(state.activeSession);
+  const session = state.activeSession;
+  const deleteDisabled = !session || isSessionRunning(session);
+  const statusMarkup = session
+    ? renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
+        live: isSessionRunning(session),
+      })
+    : renderStatusBadge("Bereit", "muted");
+  const title = session
+    ? session.title || shorten(session.task, 84) || "Neuer Thread"
+    : workspace?.name || "Projekt auswaehlen";
+  const subtitleParts = [];
+  if (workspace?.name && workspace.name !== title) {
+    subtitleParts.push(workspace.name);
+  }
+  if (workspace?.path) {
+    subtitleParts.push(shortenPath(workspace.path, 90));
+  }
+  if (session?.updated_at) {
+    subtitleParts.push(`Aktualisiert ${formatSessionTimestamp(session.updated_at)}`);
+  }
+  const subtitle = subtitleParts.join("  ·  ") || "Links ein Projekt waehlen oder einen neuen Thread starten.";
 
   return `
-    <header class="top-bar">
-      <div class="top-bar-inner">
-        <h1 class="workspace-title">${escapeHtml(workspace?.name || "Kein Workspace")}</h1>
-        <div class="top-bar-actions">
+    <header class="thread-topbar">
+      <div class="thread-topbar-inner">
+        <div class="thread-topbar-copy">
+          <h1 class="thread-topbar-title">${escapeHtml(title)}</h1>
+          <p class="thread-topbar-subtitle">${escapeHtml(subtitle)}</p>
+        </div>
+        <div class="thread-toolbar">
+          ${statusMarkup}
           <button
             class="button-secondary"
             type="button"
             data-action="${workspace ? "new-chat" : "open-workspace-modal"}"
             ${workspace ? `data-workspace-id="${escapeHtml(workspace.id)}"` : ""}
           >
-            Neuer Chat
+            Neuer Thread
           </button>
           <button
             class="icon-button top-bar-icon"
@@ -896,6 +1549,30 @@ function renderTopBar() {
           >
             ${icon("git-push")}
           </button>
+          <button
+            class="icon-button top-bar-icon"
+            type="button"
+            data-action="delete-session"
+            data-session-id="${escapeHtml(session?.id || "")}"
+            aria-label="Thread loeschen"
+            title="${escapeAttribute(
+              deleteDisabled
+                ? "Thread kann erst geloescht werden, wenn kein Lauf aktiv ist."
+                : "Thread loeschen",
+            )}"
+            ${deleteDisabled ? "disabled" : ""}
+          >
+            ${icon("trash")}
+          </button>
+          <button
+            class="icon-button top-bar-icon"
+            type="button"
+            data-action="open-settings-modal"
+            aria-label="Einstellungen"
+            title="Agent- und Laufzeitoptionen"
+          >
+            ${icon("sliders")}
+          </button>
         </div>
       </div>
     </header>
@@ -906,11 +1583,7 @@ function renderChatContainer() {
   return `
     <section class="chat-stage">
       <div class="chat-stage-inner">
-        <div class="chat-container">
-          <div class="message-list">
-            ${renderChatStateMessages()}
-          </div>
-        </div>
+        ${renderChatStateMessages()}
       </div>
     </section>
   `;
@@ -918,29 +1591,116 @@ function renderChatContainer() {
 
 function renderChatStateMessages() {
   if (state.ui.booting) {
-    return renderInlineNote("Oberflaeche wird geladen");
+    return renderStageState(
+      "Oberflaeche wird vorbereitet",
+      "Projekte, Threads und Laufzeitstatus werden geladen.",
+    );
   }
 
   if (state.ui.sessionLoading) {
-    return renderInlineNote("Thread wird geladen");
+    return renderStageState(
+      "Thread wird geladen",
+      "Konversation, Arbeitsdetails und Validierung werden zusammengestellt.",
+    );
   }
 
   if (!state.activeSession) {
-    return "";
+    return renderEmptyThreadState();
   }
 
-  const entries = conversationTimeline(state.activeSession, state.logs);
-  return [
-    entries.map(renderTimelineEntry).join(""),
-    ["queued", "running"].includes(state.activeSession.status) ? renderRunningMessage() : "",
+  return renderThreadView(state.activeSession);
+}
+
+function renderStageState(title, copy, actions = "") {
+  return `
+    <section class="surface-panel empty-state-panel">
+      <div class="empty-state-copy">
+        <p class="panel-kicker">Status</p>
+        <h2>${escapeHtml(title)}</h2>
+        <p>${escapeHtml(copy)}</p>
+      </div>
+      ${actions ? `<div class="empty-state-actions">${actions}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderEmptyThreadState() {
+  const workspace = selectedWorkspace();
+  if (!workspace) {
+    return renderStageState(
+      "Verbinde zuerst ein Projekt",
+      "Lege einen lokalen Projektordner an. Danach erscheinen Threads, Laufstatus und Dateiaenderungen direkt hier.",
+      `
+        <button class="button-primary" type="button" data-action="open-workspace-modal">
+          Projekt anlegen
+        </button>
+      `,
+    );
+  }
+
+  const sessions = sessionsForWorkspace(workspace.id);
+  return renderStageState(
+    `${workspace.name} ist bereit`,
+    "Starte einen neuen Thread. Status, Dateien und Validierung erscheinen anschliessend direkt im Verlauf.",
+    `
+      <div class="empty-state-facts">
+        ${renderMetaChip(shortenPath(workspace.path, 60), "muted")}
+        ${renderMetaChip(countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`), "muted")}
+      </div>
+      <button
+        class="button-primary"
+        type="button"
+        data-action="new-chat"
+        data-workspace-id="${escapeHtml(workspace.id)}"
+      >
+        Neuen Thread starten
+      </button>
+    `,
+  );
+}
+
+function renderThreadView(session) {
+  return renderConversationPanel(session);
+}
+
+function renderThreadHero(session) {
+  const overview = buildSessionOverview(session);
+  const validation = buildValidationSnapshot(session);
+  const metaChips = [
+    renderMetaChip(labelForAccessMode(session.access_mode), "muted"),
+    renderMetaChip(
+      countLabel(session.tool_calls?.length || 0, "1 Schritt", `${session.tool_calls?.length || 0} Schritte`),
+      "muted",
+    ),
+    renderMetaChip(
+      countLabel(session.changed_files?.length || 0, "1 Datei", `${session.changed_files?.length || 0} Dateien`),
+      session.changed_files?.length ? "success" : "muted",
+    ),
+    renderMetaChip(validation.statusLabel, validation.tone),
   ].join("");
+
+  return `
+    <section class="surface-panel thread-header-card tone-${escapeHtml(overview.tone)}">
+      <div class="thread-header-top">
+        <div class="thread-header-copy">
+          <p class="panel-kicker">Thread</p>
+          <h2 class="thread-heading">${escapeHtml(session.title || shorten(session.task, 96) || "Neuer Thread")}</h2>
+          <p class="thread-header-summary">${escapeHtml(overview.summary)}</p>
+        </div>
+        <div class="thread-header-side">
+          ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
+            live: isSessionRunning(session),
+          })}
+          <span class="thread-updated">Aktualisiert ${escapeHtml(formatTime(session.updated_at))}</span>
+        </div>
+      </div>
+      <div class="thread-header-facts">${metaChips}</div>
+    </section>
+  `;
 }
 
-function renderInlineNote(text) {
-  return `<div class="inline-note">${escapeHtml(text)}</div>`;
-}
-
-function renderMessageBubble(message) {
+function renderMessageBubble(message, options = {}) {
+  const display = messageDisplayState(message, options.session);
   return `
     <div class="message-row ${escapeHtml(message.role)}">
       <article class="message-bubble ${escapeHtml(message.role)}">
@@ -948,77 +1708,393 @@ function renderMessageBubble(message) {
           <span class="message-author">${escapeHtml(roleLabel(message.role))}</span>
           <span class="message-time">${escapeHtml(formatTime(message.created_at))}</span>
         </div>
-        <div class="message-body">${renderRichText(message.content)}</div>
+        <div class="message-body rich-text">${renderRichText(display.content)}</div>
+        ${display.note ? `<p class="message-note">${escapeHtml(display.note)}</p>` : ""}
       </article>
     </div>
   `;
 }
 
-function renderTimelineEntry(entry) {
-  if (entry.type === "activity") {
-    return renderActivityLine(entry.record);
-  }
-  return renderMessageBubble(entry.message);
+function renderConversationPanel(session) {
+  const messages = conversationMessages(session);
+  const workspace = workspaceForSession(session);
+  const overview = buildSessionOverview(session);
+  const validation = buildValidationSnapshot(session);
+  return `
+    <section class="thread-canvas">
+      <div class="thread-context">
+        <div class="thread-context-copy">
+          <span class="thread-context-project">${escapeHtml(workspace?.name || "Projekt")}</span>
+          <p class="thread-context-summary">${escapeHtml(overview.summary)}</p>
+        </div>
+        <div class="thread-context-chips">
+          ${renderMetaChip(labelForAccessMode(session.access_mode), "muted")}
+          ${renderMetaChip(countLabel(messages.length, "1 Nachricht", `${messages.length} Nachrichten`), "muted")}
+          ${renderMetaChip(countLabel(session.tool_calls?.length || 0, "1 Schritt", `${session.tool_calls?.length || 0} Schritte`), "muted")}
+          ${renderMetaChip(validation.statusLabel, validation.tone)}
+        </div>
+      </div>
+      <div class="thread-feed">
+        ${messages.length ? messages.map((message) => renderMessageBubble(message, { session })).join("") : `<div class="inline-note">Noch keine Nachrichten in diesem Thread.</div>`}
+        ${isSessionRunning(session) ? renderRunningMessage(session) : ""}
+        ${renderWorklogPanel(session, state.logs)}
+      </div>
+    </section>
+  `;
 }
 
-function renderActivityLine(record) {
-  const detail = describeLogRecord(record);
-  if (!detail) {
+function renderWorklogPanel(session, logs) {
+  if (!hasWorklogContent(session, logs)) {
+    return "";
+  }
+
+  const overview = buildSessionOverview(session);
+  const validation = buildValidationSnapshot(session);
+  const changes = Array.isArray(session.changed_files) ? session.changed_files : [];
+  const issues = buildIssueItems(session);
+  const activity = buildActivityClusters(session, logs);
+  const highlights = buildRunHighlights(session);
+
+  return `
+    <details
+      class="worklog-card tone-${escapeHtml(sessionStatusTone(session))}"
+      data-preserve-open
+      id="worklog-${escapeHtml(session.id)}"
+      ${shouldOpenDetailPanel(sessionStatusTone(session), session) ? "open" : ""}
+    >
+      <summary class="worklog-summary">
+        <div class="worklog-summary-main">
+          <span class="worklog-chevron" aria-hidden="true">${icon("chevron-right")}</span>
+          <div>
+            <p class="panel-kicker">Review</p>
+            <h3>Aenderungen und Laufdetails</h3>
+          </div>
+        </div>
+        <div class="worklog-summary-meta">
+          ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
+            compact: true,
+            live: isSessionRunning(session),
+          })}
+          ${changes.length ? renderMetaChip(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`), changes.length ? "success" : "muted") : ""}
+          ${renderMetaChip(validation.statusLabel, validation.tone)}
+        </div>
+      </summary>
+      <div class="worklog-body">
+        <div class="worklog-highlight-grid">
+          ${highlights.map(renderStatCell).join("")}
+        </div>
+        <section class="worklog-section tone-${escapeHtml(overview.tone)}">
+          <div class="worklog-section-head">
+            <div>
+              <p class="panel-kicker">Lauf</p>
+              <strong class="worklog-section-title">${escapeHtml(overview.title)}</strong>
+            </div>
+            <span class="worklog-section-meta">${escapeHtml(labelForPhase(session.current_phase))}</span>
+          </div>
+          <p class="worklog-section-copy">${escapeHtml(overview.summary)}</p>
+          <div class="phase-track phase-track-inline">
+            ${buildPhaseSteps(session)
+              .map(
+                (step, index) => `
+                  <div class="phase-step ${escapeHtml(step.state)} compact">
+                    <span class="phase-step-index">${index + 1}</span>
+                    <span class="phase-step-label">${escapeHtml(step.label)}</span>
+                  </div>
+                `,
+              )
+              .join("")}
+          </div>
+        </section>
+
+        <section class="worklog-section tone-${escapeHtml(validation.tone)}">
+          <div class="worklog-section-head">
+            <div>
+              <p class="panel-kicker">Validierung</p>
+              <strong class="worklog-section-title">${escapeHtml(validation.title)}</strong>
+            </div>
+            ${renderStatusBadge(validation.statusLabel, validation.tone, { compact: true })}
+          </div>
+          <p class="worklog-section-copy">${escapeHtml(validation.summary)}</p>
+          ${validation.latest?.command ? `<code class="detail-code">${escapeHtml(validation.latest.command)}</code>` : ""}
+          ${
+            validation.runs.length
+              ? `<div class="validation-list">${validation.runs.map(renderValidationRun).join("")}</div>`
+              : ""
+          }
+        </section>
+
+        ${
+          changes.length
+            ? `
+              <section class="worklog-section">
+                <div class="worklog-section-head">
+                  <div>
+                    <p class="panel-kicker">Dateien</p>
+                    <strong class="worklog-section-title">${escapeHtml(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`))}</strong>
+                  </div>
+                </div>
+                <div class="file-change-list">
+                  ${changes.map(renderFileChangeRow).join("")}
+                </div>
+              </section>
+            `
+            : ""
+        }
+
+        ${
+          issues.length
+            ? `
+              <section class="worklog-section tone-${escapeHtml(issues.some((item) => item.tone === "danger") ? "danger" : "warning")}">
+                <div class="worklog-section-head">
+                  <div>
+                    <p class="panel-kicker">Hinweise</p>
+                    <strong class="worklog-section-title">${escapeHtml(issues.some((item) => item.label === "Blocker") ? "Blocker" : "Risiken")}</strong>
+                  </div>
+                </div>
+                <div class="issue-list">
+                  ${issues.map(renderIssueRow).join("")}
+                </div>
+              </section>
+            `
+            : ""
+        }
+
+        ${
+          activity.length
+            ? `
+              <section class="worklog-section">
+                <div class="worklog-section-head">
+                  <div>
+                    <p class="panel-kicker">Aktivitaet</p>
+                    <strong class="worklog-section-title">${escapeHtml(countLabel(activity.length, "1 Eintrag", `${activity.length} Eintraege`))}</strong>
+                  </div>
+                </div>
+                <div class="activity-feed">
+                  ${activity.map(renderActivityItem).join("")}
+                </div>
+              </section>
+            `
+            : ""
+        }
+      </div>
+    </details>
+  `;
+}
+
+function renderRunSummaryCard(session) {
+  const overview = buildSessionOverview(session);
+  const highlights = buildRunHighlights(session);
+  return `
+    <section class="surface-panel rail-panel status-panel tone-${escapeHtml(overview.tone)}">
+      <div class="panel-head">
+        <div>
+          <p class="panel-kicker">Agent</p>
+          <h3>Aktueller Lauf</h3>
+        </div>
+        ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
+          compact: true,
+          live: isSessionRunning(session),
+        })}
+      </div>
+      <div class="status-panel-body">
+        <strong class="status-panel-title">${escapeHtml(overview.title)}</strong>
+        <p class="status-panel-copy">${escapeHtml(overview.summary)}</p>
+        <div class="status-stats">
+          ${highlights.map(renderStatCell).join("")}
+        </div>
+        <div class="phase-track phase-track-compact">
+          ${buildPhaseSteps(session)
+            .map(
+              (step, index) => `
+                <div class="phase-step ${escapeHtml(step.state)}">
+                  <span class="phase-step-index">${index + 1}</span>
+                  <span class="phase-step-label">${escapeHtml(step.label)}</span>
+                </div>
+              `,
+            )
+            .join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderValidationCard(session) {
+  const validation = buildValidationSnapshot(session);
+  return `
+    <details
+      class="surface-panel rail-panel detail-panel tone-${escapeHtml(validation.tone)}"
+      data-preserve-open
+      id="validation-${escapeHtml(session.id)}"
+      ${shouldOpenDetailPanel(validation.tone, session) ? "open" : ""}
+    >
+      <summary class="detail-summary">
+        <div>
+          <p class="panel-kicker">Validierung</p>
+          <h3>${escapeHtml(validation.title)}</h3>
+        </div>
+        ${renderStatusBadge(validation.statusLabel, validation.tone, { compact: true })}
+      </summary>
+      <div class="detail-body">
+        <p class="detail-copy">${escapeHtml(validation.summary)}</p>
+        ${validation.latest?.command ? `<code class="detail-code">${escapeHtml(validation.latest.command)}</code>` : ""}
+        ${
+          validation.runs.length
+            ? `
+              <div class="validation-list">
+                ${validation.runs.map(renderValidationRun).join("")}
+              </div>
+            `
+            : ""
+        }
+      </div>
+    </details>
+  `;
+}
+
+function renderFilesCard(session) {
+  const changes = Array.isArray(session.changed_files) ? session.changed_files : [];
+  if (!changes.length) {
     return "";
   }
 
   return `
-    <div class="message-row activity">
-      <div class="activity-line ${escapeHtml(detail.tone || "neutral")}">
-        <div class="activity-main">
-          <span class="activity-marker" aria-hidden="true"></span>
-          <span class="activity-text">${escapeHtml(detail.text)}</span>
-          ${detail.meta ? `<code class="activity-code">${escapeHtml(detail.meta)}</code>` : ""}
+    <details
+      class="surface-panel rail-panel detail-panel"
+      data-preserve-open
+      id="changes-${escapeHtml(session.id)}"
+      ${changes.length <= 4 ? "open" : ""}
+    >
+      <summary class="detail-summary">
+        <div>
+          <p class="panel-kicker">Aenderungen</p>
+          <h3>Dateien</h3>
         </div>
-        ${record.timestamp ? `
-          <span class="activity-time">${escapeHtml(formatTime(record.timestamp))}</span>
-        ` : ""}
+        ${renderStatusBadge(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`), "muted", {
+          compact: true,
+        })}
+      </summary>
+      <div class="detail-body">
+        <div class="file-change-list">
+          ${changes.map(renderFileChangeRow).join("")}
+        </div>
       </div>
-    </div>
+    </details>
   `;
 }
 
-function renderRunningMessage() {
-  const stopping = Boolean(state.activeSession?.stop_requested);
+function renderIssuesCard(session) {
+  const issues = buildIssueItems(session);
+  if (!issues.length) {
+    return "";
+  }
+
+  const tone = issues.some((item) => item.tone === "danger")
+    ? "danger"
+    : issues.some((item) => item.tone === "warning")
+      ? "warning"
+      : "muted";
+
   return `
-    <div class="message-row activity">
-      <div class="activity-line live ${stopping ? "danger" : "neutral"}">
-        <div class="activity-main">
-          <span class="activity-marker" aria-hidden="true"></span>
-          <span class="activity-text">
-            ${escapeHtml(stopping ? "Stop-Anfrage gesendet. Der Agent beendet den aktuellen Schritt." : "Agent arbeitet gerade")}
-          </span>
-          ${stopping ? "" : `<div class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></div>`}
+    <details
+      class="surface-panel rail-panel detail-panel tone-${escapeHtml(tone)}"
+      data-preserve-open
+      id="issues-${escapeHtml(session.id)}"
+      ${tone !== "muted" ? "open" : ""}
+    >
+      <summary class="detail-summary">
+        <div>
+          <p class="panel-kicker">Hinweise</p>
+          <h3>${escapeHtml(tone === "danger" ? "Blocker" : "Risiken")}</h3>
+        </div>
+        ${renderStatusBadge(countLabel(issues.length, "1 Eintrag", `${issues.length} Eintraege`), tone, {
+          compact: true,
+        })}
+      </summary>
+      <div class="detail-body">
+        <div class="issue-list">
+          ${issues.map(renderIssueRow).join("")}
         </div>
       </div>
+    </details>
+  `;
+}
+
+function renderActivityCard(session, logs) {
+  const activity = buildActivityClusters(session, logs);
+  if (!activity.length) {
+    return "";
+  }
+
+  return `
+    <details
+      class="surface-panel rail-panel detail-panel"
+      data-preserve-open
+      id="activity-${escapeHtml(session.id)}"
+      ${isSessionRunning(session) ? "open" : ""}
+    >
+      <summary class="detail-summary">
+        <div>
+          <p class="panel-kicker">Arbeitsdetails</p>
+          <h3>Aktivitaet</h3>
+        </div>
+        ${renderStatusBadge(countLabel(activity.length, "1 Eintrag", `${activity.length} Eintraege`), "muted", {
+          compact: true,
+        })}
+      </summary>
+      <div class="detail-body">
+        <p class="detail-copy">
+          Werkzeuge, Reparaturen und Zwischenphasen erscheinen hier kompakt, ohne den Chatfluss zu stoeren.
+        </p>
+        <div class="activity-feed">
+          ${activity.map(renderActivityItem).join("")}
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function renderRunningMessage(session = state.activeSession) {
+  const stopping = Boolean(session?.stop_requested);
+  const tone = stopping ? "warning" : "running";
+  const headline = stopping ? "Stop-Anfrage liegt vor" : phaseHeadline(session?.current_phase);
+  const copy = stopping
+    ? "Der aktuelle Schritt wird sauber beendet. Danach bleibt der Thread fuer den naechsten Auftrag offen."
+    : currentThought() || "Der Agent arbeitet gerade im Hintergrund.";
+
+  return `
+    <div class="run-notice tone-${escapeHtml(tone)}">
+      <div class="run-notice-head">
+        <span class="run-notice-label">Agent aktiv</span>
+        ${renderStatusBadge(headline, tone, {
+          compact: true,
+          live: !stopping,
+        })}
+      </div>
+      <strong class="run-notice-title">${escapeHtml(headline)}</strong>
+      <p class="run-notice-copy">${escapeHtml(copy)}</p>
+      <p class="run-notice-foot">
+        Fortschritt, Dateien und Validierung aktualisieren sich im Bereich darunter.
+      </p>
     </div>
   `;
 }
 
 function renderChatInput() {
   const workspace = workspaceForSession(state.activeSession) || selectedWorkspace();
-  const chatHint = composerHint(workspace);
   const thought = currentThought();
   const running = isSessionRunning(state.activeSession);
   const modelInstallNotice = currentModelInstallNotice();
+  const notices = [
+    modelInstallNotice ? { label: "Modelle", text: modelInstallNotice, tone: "muted" } : null,
+    thought ? { label: "Laufstatus", text: thought, tone: running ? "running" : "muted" } : null,
+  ].filter(Boolean);
 
   return `
     <footer class="chat-input-shell">
       <div class="chat-input-inner">
-        <div class="chat-input-container">
-          <div class="composer-toolbar">
-            <span class="chat-hint">${escapeHtml(chatHint)}</span>
-            <button class="button-ghost" type="button" data-action="open-settings-modal">
-              Optionen
-            </button>
-          </div>
-          ${modelInstallNotice ? renderModelInstallStrip(modelInstallNotice) : ""}
-          ${thought ? renderThoughtStrip(thought) : ""}
+        <div class="chat-input-container composer-panel">
+          ${notices.length ? `<div class="composer-notice-row">${notices.map(renderComposerNotice).join("")}</div>` : ""}
           <div class="chat-input-row">
             <textarea
               id="composerInput"
@@ -1035,27 +2111,45 @@ function renderChatInput() {
               ${icon(running ? "stop" : "arrow")}
             </button>
           </div>
+          <div class="composer-meta-row">
+            ${renderMetaChip(workspace?.name || "Kein Projekt", "muted")}
+            ${renderMetaChip(state.composer.modelName || "Standardmodell", "muted")}
+            ${renderMetaChip(labelForAccessMode(state.composer.accessMode), "muted")}
+            ${renderMetaChip(currentExecutionProfileLabel(), "muted")}
+            <button class="button-ghost composer-options-button" type="button" data-action="open-settings-modal">
+              Optionen
+            </button>
+          </div>
         </div>
       </div>
     </footer>
   `;
 }
 
-function renderModelInstallStrip(notice) {
+function currentExecutionProfileLabel() {
+  return (
+    getExecutionProfiles().find((item) => item.id === state.composer.executionProfile)?.label ||
+    state.composer.executionProfile ||
+    "Standardprofil"
+  );
+}
+
+function renderComposerNotice(notice) {
   return `
-    <div class="model-install-strip">
-      <span class="thought-label">Modelle</span>
-      <span class="thought-text">${escapeHtml(notice)}</span>
+    <div class="composer-notice tone-${escapeHtml(notice.tone || "muted")}">
+      <span class="composer-notice-label">${escapeHtml(notice.label)}</span>
+      <span class="composer-notice-text">${escapeHtml(notice.text)}</span>
     </div>
   `;
 }
 
+function renderModelInstallStrip(notice) {
+  return renderComposerNotice({ label: "Modelle", text: notice, tone: "muted" });
+}
+
 function renderThoughtStrip(thought) {
   return `
-    <div class="thought-strip">
-      <span class="thought-label">Arbeitet gerade</span>
-      <span class="thought-text">${escapeHtml(thought)}</span>
-    </div>
+    ${renderComposerNotice({ label: "Laufstatus", text: thought, tone: "running" })}
   `;
 }
 
@@ -1070,11 +2164,11 @@ function renderSettingsModal() {
       <section class="modal-card">
         <header class="modal-head">
           <div>
-            <p class="modal-kicker">Chat-Optionen</p>
-            <h3>Einstellungen</h3>
+            <p class="modal-kicker">Laufzeit</p>
+            <h3>Agent-Einstellungen</h3>
           </div>
-          <button class="icon-button" type="button" data-action="close-settings-modal" aria-label="Schliessen">
-            ${icon("close")}
+          <button class="icon-button modal-close" type="button" data-action="close-settings-modal" aria-label="Schliessen">
+            <span class="modal-close-glyph" aria-hidden="true">X</span>
           </button>
         </header>
         <div class="modal-body settings-form">
@@ -1085,28 +2179,28 @@ function renderSettingsModal() {
             </select>
           </label>
           <label class="modal-field">
-            <span>Access Mode</span>
+            <span>Zugriffsmodus</span>
             <select id="accessModeSelect">
               ${renderAccessModeOptions()}
             </select>
           </label>
           <label class="modal-field">
-            <span>Model</span>
+            <span>Modell</span>
             <select id="modelNameSelect">
               ${renderModelOptions()}
             </select>
             <small>${escapeHtml(modelFieldHelperText())}</small>
           </label>
           <label class="modal-field">
-            <span>Execution</span>
+            <span>Ausfuehrungsprofil</span>
             <select id="executionProfileSelect">
               ${renderExecutionProfileOptions()}
             </select>
           </label>
           <label class="settings-toggle">
             <span>
-              <strong>Dry Run</strong>
-              <small>Werkzeuge nur simulieren</small>
+              <strong>Trockenlauf</strong>
+              <small>Werkzeuge nur simulieren, ohne Dateien zu veraendern</small>
             </span>
             <input id="dryRunToggle" type="checkbox"${state.composer.dryRun ? " checked" : ""} />
           </label>
@@ -1114,10 +2208,10 @@ function renderSettingsModal() {
             <div class="model-panel-head">
               <div>
                 <strong>Empfohlene Modelle</strong>
-                <small>Die App haelt die drei staerksten lokalen Modelle fuer Coding-Aufgaben bereit.</small>
+                <small>Die App haelt lokale Modelle fuer staerkere Coding- und Agent-Aufgaben verfuegbar.</small>
               </div>
               <button class="button-ghost model-panel-action" type="button" data-action="ensure-models">
-                Jetzt pruefen
+                Jetzt aktualisieren
               </button>
             </div>
             <div class="model-list">
@@ -1142,11 +2236,11 @@ function renderWorkspaceModal() {
       <section class="modal-card">
         <header class="modal-head">
           <div>
-            <p class="modal-kicker">Workspace</p>
-            <h3>${edit ? "Workspace bearbeiten" : "Workspace anlegen"}</h3>
+            <p class="modal-kicker">Projekt</p>
+            <h3>${edit ? "Projekt bearbeiten" : "Projekt anlegen"}</h3>
           </div>
-          <button class="icon-button" type="button" data-action="close-workspace-modal" aria-label="Schliessen">
-            ${icon("close")}
+          <button class="icon-button modal-close" type="button" data-action="close-workspace-modal" aria-label="Schliessen">
+            <span class="modal-close-glyph" aria-hidden="true">X</span>
           </button>
         </header>
         <div class="modal-body">
@@ -1158,7 +2252,7 @@ function renderWorkspaceModal() {
             <span>Ordnerpfad</span>
             <input id="workspacePathInput" type="text" placeholder="/Users/.../projekt" value="${escapeAttribute(state.ui.workspacePath)}" />
           </label>
-          <p class="modal-note">Der Workspace-Pfad wird in dieser Browser-Oberflaeche direkt als lokaler Ordnerpfad eingetragen.</p>
+          <p class="modal-note">Der Projektpfad wird in dieser Browser-Oberflaeche direkt als lokaler Ordnerpfad eingetragen.</p>
         </div>
         <footer class="modal-actions">
           <button class="button-secondary" type="button" data-action="close-workspace-modal">Abbrechen</button>
@@ -1180,6 +2274,114 @@ function renderToast() {
   `;
 }
 
+function renderValidationRun(run) {
+  const tone = validationRunTone(run);
+  const summary = [run.summary, run.excerpt].filter(Boolean).join(" · ");
+  return `
+    <article class="validation-item tone-${escapeHtml(tone)}">
+      <div class="validation-item-head">
+        ${renderStatusBadge(labelForValidationRunStatus(run.status), tone, { compact: true })}
+        <span class="validation-scope">${escapeHtml(labelForVerificationScope(run.verification_scope))}</span>
+      </div>
+      <code class="detail-code">${escapeHtml(run.command || "Ohne Befehl")}</code>
+      ${summary ? `<p class="validation-summary">${escapeHtml(shorten(summary, 180))}</p>` : ""}
+    </article>
+  `;
+}
+
+function renderFileChangeRow(change) {
+  return `
+    <div class="file-change-row">
+      ${renderStatusBadge(labelForFileOperation(change.operation), operationTone(change.operation), {
+        compact: true,
+      })}
+      <span class="file-change-path">${escapeHtml(shortenPath(change.path, 72))}</span>
+    </div>
+  `;
+}
+
+function renderIssueRow(issue) {
+  return `
+    <article class="issue-row tone-${escapeHtml(issue.tone)}">
+      <div class="issue-row-head">
+        ${renderStatusBadge(issue.label, issue.tone, { compact: true })}
+        ${issue.meta ? `<span class="issue-row-meta">${escapeHtml(issue.meta)}</span>` : ""}
+      </div>
+      <p class="issue-row-copy">${escapeHtml(issue.text)}</p>
+    </article>
+  `;
+}
+
+function renderActivityItem(item) {
+  return `
+    <article class="activity-item tone-${escapeHtml(item.tone || "muted")}">
+      <div class="activity-item-copy">
+        <div class="activity-item-head">
+          <strong>${escapeHtml(item.text)}</strong>
+          ${
+            item.count > 1
+              ? `<span class="activity-count">${escapeHtml(countLabel(item.count, "1x", `${item.count}x`))}</span>`
+              : ""
+          }
+        </div>
+        ${item.meta ? `<p class="activity-item-meta">${escapeHtml(item.meta)}</p>` : ""}
+      </div>
+      <span class="activity-time">${escapeHtml(formatTime(item.timestamp))}</span>
+    </article>
+  `;
+}
+
+function renderPhaseTrack(session) {
+  return `
+    <div class="phase-track">
+      ${buildPhaseSteps(session)
+        .map(
+          (step, index) => `
+            <div class="phase-step ${escapeHtml(step.state)}">
+              <span class="phase-step-index">${index + 1}</span>
+              <span class="phase-step-label">${escapeHtml(step.label)}</span>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderStatCell(item) {
+  return `
+    <div class="stat-cell tone-${escapeHtml(item.tone || "muted")}">
+      <span class="stat-cell-label">${escapeHtml(item.label)}</span>
+      <strong class="stat-cell-value">${escapeHtml(item.value)}</strong>
+    </div>
+  `;
+}
+
+function renderStatusBadge(label, tone = "muted", options = {}) {
+  const { live = false, compact = false } = options;
+  return `
+    <span class="status-badge ${escapeHtml(tone)} ${compact ? "compact" : ""}">
+      ${live ? `<span class="status-badge-dot" aria-hidden="true"></span>` : ""}
+      ${escapeHtml(label)}
+    </span>
+  `;
+}
+
+function renderMetaChip(label, tone = "muted") {
+  return `<span class="meta-chip ${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
+}
+
+function hasWorklogContent(session, logs) {
+  return Boolean(
+    (Array.isArray(logs) && logs.length) ||
+      session?.validation_runs?.length ||
+      session?.changed_files?.length ||
+      session?.blockers?.length ||
+      session?.diagnostics?.length ||
+      session?.tool_calls?.length,
+  );
+}
+
 function syncComposerControls() {
   syncTextArea("composerInput", state.composer.prompt);
 }
@@ -1190,6 +2392,11 @@ function captureUiSnapshot() {
     activeId: activeElement?.id || null,
     selectionStart: null,
     selectionEnd: null,
+    openDetailsIds: Array.from(
+      document.querySelectorAll("details[data-preserve-open][open]"),
+    )
+      .map((item) => item.id)
+      .filter(Boolean),
   };
 
   if (activeElement && typeof activeElement.selectionStart === "number") {
@@ -1202,31 +2409,41 @@ function captureUiSnapshot() {
 
 function restoreUiSnapshot(snapshot) {
   if (!snapshot?.activeId) {
-    return;
-  }
+    restoreDetailPanels(snapshot);
+  } else {
+    const target = document.getElementById(snapshot.activeId);
+    if (target) {
+      if (typeof target.focus === "function") {
+        try {
+          target.focus({ preventScroll: true });
+        } catch (error) {
+          target.focus();
+        }
+      }
 
-  const target = document.getElementById(snapshot.activeId);
-  if (!target) {
-    return;
-  }
-
-  if (typeof target.focus === "function") {
-    try {
-      target.focus({ preventScroll: true });
-    } catch (error) {
-      target.focus();
+      if (
+        typeof snapshot.selectionStart === "number" &&
+        typeof snapshot.selectionEnd === "number" &&
+        typeof target.setSelectionRange === "function"
+      ) {
+        const nextLength = typeof target.value === "string" ? target.value.length : 0;
+        const start = Math.min(snapshot.selectionStart, nextLength);
+        const end = Math.min(snapshot.selectionEnd, nextLength);
+        target.setSelectionRange(start, end);
+      }
     }
   }
 
-  if (
-    typeof snapshot.selectionStart === "number" &&
-    typeof snapshot.selectionEnd === "number" &&
-    typeof target.setSelectionRange === "function"
-  ) {
-    const nextLength = typeof target.value === "string" ? target.value.length : 0;
-    const start = Math.min(snapshot.selectionStart, nextLength);
-    const end = Math.min(snapshot.selectionEnd, nextLength);
-    target.setSelectionRange(start, end);
+  restoreDetailPanels(snapshot);
+}
+
+function restoreDetailPanels(snapshot) {
+  const openDetailsIds = Array.isArray(snapshot?.openDetailsIds) ? snapshot.openDetailsIds : [];
+  for (const id of openDetailsIds) {
+    const panel = document.getElementById(id);
+    if (panel instanceof HTMLDetailsElement) {
+      panel.open = true;
+    }
   }
 }
 
@@ -1304,6 +2521,78 @@ function focusComposer() {
   }
 }
 
+function threadPreview(session) {
+  const candidate = String(session?.last_message_preview || "").trim();
+  if (!candidate) {
+    return session?.task || "Noch keine Vorschau.";
+  }
+  if (
+    /^(geaendert|validierung|validation|blocker|repair blocker|status=|workflow_stage=)/i.test(candidate) ||
+    /internal:/i.test(candidate)
+  ) {
+    return session?.task || candidate;
+  }
+  return candidate;
+}
+
+function messageDisplayState(message, session) {
+  const raw = String(message?.content || "").trim();
+  if (!raw || message?.role !== "assistant" || !isLatestAssistantMessage(session, message) || !hasWorklogContent(session, state.logs)) {
+    return { content: raw, note: "" };
+  }
+
+  const cleaned = sanitizeAssistantMessageContent(raw);
+  const shortened = cleaned !== raw;
+  return {
+    content: cleaned || raw,
+    note: shortened ? "Weitere Arbeitsdetails stehen im aufklappbaren Bereich darunter." : "",
+  };
+}
+
+function isLatestAssistantMessage(session, message) {
+  const latestAssistant = [...conversationMessages(session)]
+    .reverse()
+    .find((item) => item.role === "assistant");
+  if (!latestAssistant) {
+    return false;
+  }
+  return latestAssistant.id === message.id;
+}
+
+function sanitizeAssistantMessageContent(text) {
+  const value = String(text || "").trim();
+  if (!value) {
+    return "";
+  }
+
+  const telemetryPatterns = [
+    /^(geaendert|changed|validierung|validation|blocker|repair blocker|letzter check|last check)/i,
+    /^status=/i,
+    /^workflow_stage=/i,
+    /internal:/i,
+  ];
+
+  const paragraphs = value
+    .split(/\n{2,}/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  const cleanedParagraphs = paragraphs.filter(
+    (paragraph) => !telemetryPatterns.some((pattern) => pattern.test(paragraph)),
+  );
+
+  if (paragraphs.length > 1 && cleanedParagraphs.length) {
+    return cleanedParagraphs[0];
+  }
+
+  const cleanedLines = value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !telemetryPatterns.some((pattern) => pattern.test(line)));
+
+  return cleanedLines.join("\n") || value;
+}
+
 function conversationMessages(session) {
   if (Array.isArray(session.messages) && session.messages.length) {
     return session.messages;
@@ -1329,9 +2618,7 @@ function conversationTimeline(session, logs) {
     timestamp: message.created_at,
     message,
   }));
-  const activityEntries = (logs || [])
-    .filter((record) => Boolean(describeLogRecord(record)))
-    .map((record) => ({
+  const activityEntries = buildActivityClusters(session, logs).map((record) => ({
       type: "activity",
       timestamp: record.timestamp,
       record,
@@ -1340,6 +2627,464 @@ function conversationTimeline(session, logs) {
   return [...messageEntries, ...activityEntries].sort((left, right) =>
     String(left.timestamp || "").localeCompare(String(right.timestamp || "")),
   );
+}
+
+function buildSessionOverview(session) {
+  const validation = buildValidationSnapshot(session);
+  const issueText = latestIssueText(session);
+
+  if (session?.stop_requested && isSessionRunning(session)) {
+    return {
+      tone: "warning",
+      title: "Beendet den aktuellen Schritt",
+      summary:
+        "Die Stop-Anfrage ist aktiv. Der Agent schliesst den laufenden Schritt sauber ab und bleibt danach fuer den naechsten Auftrag bereit.",
+    };
+  }
+
+  if (isSessionRunning(session)) {
+    return {
+      tone: "running",
+      title: phaseHeadline(session.current_phase),
+      summary: currentThought() || "Der Agent arbeitet gerade im Hintergrund.",
+    };
+  }
+
+  if (session?.status === "completed") {
+    return {
+      tone: "success",
+      title: "Ergebnis bereit",
+      summary: buildCompletionSummary(session, validation),
+    };
+  }
+
+  if (session?.status === "partial") {
+    return {
+      tone: "warning",
+      title: "Offene Punkte im Thread",
+      summary:
+        issueText ||
+        validation.summary ||
+        "Der Thread wurde mit offenen Punkten beendet und braucht noch einen gezielten Nachschritt.",
+    };
+  }
+
+  if (session?.status === "failed") {
+    return {
+      tone: "danger",
+      title: "Eingriff erforderlich",
+      summary:
+        issueText ||
+        validation.summary ||
+        session?.last_error ||
+        "Der Lauf ist mit einem Fehler beendet worden.",
+    };
+  }
+
+  return {
+    tone: "muted",
+    title: "Bereit fuer den naechsten Auftrag",
+    summary: "Dieser Thread wartet auf eine neue Nachricht.",
+  };
+}
+
+function buildCompletionSummary(session, validation) {
+  const parts = [];
+  if (session?.report?.summary) {
+    parts.push(session.report.summary);
+  } else if (session?.changed_files?.length) {
+    parts.push(
+      session.changed_files.length === 1
+        ? "1 Datei wurde angepasst."
+        : `${session.changed_files.length} Dateien wurden angepasst.`,
+    );
+  } else if (session?.final_response) {
+    parts.push("Die Antwort wurde bereitgestellt.");
+  }
+
+  if (validation.tone === "success") {
+    parts.push("Validierung bestaetigt.");
+  } else if (validation.tone === "warning" || validation.tone === "danger") {
+    parts.push(validation.summary);
+  }
+
+  return shorten(parts.filter(Boolean).join(" ") || "Der Thread ist abgeschlossen.", 220);
+}
+
+function buildRunHighlights(session) {
+  const validation = buildValidationSnapshot(session);
+  return [
+    {
+      label: "Phase",
+      value: labelForPhase(session?.current_phase),
+      tone: sessionStatusTone(session),
+    },
+    {
+      label: "Werkzeuge",
+      value: String(session?.tool_calls?.length || 0),
+      tone: "muted",
+    },
+    {
+      label: "Dateien",
+      value: String(session?.changed_files?.length || 0),
+      tone: session?.changed_files?.length ? "success" : "muted",
+    },
+    {
+      label: "Checks",
+      value: buildValidationSnapshot(session).statusLabel,
+      tone: validation.tone,
+    },
+  ];
+}
+
+function buildValidationSnapshot(session) {
+  const runs = Array.isArray(session?.validation_runs)
+    ? [...session.validation_runs].slice(-4).reverse()
+    : [];
+  const latest = runs[0] || null;
+  const changedCount = Array.isArray(session?.changed_files) ? session.changed_files.length : 0;
+
+  if (isSessionRunning(session) && session?.current_phase === "verifying") {
+    return {
+      tone: "running",
+      statusLabel: "Laeuft",
+      title: "Validierung laeuft",
+      summary: currentThought() || "Die letzten Aenderungen werden gerade geprueft.",
+      latest,
+      runs,
+    };
+  }
+
+  if (session?.validation_status === "passed") {
+    return {
+      tone: "success",
+      statusLabel: "Bestanden",
+      title: "Validierung bestaetigt",
+      summary:
+        latest?.summary ||
+        latest?.excerpt ||
+        "Die bestaetigenden Checks sind erfolgreich durchgelaufen.",
+      latest,
+      runs,
+    };
+  }
+
+  if (session?.validation_status === "failed") {
+    return {
+      tone: "danger",
+      statusLabel: "Fehler",
+      title: "Validierung fehlgeschlagen",
+      summary:
+        latest?.summary ||
+        latest?.excerpt ||
+        "Mindestens ein Check ist fehlgeschlagen.",
+      latest,
+      runs,
+    };
+  }
+
+  if (session?.validation_status === "blocked") {
+    return {
+      tone: "warning",
+      statusLabel: "Blockiert",
+      title: "Validierung blockiert",
+      summary:
+        latest?.summary ||
+        latest?.excerpt ||
+        "Der naechste Check konnte nicht sicher ausgefuehrt werden.",
+      latest,
+      runs,
+    };
+  }
+
+  if (changedCount > 0) {
+    return {
+      tone: "warning",
+      statusLabel: "Ausstehend",
+      title: "Validierung ausstehend",
+      summary: "Es liegen Aenderungen vor, aber noch kein bestaetigender Check.",
+      latest,
+      runs,
+    };
+  }
+
+  return {
+    tone: "muted",
+    statusLabel: "Nicht noetig",
+    title: "Noch keine Validierung",
+    summary: "In diesem Thread wurden bisher keine geaenderten Dateien bestaetigend geprueft.",
+    latest,
+    runs,
+  };
+}
+
+function buildIssueItems(session) {
+  const items = [];
+  const blockers = Array.isArray(session?.blockers) ? [...session.blockers].slice(-3).reverse() : [];
+
+  for (const blocker of blockers) {
+    items.push({
+      label: "Blocker",
+      tone: "danger",
+      text: blocker,
+      meta: null,
+    });
+  }
+
+  if (session?.last_error && !items.some((item) => item.text === session.last_error)) {
+    items.unshift({
+      label: "Fehler",
+      tone: "danger",
+      text: session.last_error,
+      meta: null,
+    });
+  }
+
+  const diagnostics = Array.isArray(session?.diagnostics)
+    ? [...session.diagnostics].slice(-3).reverse()
+    : [];
+  for (const diagnostic of diagnostics) {
+    const metaParts = [
+      diagnostic.command ? shorten(diagnostic.command, 56) : "",
+      diagnostic.file_hints?.[0] ? shortenPath(diagnostic.file_hints[0], 48) : "",
+    ].filter(Boolean);
+
+    items.push({
+      label:
+        diagnostic.severity === "warning"
+          ? "Hinweis"
+          : diagnostic.severity === "info"
+            ? "Info"
+            : "Diagnose",
+      tone:
+        diagnostic.severity === "warning"
+          ? "warning"
+          : diagnostic.severity === "info"
+            ? "muted"
+            : "danger",
+      text: shorten(
+        [diagnostic.summary, diagnostic.action_hints?.[0]].filter(Boolean).join(" · ") ||
+          "Diagnostischer Hinweis",
+        180,
+      ),
+      meta: metaParts.join(" · ") || null,
+    });
+  }
+
+  return items.slice(0, 5);
+}
+
+function latestIssueText(session) {
+  const issues = buildIssueItems(session);
+  return issues[0]?.text || "";
+}
+
+function buildActivityClusters(session, logs) {
+  const source = (Array.isArray(logs) ? logs : [])
+    .map((record) => {
+      const detail = describeLogRecord(record);
+      if (!detail) {
+        return null;
+      }
+      return {
+        ...detail,
+        timestamp: record.timestamp,
+      };
+    })
+    .filter(Boolean);
+
+  const items = source.length ? source : buildActivityFallback(session);
+  const clusters = [];
+
+  for (const item of items) {
+    const previous = clusters[clusters.length - 1];
+    if (
+      previous &&
+      item.groupKey &&
+      previous.groupKey === item.groupKey &&
+      previous.tone === item.tone
+    ) {
+      previous.count += 1;
+      previous.timestamp = item.timestamp;
+      previous.text = item.text;
+      if (item.meta) {
+        previous.meta = item.meta;
+      }
+      continue;
+    }
+
+    clusters.push({
+      ...item,
+      count: 1,
+    });
+  }
+
+  return clusters.slice(-12).reverse();
+}
+
+function buildActivityFallback(session) {
+  const toolCalls = Array.isArray(session?.tool_calls) ? session.tool_calls.slice(-8) : [];
+  return toolCalls.map((call) => {
+    const path = extractPathFromPayload({ tool_args: call.tool_args || {} });
+    const command = extractCommandFromPayload({ tool_args: call.tool_args || {} });
+    return {
+      text: call.success
+        ? describeToolActivity({
+            tool_name: call.tool_name,
+            tool_args: call.tool_args || {},
+            thought_summary: call.thought_summary,
+            expected_outcome: call.expected_outcome,
+          }) || "Werkzeugschritt abgeschlossen"
+        : `Schritt fehlgeschlagen: ${humanizeToolName(call.tool_name || "tool")}`,
+      meta: path ? shortenPath(path, 64) : command ? shorten(command, 72) : null,
+      tone: call.success ? "muted" : "danger",
+      timestamp: call.timestamp,
+      groupKey: null,
+    };
+  });
+}
+
+function buildPhaseSteps(session) {
+  const steps = [
+    { key: "planning", label: "Plan" },
+    { key: "exploring", label: "Analyse" },
+    { key: "editing", label: "Umsetzung" },
+    { key: "verifying", label: "Validierung" },
+    { key: "reporting", label: "Ergebnis" },
+  ];
+  const activeKey = phaseStepKey(session);
+  const activeIndex = Math.max(
+    0,
+    steps.findIndex((step) => step.key === activeKey),
+  );
+  const blocked = !isSessionRunning(session) && (session?.status === "failed" || session?.status === "partial");
+
+  return steps.map((step, index) => {
+    if (session?.status === "completed") {
+      return { ...step, state: "completed" };
+    }
+    if (index < activeIndex) {
+      return { ...step, state: "completed" };
+    }
+    if (index === activeIndex) {
+      return { ...step, state: blocked ? "blocked" : "active" };
+    }
+    return { ...step, state: "pending" };
+  });
+}
+
+function phaseStepKey(session) {
+  const phase = String(session?.current_phase || "").trim();
+  if (phase === "planning") return "planning";
+  if (phase === "exploring") return "exploring";
+  if (phase === "editing") return "editing";
+  if (phase === "verifying" || phase === "repairing") return "verifying";
+  if (phase === "reporting" || phase === "completed") return "reporting";
+  if (phase === "blocked") {
+    if (session?.validation_status === "failed" || session?.validation_status === "blocked" || session?.validation_runs?.length) {
+      return "verifying";
+    }
+    if (session?.changed_files?.length) {
+      return "editing";
+    }
+    return "exploring";
+  }
+  return "planning";
+}
+
+function phaseHeadline(phase) {
+  if (phase === "planning") return "Plant den naechsten Schritt";
+  if (phase === "exploring") return "Sammelt Projektkontext";
+  if (phase === "editing") return "Setzt die Aenderung um";
+  if (phase === "verifying") return "Prueft die Aenderung";
+  if (phase === "repairing") return "Repariert nach einem Check";
+  if (phase === "reporting") return "Bereitet das Ergebnis auf";
+  if (phase === "blocked") return "Braucht einen Eingriff";
+  if (phase === "completed") return "Ergebnis bereit";
+  return "Agent arbeitet";
+}
+
+function labelForPhase(phase) {
+  if (phase === "planning") return "Plan";
+  if (phase === "exploring") return "Analyse";
+  if (phase === "editing") return "Umsetzung";
+  if (phase === "verifying") return "Validierung";
+  if (phase === "repairing") return "Reparatur";
+  if (phase === "reporting") return "Ergebnis";
+  if (phase === "blocked") return "Blockiert";
+  if (phase === "completed") return "Abgeschlossen";
+  return phase || "-";
+}
+
+function sessionBadgeText(session) {
+  if (session?.stop_requested && isSessionRunning(session)) return "Stoppt";
+  if (session?.status === "queued") return "Startet";
+  if (session?.status === "running") return "Aktiv";
+  if (session?.status === "completed") return "Fertig";
+  if (session?.status === "partial") return session?.blockers?.length ? "Blockiert" : "Offen";
+  if (session?.status === "failed") return "Fehler";
+  return "Bereit";
+}
+
+function sessionStatusTone(session) {
+  if (session?.stop_requested && isSessionRunning(session)) return "warning";
+  if (session?.status === "queued" || session?.status === "running") return "running";
+  if (session?.status === "completed") return "success";
+  if (session?.status === "partial") {
+    return session?.blockers?.length || session?.validation_status === "failed" || session?.validation_status === "blocked"
+      ? "warning"
+      : "muted";
+  }
+  if (session?.status === "failed") return "danger";
+  return "muted";
+}
+
+function validationRunTone(run) {
+  if (run?.status === "passed") return "success";
+  if (run?.status === "failed" || run?.status === "timeout") return "danger";
+  if (run?.status === "blocked") return "warning";
+  return "muted";
+}
+
+function labelForValidationRunStatus(status) {
+  if (status === "passed") return "Bestanden";
+  if (status === "failed") return "Fehler";
+  if (status === "blocked") return "Blockiert";
+  if (status === "timeout") return "Timeout";
+  return status || "-";
+}
+
+function labelForVerificationScope(scope) {
+  if (scope === "runtime") return "Runtime";
+  if (scope === "structural") return "Struktur";
+  if (scope === "static") return "Static";
+  if (scope === "syntax") return "Syntax";
+  return scope || "Check";
+}
+
+function labelForFileOperation(operation) {
+  if (operation === "create") return "Neu";
+  if (operation === "write" || operation === "update" || operation === "modify") return "Update";
+  if (operation === "delete") return "Entfernt";
+  if (operation === "append") return "Anhang";
+  if (operation === "patch" || operation === "replace") return "Patch";
+  return humanizeToolName(operation || "Datei");
+}
+
+function operationTone(operation) {
+  if (operation === "delete") return "warning";
+  if (["create", "write", "update", "modify", "append", "patch", "replace"].includes(operation || "")) {
+    return "success";
+  }
+  return "muted";
+}
+
+function shouldOpenDetailPanel(tone, session) {
+  return tone === "danger" || tone === "warning" || (tone === "running" && isSessionRunning(session));
+}
+
+function countLabel(count, singular, plural) {
+  return Number(count) === 1 ? singular : plural;
 }
 
 function describeLogRecord(record) {
@@ -1368,46 +3113,59 @@ function describeLogRecord(record) {
       text: `Tool blockiert: ${humanizeToolName(toolName || "tool")}`,
       meta: ((payload.reasons || []).join(" · ") || "").trim() || null,
       tone: "danger",
+      groupKey: `tool-blocked:${toolName || "tool"}`,
     };
   }
 
-  if (record.event === "tool_error" || record.event === "tool_execution_error" || record.event === "tool_validation_error") {
+  if (
+    record.event === "tool_error" ||
+    record.event === "tool_execution_error" ||
+    record.event === "tool_validation_error"
+  ) {
     return {
-      text: `Fehler in ${humanizeToolName(toolName || "tool")}`,
+      text: `Werkzeugfehler in ${humanizeToolName(toolName || "tool")}`,
       meta: message || null,
       tone: "danger",
+      groupKey: `tool-error:${toolName || "tool"}`,
     };
   }
 
   if (record.event === "task_stop_requested") {
     return {
-      text: "Stop angefordert",
-      meta: "Der Agent beendet den aktuellen Schritt und stoppt danach.",
-      tone: "neutral",
+      text: "Stop-Anfrage registriert",
+      meta: "Der aktuelle Schritt wird noch sauber abgeschlossen.",
+      tone: "warning",
+      groupKey: "task-stop-requested",
     };
   }
 
   if (record.event === "task_stopped") {
     return {
-      text: "Agent gestoppt",
-      meta: "Die laufende Session wurde angehalten.",
-      tone: "neutral",
+      text: "Lauf angehalten",
+      meta: "Der Thread wurde auf Wunsch gestoppt.",
+      tone: "warning",
+      groupKey: "task-stopped",
     };
   }
 
   if (record.event === "task_crashed") {
     return {
-      text: "Agent abgestuerzt",
-      meta: message || "Unbekannter Laufzeitfehler",
+      text: "Laufzeitfehler",
+      meta: message || "Unbekannter Fehler",
       tone: "danger",
+      groupKey: "task-crashed",
     };
   }
 
-  if (record.event === "task_finished" && payload.status !== "completed") {
+  if (record.event === "task_finished") {
     return {
-      text: `Task beendet: ${labelForStatus(payload.status || "")}`,
+      text:
+        payload.status === "completed"
+          ? "Lauf abgeschlossen"
+          : `Lauf beendet: ${labelForStatus(payload.status || "")}`,
       meta: String(payload.stop_reason || payload.workflow_stage || "").trim() || null,
-      tone: payload.status === "failed" ? "danger" : "neutral",
+      tone: payload.status === "completed" ? "success" : payload.status === "failed" ? "danger" : "warning",
+      groupKey: "task-finished",
     };
   }
 
@@ -1420,20 +3178,52 @@ function describeAgentProgressLog(event, payload) {
     return null;
   }
 
-  let meta = null;
-  if (event === "router_retry_started") {
-    meta = "Der erste Routing-Versuch war zu langsam. Ich versuche es schlanker erneut.";
-  } else if (event === "content_generation_started") {
-    meta = "Der Agent baut gerade den eigentlichen Dateiinhalt.";
-  } else if (event === "path_generation_started") {
-    meta = "Ich leite gerade einen sinnvollen Zielpfad aus dem Auftrag ab.";
-  }
-
   return {
     text,
-    meta,
-    tone: "neutral",
+    meta: describeActivityMeta(event, payload),
+    tone: event.includes("retry") ? "warning" : event.includes("finished") ? "success" : "muted",
+    groupKey: describeActivityGroupKey(event, payload),
   };
+}
+
+function describeActivityMeta(event, payload) {
+  const path = extractPathFromPayload(payload || {});
+  const model = String(payload?.model || "").trim();
+
+  if ((event === "path_generation_started" || event === "path_generation_finished") && path) {
+    return shortenPath(path, 64);
+  }
+  if (event === "content_generation_started" && path) {
+    return shortenPath(path, 64);
+  }
+  if (
+    event === "content_generation_fallback_started" ||
+    event === "content_generation_retry_started" ||
+    event === "content_generation_recovery_started"
+  ) {
+    return describeContentGenerationRetry(path, payload);
+  }
+  if (event === "content_generation_progress" || event === "final_response_generation_progress") {
+    return model ? shorten(model, 28) : null;
+  }
+  if (event === "router_retry_started") {
+    return "Fallback auf kompakteres Routing";
+  }
+  return null;
+}
+
+function describeActivityGroupKey(event, payload) {
+  const path = extractPathFromPayload(payload || {});
+  if (event === "content_generation_progress") {
+    return `progress:content:${path || "-"}`;
+  }
+  if (event === "final_response_generation_progress") {
+    return "progress:final-response";
+  }
+  if (event === "router_retry_started") {
+    return "router-retry";
+  }
+  return null;
 }
 
 function describeToolRequestLog(toolName, payload) {
@@ -1445,80 +3235,99 @@ function describeToolRequestLog(toolName, payload) {
 
   if (toolName === "inspect_workspace") {
     return {
-      text: "Analysiert den Workspace",
-      meta: focus ? shorten(focus, 52) : null,
-      tone: "neutral",
+      text: "Projektkontext wird gesammelt",
+      meta: focus ? shorten(focus, 60) : null,
+      tone: "muted",
+      groupKey: focus ? `inspect:${focus}` : "inspect-workspace",
     };
   }
 
   if (toolName === "search_in_files") {
     return {
-      text: "Sucht im Projekt",
+      text: "Projekt wird durchsucht",
       meta: query || null,
-      tone: "neutral",
+      tone: "muted",
+      groupKey: query ? `search:${query}` : "search-project",
     };
   }
 
   if (toolName === "read_file") {
     return {
-      text: "Liest Datei",
-      meta: path ? shortenPath(path, 56) : null,
-      tone: "neutral",
+      text: "Datei wird gelesen",
+      meta: path ? shortenPath(path, 64) : null,
+      tone: "muted",
+      groupKey: path ? `read:${path}` : "read-file",
     };
   }
 
   if (toolName === "list_files") {
     return {
-      text: "Prueft die Projektstruktur",
-      meta: path && path !== "." ? shortenPath(path, 56) : null,
-      tone: "neutral",
+      text: "Projektstruktur wird geprueft",
+      meta: path && path !== "." ? shortenPath(path, 64) : null,
+      tone: "muted",
+      groupKey: path && path !== "." ? `list:${path}` : "list-files",
     };
   }
 
   if (["create_file", "write_file", "append_file", "replace_in_file", "patch_file", "delete_file"].includes(toolName || "")) {
     return {
-      text: "Bearbeitet Datei",
-      meta: path ? shortenPath(path, 56) : null,
-      tone: "neutral",
+      text: toolName === "delete_file" ? "Datei wird entfernt" : "Datei wird bearbeitet",
+      meta: path ? shortenPath(path, 64) : null,
+      tone: "running",
+      groupKey: path ? `write:${path}` : `write:${toolName}`,
     };
   }
 
-  if (toolName === "run_shell" || toolName === "run_tests") {
+  if (toolName === "run_tests") {
     return {
-      text: "Fuehrt Befehl aus",
-      meta: command ? shorten(command, 68) : humanizeToolName(toolName),
-      tone: "command",
+      text: "Check wird ausgefuehrt",
+      meta: command ? shorten(command, 76) : null,
+      tone: "running",
+      groupKey: command ? `validation:${command}` : "validation-run",
+    };
+  }
+
+  if (toolName === "run_shell") {
+    return {
+      text: "Befehl wird ausgefuehrt",
+      meta: command ? shorten(command, 76) : humanizeToolName(toolName),
+      tone: "running",
+      groupKey: command ? `command:${command}` : "shell-run",
     };
   }
 
   if (toolName === "git_status") {
     return {
-      text: "Prueft den Git-Status",
+      text: "Git-Status wird geprueft",
       meta: null,
-      tone: "neutral",
+      tone: "muted",
+      groupKey: "git-status",
     };
   }
 
   if (toolName === "git_diff" || toolName === "show_diff") {
     return {
-      text: "Prueft Aenderungen im Diff",
+      text: "Diff wird geprueft",
       meta: null,
-      tone: "neutral",
+      tone: "muted",
+      groupKey: "git-diff",
     };
   }
 
   if (toolName === "git_log") {
     return {
-      text: "Liest die letzten Commits",
+      text: "Commit-Verlauf wird gelesen",
       meta: null,
-      tone: "neutral",
+      tone: "muted",
+      groupKey: "git-log",
     };
   }
 
   return {
-    text: `Startet ${humanizeToolName(toolName || "Tool")}`,
-    meta: null,
-    tone: command ? "command" : "neutral",
+    text: `${humanizeToolName(toolName || "Tool")} wird gestartet`,
+    meta: command ? shorten(command, 76) : null,
+    tone: command ? "running" : "muted",
+    groupKey: null,
   };
 }
 
@@ -1529,9 +3338,10 @@ function describeToolResultLog(toolName, payload) {
 
   if (!success) {
     return {
-      text: `Fehler in ${humanizeToolName(toolName || "tool")}`,
+      text: `Schritt fehlgeschlagen: ${humanizeToolName(toolName || "tool")}`,
       meta: message || null,
       tone: "danger",
+      groupKey: null,
     };
   }
 
@@ -1544,31 +3354,44 @@ function describeToolResultLog(toolName, payload) {
     return {
       text: count === 0 ? "Keine Treffer gefunden" : `${count} Treffer gefunden`,
       meta: null,
-      tone: "neutral",
+      tone: "muted",
+      groupKey: null,
     };
   }
 
-  if (toolName === "run_shell" || toolName === "run_tests") {
+  if (toolName === "run_tests") {
+    return {
+      text: "Check abgeschlossen",
+      meta: message ? shorten(message, 120) : null,
+      tone: "success",
+      groupKey: null,
+    };
+  }
+
+  if (toolName === "run_shell") {
     return {
       text: "Befehl abgeschlossen",
-      meta: message ? shorten(message, 80) : null,
+      meta: message ? shorten(message, 120) : null,
       tone: "success",
+      groupKey: null,
     };
   }
 
   if (changedFiles > 0) {
     return {
-      text: changedFiles === 1 ? "1 Datei geaendert" : `${changedFiles} Dateien geaendert`,
-      meta: message && !/changed|updated|created|deleted/i.test(message) ? shorten(message, 80) : null,
+      text: changedFiles === 1 ? "1 Datei aktualisiert" : `${changedFiles} Dateien aktualisiert`,
+      meta: message && !/changed|updated|created|deleted/i.test(message) ? shorten(message, 120) : null,
       tone: "success",
+      groupKey: null,
     };
   }
 
   if (message) {
     return {
-      text: shorten(message, 88),
+      text: shorten(message, 96),
       meta: null,
       tone: "success",
+      groupKey: null,
     };
   }
 
@@ -1724,25 +3547,25 @@ function renderModelProgressBar(model) {
 
 function composerPlaceholder(workspace) {
   if (!workspace) {
-    return "Lege zuerst links einen Workspace an und trage den Ordnerpfad ein";
+    return "Verbinde zuerst links ein lokales Projekt";
   }
   if (state.activeSession) {
-    return `Schreibe in diesem Chat weiter (${workspace.name})`;
+    return `Beschreibe den naechsten Schritt fuer ${workspace.name}`;
   }
-  return `Starte einen neuen Chat im Workspace ${workspace.name}`;
+  return `Starte einen neuen Thread in ${workspace.name}`;
 }
 
 function composerHint(workspace) {
   if (!workspace) {
-    return "Lege zuerst einen Workspace an";
+    return "Projekt auswaehlen";
   }
   if (!state.activeSession) {
-    return "Starte einen neuen Chat im Workspace";
+    return "Neuer Thread";
   }
   if (state.activeSession.stop_requested) {
-    return "Stoppe laufende Session...";
+    return "Stop wird vorbereitet";
   }
-  return "Der Agent protokolliert seine Schritte direkt im Chat";
+  return "Antwort oder Korrektur senden";
 }
 
 function applyModelCatalog(catalog) {
@@ -1804,35 +3627,101 @@ function showToast(message, tone = "success") {
   }, 3200);
 }
 
-function fetchJSON(url, options) {
-  return fetch(url, options).then(async (response) => {
-    if (!response.ok) {
-      let detail = response.statusText;
-      try {
-        const payload = await response.json();
-        detail = payload.detail || JSON.stringify(payload);
-      } catch (error) {
-        detail = await response.text();
-      }
-      throw new Error(detail || `HTTP ${response.status}`);
+class ApiError extends Error {
+  constructor(message, { status, payload = null, retryAfter = 0 } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.payload = payload;
+    this.retryAfter = retryAfter;
+  }
+}
+
+async function fetchJSON(url, options = {}) {
+  const requestOptions = buildRequestOptions(options);
+  const response = await fetch(url, requestOptions);
+  if (!response.ok) {
+    const payload = await readResponsePayload(response);
+    const detail =
+      payload && typeof payload === "object" && "detail" in payload
+        ? String(payload.detail || "")
+        : typeof payload === "string"
+          ? payload
+          : response.statusText;
+    const error = new ApiError(detail || `HTTP ${response.status}`, {
+      status: response.status,
+      payload,
+      retryAfter: Number(response.headers.get("retry-after") || 0),
+    });
+    if (response.status === 401 && shouldHandleUnauthorized(url)) {
+      await handleUnauthorizedResponse(detail || "Sitzung abgelaufen. Bitte erneut anmelden.");
     }
-    if (response.status === 204) {
-      return null;
+    throw error;
+  }
+  if (response.status === 204) {
+    return null;
+  }
+  return readResponsePayload(response);
+}
+
+function buildRequestOptions(options = {}) {
+  const nextOptions = { ...options, credentials: options.credentials || "same-origin" };
+  const method = String(nextOptions.method || "GET").toUpperCase();
+  const headers = new Headers(nextOptions.headers || {});
+  if (!headers.has("Accept")) {
+    headers.set("Accept", "application/json");
+  }
+  if (isMutatingMethod(method)) {
+    const csrfToken = readCookieValue("__Host-marc_csrf") || readCookieValue("marc_csrf");
+    if (csrfToken && !headers.has(state.auth.csrfHeaderName || "X-CSRF-Token")) {
+      headers.set(state.auth.csrfHeaderName || "X-CSRF-Token", csrfToken);
     }
-    const contentType = response.headers.get("content-type") || "";
-    const text = await response.text();
-    if (!text) {
-      return null;
+  }
+  nextOptions.headers = headers;
+  return nextOptions;
+}
+
+async function readResponsePayload(response) {
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+  if (contentType.includes("application/json")) {
+    return JSON.parse(text);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    return text;
+  }
+}
+
+function shouldHandleUnauthorized(url) {
+  const target = String(url || "");
+  return target.startsWith("/api/") && !target.startsWith("/api/auth/");
+}
+
+function isMutatingMethod(method) {
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(String(method || "").toUpperCase());
+}
+
+function readCookieValue(name) {
+  const source = typeof document === "undefined" ? "" : String(document.cookie || "");
+  for (const part of source.split(";")) {
+    const [rawKey, ...rest] = part.trim().split("=");
+    if (rawKey === name) {
+      return decodeURIComponent(rest.join("="));
     }
-    if (contentType.includes("application/json")) {
-      return JSON.parse(text);
-    }
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      return text;
-    }
-  });
+  }
+  return "";
+}
+
+function loginRetryAfterSeconds() {
+  if (!state.auth.rateLimitedUntil) {
+    return 0;
+  }
+  return Math.max(0, Math.ceil((state.auth.rateLimitedUntil - Date.now()) / 1000));
 }
 
 function hydrateRouteFromLocation() {
@@ -1883,9 +3772,9 @@ function readStoredPreferences() {
 }
 
 function labelForAccessMode(mode) {
-  if (mode === "safe") return "Safe";
-  if (mode === "approval") return "Approval";
-  if (mode === "full") return "Full Access";
+  if (mode === "safe") return "Nur Lesen";
+  if (mode === "approval") return "Mit Freigabe";
+  if (mode === "full") return "Voller Zugriff";
   return mode || "-";
 }
 
@@ -1970,7 +3859,155 @@ function roleLabel(role) {
 }
 
 function renderRichText(text) {
-  return escapeHtml(String(text || "")).replaceAll("\n", "<br />");
+  return renderMarkdownDocument(String(text || ""));
+}
+
+function renderMarkdownDocument(value) {
+  const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
+  const html = [];
+  const paragraph = [];
+  const quote = [];
+  const code = [];
+  let listItems = [];
+  let listType = null;
+  let inCode = false;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) {
+      return;
+    }
+    html.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+    paragraph.length = 0;
+  };
+
+  const flushList = () => {
+    if (!listItems.length || !listType) {
+      return;
+    }
+    html.push(
+      `<${listType} class="rich-list">${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</${listType}>`,
+    );
+    listItems = [];
+    listType = null;
+  };
+
+  const flushQuote = () => {
+    if (!quote.length) {
+      return;
+    }
+    html.push(`<blockquote>${renderMarkdownDocument(quote.join("\n"))}</blockquote>`);
+    quote.length = 0;
+  };
+
+  const flushCode = () => {
+    if (!code.length) {
+      return;
+    }
+    html.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+    code.length = 0;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\t/g, "  ");
+    const trimmed = line.trim();
+
+    if (/^```/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      if (inCode) {
+        flushCode();
+        inCode = false;
+      } else {
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      code.push(rawLine);
+      continue;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      flushList();
+      flushQuote();
+      const level = Math.min(headingMatch[1].length, 3);
+      html.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+      continue;
+    }
+
+    if (/^>\s?/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      quote.push(trimmed.replace(/^>\s?/, ""));
+      continue;
+    }
+
+    const orderedMatch = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (orderedMatch) {
+      flushParagraph();
+      flushQuote();
+      if (listType && listType !== "ol") {
+        flushList();
+      }
+      listType = "ol";
+      listItems.push(orderedMatch[1]);
+      continue;
+    }
+
+    const unorderedMatch = trimmed.match(/^[-*]\s+(.+)$/);
+    if (unorderedMatch) {
+      flushParagraph();
+      flushQuote();
+      if (listType && listType !== "ul") {
+        flushList();
+      }
+      listType = "ul";
+      listItems.push(unorderedMatch[1]);
+      continue;
+    }
+
+    flushQuote();
+    flushList();
+    paragraph.push(trimmed);
+  }
+
+  flushParagraph();
+  flushList();
+  flushQuote();
+  flushCode();
+
+  return html.join("");
+}
+
+function renderInlineMarkdown(text) {
+  const codeTokens = [];
+  let value = String(text || "").replace(/`([^`]+)`/g, (_, code) => {
+    const token = `@@CODE${codeTokens.length}@@`;
+    codeTokens.push(code);
+    return token;
+  });
+
+  value = escapeHtml(value)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^)\s]+|\/[^)\s]+)\)/g,
+      (_, label, href) =>
+        `<a class="rich-link" href="${escapeAttribute(href)}"${String(href).startsWith("http") ? ' target="_blank" rel="noreferrer noopener"' : ""}>${label}</a>`,
+    );
+
+  return value.replace(/@@CODE(\d+)@@/g, (_, index) => `<code>${escapeHtml(codeTokens[Number(index)] || "")}</code>`);
 }
 
 function formatSessionTimestamp(value) {
@@ -2039,11 +4076,11 @@ function currentThought() {
   }
 
   if (state.activeSession?.stop_requested) {
-    return "Stop-Anfrage aktiv. Der laufende Schritt wird gerade sauber beendet.";
+    return "Der laufende Schritt wird sauber beendet.";
   }
 
   if (state.activeSession?.status === "queued" && state.logs.length === 0) {
-    return "Ich bereite gerade die Aufgabe vor.";
+    return "Der Lauf wird vorbereitet.";
   }
 
   for (const record of [...state.logs].reverse()) {
@@ -2069,7 +4106,7 @@ function currentThought() {
     }
   }
 
-  return "Ich arbeite gerade an deinem Auftrag.";
+  return "Der Agent arbeitet am aktuellen Auftrag.";
 }
 
 function describeCurrentStep(record) {
@@ -2097,26 +4134,26 @@ function describeAgentProgressActivity(event, payload) {
   const path = extractPathFromPayload(payload || {});
 
   if (event === "router_input") {
-    return "Ich ordne gerade deine Anfrage ein.";
+    return "Auftrag wird eingeordnet";
   }
   if (event === "router_retry_started") {
-    return "Der erste Router-Versuch war zu langsam. Ich probiere eine schlankere Einordnung.";
+    return "Einordnung wird kompakter neu versucht";
   }
   if (event === "router_fast_path" || event === "router_timeout_fast_fallback") {
-    return "Ich habe die Aufgabe klar erkannt und gehe direkt zum naechsten Schritt.";
+    return "Auftrag ist klar und geht direkt weiter";
   }
   if (event === "path_generation_started") {
-    return "Ich bestimme gerade die passende Zieldatei.";
+    return "Zielpfad wird bestimmt";
   }
   if (event === "path_generation_skipped" || event === "path_generation_finished") {
     return path
-      ? `Ich verwende ${shortenPath(path, 56)} als Zieldatei.`
-      : "Ich habe den Zielpfad festgelegt.";
+      ? `Zieldatei festgelegt: ${shortenPath(path, 56)}`
+      : "Zielpfad ist festgelegt";
   }
   if (event === "content_generation_started") {
     return path
-      ? `Ich entwerfe gerade den Inhalt fuer ${shortenPath(path, 56)}.`
-      : "Ich entwerfe gerade den Dateiinhalt.";
+      ? `Inhalt wird erstellt fuer ${shortenPath(path, 56)}`
+      : "Dateiinhalt wird erstellt";
   }
   if (event === "content_generation_progress") {
     return describeStreamingModelProgress("content", payload);
@@ -2124,28 +4161,57 @@ function describeAgentProgressActivity(event, payload) {
   if (event === "content_generation_retry_started") {
     return describeContentGenerationRetry(path, payload);
   }
-  if (event === "content_generation_fallback_started") {
+  if (event === "content_generation_retry_error") {
+    return describeContentGenerationRetryError(path, payload);
+  }
+  if (event === "content_generation_recovery_started") {
+    return describeContentGenerationRecovery(path, payload);
+  }
+  if (event === "content_generation_recovery_finished") {
+    return describeContentGenerationRecoveryFinished(path, payload);
+  }
+  if (event === "content_generation_recovery_unavailable") {
     return path
-      ? `Das Modell war zu langsam. Ich nutze fuer ${shortenPath(path, 56)} eine lokale Vorlage.`
-      : "Das Modell war zu langsam. Ich nutze eine lokale Vorlage.";
+      ? `Kein sicherer lokaler Recovery-Pfad fuer ${shortenPath(path, 56)}`
+      : "Kein sicherer lokaler Recovery-Pfad";
+  }
+  if (event === "content_generation_fallback_started") {
+    const source = String(payload?.source || "").trim();
+    if (source === "starter_scaffold") {
+      return path
+        ? `Lokales Starter-Grundgeruest wird vorbereitet fuer ${shortenPath(path, 56)}`
+        : "Lokales Starter-Grundgeruest wird vorbereitet";
+    }
+    return path
+      ? `Fallback aktiv fuer ${shortenPath(path, 56)}`
+      : "Fallback fuer die Inhaltserstellung aktiv";
   }
   if (event === "content_generation_finished") {
     return path
-      ? `Der Inhalt fuer ${shortenPath(path, 56)} ist vorbereitet.`
-      : "Der Dateiinhalt ist vorbereitet.";
+      ? `Inhalt vorbereitet fuer ${shortenPath(path, 56)}`
+      : "Dateiinhalt vorbereitet";
   }
   if (event === "content_generation_retry_finished") {
     return path
-      ? `Der kompaktere Versuch fuer ${shortenPath(path, 56)} hat funktioniert.`
-      : "Der kompaktere Versuch hat funktioniert.";
+      ? `Kompakter Retry erfolgreich fuer ${shortenPath(path, 56)}`
+      : "Kompakter Retry erfolgreich";
   }
   if (event === "content_generation_fallback_finished") {
+    const source = String(payload?.source || "").trim();
+    if (source === "starter_scaffold") {
+      return path
+        ? `Starter-Grundgeruest bereit fuer ${shortenPath(path, 56)}`
+        : "Starter-Grundgeruest ist bereit";
+    }
     return path
-      ? `Die lokale Vorlage fuer ${shortenPath(path, 56)} ist bereit.`
-      : "Die lokale Vorlage ist bereit.";
+      ? `Fallback-Inhalt bereit fuer ${shortenPath(path, 56)}`
+      : "Fallback-Inhalt ist bereit";
+  }
+  if (event === "final_block_reason") {
+    return describeFinalBlock(payload);
   }
   if (event === "final_response_generation_started") {
-    return "Ich formuliere gerade die Antwort.";
+    return "Antwort wird formuliert";
   }
   if (event === "final_response_generation_progress") {
     return describeStreamingModelProgress("final_response", payload);
@@ -2170,7 +4236,7 @@ function describeDecisionActivity(payload) {
   }
 
   if (payload.action_type === "final") {
-    return "Ich formuliere gerade die Antwort.";
+    return "Antwort wird formuliert";
   }
 
   const summary = normalizeProgressText(payload.thought_summary || payload.expected_outcome || "");
@@ -2178,7 +4244,7 @@ function describeDecisionActivity(payload) {
     return summary;
   }
 
-  return "Ich plane gerade den naechsten Schritt.";
+  return "Naechster Schritt wird geplant";
 }
 
 function describeToolActivity(payload, options = {}) {
@@ -2201,62 +4267,62 @@ function describeToolActivity(payload, options = {}) {
 
   if (toolName === "create_file") {
     return path
-      ? `Ich lege gerade ${shortenPath(path, 56)} an.`
-      : "Ich lege gerade neue Dateien an.";
+      ? `Neue Datei: ${shortenPath(path, 56)}`
+      : "Neue Datei wird angelegt";
   }
   if (["write_file", "append_file", "replace_in_file", "patch_file"].includes(toolName)) {
     return path
-      ? `Ich passe gerade ${shortenPath(path, 56)} an.`
-      : "Ich passe gerade Dateien an.";
+      ? `Datei wird angepasst: ${shortenPath(path, 56)}`
+      : "Datei wird angepasst";
   }
   if (toolName === "delete_file") {
     return path
-      ? `Ich entferne gerade ${shortenPath(path, 56)}.`
-      : "Ich entferne gerade eine Datei.";
+      ? `Datei wird entfernt: ${shortenPath(path, 56)}`
+      : "Datei wird entfernt";
   }
   if (toolName === "read_file") {
     return path
-      ? `Ich lese gerade ${shortenPath(path, 56)}.`
-      : "Ich lese gerade relevante Dateien.";
+      ? `Datei wird gelesen: ${shortenPath(path, 56)}`
+      : "Relevante Dateien werden gelesen";
   }
   if (toolName === "search_in_files") {
     return query
-      ? `Ich suche gerade nach "${shorten(query, 32)}" im Projekt.`
-      : "Ich suche gerade die passende Stelle im Projekt.";
+      ? `Projekt durchsuchen nach "${shorten(query, 32)}"`
+      : "Projekt wird nach der passenden Stelle durchsucht";
   }
   if (toolName === "list_files") {
     return path && path !== "."
-      ? `Ich pruefe gerade die Projektstruktur in ${shortenPath(path, 56)}.`
-      : "Ich pruefe gerade die Projektstruktur.";
+      ? `Projektstruktur wird geprueft: ${shortenPath(path, 56)}`
+      : "Projektstruktur wird geprueft";
   }
   if (toolName === "inspect_workspace") {
     return focus
-      ? `Ich verschaffe mir gerade einen Ueberblick ueber ${shorten(focus, 40)}.`
-      : "Ich verschaffe mir gerade einen Ueberblick ueber das Projekt.";
+      ? `Projektkontext wird gesammelt: ${shorten(focus, 40)}`
+      : "Projektkontext wird gesammelt";
   }
   if (toolName === "run_tests") {
     return command
-      ? `Ich pruefe die Aenderungen gerade mit ${shorten(command, 56)}.`
-      : "Ich pruefe gerade die Aenderungen mit Tests oder Checks.";
+      ? `Check laeuft: ${shorten(command, 56)}`
+      : "Checks werden ausgefuehrt";
   }
   if (toolName === "run_shell") {
     return command
-      ? `Ich fuehre gerade ${shorten(command, 56)} aus.`
-      : "Ich fuehre gerade einen Befehl aus.";
+      ? `Befehl laeuft: ${shorten(command, 56)}`
+      : "Befehl wird ausgefuehrt";
   }
   if (toolName === "show_diff" || toolName === "git_diff") {
-    return "Ich pruefe gerade die Dateiaenderungen im Diff.";
+    return "Diff wird geprueft";
   }
   if (toolName === "git_log") {
-    return "Ich schaue mir gerade die letzten Commits an.";
+    return "Commit-Verlauf wird geprueft";
   }
   if (toolName === "git_create_branch") {
     return branchName
-      ? `Ich erstelle gerade den Branch ${shorten(branchName, 32)}.`
-      : "Ich erstelle gerade einen neuen Branch.";
+      ? `Branch wird erstellt: ${shorten(branchName, 32)}`
+      : "Neuer Branch wird erstellt";
   }
 
-  return genericSummary || "Ich arbeite gerade am naechsten Schritt.";
+  return genericSummary || "Naechster Schritt wird ausgefuehrt";
 }
 
 function describeStreamingModelProgress(kind, payload) {
@@ -2269,18 +4335,26 @@ function describeStreamingModelProgress(kind, payload) {
     if (stage === "request_started") {
       if (kind === "content") {
         return path
-          ? `Ich starte ${model || "das Modell"} fuer ${shortenPath(path, 56)}.`
-          : `Ich starte ${model || "das Modell"} fuer den Dateiinhalt.`;
+          ? `Modellstart fuer ${shortenPath(path, 56)}`
+          : `Modellstart fuer den Dateiinhalt`;
       }
-      return `Ich starte ${model || "das Modell"} fuer die Antwort.`;
+      return "Modellstart fuer die Antwort";
+    }
+    if (stage === "waiting_for_first_chunk") {
+      if (kind === "content") {
+        return path
+          ? `Wartet auf ersten Chunk fuer ${shortenPath(path, 56)}`
+          : "Wartet auf den ersten Chunk";
+      }
+      return "Wartet auf den ersten Antwort-Chunk";
     }
     if (stage === "startup_timeout_warning") {
       if (kind === "content") {
         return path
-          ? `Ich warte noch auf den ersten Stream von ${model || "dem Modell"} fuer ${shortenPath(path, 56)}.`
-          : `Ich warte noch auf den ersten Stream von ${model || "dem Modell"}.`;
+          ? `Wartet auf ersten Output fuer ${shortenPath(path, 56)}`
+          : "Wartet auf ersten Inhalt";
       }
-      return `Ich warte noch auf den ersten Stream von ${model || "dem Modell"} fuer die Antwort.`;
+      return "Wartet auf ersten Antwort-Output";
     }
   }
 
@@ -2288,26 +4362,26 @@ function describeStreamingModelProgress(kind, payload) {
     if (payload?.phase === "waiting_for_start") {
       if (kind === "content") {
         return path
-          ? `Das Modell startet noch fuer ${shortenPath(path, 56)}. Ich warte auf den ersten Output.`
-          : "Das Modell startet noch. Ich warte auf den ersten Output.";
+          ? `Modell startet noch fuer ${shortenPath(path, 56)}`
+          : "Modell startet noch";
       }
-      return "Das Modell startet noch. Ich warte auf den ersten Antwort-Output.";
+      return "Modell startet noch fuer die Antwort";
     }
     if (kind === "content") {
       return path
-        ? `Das Modell arbeitet weiter an ${shortenPath(path, 56)}.`
-        : "Das Modell arbeitet weiter am Dateiinhalt.";
+        ? `Inhalt wird weiter generiert fuer ${shortenPath(path, 56)}`
+        : "Dateiinhalt wird weiter generiert";
     }
-    return "Ich formuliere die Antwort noch, aber das Modell arbeitet weiter.";
+    return "Antworttext wird weiter generiert";
   }
 
   if (progressType === "chunk") {
     if (kind === "content") {
       return path
-        ? `Ich erhalte weiter Inhalt fuer ${shortenPath(path, 56)}.`
-        : "Ich erhalte weiter Dateiinhalt.";
+        ? `Streamt weiter fuer ${shortenPath(path, 56)}`
+        : "Inhalt streamt weiter";
     }
-    return "Ich erhalte weiter Text fuer die Antwort.";
+    return "Antwort streamt weiter";
   }
 
   return "";
@@ -2318,28 +4392,109 @@ function describeContentGenerationRetry(path, payload) {
 
   if (strategy === "resume_same_model") {
     return path
-      ? `Ich setze den begonnenen Entwurf fuer ${shortenPath(path, 56)} mit dem bisherigen Fortschritt fort.`
-      : "Ich setze den begonnenen Entwurf mit dem bisherigen Fortschritt fort.";
+      ? `Wird mit vorhandenem Fortschritt fortgesetzt: ${shortenPath(path, 56)}`
+      : "Wird mit vorhandenem Fortschritt fortgesetzt";
   }
   if (strategy === "resume_fallback_model") {
     return path
-      ? `Ich setze den begonnenen Entwurf fuer ${shortenPath(path, 56)} mit einem kleineren Modell fort.`
-      : "Ich setze den begonnenen Entwurf mit einem kleineren Modell fort.";
+      ? `Fortsetzung mit kleinerem Modell: ${shortenPath(path, 56)}`
+      : "Fortsetzung mit kleinerem Modell";
   }
   if (strategy === "fallback_model") {
     return path
-      ? `Der erste Lauf blieb stecken. Ich probiere ${shortenPath(path, 56)} mit einem kleineren Modell erneut.`
-      : "Der erste Lauf blieb stecken. Ich probiere es mit einem kleineren Modell erneut.";
+      ? `Retry mit kleinerem Modell: ${shortenPath(path, 56)}`
+      : "Retry mit kleinerem Modell";
   }
   if (strategy === "compact_fallback_model") {
     return path
-      ? `Ich probiere ${shortenPath(path, 56)} mit weniger Kontext und einem kleineren Modell erneut.`
-      : "Ich probiere es mit weniger Kontext und einem kleineren Modell erneut.";
+      ? `Kompakter Retry: ${shortenPath(path, 56)}`
+      : "Kompakter Retry mit weniger Kontext";
+  }
+  if (strategy === "starter_scaffold") {
+    return path
+      ? `Lokales Starter-Grundgeruest: ${shortenPath(path, 56)}`
+      : "Lokales Starter-Grundgeruest";
+  }
+  if (strategy === "deterministic_template") {
+    return path
+      ? `Deterministische Vorlage: ${shortenPath(path, 56)}`
+      : "Deterministische Vorlage";
   }
 
   return path
-    ? `Der erste Versuch war zu langsam. Ich probiere ${shortenPath(path, 56)} mit weniger Kontext erneut.`
-    : "Der erste Versuch war zu langsam. Ich probiere es mit weniger Kontext erneut.";
+    ? `Retry mit reduziertem Kontext: ${shortenPath(path, 56)}`
+    : "Retry mit reduziertem Kontext";
+}
+
+function describeContentGenerationRetryError(path, payload) {
+  const strategy = String(payload?.strategy || "").trim();
+  const reason = String(payload?.reason || "").trim();
+  const hadProgress = Boolean(payload?.had_progress);
+
+  if (reason === "startup_timeout" && !hadProgress) {
+    if (strategy === "fallback_model") {
+      return path
+        ? `Auch das Fallback-Modell startet nicht sauber fuer ${shortenPath(path, 56)}`
+        : "Auch das Fallback-Modell startet nicht sauber";
+    }
+    return path
+      ? `Modellstart weiterhin blockiert fuer ${shortenPath(path, 56)}`
+      : "Modellstart weiterhin blockiert";
+  }
+
+  return "";
+}
+
+function describeContentGenerationRecovery(path, payload) {
+  const strategy = String(payload?.strategy || "").trim();
+
+  if (strategy === "starter_scaffold") {
+    return path
+      ? `Recovery ueber lokales Starter-Grundgeruest fuer ${shortenPath(path, 56)}`
+      : "Recovery ueber lokales Starter-Grundgeruest";
+  }
+  if (strategy === "deterministic_template") {
+    return path
+      ? `Recovery ueber lokale Vorlage fuer ${shortenPath(path, 56)}`
+      : "Recovery ueber lokale Vorlage";
+  }
+
+  return path
+    ? `Recovery gestartet fuer ${shortenPath(path, 56)}`
+    : "Recovery gestartet";
+}
+
+function describeContentGenerationRecoveryFinished(path, payload) {
+  const strategy = String(payload?.strategy || "").trim();
+
+  if (strategy === "starter_scaffold") {
+    return path
+      ? `Starter-Recovery abgeschlossen fuer ${shortenPath(path, 56)}`
+      : "Starter-Recovery abgeschlossen";
+  }
+  if (strategy === "deterministic_template") {
+    return path
+      ? `Vorlagen-Recovery abgeschlossen fuer ${shortenPath(path, 56)}`
+      : "Vorlagen-Recovery abgeschlossen";
+  }
+
+  return "";
+}
+
+function describeFinalBlock(payload) {
+  const stopReason = String(payload?.stop_reason || "").trim();
+
+  if (stopReason === "model_start_failed") {
+    return "Blockiert am Modellstart";
+  }
+  if (stopReason === "generation_failed_after_progress") {
+    return "Blockiert nach Teilfortschritt";
+  }
+  if (stopReason === "repair_generation_failed") {
+    return "Blockiert im Repair-Generierungspfad";
+  }
+
+  return "";
 }
 
 function extractPathFromPayload(payload) {
@@ -2400,6 +4555,10 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5.5 6.5h9M8 6.5V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M7 8.5v6M10 8.5v6M13 8.5v6M6.5 6.5l.6 9a1.8 1.8 0 0 0 1.8 1.5h2.2a1.8 1.8 0 0 0 1.8-1.5l.6-9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     "git-push":
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 14.5h8a2 2 0 0 0 2-2V9.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><path d="M10 12.5V4.5M6.8 7.7 10 4.5l3.2 3.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
+    sliders:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 5.5h12M4 10h12M4 14.5h12" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.6"/><circle cx="7" cy="5.5" r="1.6" fill="currentColor"/><circle cx="12.5" cy="10" r="1.6" fill="currentColor"/><circle cx="9" cy="14.5" r="1.6" fill="currentColor"/></svg>',
+    "chevron-right":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M7.5 5.5 12 10l-4.5 4.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></svg>',
     chat:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 4.5h12v8H7.5L4 15z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     search:
@@ -2408,4 +4567,20 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M10 3.5 11.8 8.2 16.5 10l-4.7 1.8L10 16.5l-1.8-4.7L3.5 10l4.7-1.8z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
   };
   return icons[name] || icons.spark;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    buildActivityClusters,
+    buildPhaseSteps,
+    buildSessionOverview,
+    buildValidationSnapshot,
+    describeLogRecord,
+    messageDisplayState,
+    phaseStepKey,
+    renderRichText,
+    sanitizeAssistantMessageContent,
+    sessionBadgeText,
+    sessionStatusTone,
+  };
 }

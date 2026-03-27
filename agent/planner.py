@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
 import time
 
 from agent.decision import ExecutionDecisionPolicy
-from agent.models import SessionState, WorkspaceSnapshot
+from agent.models import (
+    RepairAttemptRecord,
+    SessionState,
+    ValidationFailureEvidence,
+    WorkspaceSnapshot,
+)
 from agent.prompts import (
+    REPAIR_BLOCKED_SENTINEL,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
@@ -34,6 +40,16 @@ from runtime.logger import AgentLogger
 
 
 WRITE_INTENTS = {RouteIntent.CREATE, RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.DELETE}
+WRITE_TOOL_NAMES = {
+    "write_file",
+    "append_file",
+    "create_file",
+    "delete_file",
+    "replace_in_file",
+    "patch_file",
+}
+TARGETED_REPAIR_STRATEGY = "validation_targeted"
+ESCALATED_REPAIR_STRATEGY = "validation_escalated"
 
 
 @dataclass(slots=True)
@@ -46,12 +62,67 @@ class GenerationIssue:
     characters: int = 0
     retryable: bool = True
 
+    @property
+    def no_start_failure(self) -> bool:
+        return (
+            self.reason == "startup_timeout"
+            and not self.had_progress
+            and self.characters <= 0
+            and not self.partial_text
+        )
+
+    @property
+    def classification(self) -> str:
+        if self.no_start_failure:
+            return "no_start_failure"
+        if self.had_progress or self.characters > 0 or self.partial_text:
+            return "generation_failed_after_progress"
+        if self.reason == "startup_timeout":
+            return "startup_timeout"
+        return "generation_failed"
+
 
 @dataclass(slots=True)
 class GenerationRecoveryAttempt:
     strategy: str
     prompt_kind: str
     model_name: str | None = None
+
+
+@dataclass(slots=True)
+class GenerationAttemptRecord:
+    strategy: str
+    prompt_kind: str
+    model_name: str | None
+    issue: GenerationIssue
+
+
+@dataclass(slots=True)
+class GenerationRetryResult:
+    content: str | None = None
+    attempts: list[GenerationAttemptRecord] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ContentGenerationFailure:
+    stop_reason: str
+    failure_class: str
+    blocker_message: str
+    user_message: str
+    attempts: list[GenerationAttemptRecord] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ContentGenerationResult:
+    content: str | None = None
+    source: str = "model"
+    failure: ContentGenerationFailure | None = None
+
+
+@dataclass(slots=True)
+class MutationAssessment:
+    effective: bool
+    reason: str
 
 
 class Planner:
@@ -583,20 +654,29 @@ class Planner:
         path = self._choose_create_path(route, session)
         if not path:
             return None
-        content = self._generate_file_content(route, session, path=path)
-        if not content:
+        generation = self._generate_file_content(route, session, path=path)
+        if not generation.content:
+            failure = generation.failure or self._build_content_generation_failure(
+                route,
+                session,
+                path=path,
+                current_content=None,
+                repair_context=None,
+                attempts=[],
+            )
             self._record_generation_blocker(
                 session,
-                "No reliable content could be generated for the routed artifact.",
-                stop_reason="generation_failed",
+                failure.blocker_message,
+                stop_reason=failure.stop_reason,
+                failure_class=failure.failure_class,
             )
             return self._final_decision(
                 "The new artifact could not be generated from the routed goal.",
-                "Ich konnte noch keinen belastbaren Inhalt fuer die neue Datei erzeugen.",
+                failure.user_message,
             )
         absolute_target = Path(session.workspace_root, path)
         tool_name = "write_file" if absolute_target.exists() else "create_file"
-        tool_args = {"path": path, "content": content}
+        tool_args = {"path": path, "content": generation.content}
         if tool_name == "create_file":
             tool_args["overwrite"] = False
         return AgentDecision(
@@ -617,39 +697,300 @@ class Planner:
         current_content = self._current_file_content(session, target)
         if current_content is None:
             return None
-        content = self._generate_file_content(
-            route,
-            session,
-            path=target,
-            current_content=current_content,
+        repair_context = self._repair_context_for_target(route, session, target)
+        strategies = self._repair_generation_strategies(session, repair_context, target)
+        if repair_context is not None and not strategies:
+            final_failure_reason = (
+                f"The validation-guided repair for {target} already exhausted the targeted and escalated strategies without new evidence."
+            )
+            self._record_generation_blocker(
+                session,
+                final_failure_reason,
+                stop_reason="repair_blocked_after_validation_failure",
+                failure_class="repair_blocked_after_validation_failure",
+            )
+            return self._final_decision(
+                "The current validation-guided repair is blocked until new evidence is gathered.",
+                "Ich habe bereits einen gezielten und einen verschaerften Repair-Versuch ohne wirksame Mutation ausgeschoepft. Ohne neue Evidenz kann ich keinen ehrlichen weiteren Fix ableiten.",
+            )
+        final_failure_reason = f"No reliable update content could be generated for {target}."
+        final_stop_reason = "generation_failed"
+        final_failure_class = "generation_failed"
+        final_user_message = self._localized_text(
+            self._session_language(session),
+            de="Ich konnte noch keine belastbare Aktualisierung fuer die Zieldatei erzeugen.",
+            en="I could not produce a reliable update for the target file yet.",
         )
-        if not content:
-            self._record_generation_blocker(
+
+        for strategy in strategies:
+            generation = self._generate_file_content(
+                route,
                 session,
-                f"No reliable update content could be generated for {target}.",
-                stop_reason="generation_failed",
+                path=target,
+                current_content=current_content,
+                repair_context=repair_context,
+                repair_strategy=strategy,
             )
-            return self._final_decision(
-                "The update content could not be generated from the routed goal.",
-                "Ich konnte noch keine belastbare Aktualisierung fuer die Zieldatei erzeugen.",
+            if not generation.content:
+                failure = generation.failure or self._build_content_generation_failure(
+                    route,
+                    session,
+                    path=target,
+                    current_content=current_content,
+                    repair_context=repair_context,
+                    attempts=[],
+                )
+                final_failure_reason = failure.blocker_message
+                final_stop_reason = failure.stop_reason
+                final_failure_class = failure.failure_class
+                final_user_message = failure.user_message
+                if repair_context is not None:
+                    self._record_repair_attempt(
+                        session,
+                        repair_context,
+                        target=target,
+                        strategy=strategy,
+                        result="generation_failed",
+                        reason=failure.blocker_message,
+                    )
+                if repair_context is not None and strategy != strategies[-1]:
+                    continue
+                break
+
+            content = generation.content
+            if repair_context is not None and content.strip() == REPAIR_BLOCKED_SENTINEL:
+                final_failure_reason = (
+                    f"The validation-guided repair for {target} could not derive a concrete fix from the current evidence."
+                )
+                final_stop_reason = "repair_blocked_after_validation_failure"
+                final_failure_class = "repair_blocked_after_validation_failure"
+                final_user_message = self._localized_text(
+                    self._session_language(session),
+                    de="Ich konnte aus der aktuellen Validierungs-Evidenz keinen ehrlichen weiteren Fix ableiten.",
+                    en="I could not derive an honest follow-up fix from the current validation evidence.",
+                )
+                self._record_repair_attempt(
+                    session,
+                    repair_context,
+                    target=target,
+                    strategy=strategy,
+                    result="blocked",
+                    reason=final_failure_reason,
+                )
+                if strategy != strategies[-1]:
+                    continue
+                break
+
+            mutation = self._assess_effective_mutation(current_content, content)
+            if mutation.effective:
+                if repair_context is not None:
+                    self._record_repair_attempt(
+                        session,
+                        repair_context,
+                        target=target,
+                        strategy=strategy,
+                        result="mutation_planned",
+                        reason=mutation.reason,
+                    )
+                return AgentDecision(
+                    thought_summary=f"Update {target} according to the routed goal.",
+                    action_type=AgentActionType.CALL_TOOL,
+                    tool_name="write_file",
+                    tool_args={"path": target, "content": content},
+                    expected_outcome="Apply the requested update to the target artifact.",
+                    final_response=None,
+                )
+
+            final_failure_reason = (
+                f"The routed update for {target} did not produce a substantive repair change ({mutation.reason})."
             )
-        if content.strip() == current_content.strip():
-            self._record_generation_blocker(
+            final_stop_reason = "no_effective_change"
+            final_failure_class = "no_effective_change"
+            final_user_message = self._localized_text(
+                self._session_language(session),
+                de="Ich konnte keine belastbare inhaltliche Aenderung fuer die Zieldatei ableiten.",
+                en="I could not derive a reliable substantive change for the target file.",
+            )
+            if repair_context is not None:
+                self._record_repair_attempt(
+                    session,
+                    repair_context,
+                    target=target,
+                    strategy=strategy,
+                    result="no_effective_change",
+                    reason=mutation.reason,
+                )
+                if strategy != strategies[-1]:
+                    continue
+            break
+
+        self._record_generation_blocker(
+            session,
+            final_failure_reason,
+            stop_reason=final_stop_reason,
+            failure_class=final_failure_class,
+        )
+        return self._final_decision(
+            "The update content could not produce a repairable mutation.",
+            final_user_message,
+        )
+
+    def _repair_context_for_target(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        target: str,
+    ) -> ValidationFailureEvidence | None:
+        del route
+        context = session.active_repair_context
+        if context is None:
+            failed_run = self.validation_planner.latest_failed_run(
                 session,
-                f"The routed update for {target} did not produce a real file change.",
-                stop_reason="no_effective_change",
+                current_generation_only=False,
             )
-            return self._final_decision(
-                "The routed update does not change the current file content.",
-                "Ich habe keine belastbare inhaltliche Aenderung fuer die Zieldatei ableiten koennen.",
+            if failed_run is None:
+                return None
+            context = self.validation_planner.build_failure_evidence(session, failed_run)
+            session.active_repair_context = context
+        if context.artifact_paths and target not in context.artifact_paths:
+            return None
+        return context
+
+    def _repair_generation_strategies(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence | None,
+        target: str,
+    ) -> list[str]:
+        if repair_context is None:
+            return ["default"]
+        if self._repair_attempt_needs_new_evidence(session, repair_context, target):
+            return []
+        if self._repair_attempt_seen(
+            session,
+            repair_context,
+            target,
+            strategy=ESCALATED_REPAIR_STRATEGY,
+            results={"no_effective_change", "blocked", "generation_failed"},
+        ):
+            return []
+        if self._repair_attempt_seen(
+            session,
+            repair_context,
+            target,
+            strategy=TARGETED_REPAIR_STRATEGY,
+            results={"no_effective_change", "blocked", "generation_failed"},
+        ):
+            return [ESCALATED_REPAIR_STRATEGY]
+        return [TARGETED_REPAIR_STRATEGY, ESCALATED_REPAIR_STRATEGY]
+
+    def _repair_attempt_seen(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        target: str,
+        *,
+        strategy: str,
+        results: set[str],
+    ) -> bool:
+        return any(
+            item.strategy == strategy
+            and item.result in results
+            and item.evidence_signature == repair_context.evidence_signature
+            and item.artifact_path == target
+            for item in session.repair_history
+        )
+
+    def _repair_attempt_needs_new_evidence(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        target: str,
+    ) -> bool:
+        last_attempt = next(
+            (
+                item
+                for item in reversed(session.repair_history)
+                if item.evidence_signature == repair_context.evidence_signature
+                and item.artifact_path == target
+            ),
+            None,
+        )
+        if last_attempt is None:
+            return False
+        if last_attempt.result == "mutation_planned":
+            return False
+        last_iteration = int(last_attempt.iteration or 0)
+        if any(
+            int(getattr(item, "iteration", 0) or 0) > last_iteration
+            for item in session.diagnostics
+        ):
+            return False
+        if any(
+            int(getattr(item, "iteration", 0) or 0) > last_iteration
+            and item.tool_name == "read_file"
+            and str(item.tool_args.get("path") or "").strip() == target
+            for item in session.tool_calls
+        ):
+            return False
+        return self._repair_attempt_seen(
+            session,
+            repair_context,
+            target,
+            strategy=ESCALATED_REPAIR_STRATEGY,
+            results={"no_effective_change", "blocked", "generation_failed"},
+        )
+
+    def _record_repair_attempt(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        *,
+        target: str,
+        strategy: str,
+        result: str,
+        reason: str,
+    ) -> None:
+        session.repair_history.append(
+            RepairAttemptRecord(
+                artifact_path=target,
+                validation_command=repair_context.command,
+                verification_scope=repair_context.verification_scope,
+                strategy=strategy,
+                result=result,
+                reason=reason,
+                evidence_signature=repair_context.evidence_signature,
+                iteration=session.iterations,
             )
-        return AgentDecision(
-            thought_summary=f"Update {target} according to the routed goal.",
-            action_type=AgentActionType.CALL_TOOL,
-            tool_name="write_file",
-            tool_args={"path": target, "content": content},
-            expected_outcome="Apply the requested update to the target artifact.",
-            final_response=None,
+        )
+        session.repair_history = session.repair_history[-20:]
+
+    def _assess_effective_mutation(
+        self,
+        current_content: str,
+        new_content: str,
+    ) -> MutationAssessment:
+        if new_content.strip() == current_content.strip():
+            return MutationAssessment(False, "identical content")
+        if self._normalized_mutation_content(new_content) == self._normalized_mutation_content(current_content):
+            return MutationAssessment(False, "whitespace-only change")
+        return MutationAssessment(True, "substantive mutation prepared")
+
+    def _normalized_mutation_content(self, content: str) -> str:
+        return re.sub(r"\s+", " ", str(content or "").strip())
+
+    def _has_mutation_since_failed_validation(
+        self,
+        session: SessionState,
+        failed_run,
+    ) -> bool:
+        if int(getattr(failed_run, "edit_generation", 0) or 0) < int(session.edit_generation or 0):
+            return True
+        failed_iteration = int(getattr(failed_run, "iteration", 0) or 0)
+        return any(
+            int(getattr(item, "iteration", 0) or 0) > failed_iteration
+            and item.tool_name in WRITE_TOOL_NAMES
+            for item in session.tool_calls
         )
 
     def _diagnose_issue_decision(
@@ -704,20 +1045,61 @@ class Planner:
         if failed_run is None:
             return None
 
-        repair_route = self._repair_route_after_failed_validation(route, session, failed_run)
+        repair_context = self.validation_planner.build_failure_evidence(session, failed_run)
+        session.active_repair_context = repair_context
+
+        repair_route = self._repair_route_after_failed_validation(
+            route,
+            session,
+            failed_run,
+            repair_context,
+        )
         if repair_route is not None:
             repair_decision = self.execute_action_from_plan(repair_route, session)
             if repair_decision.action_type != AgentActionType.FINAL or session.stop_reason:
                 return repair_decision
+        else:
+            blocker = self._validation_repair_blocker_message(
+                failed_run,
+                repair_context,
+                repair_target_missing=True,
+            )
+            if blocker not in session.blockers:
+                session.blockers.append(blocker)
+                session.blockers = session.blockers[-10:]
+            session.last_error = blocker
+            session.stop_reason = "repair_blocked_after_validation_failure"
+            return self._final_decision(
+                "The failed validation cannot be repaired safely without a concrete artifact target.",
+                self._validation_repair_blocked_response(
+                    route,
+                    session,
+                    failed_run,
+                    repair_context,
+                    repair_target_missing=True,
+                ),
+            )
+
+        if not self._has_mutation_since_failed_validation(session, failed_run):
+            blocker = self._validation_repair_blocker_message(failed_run, repair_context)
+            if blocker not in session.blockers:
+                session.blockers.append(blocker)
+                session.blockers = session.blockers[-10:]
+            session.last_error = blocker
+            session.stop_reason = "repair_blocked_after_validation_failure"
+            return self._final_decision(
+                "Validation failed and there is still no substantive repair mutation to re-verify.",
+                self._validation_repair_blocked_response(route, session, failed_run, repair_context),
+            )
 
         command = self._pick_validation_command(session)
         if command is not None:
             return self._validation_decision(
-                "Only rerun validation when there is new evidence, a different command, or a completed repair step.",
+                "Only rerun validation after a substantive repair mutation has been prepared.",
                 command,
             )
 
-        blocker = self._validation_repair_blocker_message(failed_run)
+        blocker = self._validation_repair_blocker_message(failed_run, repair_context)
         if blocker not in session.blockers:
             session.blockers.append(blocker)
             session.blockers = session.blockers[-10:]
@@ -725,7 +1107,7 @@ class Planner:
         session.stop_reason = "repair_blocked_after_validation_failure"
         return self._final_decision(
             "The failed validation cannot be rerun safely without a repairable target or new evidence.",
-            self._validation_repair_blocked_response(route, session, failed_run),
+            self._validation_repair_blocked_response(route, session, failed_run, repair_context),
         )
 
     def _repair_route_after_failed_validation(
@@ -733,11 +1115,8 @@ class Planner:
         route: RouterOutput,
         session: SessionState,
         failed_run,
+        repair_context: ValidationFailureEvidence,
     ) -> RouterOutput | None:
-        task_state = session.task_state
-        if task_state is not None and task_state.execution_strategy == "debug_repair":
-            return route
-
         target = self._repair_target_after_failed_validation(route, session, failed_run)
         if target is None:
             return None
@@ -765,19 +1144,48 @@ class Planner:
                 reason="Report the repair result and remaining validation state honestly.",
             ),
         ]
+        failure_scope = repair_context.verification_scope
+        failure_summary = repair_context.failure_summary
+        constraint_lines = self._unique_paths(
+            [
+                *route.entities.constraints,
+                *repair_context.repair_requirements[:4],
+                "Do not return an equivalent file without a substantive fix.",
+            ]
+        )
+        attribute_lines = self._unique_paths(
+            [
+                *route.entities.attributes,
+                f"failed_validation_scope:{failure_scope}",
+                *(f"missing_feature:{item}" for item in repair_context.missing_features[:4]),
+            ]
+        )
+        search_terms = self._unique_paths(
+            [
+                *route.search_terms,
+                target_name,
+                failure_scope,
+                *repair_context.missing_features[:4],
+            ]
+        )
+        next_intent = RouteIntent.DEBUG if route.intent == RouteIntent.DEBUG else RouteIntent.UPDATE
         return route.model_copy(
             update={
-                "intent": RouteIntent.UPDATE,
+                "intent": next_intent,
                 "requested_outcome": (
-                    f"Repair {target_name} so the failed validation passes while preserving the original requested outcome."
+                    f"Repair {target_name} so the failed {failure_scope} validation passes. "
+                    f"Failure summary: {failure_summary} Preserve the original requested outcome."
                 ),
                 "entities": route.entities.model_copy(
                     update={
                         "target_name": target_name,
                         "target_paths": [target],
+                        "attributes": attribute_lines[:8],
+                        "constraints": constraint_lines[:8],
                     }
                 ),
                 "action_plan": action_plan,
+                "search_terms": search_terms[:6],
             }
         )
 
@@ -824,8 +1232,28 @@ class Planner:
                     paths.append(cleaned)
         return self._unique_paths(paths)
 
-    def _validation_repair_blocker_message(self, failed_run) -> str:
+    def _validation_repair_blocker_message(
+        self,
+        failed_run,
+        repair_context: ValidationFailureEvidence | None = None,
+        *,
+        repair_target_missing: bool = False,
+    ) -> str:
         command = str(getattr(failed_run, "command", "") or "").strip() or "the last validation command"
+        if repair_target_missing:
+            suffix = (
+                f" Known failure evidence: {repair_context.failure_summary}"
+                if repair_context is not None and repair_context.failure_summary
+                else ""
+            )
+            return (
+                f"Validation failed for {command}, and I do not have a repairable target that I can safely mutate.{suffix}"
+            )
+        if repair_context is not None and repair_context.failure_summary:
+            return (
+                f"Validation failed for {command}. The current repair evidence still does not support a substantive fix: "
+                f"{repair_context.failure_summary}"
+            )
         return (
             f"Validation failed for {command}, and I do not have a repairable target or new evidence that would justify rerunning the same check."
         )
@@ -835,10 +1263,18 @@ class Planner:
         route: RouterOutput,
         session: SessionState,
         failed_run,
+        repair_context: ValidationFailureEvidence | None = None,
+        *,
+        repair_target_missing: bool = False,
     ) -> str:
         language = self._session_language(session)
         command = str(getattr(failed_run, "command", "") or "").strip() or "the last validation command"
         target = self._repair_target_after_failed_validation(route, session, failed_run)
+        failure_summary = (
+            str(repair_context.failure_summary or "").strip()
+            if repair_context is not None
+            else ""
+        )
         if language == "de":
             lines = [
                 "Ich habe den fehlgeschlagenen Validierungsschritt als Reparaturausloeser behandelt und keinen sinnlosen Verify-Loop gestartet.",
@@ -846,7 +1282,12 @@ class Planner:
             ]
             if target:
                 lines.append(f"Betroffenes Artefakt: {target}.")
-            lines.append("Mir fehlt aber entweder ein reparierbares Ziel oder neue Evidenz fuer einen sicheren weiteren Schritt.")
+            if failure_summary:
+                lines.append(f"Bekannte Fehler-Evidenz: {failure_summary}")
+            if repair_target_missing:
+                lines.append("Mir fehlt aber ein reparierbares Artefaktziel fuer einen sicheren weiteren Schritt.")
+            else:
+                lines.append("Mir fehlt aber noch eine belastbare, nicht-aequivalente Reparatur, die diesen Fehler wirklich adressiert.")
             return "\n".join(lines)
         lines = [
             "I treated the failed validation as a repair trigger and did not start a useless verify loop.",
@@ -854,7 +1295,12 @@ class Planner:
         ]
         if target:
             lines.append(f"Affected artifact: {target}.")
-        lines.append("I still lack either a repairable target or new evidence for a safe next step.")
+        if failure_summary:
+            lines.append(f"Known failure evidence: {failure_summary}")
+        if repair_target_missing:
+            lines.append("I still lack a repairable artifact target for a safe next step.")
+        else:
+            lines.append("I still lack a substantive, non-equivalent repair that would address this failure safely.")
         return "\n".join(lines)
 
     def _validation_decision(
@@ -1159,12 +1605,16 @@ class Planner:
         *,
         path: str,
         current_content: str | None = None,
-    ) -> str | None:
+        repair_context: ValidationFailureEvidence | None = None,
+        repair_strategy: str | None = None,
+    ) -> ContentGenerationResult:
         prompt = generate_content_prompt(
             route,
             session,
             path=path,
             current_content=current_content,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
         )
         model_name = self._content_generation_model_name(
             route,
@@ -1172,12 +1622,13 @@ class Planner:
             path=path,
             current_content=current_content,
         )
+        effective_model = model_name or self._primary_generation_model_name()
         try:
             self._log(
                 "content_generation_started",
                 path=path,
                 update=current_content is not None,
-                model=model_name or self._primary_generation_model_name(),
+                model=effective_model,
             )
             content = self.llm.generate(
                 prompt,
@@ -1198,6 +1649,12 @@ class Planner:
                 prompt=prompt,
                 current_content=current_content,
             )
+            primary_attempt = GenerationAttemptRecord(
+                "primary_model",
+                "full",
+                effective_model,
+                issue,
+            )
             self._log(
                 "content_generation_error",
                 error=str(exc),
@@ -1206,35 +1663,72 @@ class Planner:
                 had_progress=issue.had_progress,
                 partial_characters=issue.characters,
                 context_pressure=issue.context_pressure_likely,
+                failure_class=issue.classification,
             )
-            retried = self._retry_content_generation(
+            retry_result = self._retry_content_generation(
                 route,
                 session=session,
                 path=path,
                 current_content=current_content,
                 cause=exc,
                 prompt=prompt,
+                repair_context=repair_context,
+                repair_strategy=repair_strategy,
             )
-            if retried is not None:
+            attempts = [primary_attempt, *retry_result.attempts]
+            if retry_result.content is not None:
                 self._log(
                     "content_generation_finished",
                     path=path,
-                    characters=len(retried),
+                    characters=len(retry_result.content),
                     update=current_content is not None,
                     source="retry",
                 )
-                return retried
-            fallback = self._template_fallback_content(
-                route,
-                session,
-                path=path,
-                current_content=current_content,
+                return ContentGenerationResult(
+                    content=retry_result.content,
+                    source="retry",
+                )
+            if self._startup_failure_exhausted(attempts):
+                recovery = self._no_start_recovery_content(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                    attempts=attempts,
+                )
+                if recovery is not None:
+                    return recovery
+                self._log(
+                    "content_generation_recovery_unavailable",
+                    path=path,
+                    reason="startup_failure_exhausted",
+                    failure_class="startup_failure_exhausted",
+                )
+            else:
+                fallback = self._template_fallback_content(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                )
+                if fallback is not None:
+                    self._log("content_generation_fallback_started", path=path, source="template")
+                    self._log("content_generation_fallback_finished", path=path, source="template")
+                    return ContentGenerationResult(
+                        content=fallback,
+                        source="template",
+                    )
+            return ContentGenerationResult(
+                source="failed",
+                failure=self._build_content_generation_failure(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                    repair_context=repair_context,
+                    attempts=attempts,
+                ),
             )
-            if fallback is None:
-                return None
-            self._log("content_generation_fallback_started", path=path, source="template")
-            self._log("content_generation_fallback_finished", path=path, source="template")
-            return fallback
         cleaned = self._strip_code_fences(content).strip()
         self._log(
             "content_generation_finished",
@@ -1242,7 +1736,31 @@ class Planner:
             characters=len(cleaned),
             update=current_content is not None,
         )
-        return cleaned or None
+        if cleaned:
+            return ContentGenerationResult(content=cleaned)
+        return ContentGenerationResult(
+            source="failed",
+            failure=self._build_content_generation_failure(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                attempts=[
+                    GenerationAttemptRecord(
+                        "primary_model",
+                        "full",
+                        effective_model,
+                        GenerationIssue(
+                            reason="empty_response",
+                            timeout_like=False,
+                            context_pressure_likely=False,
+                            retryable=False,
+                        ),
+                    )
+                ],
+            ),
+        )
 
     def _retry_content_generation(
         self,
@@ -1253,7 +1771,9 @@ class Planner:
         current_content: str | None = None,
         cause: Exception | None = None,
         prompt: str,
-    ) -> str | None:
+        repair_context: ValidationFailureEvidence | None = None,
+        repair_strategy: str | None = None,
+    ) -> GenerationRetryResult:
         issue = self._assess_generation_issue(
             cause,
             prompt=prompt,
@@ -1261,8 +1781,9 @@ class Planner:
         )
         attempts = self._content_generation_recovery_attempts(issue)
         if not attempts:
-            return None
+            return GenerationRetryResult()
 
+        retry_attempts: list[GenerationAttemptRecord] = []
         for attempt in attempts:
             retry_prompt = self._content_generation_prompt_for_attempt(
                 attempt,
@@ -1272,6 +1793,8 @@ class Planner:
                 current_content=current_content,
                 prompt=prompt,
                 partial_text=issue.partial_text,
+                repair_context=repair_context,
+                repair_strategy=repair_strategy,
             )
             timeout_seconds, total_timeout_seconds, num_ctx = self._content_generation_runtime_for_attempt(
                 attempt,
@@ -1287,6 +1810,7 @@ class Planner:
                     had_progress=issue.had_progress,
                     partial_characters=issue.characters,
                     context_pressure=issue.context_pressure_likely,
+                    failure_class=issue.classification,
                 )
                 text = self.llm.generate(
                     retry_prompt,
@@ -1310,12 +1834,47 @@ class Planner:
                         strategy=attempt.strategy,
                         characters=len(cleaned),
                     )
-                    return cleaned
+                    return GenerationRetryResult(
+                        content=cleaned,
+                        attempts=retry_attempts,
+                    )
+                empty_issue = GenerationIssue(
+                    reason="empty_response",
+                    timeout_like=False,
+                    context_pressure_likely=False,
+                    retryable=False,
+                )
+                retry_attempts.append(
+                    GenerationAttemptRecord(
+                        attempt.strategy,
+                        attempt.prompt_kind,
+                        attempt.model_name or self._primary_generation_model_name(),
+                        empty_issue,
+                    )
+                )
+                self._log(
+                    "content_generation_retry_error",
+                    path=path,
+                    strategy=attempt.strategy,
+                    error="empty model response",
+                    reason=empty_issue.reason,
+                    had_progress=empty_issue.had_progress,
+                    partial_characters=empty_issue.characters,
+                    failure_class=empty_issue.classification,
+                )
             except Exception as exc:
                 retry_issue = self._assess_generation_issue(
                     exc,
                     prompt=retry_prompt,
                     current_content=current_content,
+                )
+                retry_attempts.append(
+                    GenerationAttemptRecord(
+                        attempt.strategy,
+                        attempt.prompt_kind,
+                        attempt.model_name or self._primary_generation_model_name(),
+                        retry_issue,
+                    )
                 )
                 self._log(
                     "content_generation_retry_error",
@@ -1325,8 +1884,9 @@ class Planner:
                     reason=retry_issue.reason,
                     had_progress=retry_issue.had_progress,
                     partial_characters=retry_issue.characters,
+                    failure_class=retry_issue.classification,
                 )
-        return None
+        return GenerationRetryResult(attempts=retry_attempts)
 
     def _assess_generation_issue(
         self,
@@ -1392,8 +1952,8 @@ class Planner:
             attempts.append(GenerationRecoveryAttempt("resume_same_model", "resume"))
         elif issue.context_pressure_likely:
             attempts.append(GenerationRecoveryAttempt("compact_same_model", "compact"))
-        elif issue.reason == "startup_timeout":
-            if issue.retryable and not issue.had_progress:
+        elif issue.no_start_failure:
+            if issue.retryable:
                 attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
         elif issue.timeout_like and not fallback_model:
             attempts.append(GenerationRecoveryAttempt("retry_same_model", "full"))
@@ -1423,6 +1983,8 @@ class Planner:
         current_content: str | None,
         prompt: str,
         partial_text: str,
+        repair_context: ValidationFailureEvidence | None,
+        repair_strategy: str | None,
     ) -> str:
         if attempt.prompt_kind == "resume":
             return generate_content_continuation_prompt(
@@ -1431,6 +1993,8 @@ class Planner:
                 path=path,
                 partial_content=partial_text,
                 current_content=current_content,
+                repair_context=repair_context,
+                repair_strategy=repair_strategy,
             )
         if attempt.prompt_kind == "compact":
             return generate_content_retry_prompt(
@@ -1438,6 +2002,8 @@ class Planner:
                 session,
                 path=path,
                 current_content=current_content,
+                repair_context=repair_context,
+                repair_strategy=repair_strategy,
             )
         return prompt
 
@@ -1463,6 +2029,338 @@ class Planner:
             max(self._llm_timeout(total_timeout), total_timeout),
             num_ctx,
         )
+
+    def _startup_failure_exhausted(
+        self,
+        attempts: list[GenerationAttemptRecord],
+    ) -> bool:
+        issues = [attempt.issue for attempt in attempts]
+        return len(issues) >= 2 and all(issue.no_start_failure for issue in issues)
+
+    def _attempts_have_progress(
+        self,
+        attempts: list[GenerationAttemptRecord],
+    ) -> bool:
+        return any(
+            attempt.issue.had_progress
+            or attempt.issue.characters > 0
+            or bool(attempt.issue.partial_text)
+            for attempt in attempts
+        )
+
+    def _generation_models_summary(
+        self,
+        attempts: list[GenerationAttemptRecord],
+    ) -> str:
+        models: list[str] = []
+        for attempt in attempts:
+            model_name = str(attempt.model_name or "").strip()
+            if model_name and model_name not in models:
+                models.append(model_name)
+        return ", ".join(models[:3])
+
+    def _build_content_generation_failure(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        attempts: list[GenerationAttemptRecord],
+    ) -> ContentGenerationFailure:
+        del route
+        language = self._session_language(session)
+        if self._startup_failure_exhausted(attempts):
+            models = self._generation_models_summary(attempts) or "the primary and fallback models"
+            blocker_message = (
+                f"Repeated model start failure for {path}: {models} produced no first chunk, and no safe local recovery path applied."
+            )
+            user_message = self._localized_text(
+                language,
+                de=(
+                    f"Ich konnte die Generierung fuer {path} nicht starten: "
+                    "Weder das Primaer- noch das Fallback-Modell haben vor dem ersten Chunk geantwortet, "
+                    "und fuer diese Aufgabe gab es keinen sicheren lokalen Recovery-Pfad."
+                ),
+                en=(
+                    f"I could not start generation for {path}: "
+                    "neither the primary nor the fallback model produced a first chunk, "
+                    "and there was no safe local recovery path for this task."
+                ),
+            )
+            return ContentGenerationFailure(
+                stop_reason="model_start_failed",
+                failure_class="startup_failure_exhausted",
+                blocker_message=blocker_message,
+                user_message=user_message,
+                attempts=attempts,
+            )
+
+        if repair_context is not None:
+            blocker_message = (
+                f"Repair generation failed for {path}; no reliable content could be generated from the current validation evidence."
+            )
+            user_message = self._localized_text(
+                language,
+                de=(
+                    "Ich konnte aus der aktuellen Validierungs-Evidenz keine belastbare Reparatur erzeugen. "
+                    "Das Modell hat den Repair-Pfad nicht stabil zu einem verwertbaren Inhalt abgeschlossen."
+                ),
+                en=(
+                    "I could not generate a reliable repair from the current validation evidence. "
+                    "The model did not complete the repair path into usable content."
+                ),
+            )
+            return ContentGenerationFailure(
+                stop_reason="repair_generation_failed",
+                failure_class="repair_generation_failed",
+                blocker_message=blocker_message,
+                user_message=user_message,
+                attempts=attempts,
+            )
+
+        if self._attempts_have_progress(attempts):
+            blocker_message = f"Content generation for {path} failed after partial progress."
+            user_message = self._localized_text(
+                language,
+                de=(
+                    f"Ich habe fuer {path} Teilfortschritt gesehen, aber keinen belastbaren Abschluss erzeugen koennen."
+                ),
+                en=(
+                    f"I saw partial progress for {path}, but I could not complete it into a reliable final result."
+                ),
+            )
+            return ContentGenerationFailure(
+                stop_reason="generation_failed_after_progress",
+                failure_class="generation_failed_after_progress",
+                blocker_message=blocker_message,
+                user_message=user_message,
+                attempts=attempts,
+            )
+
+        blocker_message = (
+            f"No reliable update content could be generated for {path}."
+            if current_content is not None
+            else f"No reliable content could be generated for {path}."
+        )
+        user_message = self._localized_text(
+            language,
+            de=(
+                f"Ich konnte noch keinen belastbaren Inhalt fuer {path} erzeugen."
+                if current_content is None
+                else f"Ich konnte noch keine belastbare Aktualisierung fuer {path} erzeugen."
+            ),
+            en=(
+                f"I could not produce reliable content for {path} yet."
+                if current_content is None
+                else f"I could not produce a reliable update for {path} yet."
+            ),
+        )
+        return ContentGenerationFailure(
+            stop_reason="generation_failed",
+            failure_class="generation_failed",
+            blocker_message=blocker_message,
+            user_message=user_message,
+            attempts=attempts,
+        )
+
+    def _no_start_recovery_content(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        attempts: list[GenerationAttemptRecord],
+    ) -> ContentGenerationResult | None:
+        template = self._template_fallback_content(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
+        if template is not None:
+            self._log(
+                "content_generation_recovery_started",
+                path=path,
+                strategy="deterministic_template",
+                failure_class="startup_failure_exhausted",
+                models=self._generation_models_summary(attempts),
+            )
+            self._log("content_generation_fallback_started", path=path, source="template")
+            self._log("content_generation_fallback_finished", path=path, source="template")
+            self._log(
+                "content_generation_recovery_finished",
+                path=path,
+                strategy="deterministic_template",
+                source="template",
+            )
+            return ContentGenerationResult(
+                content=template,
+                source="template",
+            )
+
+        scaffold = self._starter_scaffold_content(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
+        if scaffold is None:
+            return None
+        self._log(
+            "content_generation_recovery_started",
+            path=path,
+            strategy="starter_scaffold",
+            failure_class="startup_failure_exhausted",
+            models=self._generation_models_summary(attempts),
+        )
+        self._log("content_generation_fallback_started", path=path, source="starter_scaffold")
+        self._log("content_generation_fallback_finished", path=path, source="starter_scaffold")
+        self._log(
+            "content_generation_recovery_finished",
+            path=path,
+            strategy="starter_scaffold",
+            source="starter_scaffold",
+        )
+        return ContentGenerationResult(
+            content=scaffold,
+            source="starter_scaffold",
+        )
+
+    def _starter_scaffold_content(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+    ) -> str | None:
+        if current_content is not None or not self._is_low_risk_starter_task(route, session, path=path):
+            return None
+
+        title = self._starter_title(route, path)
+        suffix = Path(path).suffix.lower()
+        if suffix == ".py":
+            return (
+                "def main():\n"
+                f"    print(\"{title} starter scaffold ready.\")\n"
+                "\n"
+                "\n"
+                "if __name__ == \"__main__\":\n"
+                "    main()\n"
+            )
+        if suffix == ".js":
+            return (
+                "function main() {\n"
+                f"  console.log(\"{title} starter scaffold ready.\");\n"
+                "}\n"
+                "\n"
+                "main();\n"
+            )
+        if suffix == ".html":
+            return (
+                "<!doctype html>\n"
+                "<html lang=\"en\">\n"
+                "<head>\n"
+                "  <meta charset=\"utf-8\">\n"
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+                f"  <title>{title}</title>\n"
+                "  <style>\n"
+                "    body { font-family: sans-serif; margin: 2rem; }\n"
+                "    main { max-width: 48rem; }\n"
+                "  </style>\n"
+                "</head>\n"
+                "<body>\n"
+                "  <main>\n"
+                f"    <h1>{title}</h1>\n"
+                "    <p>Starter scaffold ready.</p>\n"
+                "  </main>\n"
+                "  <script>\n"
+                f"    console.log(\"{title} starter scaffold ready.\");\n"
+                "  </script>\n"
+                "</body>\n"
+                "</html>\n"
+            )
+        return None
+
+    def _is_low_risk_starter_task(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> bool:
+        task_state = session.task_state
+        if route.intent != RouteIntent.CREATE:
+            return False
+        if task_state is None or task_state.goal_relation != "new_task":
+            return False
+        if task_state.execution_strategy != "feature_implementation":
+            return False
+        if route.repo_context_needed or route.needs_clarification or not route.safe_to_execute:
+            return False
+        if session.changed_files or session.validation_runs or session.diagnostics:
+            return False
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count > 25:
+            return False
+        if Path(path).suffix.lower() not in {".py", ".js", ".html"}:
+            return False
+        if len([item for item in route.entities.target_paths if item]) > 1:
+            return False
+        if len(Path(path).parts) > 2:
+            return False
+        return self._starter_scope_requested(route, session, path=path)
+
+    def _starter_scope_requested(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> bool:
+        task_state = session.task_state
+        normalized = " ".join(
+            part.strip().lower()
+            for part in [
+                route.user_goal,
+                route.requested_outcome,
+                route.entities.target_name or "",
+                path,
+                task_state.root_goal if task_state is not None else "",
+                task_state.active_goal if task_state is not None else "",
+                task_state.output_expectation if task_state is not None else "",
+            ]
+            if str(part or "").strip()
+        )
+        starter_markers = (
+            "starter",
+            "scaffold",
+            "skeleton",
+            "template",
+            "boilerplate",
+            "grundgeruest",
+            "grundgerüst",
+            "geruest",
+            "gerüst",
+            "stub",
+            "hello world",
+        )
+        if any(marker in normalized for marker in starter_markers):
+            return True
+        conventional_names = {"index.html", "main.py", "script.js", "app.py", "app.js"}
+        return len(normalized) <= 120 and Path(path).name.lower() in conventional_names
+
+    def _starter_title(
+        self,
+        route: RouterOutput,
+        path: str,
+    ) -> str:
+        raw = str(route.entities.target_name or Path(path).stem).strip() or Path(path).stem
+        cleaned = re.sub(r"[_-]+", " ", raw).strip()
+        return cleaned[:80] or "Starter"
 
     def _current_file_content(self, session: SessionState, path: str) -> str | None:
         target = Path(session.workspace_root, path)
@@ -1572,6 +2470,7 @@ class Planner:
         message: str,
         *,
         stop_reason: str,
+        failure_class: str | None = None,
     ) -> None:
         text = str(message or "").strip()
         if not text:
@@ -1581,6 +2480,12 @@ class Planner:
             session.blockers = session.blockers[-10:]
         session.last_error = text
         session.stop_reason = stop_reason
+        self._log(
+            "final_block_reason",
+            stop_reason=stop_reason,
+            failure_class=failure_class or stop_reason,
+            message=text,
+        )
 
     def _read_paths(self, session: SessionState) -> list[str]:
         return [

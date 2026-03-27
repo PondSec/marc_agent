@@ -130,6 +130,18 @@ Standardadresse nach dem Start:
 http://127.0.0.1:8000
 ```
 
+## Login Und Security
+
+Die Web-GUI ist jetzt durch eine serverseitige Login-Schicht geschuetzt:
+
+- Argon2id fuer Passwort-Hashes
+- serverseitige Sessions mit HttpOnly-Cookies
+- CSRF-Schutz fuer mutierende Requests
+- Rate-Limits gegen Brute Force und Credential Stuffing
+- optionale TOTP-2FA ueber `AUTH_INITIAL_ADMIN_TOTP_SECRET`
+
+Die konkrete Architektur, das Threat Model, die Security-Entscheidungen und die Pruefanleitung stehen in [docs/auth-security.md](docs/auth-security.md).
+
 ## Architektur
 
 Die Architektur ist modular, aber klar auf agentische Entwicklungsarbeit ausgerichtet.

@@ -41,6 +41,25 @@ def test_core_marks_generation_failure_without_changes_as_partial(tmp_path):
     assert status == "partial"
 
 
+def test_core_marks_model_start_failure_without_changes_as_partial(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Erstelle snake.html",
+        workspace_root=str(tmp_path),
+        validation_status="not_run",
+        stop_reason="model_start_failed",
+    )
+    session.blockers.append(
+        "Repeated model start failure for snake.html: qwen3-coder:30b, qwen2.5-coder:14b produced no first chunk, and no safe local recovery path applied."
+    )
+
+    status = core._resolve_final_status(session, final_action=True)
+
+    assert status == "partial"
+
+
 def test_core_marks_debug_follow_up_without_runtime_reproduction_as_partial(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

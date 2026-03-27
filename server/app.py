@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from config.settings import AGENT_NAME, AppConfig
 from llm.ollama_client import OllamaClient
+from server.auth_schemas import AuthStatusResponse, LoginRequest
+from server.auth_service import AuthService
 from server.model_manager import ModelManager
+from server.security import configure_security
 from server.schemas import (
     HealthResponse,
     ModelCatalogResponse,
@@ -38,28 +43,91 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     config.ensure_state_dirs()
     task_manager = TaskManager(config)
     model_manager = ModelManager(config)
+    auth_service = AuthService(config) if config.auth_enabled else None
+    if auth_service is not None:
+        auth_service.bootstrap_initial_admin()
     static_dir = Path(__file__).resolve().parent.parent / "webui"
 
-    app = FastAPI(title=f"{AGENT_NAME} Web Console", version="1.0.0")
-    app.state.task_manager = task_manager
-    app.state.model_manager = model_manager
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-    @app.on_event("startup")
-    async def ensure_models_on_startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if auth_service is not None:
+            await asyncio.to_thread(
+                auth_service.store.purge_expired_sessions,
+                datetime.now(timezone.utc),
+            )
         await asyncio.to_thread(model_manager.ensure_recommended)
         if config.warmup_models_on_startup:
             asyncio.create_task(asyncio.to_thread(model_manager.warmup_preferred_models))
+        yield
+
+    app = FastAPI(title=f"{AGENT_NAME} Web Console", version="1.0.0", lifespan=lifespan)
+    app.state.task_manager = task_manager
+    app.state.model_manager = model_manager
+    app.state.auth_service = auth_service
+    configure_security(app, config)
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    async def require_auth(request: Request, response: Response):
+        if auth_service is None:
+            return None
+        return auth_service.current_user(request, response)
+
+    async def require_csrf(request: Request, response: Response):
+        if auth_service is None:
+            return None
+        auth_service.require_csrf(request, response)
+        return None
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
-        return FileResponse(static_dir / "index.html")
+        return FileResponse(
+            static_dir / "index.html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
-    @app.get("/api/health", response_model=HealthResponse)
+    @app.get("/healthz")
+    async def healthz() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.get("/api/auth/session", response_model=AuthStatusResponse)
+    async def auth_session(request: Request, response: Response) -> AuthStatusResponse:
+        if auth_service is None:
+            raise HTTPException(status_code=404, detail="Authentication is disabled.")
+        context = auth_service.resolve_session(request, response)
+        auth_service.ensure_csrf_cookie(request, response, context)
+        return auth_service.build_auth_status(context)
+
+    @app.post(
+        "/api/auth/login",
+        response_model=AuthStatusResponse,
+        dependencies=[Depends(require_csrf)],
+    )
+    async def auth_login(
+        request: Request,
+        response: Response,
+        payload: LoginRequest,
+    ) -> AuthStatusResponse:
+        if auth_service is None:
+            raise HTTPException(status_code=404, detail="Authentication is disabled.")
+        return auth_service.login(request, response, payload)
+
+    @app.post(
+        "/api/auth/logout",
+        status_code=204,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
+    async def auth_logout(request: Request, response: Response) -> Response:
+        if auth_service is None:
+            return Response(status_code=204)
+        auth_service.logout(request, response)
+        response.status_code = 204
+        return response
+
+    @app.get("/api/health", response_model=HealthResponse, dependencies=[Depends(require_auth)])
     async def health() -> HealthResponse:
         return HealthResponse(ok=True, active_sessions=task_manager.active_sessions())
 
-    @app.get("/api/config")
+    @app.get("/api/config", dependencies=[Depends(require_auth)])
     async def get_config() -> dict:
         public_config = config.to_public_dict()
         model_catalog = model_manager.catalog()
@@ -73,15 +141,20 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         public_config["recommended_models"] = model_catalog["recommended_models"]
         return public_config
 
-    @app.get("/api/models", response_model=ModelCatalogResponse)
+    @app.get("/api/models", response_model=ModelCatalogResponse, dependencies=[Depends(require_auth)])
     async def get_models() -> ModelCatalogResponse:
         return ModelCatalogResponse.model_validate(model_manager.catalog())
 
-    @app.post("/api/models/ensure-recommended", response_model=ModelCatalogResponse, status_code=202)
+    @app.post(
+        "/api/models/ensure-recommended",
+        response_model=ModelCatalogResponse,
+        status_code=202,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def ensure_recommended_models() -> ModelCatalogResponse:
         return ModelCatalogResponse.model_validate(model_manager.ensure_recommended())
 
-    @app.get("/api/workspace/inspect")
+    @app.get("/api/workspace/inspect", dependencies=[Depends(require_auth)])
     async def inspect_workspace(
         focus: str | None = Query(default=None),
         workspace_id: str | None = Query(default=None),
@@ -97,15 +170,24 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return response.model_dump()
 
-    @app.get("/api/workspaces", response_model=list[WorkspaceRecord])
+    @app.get("/api/workspaces", response_model=list[WorkspaceRecord], dependencies=[Depends(require_auth)])
     async def list_workspaces() -> list[WorkspaceRecord]:
         return task_manager.list_workspaces()
 
-    @app.post("/api/workspaces", response_model=WorkspaceRecord, status_code=201)
+    @app.post(
+        "/api/workspaces",
+        response_model=WorkspaceRecord,
+        status_code=201,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def create_workspace(request: WorkspaceCreateRequest) -> WorkspaceRecord:
         return task_manager.create_workspace(request.name, request.path)
 
-    @app.patch("/api/workspaces/{workspace_id}", response_model=WorkspaceRecord)
+    @app.patch(
+        "/api/workspaces/{workspace_id}",
+        response_model=WorkspaceRecord,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def update_workspace(
         workspace_id: str,
         request: WorkspaceUpdateRequest,
@@ -119,24 +201,29 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace not found.")
         return workspace
 
-    @app.get("/api/sessions", response_model=list[SessionSummary])
+    @app.get("/api/sessions", response_model=list[SessionSummary], dependencies=[Depends(require_auth)])
     async def list_sessions(limit: int = Query(default=100, ge=1, le=500)) -> list[SessionSummary]:
         return task_manager.list_sessions(limit=limit)
 
-    @app.get("/api/sessions/{session_id}")
+    @app.get("/api/sessions/{session_id}", dependencies=[Depends(require_auth)])
     async def get_session(session_id: str) -> dict:
         session = task_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found.")
         return session.model_dump()
 
-    @app.get("/api/sessions/{session_id}/logs")
+    @app.get("/api/sessions/{session_id}/logs", dependencies=[Depends(require_auth)])
     async def get_session_logs(session_id: str) -> list[dict]:
         if task_manager.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="Session not found.")
         return [record.model_dump() for record in task_manager.get_logs(session_id)]
 
-    @app.post("/api/tasks", response_model=SessionSummary, status_code=202)
+    @app.post(
+        "/api/tasks",
+        response_model=SessionSummary,
+        status_code=202,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def create_task(request: TaskCreateRequest) -> SessionSummary:
         try:
             return task_manager.start_task(
@@ -163,7 +250,10 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         except WorkspaceNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.patch("/api/sessions/{session_id}")
+    @app.patch(
+        "/api/sessions/{session_id}",
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def update_session(session_id: str, request: SessionUpdateRequest) -> dict:
         session = task_manager.update_session(
             session_id,
@@ -174,7 +264,11 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Session not found.")
         return session.model_dump()
 
-    @app.delete("/api/sessions/{session_id}", status_code=204)
+    @app.delete(
+        "/api/sessions/{session_id}",
+        status_code=204,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def delete_session(session_id: str) -> Response:
         try:
             deleted = task_manager.delete_session(session_id)
@@ -184,7 +278,11 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Session not found.")
         return Response(status_code=204)
 
-    @app.delete("/api/workspaces/{workspace_id}", status_code=204)
+    @app.delete(
+        "/api/workspaces/{workspace_id}",
+        status_code=204,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
     async def delete_workspace(workspace_id: str) -> Response:
         try:
             deleted = task_manager.delete_workspace(workspace_id)
@@ -194,7 +292,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace not found.")
         return Response(status_code=204)
 
-    @app.get("/api/sessions/{session_id}/events")
+    @app.get("/api/sessions/{session_id}/events", dependencies=[Depends(require_auth)])
     async def stream_session_events(session_id: str) -> StreamingResponse:
         if task_manager.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="Session not found.")

@@ -10,6 +10,55 @@ from agent.models import FileChangeRecord, ToolCallRecord
 from config.settings import AppConfig
 from server.app import _with_available_models, create_app
 
+TEST_ORIGIN = "https://testserver"
+TEST_AUTH_SECRET = "test-auth-secret-please-change"
+TEST_ADMIN_EMAIL = "operator@example.com"
+TEST_ADMIN_PASSWORD = "VeryStrongPassword!2026"
+
+
+def build_test_config(root, **overrides) -> AppConfig:
+    return AppConfig(
+        workspace_root=str(root),
+        ollama_host="http://127.0.0.1:9",
+        auth_secret_key=TEST_AUTH_SECRET,
+        auth_initial_admin_email=TEST_ADMIN_EMAIL,
+        auth_initial_admin_password=TEST_ADMIN_PASSWORD,
+        auth_cookie_secure=True,
+        **overrides,
+    )
+
+
+def current_csrf_token(client: TestClient) -> str:
+    return client.cookies.get("__Host-marc_csrf") or client.cookies.get("marc_csrf") or ""
+
+
+def apply_csrf_headers(client: TestClient) -> None:
+    client.headers.update(
+        {
+            "Origin": TEST_ORIGIN,
+            "X-CSRF-Token": current_csrf_token(client),
+        }
+    )
+
+
+def authenticate_client(client: TestClient) -> None:
+    session_response = client.get("/api/auth/session")
+    assert session_response.status_code == 200
+    apply_csrf_headers(client)
+    login_response = client.post(
+        "/api/auth/login",
+        json={"email": TEST_ADMIN_EMAIL, "password": TEST_ADMIN_PASSWORD},
+    )
+    assert login_response.status_code == 200
+    apply_csrf_headers(client)
+
+
+def build_test_client(app, *, authenticate: bool = True) -> TestClient:
+    client = TestClient(app, base_url=TEST_ORIGIN)
+    if authenticate:
+        authenticate_client(client)
+    return client
+
 
 def create_test_workspace(client: TestClient, root, name: str = "Workspace A") -> dict:
     workspace_root = root / name.lower().replace(" ", "-")
@@ -23,10 +72,10 @@ def create_test_workspace(client: TestClient, root, name: str = "Workspace A") -
 
 
 def test_web_root_serves_gui(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config = build_test_config(tmp_path)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app, authenticate=False)
 
     response = client.get("/")
 
@@ -35,10 +84,10 @@ def test_web_root_serves_gui(tmp_path):
 
 
 def test_workspaces_api_does_not_auto_add_base_workspace(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config = build_test_config(tmp_path)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
 
     response = client.get("/api/workspaces")
 
@@ -47,10 +96,10 @@ def test_workspaces_api_does_not_auto_add_base_workspace(tmp_path):
 
 
 def test_new_chat_requires_explicit_workspace_selection(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config = build_test_config(tmp_path)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
 
     response = client.post("/api/tasks", json={"prompt": "ohne workspace starten"})
 
@@ -61,15 +110,10 @@ def test_new_chat_requires_explicit_workspace_selection(tmp_path):
 def test_start_task_and_fetch_session_via_api(tmp_path):
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
 
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        ollama_host="http://127.0.0.1:9",
-        max_iterations=1,
-        shell_timeout=1,
-    )
+    config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
     workspace = create_test_workspace(client, tmp_path)
 
     create_response = client.post(
@@ -126,7 +170,7 @@ def test_start_task_and_fetch_session_via_api(tmp_path):
 
 
 def test_config_exposes_preferred_and_installed_ollama_models(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config = build_test_config(tmp_path)
     config.ensure_state_dirs()
     catalog = {
         "installed_models": [
@@ -168,7 +212,7 @@ def test_config_exposes_preferred_and_installed_ollama_models(tmp_path):
         ],
     ), patch("server.app.ModelManager.catalog", return_value=catalog):
         app = create_app(config)
-        client = TestClient(app)
+        client = build_test_client(app)
 
         response = client.get("/api/config")
 
@@ -202,7 +246,7 @@ def test_available_models_pick_fast_router_model_when_possible(tmp_path):
 
 
 def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), ollama_host="http://127.0.0.1:9")
+    config = build_test_config(tmp_path)
     config.ensure_state_dirs()
     catalog = {
         "installed_models": [
@@ -236,7 +280,7 @@ def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_p
         return_value=catalog,
     ) as ensure_mock:
         app = create_app(config)
-        client = TestClient(app)
+        client = build_test_client(app)
 
         response = client.get("/api/models")
         ensure_response = client.post("/api/models/ensure-recommended")
@@ -249,15 +293,10 @@ def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_p
 
 
 def test_workspace_crud_and_follow_up_messages_stay_in_same_chat(tmp_path):
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        ollama_host="http://127.0.0.1:9",
-        max_iterations=1,
-        shell_timeout=1,
-    )
+    config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
 
     workspace = create_test_workspace(client, tmp_path)
     workspace_root = tmp_path / "workspace-a"
@@ -371,15 +410,10 @@ def test_workspace_crud_and_follow_up_messages_stay_in_same_chat(tmp_path):
 
 
 def test_stop_requested_updates_running_session(tmp_path):
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        ollama_host="http://127.0.0.1:9",
-        max_iterations=2,
-        shell_timeout=1,
-    )
+    config = build_test_config(tmp_path, max_iterations=2, shell_timeout=1)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
 
     started = Event()
 
@@ -451,15 +485,10 @@ def test_stop_requested_updates_running_session(tmp_path):
 
 
 def test_follow_up_task_clears_old_execution_state_but_keeps_last_paths(tmp_path):
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        ollama_host="http://127.0.0.1:9",
-        max_iterations=1,
-        shell_timeout=1,
-    )
+    config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
 
     observed_states: list[dict] = []
 
@@ -542,15 +571,10 @@ def test_follow_up_task_clears_old_execution_state_but_keeps_last_paths(tmp_path
 
 
 def test_delete_session_removes_chat_metadata_and_logs(tmp_path):
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        ollama_host="http://127.0.0.1:9",
-        max_iterations=1,
-        shell_timeout=1,
-    )
+    config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
     workspace = create_test_workspace(client, tmp_path)
 
     create_response = client.post(
@@ -591,15 +615,10 @@ def test_delete_session_removes_chat_metadata_and_logs(tmp_path):
 
 
 def test_delete_workspace_removes_workspace_and_associated_chats(tmp_path):
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        ollama_host="http://127.0.0.1:9",
-        max_iterations=1,
-        shell_timeout=1,
-    )
+    config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
     app = create_app(config)
-    client = TestClient(app)
+    client = build_test_client(app)
     workspace = create_test_workspace(client, tmp_path)
 
     create_response = client.post(

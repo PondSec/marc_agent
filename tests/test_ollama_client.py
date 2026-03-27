@@ -169,7 +169,8 @@ def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypa
     )
 
     assert result == "hello"
-    assert [event["type"] for event in progress_events] == ["status", "chunk", "heartbeat", "chunk"]
+    assert [event["type"] for event in progress_events] == ["status", "status", "chunk", "heartbeat", "chunk"]
+    assert progress_events[1]["stage"] == "waiting_for_first_chunk"
 
 
 def test_ollama_client_uses_longer_initial_response_timeout_for_slow_local_models(monkeypatch, tmp_path):
@@ -265,5 +266,6 @@ def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monke
     assert error.progress_seen is False
     assert error.retryable is False
     assert progress_events[0]["stage"] == "request_started"
+    assert any(event.get("stage") == "waiting_for_first_chunk" for event in progress_events if event.get("type") == "status")
     assert any(event.get("phase") == "waiting_for_start" for event in progress_events if event.get("type") == "heartbeat")
     assert any(event.get("stage") == "startup_timeout_warning" for event in progress_events if event.get("type") == "status")

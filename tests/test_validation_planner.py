@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 
-from agent.models import FileChangeRecord, SessionState, ValidationCommand, ValidationRunRecord, WorkspaceSnapshot
+from agent.models import (
+    DiagnosticRecord,
+    FileChangeRecord,
+    SessionState,
+    ValidationCommand,
+    ValidationRunRecord,
+    WorkspaceSnapshot,
+)
 from agent.verification import ValidationPlanner
 
 
@@ -184,3 +191,45 @@ def test_validation_planner_adds_structural_web_checks_with_expected_features():
     assert payload[0]["path"] == "snake.html"
     assert "menu" in payload[0]["expected_features"]
     assert "highscore" in payload[0]["expected_features"]
+
+
+def test_validation_planner_builds_structured_failure_evidence_for_web_validation():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Baue ein Menü und einen Highscore dazu",
+        workspace_root="/tmp/demo",
+        edit_generation=1,
+    )
+    session.changed_files.append(FileChangeRecord(path="snake.html", operation="modify"))
+    failed_run = ValidationRunRecord(
+        command='internal:web_artifact:[{"path":"snake.html","expected_features":["menu","highscore"]}]',
+        kind="check",
+        verification_scope="structural",
+        status="failed",
+        edit_generation=1,
+        summary="Structural web validation failed.",
+        excerpt="snake.html: missing expected web features (menu, highscore)",
+    )
+    session.validation_runs.append(failed_run)
+    session.diagnostics.append(
+        DiagnosticRecord(
+            source="run_tests",
+            category="command_failure",
+            summary="snake.html is still missing the required menu and highscore markers",
+            tool_name="run_tests",
+            command=failed_run.command,
+            file_hints=["snake.html"],
+            action_hints=["Inspect the failing output and repair the reported artifact before rerunning the check."],
+            excerpt="snake.html: missing expected web features (menu, highscore)",
+        )
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.verification_scope == "structural"
+    assert evidence.artifact_paths == ["snake.html"]
+    assert evidence.expected_features == ["menu", "highscore"]
+    assert evidence.missing_features == ["menu", "highscore"]
+    assert "snake.html is missing validation-required features" in evidence.failure_summary
+    assert any("Add or restore the structural features" in item for item in evidence.repair_requirements)
+    assert any("Do not stop at an equivalent" in item for item in evidence.repair_requirements)

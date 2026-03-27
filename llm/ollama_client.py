@@ -45,6 +45,10 @@ class OllamaGenerationError(OllamaClientError):
     def progress_seen(self) -> bool:
         return bool(self.partial_text) or self.characters > 0 or self.activity_count > 0
 
+    @property
+    def no_start_failure(self) -> bool:
+        return self.reason == "startup_timeout" and not self.progress_seen and self.characters <= 0
+
 
 class OllamaClient:
     def __init__(self, config: AppConfig):
@@ -221,6 +225,18 @@ class OllamaClient:
         total_characters = 0
         activity_count = 0
         startup_warning_sent = False
+
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "type": "status",
+                    "stage": "waiting_for_first_chunk",
+                    "model": model_name,
+                    "startup_timeout": startup_timeout,
+                    "inactivity_timeout": inactivity_timeout,
+                    "total_timeout": total_timeout,
+                }
+            )
 
         while True:
             try:

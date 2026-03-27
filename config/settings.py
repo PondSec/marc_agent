@@ -39,6 +39,18 @@ def _parse_float(value: Any, default: float) -> float:
     return float(value)
 
 
+def _parse_csv_list(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return tuple(items) or default
+    text = str(value).strip()
+    if not text:
+        return default
+    return tuple(part.strip() for part in text.split(",") if part.strip()) or default
+
+
 def _load_dotenv(path: Path) -> dict[str, str]:
     data: dict[str, str] = {}
     if not path.exists():
@@ -111,6 +123,26 @@ class AppConfig:
     ollama_temperature: float = 0.1
     warmup_models_on_startup: bool = True
     warmup_timeout: int = 45
+    auth_enabled: bool = True
+    auth_secret_key: str | None = None
+    auth_initial_admin_email: str | None = None
+    auth_initial_admin_password: str | None = None
+    auth_initial_admin_name: str = "Administrator"
+    auth_initial_admin_totp_secret: str | None = None
+    auth_cookie_secure: bool = True
+    auth_session_idle_seconds: int = 1800
+    auth_session_absolute_seconds: int = 43200
+    auth_session_touch_interval_seconds: int = 60
+    auth_min_password_length: int = 14
+    security_allowed_hosts: tuple[str, ...] = (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "testserver",
+    )
+    cors_allowed_origins: tuple[str, ...] = ()
+    hsts_enabled: bool = True
+    public_base_url: str | None = None
 
     @classmethod
     def from_sources(
@@ -232,6 +264,66 @@ class AppConfig:
                 pick("WARMUP_TIMEOUT", defaults.warmup_timeout),
                 defaults.warmup_timeout,
             ),
+            auth_enabled=_parse_bool(
+                pick("AUTH_ENABLED", defaults.auth_enabled),
+                defaults.auth_enabled,
+            ),
+            auth_secret_key=str(pick("AUTH_SECRET_KEY", defaults.auth_secret_key) or "").strip()
+            or None,
+            auth_initial_admin_email=str(
+                pick("AUTH_INITIAL_ADMIN_EMAIL", defaults.auth_initial_admin_email) or ""
+            ).strip()
+            or None,
+            auth_initial_admin_password=str(
+                pick("AUTH_INITIAL_ADMIN_PASSWORD", defaults.auth_initial_admin_password) or ""
+            ).strip()
+            or None,
+            auth_initial_admin_name=str(
+                pick("AUTH_INITIAL_ADMIN_NAME", defaults.auth_initial_admin_name)
+            ).strip()
+            or defaults.auth_initial_admin_name,
+            auth_initial_admin_totp_secret=str(
+                pick("AUTH_INITIAL_ADMIN_TOTP_SECRET", defaults.auth_initial_admin_totp_secret)
+                or ""
+            ).strip()
+            or None,
+            auth_cookie_secure=_parse_bool(
+                pick("AUTH_COOKIE_SECURE", defaults.auth_cookie_secure),
+                defaults.auth_cookie_secure,
+            ),
+            auth_session_idle_seconds=_parse_int(
+                pick("AUTH_SESSION_IDLE_SECONDS", defaults.auth_session_idle_seconds),
+                defaults.auth_session_idle_seconds,
+            ),
+            auth_session_absolute_seconds=_parse_int(
+                pick("AUTH_SESSION_ABSOLUTE_SECONDS", defaults.auth_session_absolute_seconds),
+                defaults.auth_session_absolute_seconds,
+            ),
+            auth_session_touch_interval_seconds=_parse_int(
+                pick(
+                    "AUTH_SESSION_TOUCH_INTERVAL_SECONDS",
+                    defaults.auth_session_touch_interval_seconds,
+                ),
+                defaults.auth_session_touch_interval_seconds,
+            ),
+            auth_min_password_length=_parse_int(
+                pick("AUTH_MIN_PASSWORD_LENGTH", defaults.auth_min_password_length),
+                defaults.auth_min_password_length,
+            ),
+            security_allowed_hosts=_parse_csv_list(
+                pick("ALLOWED_HOSTS", defaults.security_allowed_hosts),
+                defaults.security_allowed_hosts,
+            ),
+            cors_allowed_origins=_parse_csv_list(
+                pick("CORS_ALLOWED_ORIGINS", defaults.cors_allowed_origins),
+                defaults.cors_allowed_origins,
+            ),
+            hsts_enabled=_parse_bool(
+                pick("HSTS_ENABLED", defaults.hsts_enabled),
+                defaults.hsts_enabled,
+            ),
+            public_base_url=str(pick("PUBLIC_BASE_URL", defaults.public_base_url) or "").strip()
+            or None,
         ).normalized()
 
         if workspace_override:
@@ -292,6 +384,10 @@ class AppConfig:
         return self.state_root / "reports"
 
     @property
+    def auth_db_path(self) -> Path:
+        return self.state_root / "auth.db"
+
+    @property
     def full_access(self) -> bool:
         return self.access_mode == AccessMode.FULL.value
 
@@ -304,6 +400,12 @@ class AppConfig:
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        for secret_key in (
+            "auth_secret_key",
+            "auth_initial_admin_password",
+            "auth_initial_admin_totp_secret",
+        ):
+            data.pop(secret_key, None)
         data["workspace_root"] = str(self.workspace_path)
         data["state_root"] = str(self.state_root)
         data["session_dir"] = str(self.session_dir_path)
@@ -357,5 +459,6 @@ class AppConfig:
         ]
         data["capabilities"] = {
             "session_archiving": True,
+            "mfa_totp": True,
         }
         return data

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 
-from agent.models import SessionState, WorkspaceSnapshot
+from agent.models import SessionState, ValidationFailureEvidence, WorkspaceSnapshot
 from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
 from llm.schemas import RouteActionName, RouterOutput
+
+
+REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
 
 
 def system_prompt() -> str:
@@ -360,6 +363,8 @@ def generate_content_prompt(
     *,
     path: str,
     current_content: str | None = None,
+    repair_context: ValidationFailureEvidence | None = None,
+    repair_strategy: str | None = None,
 ) -> str:
     sections = [
         "Produce the full file content for the requested task.",
@@ -372,6 +377,13 @@ def generate_content_prompt(
         f"Diagnostic context: {_diagnostic_context(session)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
     ]
+    if repair_context is not None:
+        sections.extend(
+            [
+                f"Validation-guided repair context: {json.dumps(_compact_repair_context(repair_context), ensure_ascii=False)}",
+                _repair_rules(repair_strategy),
+            ]
+        )
     if current_content is not None:
         sections.extend(
             [
@@ -391,6 +403,8 @@ def generate_content_retry_prompt(
     *,
     path: str,
     current_content: str | None = None,
+    repair_context: ValidationFailureEvidence | None = None,
+    repair_strategy: str | None = None,
 ) -> str:
     sections = [
         "Produce the full file content for exactly one file.",
@@ -406,6 +420,13 @@ def generate_content_retry_prompt(
             [
                 f"Diagnostic context: {_diagnostic_context(session)}",
                 f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
+            ]
+        )
+    if repair_context is not None:
+        sections.extend(
+            [
+                f"Validation-guided repair context: {json.dumps(_compact_repair_context(repair_context), ensure_ascii=False)}",
+                _repair_rules(repair_strategy),
             ]
         )
     if current_content is not None:
@@ -429,6 +450,8 @@ def generate_content_continuation_prompt(
     path: str,
     partial_content: str,
     current_content: str | None = None,
+    repair_context: ValidationFailureEvidence | None = None,
+    repair_strategy: str | None = None,
 ) -> str:
     sections = [
         "Finish the full file content for exactly one file.",
@@ -445,6 +468,13 @@ def generate_content_continuation_prompt(
             [
                 f"Diagnostic context: {_diagnostic_context(session)}",
                 f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
+            ]
+        )
+    if repair_context is not None:
+        sections.extend(
+            [
+                f"Validation-guided repair context: {json.dumps(_compact_repair_context(repair_context), ensure_ascii=False)}",
+                _repair_rules(repair_strategy),
             ]
         )
     if current_content is not None:
@@ -676,6 +706,40 @@ def _compact_task_state(state: TaskState | None) -> dict[str, object]:
         "missing_info": state.missing_info[:4],
         "execution_outline": state.execution_outline[:5],
     }
+
+
+def _compact_repair_context(context: ValidationFailureEvidence) -> dict[str, object]:
+    return {
+        "command": _trim_text(context.command, 180),
+        "verification_scope": context.verification_scope,
+        "status": context.status,
+        "artifact_paths": context.artifact_paths[:6],
+        "summary": _trim_text(context.summary, 180),
+        "failure_summary": _trim_text(context.failure_summary, 220),
+        "excerpt": _trim_text(context.excerpt or "", 320),
+        "expected_features": context.expected_features[:8],
+        "missing_features": context.missing_features[:8],
+        "file_hints": context.file_hints[:6],
+        "line_hints": context.line_hints[:8],
+        "action_hints": [_trim_text(item, 160) for item in context.action_hints[:4]],
+        "repair_requirements": [_trim_text(item, 200) for item in context.repair_requirements[:6]],
+        "evidence_signature": context.evidence_signature,
+    }
+
+
+def _repair_rules(repair_strategy: str | None) -> str:
+    lines = [
+        "Repair rules:",
+        "- Use the failed validation evidence as a hard constraint for this update.",
+        "- Make a concrete mutation that addresses the failed verification scope directly.",
+        "- Do not return equivalent content or formatting-only changes.",
+        f"- If the current evidence is still insufficient to derive a concrete fix, return exactly {REPAIR_BLOCKED_SENTINEL}.",
+    ]
+    if repair_strategy == "validation_escalated":
+        lines.append(
+            "- A previous repair attempt produced no effective change. Tighten the repair and change the file materially."
+        )
+    return "\n".join(lines)
 
 
 def _inspected_context(session: SessionState) -> str:

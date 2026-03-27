@@ -539,6 +539,7 @@ class AgentCore:
                 session.repair_attempts += 1
             session.edit_generation += 1
             session.validation_status = "not_run"
+            session.active_repair_context = None
             session.last_error = None
             session.blockers = []
             self._track_helper_artifacts(session, result.changed_files)
@@ -548,9 +549,15 @@ class AgentCore:
             self._record_validation_run(session, decision, result)
             session.validation_status = self.validation_planner.rollup_status(session)
             if session.validation_status == "failed":
+                failed_run = session.validation_runs[-1]
+                session.active_repair_context = self.validation_planner.build_failure_evidence(
+                    session,
+                    failed_run,
+                )
                 session.last_error = self._build_output_excerpt(result.data) or result.message
             elif session.validation_status == "passed":
                 session.repair_attempts = 0
+                session.active_repair_context = None
                 session.last_error = None
             elif session.validation_status == "blocked":
                 self._add_blocker(session, result.message)

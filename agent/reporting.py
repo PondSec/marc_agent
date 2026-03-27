@@ -71,9 +71,22 @@ class SessionReporter:
             limit=2,
             fallback="",
         )
+        repair_summary = (
+            str(session.active_repair_context.failure_summary or "").strip()
+            if session.active_repair_context is not None
+            else ""
+        )
 
         if blocker_text:
             details.append(self._localized_text(language, de=f"Blocker: {blocker_text}.", en=f"Blocker: {blocker_text}."))
+        elif session.stop_reason in {"no_effective_change", "repair_blocked_after_validation_failure"} and repair_summary:
+            details.append(
+                self._localized_text(
+                    language,
+                    de=f"Repair-Blocker: Aus der Validierungs-Evidenz liess sich noch keine wirksame, nicht-aequivalente Aenderung ableiten ({repair_summary}).",
+                    en=f"Repair blocker: the validation evidence still did not support a substantive, non-equivalent fix ({repair_summary}).",
+                )
+            )
         elif session.validation_status == "failed":
             details.append(
                 self._localized_text(
@@ -160,6 +173,20 @@ class SessionReporter:
                 language,
                 de="Ich habe Aenderungen umgesetzt, aber ich kann noch keinen sauber validierten Abschluss melden.",
                 en="I made changes, but I cannot claim a clean validated completion yet.",
+            )
+
+        if session.stop_reason == "model_start_failed":
+            return self._localized_text(
+                language,
+                de="Ich konnte die Generierung in diesem Lauf nicht einmal sauber starten.",
+                en="I could not cleanly start generation in this run.",
+            )
+
+        if session.stop_reason == "repair_generation_failed":
+            return self._localized_text(
+                language,
+                de="Ich konnte den Repair-Inhalt in diesem Lauf nicht stabil erzeugen.",
+                en="I could not generate stable repair content in this run.",
             )
 
         if session.blockers:
