@@ -247,12 +247,22 @@ class AgentCore:
     ) -> None:
         session.current_phase = "planning"
         session.workflow_stage = "plan"
-        session.router_result = planner.interpret_user_request(
+        session.task_state = planner.update_task_state(
             task,
             session.workspace_snapshot,
             session=session,
         )
-        session.task_analysis = session.router_result.model_dump()
+        session.task_understanding = session.task_state.to_task_understanding()
+        session.router_result = planner.route_task_state(
+            session.task_state,
+            session.workspace_snapshot,
+            session=session,
+        )
+        session.task_analysis = {
+            "task_state": session.task_state.model_dump(),
+            "task_understanding": session.task_understanding.model_dump(),
+            "router_result": session.router_result.model_dump(),
+        }
         if session.router_result.direct_response and not session.router_result.repo_context_needed:
             session.plan_summary = "Respond directly without repository work."
             session.plan = []
@@ -260,7 +270,7 @@ class AgentCore:
             session.current_phase = "exploring"
             session.workflow_stage = "discover"
             return
-        plan = planner.create_plan(task, session.workspace_snapshot, session.router_result)
+        plan = planner.create_plan(task, session, session.router_result)
         session.plan_summary = plan.summary
         session.plan = [PlanItem(step=step) for step in plan.steps]
         if session.plan:
@@ -281,6 +291,7 @@ class AgentCore:
         if snapshot is None:
             return
         route = session.router_result
+        follow_up_context = session.follow_up_context
         extension_candidates: list[str] = []
         if route and route.relevant_extensions:
             extension_candidates = [
@@ -288,7 +299,35 @@ class AgentCore:
                 for path in snapshot.important_files[:24]
                 if any(path.endswith(extension) for extension in route.relevant_extensions)
             ]
+        follow_up_files: list[str] = []
+        if follow_up_context is not None:
+            follow_up_files.extend(follow_up_context.target_paths)
+            follow_up_files.extend(follow_up_context.changed_files)
+            follow_up_files.extend(follow_up_context.read_files)
+            follow_up_files.extend(
+                path
+                for item in follow_up_context.diagnostics[-6:]
+                for path in item.file_hints
+            )
+        understanding_files: list[str] = []
+        if session.task_understanding is not None:
+            understanding_files.extend(
+                artifact.path
+                for artifact in session.task_understanding.target_artifacts
+                if artifact.path
+            )
+        task_state_files: list[str] = []
+        if session.task_state is not None:
+            task_state_files.extend(
+                artifact.path
+                for artifact in session.task_state.target_artifacts
+                if artifact.path
+            )
         candidate_files = [
+            *session.candidate_files,
+            *task_state_files,
+            *understanding_files,
+            *follow_up_files,
             *((route.entities.target_paths if route else [])),
             *(planned_files or []),
             *extension_candidates,
@@ -598,6 +637,8 @@ class AgentCore:
             return "partial"
         if session.blockers or session.validation_status in {"failed", "blocked"}:
             return "partial"
+        if session.changed_files and session.validation_status == "not_run":
+            return "partial"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "partial"
         if final_action or session.tool_calls:
@@ -609,6 +650,8 @@ class AgentCore:
             return "blocked"
         if session.changed_files and session.validation_status == "passed":
             return "validated"
+        if session.changed_files and session.validation_status == "not_run":
+            return "validation_missing"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "validation_incomplete"
         return "analysis_complete"

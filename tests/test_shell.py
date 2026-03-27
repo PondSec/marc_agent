@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from config.settings import AppConfig
-from llm.schemas import RunShellArgs
+from llm.schemas import RunShellArgs, RunTestsArgs
 from runtime.workspace import WorkspaceManager
 from tools.safety import SafetyManager
 from tools.shell import ShellTools
@@ -24,3 +26,31 @@ def test_shell_command_timeout(tmp_path):
 
     assert result["success"] is False
     assert result["timeout"] is True
+
+
+def test_shell_internal_validation_handles_python_and_html_defaults(tmp_path):
+    (tmp_path / "game.py").write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / "index.html").write_text('<script src="snake.js"></script>\n', encoding="utf-8")
+    (tmp_path / "snake.js").write_text("console.log('ok');\n", encoding="utf-8")
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    python_result = shell.run_tests(
+        RunTestsArgs(
+            command=f'internal:python_syntax:{json.dumps(["game.py"])}',
+            cwd=".",
+        )
+    )
+    html_result = shell.run_tests(
+        RunTestsArgs(
+            command=f'internal:html_refs:{json.dumps(["index.html"])}',
+            cwd=".",
+        )
+    )
+
+    assert python_result["success"] is True
+    assert html_result["success"] is True

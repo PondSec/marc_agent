@@ -89,6 +89,7 @@ class FailureAnalyzer:
                 return candidate[:240]
         return "Command failed without a readable diagnostic."
 
+
     def _extract_file_hints(self, text: str) -> tuple[list[str], list[int]]:
         file_hints: list[str] = []
         line_hints: list[int] = []

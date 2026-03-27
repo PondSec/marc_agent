@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from agent.models import SessionState
 
@@ -13,7 +14,9 @@ class SessionStore:
 
     def save(self, session: SessionState) -> None:
         target = self.session_dir / f"{session.id}.json"
-        target.write_text(session.model_dump_json(indent=2), encoding="utf-8")
+        temp_target = self.session_dir / f".{session.id}.{uuid4().hex}.tmp"
+        temp_target.write_text(session.model_dump_json(indent=2), encoding="utf-8")
+        temp_target.replace(target)
         self.last_session_file.write_text(session.id, encoding="utf-8")
 
     def load(self, session_id: str | None) -> SessionState | None:

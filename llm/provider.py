@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class LLMProvider(Protocol):
@@ -13,6 +17,8 @@ class LLMProvider(Protocol):
         model: str | None = None,
         retries: int | None = None,
         timeout: int | None = None,
+        total_timeout: int | None = None,
+        progress_callback: ProgressCallback | None = None,
         num_ctx: int | None = None,
     ) -> str: ...
 
@@ -24,5 +30,7 @@ class LLMProvider(Protocol):
         model: str | None = None,
         retries: int | None = None,
         timeout: int | None = None,
+        total_timeout: int | None = None,
+        progress_callback: ProgressCallback | None = None,
         num_ctx: int | None = None,
     ) -> dict[str, Any]: ...

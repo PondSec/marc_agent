@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import shlex
+import shutil
 from pathlib import Path
 
 from agent.models import SessionState, ValidationCommand, WorkspaceSnapshot
@@ -28,6 +31,8 @@ class ValidationPlanner:
             ValidationCommand(command=item, kind="check", source="fallback")
             for item in snapshot.likely_commands
         ]
+        if not commands:
+            commands = self._default_commands(changed_files or [])
         if not commands:
             return []
 
@@ -79,7 +84,20 @@ class ValidationPlanner:
 
     def rollup_status(self, session: SessionState) -> str:
         if not session.validation_plan:
-            return "passed" if session.changed_files else "not_run"
+            if not session.changed_files:
+                return "not_run"
+            current_runs = [
+                run for run in session.validation_runs if run.edit_generation == session.edit_generation
+            ]
+            if not current_runs:
+                return "not_run"
+            if any(run.status == "blocked" for run in current_runs):
+                return "blocked"
+            if any(run.status in {"failed", "timeout"} for run in current_runs):
+                return "failed"
+            if any(run.status == "passed" for run in current_runs):
+                return "passed"
+            return "not_run"
 
         current_runs = [
             run for run in session.validation_runs if run.edit_generation == session.edit_generation
@@ -131,3 +149,59 @@ class ValidationPlanner:
                 if fallback_kind in available_kinds:
                     kinds.add(fallback_kind)
         return kinds
+
+    def _default_commands(self, changed_files: list[str]) -> list[ValidationCommand]:
+        unique_paths = self._unique_paths(changed_files)
+        if not unique_paths:
+            return []
+
+        commands: list[ValidationCommand] = []
+        python_files = [path for path in unique_paths if Path(path).suffix.lower() == ".py"]
+        html_files = [path for path in unique_paths if Path(path).suffix.lower() == ".html"]
+        js_files = [
+            path for path in unique_paths if Path(path).suffix.lower() in {".js", ".jsx", ".mjs", ".cjs"}
+        ]
+
+        if python_files:
+            commands.append(
+                ValidationCommand(
+                    command=f"internal:python_syntax:{json.dumps(python_files)}",
+                    kind="check",
+                    source="default",
+                    priority=15,
+                    reason="Syntax-check the changed Python starter artifacts.",
+                )
+            )
+
+        if html_files:
+            commands.append(
+                ValidationCommand(
+                    command=f"internal:html_refs:{json.dumps(html_files)}",
+                    kind="check",
+                    source="default",
+                    priority=20,
+                    reason="Check that local HTML asset references resolve.",
+                )
+            )
+
+        if js_files and shutil.which("node"):
+            commands.append(
+                ValidationCommand(
+                    command=f"node --check {' '.join(shlex.quote(path) for path in js_files)}",
+                    kind="check",
+                    source="default",
+                    priority=25,
+                    reason="Syntax-check the changed JavaScript starter artifacts with Node.",
+                )
+            )
+
+        return commands
+
+    def _unique_paths(self, values: list[str]) -> list[str]:
+        unique: list[str] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text or text in unique:
+                continue
+            unique.append(text)
+        return unique

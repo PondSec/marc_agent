@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from agent.models import SessionState
+from agent.models import FileChangeRecord, FollowUpContext, SessionState
 from agent.router import IntentRouter
 from llm.schemas import RouteActionName, RouteIntent, router_output_schema
 from runtime.logger import AgentLogger
@@ -161,6 +161,80 @@ def test_router_fallback_still_answers_simple_intro_questions():
     assert route.intent == RouteIntent.EXPLAIN
     assert route.safe_to_execute is True
     assert "Coding-Agent" in (route.direct_response or "")
+
+
+def test_router_fast_paths_clear_create_request_without_calling_llm():
+    llm = ScriptedLLM(fail=True, fail_message="should not be called")
+    router = IntentRouter(llm)
+
+    route = router.interpret_user_request("Programmiere mir ein Tic Tac Toe in Python", None)
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.safe_to_execute is True
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+    assert route.entities.target_name == "tic tac toe"
+    assert llm.prompts == []
+
+
+def test_router_recognizes_tictactoe_without_spaces():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
+
+    route = router.interpret_user_request("schreib ein python TicTacToe spiel", None)
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_name == "tic tac toe"
+
+
+def test_router_treats_computer_opponent_follow_up_as_update():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
+    session = SessionState(task="vorheriger prompt", workspace_root=".")
+    session.changed_files.append(FileChangeRecord(path="tic_tac_toe.py", operation="create"))
+
+    route = router.interpret_user_request(
+        "ich moechte gegen einen computer spielen statt mit 2 spielern",
+        None,
+        session=session,
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths == ["tic_tac_toe.py"]
+
+
+def test_router_treats_generic_follow_up_as_update_without_new_artifact_request():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
+    session = SessionState(task="vorheriger prompt", workspace_root=".")
+    session.changed_files.append(FileChangeRecord(path="dashboard.py", operation="create"))
+
+    route = router.interpret_user_request(
+        "mach die schrift groesser und die farben freundlicher",
+        None,
+        session=session,
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths == ["dashboard.py"]
+
+
+def test_router_treats_vague_bug_follow_up_as_debug_route():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
+    session = SessionState(task="mach ein tic tac toe", workspace_root=".")
+    session.follow_up_context = FollowUpContext(
+        previous_task="mach ein tic tac toe",
+        target_paths=["tic_tac_toe.py"],
+        changed_files=["tic_tac_toe.py"],
+        recent_commands=["python tic_tac_toe.py"],
+        last_error="Traceback: invalid move handling",
+    )
+
+    route = router.interpret_user_request(
+        "ah da ist ein fehler im terminal sieht alles buggy aus",
+        None,
+        session=session,
+    )
+
+    assert route.intent == RouteIntent.DEBUG
+    assert route.entities.target_paths == ["tic_tac_toe.py"]
+    assert any(step.action == RouteActionName.DIAGNOSE_ISSUE for step in route.action_plan)
 
 
 def test_router_timeout_retry_can_recover_with_second_attempt():

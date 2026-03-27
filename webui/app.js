@@ -1274,6 +1274,10 @@ function describeLogRecord(record) {
   const payload = record.payload || {};
   const toolName = payload.tool || payload.tool_name || null;
   const message = String(payload.message || payload.error || "").trim();
+  const progressLog = describeAgentProgressLog(record.event, payload);
+  if (progressLog) {
+    return progressLog;
+  }
 
   if (record.event === "tool_requested") {
     return describeToolRequestLog(toolName, payload);
@@ -1332,6 +1336,28 @@ function describeLogRecord(record) {
   }
 
   return null;
+}
+
+function describeAgentProgressLog(event, payload) {
+  const text = describeAgentProgressActivity(event, payload);
+  if (!text) {
+    return null;
+  }
+
+  let meta = null;
+  if (event === "router_retry_started") {
+    meta = "Der erste Routing-Versuch war zu langsam. Ich versuche es schlanker erneut.";
+  } else if (event === "content_generation_started") {
+    meta = "Der Agent baut gerade den eigentlichen Dateiinhalt.";
+  } else if (event === "path_generation_started") {
+    meta = "Ich leite gerade einen sinnvollen Zielpfad aus dem Auftrag ab.";
+  }
+
+  return {
+    text,
+    meta,
+    tone: "neutral",
+  };
 }
 
 function describeToolRequestLog(toolName, payload) {
@@ -1975,12 +2001,74 @@ function describeCurrentStep(record) {
     return "";
   }
 
+  const progress = describeAgentProgressActivity(record.event, record.payload || {});
+  if (progress) {
+    return progress;
+  }
+
   if (record.event === "tool_requested") {
     return describeToolActivity(record.payload || {});
   }
 
   if (record.event === "decision") {
     return describeDecisionActivity(record.payload || {});
+  }
+
+  return "";
+}
+
+function describeAgentProgressActivity(event, payload) {
+  const path = extractPathFromPayload(payload || {});
+
+  if (event === "router_input") {
+    return "Ich ordne gerade deine Anfrage ein.";
+  }
+  if (event === "router_retry_started") {
+    return "Der erste Router-Versuch war zu langsam. Ich probiere eine schlankere Einordnung.";
+  }
+  if (event === "router_fast_path" || event === "router_timeout_fast_fallback") {
+    return "Ich habe die Aufgabe klar erkannt und gehe direkt zum naechsten Schritt.";
+  }
+  if (event === "path_generation_started") {
+    return "Ich bestimme gerade die passende Zieldatei.";
+  }
+  if (event === "path_generation_skipped" || event === "path_generation_finished") {
+    return path
+      ? `Ich verwende ${shortenPath(path, 56)} als Zieldatei.`
+      : "Ich habe den Zielpfad festgelegt.";
+  }
+  if (event === "content_generation_started") {
+    return path
+      ? `Ich entwerfe gerade den Inhalt fuer ${shortenPath(path, 56)}.`
+      : "Ich entwerfe gerade den Dateiinhalt.";
+  }
+  if (event === "content_generation_retry_started") {
+    return path
+      ? `Der erste Versuch war zu langsam. Ich probiere ${shortenPath(path, 56)} mit weniger Kontext erneut.`
+      : "Der erste Versuch war zu langsam. Ich probiere es mit weniger Kontext erneut.";
+  }
+  if (event === "content_generation_fallback_started") {
+    return path
+      ? `Das Modell war zu langsam. Ich nutze fuer ${shortenPath(path, 56)} eine lokale Vorlage.`
+      : "Das Modell war zu langsam. Ich nutze eine lokale Vorlage.";
+  }
+  if (event === "content_generation_finished") {
+    return path
+      ? `Der Inhalt fuer ${shortenPath(path, 56)} ist vorbereitet.`
+      : "Der Dateiinhalt ist vorbereitet.";
+  }
+  if (event === "content_generation_retry_finished") {
+    return path
+      ? `Der kompaktere Versuch fuer ${shortenPath(path, 56)} hat funktioniert.`
+      : "Der kompaktere Versuch hat funktioniert.";
+  }
+  if (event === "content_generation_fallback_finished") {
+    return path
+      ? `Die lokale Vorlage fuer ${shortenPath(path, 56)} ist bereit.`
+      : "Die lokale Vorlage ist bereit.";
+  }
+  if (event === "final_response_generation_started") {
+    return "Ich formuliere gerade die Antwort.";
   }
 
   return "";

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from agent.models import SessionState, ToolCallRecord
+import pytest
+
+from agent.models import FileChangeRecord, SessionState, ToolCallRecord
 from agent.planner import Planner
 from agent.reporting import SessionReporter
+from agent.task_state import TaskState
 from config.settings import AppConfig
 from llm.schemas import AgentActionType
 
@@ -21,41 +24,64 @@ class ScriptedLLM:
 
 
 def test_planner_direct_response_is_user_facing(tmp_path):
+    payload = {
+        "user_goal": "Answer who the agent is.",
+        "intent": "explain",
+        "entities": {
+            "target_type": None,
+            "target_name": None,
+            "target_paths": [],
+            "attributes": [],
+            "constraints": [],
+        },
+        "requested_outcome": "Provide a short capability explanation.",
+        "action_plan": [
+            {
+                "step": 1,
+                "action": "respond_directly",
+                "reason": "No repository work is required.",
+            }
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+        "confidence": 0.94,
+        "safe_to_execute": True,
+        "repo_context_needed": False,
+        "search_terms": [],
+        "relevant_extensions": [],
+        "direct_response": "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.",
+    }
     planner = Planner(
-        ScriptedLLM(
-            json_payloads=[
-                {
-                    "user_goal": "Answer who the agent is.",
-                    "intent": "explain",
-                    "entities": {
-                        "target_type": None,
-                        "target_name": None,
-                        "target_paths": [],
-                        "attributes": [],
-                        "constraints": [],
-                    },
-                    "requested_outcome": "Provide a short capability explanation.",
-                    "action_plan": [
-                        {
-                            "step": 1,
-                            "action": "respond_directly",
-                            "reason": "No repository work is required.",
-                        }
-                    ],
-                    "needs_clarification": False,
-                    "clarification_questions": [],
-                    "confidence": 0.94,
-                    "safe_to_execute": True,
-                    "repo_context_needed": False,
-                    "search_terms": [],
-                    "relevant_extensions": [],
-                    "direct_response": "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.",
-                }
-            ]
-        ),
+        ScriptedLLM(json_payloads=[payload]),
         "",
     )
-    session = SessionState(task="Wer bist du?", workspace_root=str(tmp_path))
+    session = SessionState(
+        task="Wer bist du?",
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="Wer bist du?",
+            root_goal="Answer the user's intro question.",
+            active_goal="Explain briefly what the local coding agent can do.",
+            goal_relation="new_task",
+            output_expectation="A short direct capability explanation.",
+            open_problem=None,
+            verification_target="Return a concise direct answer.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.95,
+            next_action="explain",
+            execution_outline=["Answer directly"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.router_result = planner.validate_router_output(payload)
 
     decision = planner.decide_next_action(session.task, session)
 
@@ -74,6 +100,28 @@ def test_reporter_replaces_machine_summary_with_user_facing_response(tmp_path):
         current_phase="reporting",
         workflow_stage="report",
         validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="Lies die README und fasse das Repo zusammen",
+            root_goal="Summarize the repository.",
+            active_goal="Read the README and summarize the repo.",
+            goal_relation="new_task",
+            output_expectation="A concise repo summary.",
+            open_problem=None,
+            verification_target="Mention the inspected README.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.9,
+            next_action="inspect",
+            execution_outline=["Inspect README.md", "Summarize the repo"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
     )
     session.tool_calls.append(
         ToolCallRecord(
@@ -101,3 +149,118 @@ def test_reporter_replaces_machine_summary_with_user_facing_response(tmp_path):
     assert "Status=" not in response
     assert "README.md" in response
     assert "Ich habe" in response
+
+
+def test_reporter_requires_task_state_without_semantic_fallback(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(task="Hallo", workspace_root=str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="task_state"):
+        reporter.render_final_response(session, draft_response="Hallo")
+
+
+def test_reporter_marks_partial_unvalidated_changes_honestly(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="mach login sicherer",
+        workspace_root=str(tmp_path),
+        status="partial",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="mach login sicherer",
+            root_goal="Implement login for this app.",
+            active_goal="Harden the login flow without broad rewrites.",
+            goal_relation="refine",
+            output_expectation="A safer login flow.",
+            open_problem=None,
+            verification_target="Verify the login still works.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.84,
+            next_action="modify",
+            execution_outline=["Inspect auth flow", "Tighten weak spots", "Verify login path"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="app/auth.py", operation="modify"))
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(session)
+
+    assert "sauber validierten Abschluss" in response
+    assert "kein sinnvoller Check" in response
+    assert "Geaendert: app/auth.py." in response
+
+
+def test_reporter_localizes_machine_summary_fallback_to_english(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="Read the README and summarize the repo",
+        workspace_root=str(tmp_path),
+        status="completed",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="Read the README and summarize the repo",
+            root_goal="Summarize the repository.",
+            active_goal="Read the README and summarize the repo.",
+            goal_relation="new_task",
+            output_expectation="A concise repo summary.",
+            open_problem=None,
+            verification_target="Mention the inspected README.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.9,
+            next_action="inspect",
+            execution_outline=["Inspect README.md", "Summarize the repo"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "README.md"},
+            success=True,
+            summary="Read README.md.",
+            phase="exploring",
+        )
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(
+        session,
+        draft_response=(
+            "Status=completed; phase=reporting; workflow_stage=report; "
+            "access_mode=approval; validation=not_run; validations=none; "
+            "changed_files=no files changed; commands=no commands executed; "
+            "blockers=none; diagnostics=none; notes=read_file: Read README.md."
+        ),
+    )
+
+    assert "I " in response
+    assert "README.md" in response
+    assert "Ich habe" not in response

@@ -1,0 +1,1201 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from agent.core import AgentCore
+from agent.decision import ExecutionDecisionPolicy
+from agent.models import FollowUpContext, SessionState, WorkspaceSnapshot
+from agent.planner import Planner
+from agent.prompts import task_state_update_prompt
+from agent.state_updater import TaskStateUpdater
+from agent.task_state import EvidenceItem, TaskState
+from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
+from agent.understanding import TaskInterpreter
+from config.settings import AppConfig
+from llm.schemas import AgentActionType, RouteActionName, RouteIntent
+from runtime.logger import AgentLogger
+
+
+class ScriptedLLM:
+    def __init__(self, json_payloads=None):
+        self.json_payloads = list(json_payloads or [])
+        self.generate_json_calls: list[dict] = []
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if not self.json_payloads:
+            raise RuntimeError("No JSON payload configured")
+        return self.json_payloads.pop(0)
+
+    def generate(self, *args, **kwargs):
+        raise RuntimeError("Text generation not configured for this test")
+
+
+def build_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
+    return WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 4},
+        top_directories=["app", "tests"],
+        important_files=["app/main.py", "app/auth.py", "app/upload.py", "tests/test_auth.py"],
+        focus_files=["app/main.py"],
+        file_briefs={
+            "app/main.py": "Application entrypoint.",
+            "app/auth.py": "Authentication and authorization helpers.",
+            "app/upload.py": "Upload flow implementation.",
+        },
+        manifests=["pyproject.toml"],
+        configs=["pyproject.toml"],
+        test_files=["tests/test_auth.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app/main.py"],
+        repo_map=["app/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m pytest"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Python application with auth and upload flows.",
+    )
+
+
+def empty_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
+    return WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=0,
+        language_counts={},
+        top_directories=[],
+        important_files=[],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=[],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Empty workspace.",
+    )
+
+
+def task_state_from_understanding(understanding: TaskUnderstanding) -> TaskState:
+    relation_map = {
+        "new_task": "new_task",
+        "same_task_follow_up": "continue",
+        "refinement": "refine",
+        "correction": "correct",
+        "problem_report": "report_problem",
+        "constraint_update": "scope_change",
+        "clarification": "clarify",
+        "unknown": "unknown",
+    }
+    next_action_map = {
+        "create": "create",
+        "build": "create",
+        "modify": "modify",
+        "refactor": "modify",
+        "debug": "debug",
+        "test": "test",
+        "explain": "explain",
+        "analyze": "inspect",
+        "inspect": "inspect",
+        "search": "search",
+        "plan": "plan",
+        "clarify": "clarify",
+    }
+    evidence = [
+        EvidenceItem(kind="message", summary=item, confidence=0.6)
+        for item in understanding.supplied_evidence
+    ]
+    return TaskState(
+        latest_user_turn=understanding.original_request,
+        root_goal=understanding.interpreted_goal,
+        active_goal=understanding.interpreted_goal,
+        goal_relation=relation_map.get(understanding.conversation_relation, "unknown"),
+        output_expectation=understanding.interpreted_goal,
+        open_problem=None,
+        verification_target=None,
+        target_artifacts=understanding.target_artifacts,
+        evidence=evidence,
+        relevant_context=understanding.relevant_context,
+        constraints=understanding.constraints,
+        assumptions=understanding.assumptions,
+        missing_info=understanding.missing_info,
+        ambiguity_level=understanding.ambiguity_level,
+        risk_level=understanding.risk_level,
+        confidence=understanding.confidence,
+        next_action=next_action_map.get(understanding.recommended_mode, "inspect"),
+        execution_outline=[step.summary for step in understanding.execution_plan] or [understanding.interpreted_goal],
+        needs_clarification=understanding.needs_clarification,
+        clarification_questions=understanding.clarification_questions,
+    )
+
+
+def understanding_payload(
+    prompt: str,
+    *,
+    interpreted_goal: str,
+    intent_category: str,
+    recommended_mode: str,
+    confidence: float,
+    conversation_relation: str = "new_task",
+    target_artifacts=None,
+    constraints=None,
+    assumptions=None,
+    missing_info=None,
+    needs_clarification: bool = False,
+    clarification_questions=None,
+):
+    return {
+        "original_request": prompt,
+        "interpreted_goal": interpreted_goal,
+        "intent_category": intent_category,
+        "conversation_relation": conversation_relation,
+        "subgoals": ["Inspect the current implementation", "Apply the smallest safe change"],
+        "target_artifacts": target_artifacts or [],
+        "relevant_context": ["Current workspace context is available."],
+        "constraints": constraints or [],
+        "missing_info": missing_info or [],
+        "assumptions": assumptions or [],
+        "user_observations": [],
+        "supplied_evidence": [],
+        "ambiguity_level": "medium" if confidence < 0.85 else "low",
+        "risk_level": "medium",
+        "confidence": confidence,
+        "recommended_mode": recommended_mode,
+        "execution_plan": [
+            {
+                "step": 1,
+                "summary": "Inspect the most relevant implementation area.",
+                "action_hint": "inspect",
+                "requires_tools": True,
+            },
+            {
+                "step": 2,
+                "summary": "Apply the requested change.",
+                "action_hint": recommended_mode,
+                "requires_tools": True,
+            },
+        ],
+        "needs_clarification": needs_clarification,
+        "clarification_questions": clarification_questions or [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_goal"),
+    [
+        ("make this cleaner", "Improve maintainability and code clarity of the current implementation."),
+        (
+            "refactor this so it's easier to maintain",
+            "Improve maintainability and code clarity of the current implementation.",
+        ),
+    ],
+)
+def test_task_interpreter_normalizes_paraphrases_to_same_goal(prompt: str, expected_goal: str):
+    llm = ScriptedLLM(
+        [
+            understanding_payload(
+                prompt,
+                interpreted_goal=expected_goal,
+                intent_category="refactor",
+                recommended_mode="refactor",
+                confidence=0.86,
+                target_artifacts=[
+                    {
+                        "path": "app/main.py",
+                        "name": "app/main.py",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.82,
+                    }
+                ],
+            )
+        ]
+    )
+    interpreter = TaskInterpreter(llm)
+
+    understanding = interpreter.interpret(prompt)
+
+    assert understanding.interpreted_goal == expected_goal
+    assert understanding.intent_category == "refactor"
+    assert understanding.recommended_mode == "refactor"
+    assert understanding.target_artifacts[0].path == "app/main.py"
+
+
+def test_execution_policy_maps_semantic_understanding_to_update_route(tmp_path):
+    understanding = TaskUnderstanding(
+        original_request="I want the login to be safer",
+        interpreted_goal="Strengthen the login flow security without changing its main user journey.",
+        intent_category="configure",
+        conversation_relation="new_task",
+        subgoals=["Inspect the login/auth flow", "Tighten insecure behavior"],
+        target_artifacts=[
+            TaskArtifact(
+                path="app/auth.py",
+                name="app/auth.py",
+                kind="file",
+                role="primary_target",
+                confidence=0.83,
+            )
+        ],
+        relevant_context=["The workspace contains an auth module."],
+        constraints=["Preserve the existing login flow."],
+        missing_info=[],
+        assumptions=["The backend auth module is the right target."],
+        user_observations=[],
+        supplied_evidence=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.79,
+        recommended_mode="modify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Inspect auth.py", action_hint="inspect"),
+            TaskPlanStep(step=2, summary="Harden the login behavior", action_hint="modify"),
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state_from_understanding(understanding),
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task=understanding.original_request, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths == ["app/auth.py"]
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+    assert any(step.action == RouteActionName.UPDATE_ARTIFACT for step in route.action_plan)
+    assert any(step.action == RouteActionName.RUN_VALIDATION for step in route.action_plan)
+
+
+def test_execution_policy_uses_follow_up_context_for_refinement(tmp_path):
+    understanding = TaskUnderstanding(
+        original_request="do it more securely",
+        interpreted_goal="Tighten the security of the current auth implementation.",
+        intent_category="modify",
+        conversation_relation="refinement",
+        subgoals=["Continue from the current auth work"],
+        target_artifacts=[],
+        relevant_context=["Previous auth work exists in the session context."],
+        constraints=[],
+        missing_info=[],
+        assumptions=["Continue with the previously modified backend auth file."],
+        user_observations=[],
+        supplied_evidence=[],
+        ambiguity_level="medium",
+        risk_level="medium",
+        confidence=0.77,
+        recommended_mode="modify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Inspect the active auth file", action_hint="inspect"),
+            TaskPlanStep(step=2, summary="Harden the implementation", action_hint="modify"),
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    session = SessionState(
+        task=understanding.original_request,
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="add auth to this app",
+            previous_interpreted_goal="Add basic auth to the backend app.",
+            previous_recommended_mode="modify",
+            target_paths=["app/auth.py"],
+            changed_files=["app/auth.py"],
+        ),
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state_from_understanding(understanding),
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths[0] == "app/auth.py"
+    assert route.safe_to_execute is True
+
+
+def test_execution_policy_requests_clarification_on_low_confidence_high_risk():
+    understanding = TaskUnderstanding(
+        original_request="actually revert that part",
+        interpreted_goal="Revert a previously changed part of the implementation.",
+        intent_category="modify",
+        conversation_relation="correction",
+        subgoals=["Identify the exact change to revert"],
+        target_artifacts=[],
+        relevant_context=["There was previous work, but the exact scope is unclear."],
+        constraints=[],
+        missing_info=["Which exact file or change should be reverted?"],
+        assumptions=[],
+        user_observations=[],
+        supplied_evidence=[],
+        ambiguity_level="high",
+        risk_level="high",
+        confidence=0.33,
+        recommended_mode="clarify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Ask for the exact revert scope", action_hint="plan"),
+        ],
+        needs_clarification=True,
+        clarification_questions=["Which exact file or change should I revert?"],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state_from_understanding(understanding))
+
+    assert route.intent == RouteIntent.UNKNOWN
+    assert route.safe_to_execute is False
+    assert route.needs_clarification is True
+    assert "revert" in route.clarification_questions[0].lower()
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_extension"),
+    [
+        ("mach ein tic tac toe in python", ".py"),
+        ("ich moechte ein schiffe versenken spiel in python haben", ".py"),
+        ("bau mir ein snake spiel in javascript", ".js"),
+        ("erstelle eine kleine flask api mit login", ".py"),
+    ],
+)
+def test_execution_policy_allows_clear_create_requests_without_explicit_filename(prompt: str, expected_extension: str):
+    task_state = TaskState(
+        latest_user_turn=prompt,
+        root_goal=prompt,
+        active_goal=prompt,
+        goal_relation="new_task",
+        output_expectation="Create a small runnable implementation with sensible defaults.",
+        open_problem=None,
+        verification_target="Create the initial implementation and validate the most relevant path.",
+        target_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=["A conventional default artifact is acceptable for this request."],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.82,
+        next_action="create",
+        execution_outline=["Choose a conventional default artifact", "Implement it", "Verify it"],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state)
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.needs_clarification is False
+    assert route.safe_to_execute is True
+    assert route.entities.target_name
+    assert expected_extension in route.relevant_extensions
+
+
+def test_task_state_updater_tracks_continuation_with_evidence():
+    prompt = "why is this failing?"
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": prompt,
+                "root_goal": "Fix the failing upload flow.",
+                "active_goal": "Diagnose the failing upload flow and identify the highest-evidence cause.",
+                "goal_relation": "report_problem",
+                "output_expectation": "A diagnosis and, if supported, a focused fix.",
+                "open_problem": "AttributeError in upload handler",
+                "verification_target": "Rerun the failing upload path and confirm it passes.",
+                "target_artifacts": [
+                    {
+                        "path": "app/upload.py",
+                        "name": "app/upload.py",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.8,
+                    }
+                ],
+                "evidence": [
+                    {
+                        "kind": "diagnostic",
+                        "summary": "AttributeError in upload handler",
+                        "source": "pytest",
+                        "artifact_path": "app/upload.py",
+                        "confidence": 0.9,
+                    }
+                ],
+                "relevant_context": ["Previous validation already failed in the upload flow."],
+                "constraints": [],
+                "assumptions": ["The latest traceback points at app/upload.py."],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "medium",
+                "confidence": 0.86,
+                "next_action": "debug",
+                "execution_outline": [
+                    "Inspect the implicated upload handler.",
+                    "Reproduce or validate the failing path.",
+                    "Patch the highest-evidence cause.",
+                ],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(prompt)
+
+    assert task_state.root_goal == "Fix the failing upload flow."
+    assert task_state.goal_relation == "report_problem"
+    assert task_state.next_action == "debug"
+    assert task_state.open_problem == "AttributeError in upload handler"
+    assert task_state.evidence[0].artifact_path == "app/upload.py"
+
+
+def test_task_state_derives_phase_two_operational_fields_from_existing_signals():
+    state = TaskState(
+        latest_user_turn="why is this failing?",
+        root_goal="Fix the failing upload flow.",
+        active_goal="Diagnose the failing upload flow and identify the highest-evidence cause.",
+        goal_relation="report_problem",
+        output_expectation="A diagnosis and, if supported, a focused fix.",
+        open_problem="AttributeError in upload handler",
+        verification_target="Rerun the failing upload path and confirm it passes.",
+        target_artifacts=[
+            TaskArtifact(
+                path="app/upload.py",
+                name="app/upload.py",
+                kind="file",
+                role="primary_target",
+                confidence=0.82,
+            )
+        ],
+        evidence=[
+            EvidenceItem(
+                kind="diagnostic",
+                summary="AttributeError in upload handler",
+                source="pytest",
+                artifact_path="app/upload.py",
+                confidence=0.92,
+            )
+        ],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.88,
+        next_action="debug",
+        execution_outline=["Inspect app/upload.py", "Reproduce the failure", "Fix and verify"],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    assert state.current_user_intent == "repair"
+    assert state.execution_strategy == "debug_repair"
+    assert state.next_best_action == "debug"
+    assert state.active_artifacts[0].path == "app/upload.py"
+    assert state.supplied_evidence == ["AttributeError in upload handler"]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_extension"),
+    [
+        ("mach ein tic tac toe in python", ".py"),
+        ("ich moechte ein schiffe versenken spiel in python haben", ".py"),
+        ("bau mir ein snake spiel in javascript", ".js"),
+        ("erstelle eine kleine flask api mit login", ".py"),
+    ],
+)
+def test_task_state_fallback_treats_clear_new_build_requests_as_executable_creates(
+    tmp_path,
+    prompt: str,
+    expected_extension: str,
+):
+    updater = TaskStateUpdater(ScriptedLLM())
+
+    task_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.needs_clarification is False
+    assert task_state.confidence >= 0.68
+    assert task_state.target_artifacts
+    assert task_state.target_artifacts[0].kind == expected_extension
+
+
+@pytest.mark.parametrize("prompt", ["mach das besser", "aendere das", "baue das um"])
+def test_task_state_fallback_still_clarifies_vague_requests_without_active_context(tmp_path, prompt: str):
+    updater = TaskStateUpdater(ScriptedLLM())
+
+    task_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.next_action == "clarify"
+    assert task_state.needs_clarification is True
+
+
+def test_task_state_fallback_uses_existing_state_evidence_instead_of_prompt_text(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM())
+    prompt = "mach weiter"
+
+    noisy_session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="fix the upload flow",
+            root_goal="Fix the upload flow.",
+            active_goal="Stabilize the upload flow implementation.",
+            goal_relation="new_task",
+            output_expectation="A working upload flow.",
+            open_problem="Upload regression after the last change.",
+            verification_target="Rerun the failing upload command.",
+            target_artifacts=[
+                TaskArtifact(
+                    path="app/upload.py",
+                    name="app/upload.py",
+                    kind="file",
+                    role="primary_target",
+                    confidence=0.85,
+                )
+            ],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.82,
+            next_action="modify",
+            execution_outline=["Inspect upload.py", "Patch the issue", "Verify it"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+        follow_up_context=FollowUpContext(
+            previous_task="fix the upload flow",
+            previous_root_goal="Fix the upload flow.",
+            previous_active_goal="Stabilize the upload flow implementation.",
+            previous_next_action="modify",
+            target_paths=["app/upload.py"],
+            changed_files=["app/upload.py"],
+            last_error="AttributeError: uploader is None",
+        ),
+    )
+
+    quiet_session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="fix the upload flow",
+            root_goal="Fix the upload flow.",
+            active_goal="Stabilize the upload flow implementation.",
+            goal_relation="new_task",
+            output_expectation="A working upload flow.",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="medium",
+            risk_level="medium",
+            confidence=0.5,
+            next_action="modify",
+            execution_outline=["Continue the task"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+
+    noisy_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path), session=noisy_session)
+    quiet_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path), session=quiet_session)
+
+    assert noisy_state.next_action == "debug"
+    assert noisy_state.goal_relation == "report_problem"
+    assert noisy_state.target_artifacts[0].path == "app/upload.py"
+    assert "AttributeError" in (noisy_state.open_problem or "")
+    assert quiet_state.next_action in {"search", "clarify"}
+    assert quiet_state.next_action != noisy_state.next_action
+
+
+def test_task_state_fallback_clarifies_when_multiple_active_artifacts_compete(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM())
+    session = SessionState(
+        task="fix it",
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="fix it",
+            root_goal="Improve the system safely.",
+            active_goal="Continue the current implementation work.",
+            goal_relation="continue",
+            output_expectation="A safe follow-up change.",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[
+                TaskArtifact(path="app/ui.py", name="app/ui.py", kind="file", role="primary_target", confidence=0.7),
+                TaskArtifact(path="app/api.py", name="app/api.py", kind="file", role="primary_target", confidence=0.7),
+            ],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="medium",
+            risk_level="medium",
+            confidence=0.6,
+            next_action="modify",
+            execution_outline=["Continue the current task"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+
+    task_state = updater.update_task_state("mach nur den letzten Teil rueckgaengig", snapshot=build_snapshot(tmp_path), session=session)
+
+    assert task_state.next_action == "clarify"
+    assert task_state.needs_clarification is True
+    assert "mehrere" in task_state.missing_info[0].lower() or "multiple" in task_state.missing_info[0].lower()
+
+
+def test_task_state_timeout_fallback_keeps_clear_build_request_executable_even_with_follow_up_context(tmp_path):
+    logger = AgentLogger(tmp_path, "task-state-timeout-build")
+    updater = TaskStateUpdater(ScriptedLLM(), logger=logger)
+    session = SessionState(
+        task="vorheriger task",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="bau mir ein snake spiel in html und javascript",
+            previous_root_goal="Build a small Snake game in HTML and JavaScript.",
+            previous_active_goal="Create the first playable Snake implementation.",
+            previous_next_action="create",
+            previous_requested_outcome="Create a small runnable implementation with a conventional default artifact and minimal scope.",
+            target_paths=["snake.js"],
+            changed_files=["snake.js"],
+            read_files=["snake.js"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        "ich möchte ein schiffe versenken spiel in python haben",
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy(logger=logger).build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.needs_clarification is False
+    assert task_state.output_expectation.startswith("Create a small runnable implementation")
+    assert route.intent == RouteIntent.CREATE
+    assert route.needs_clarification is False
+    assert route.safe_to_execute is True
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+
+    logs = (tmp_path / "task-state-timeout-build.jsonl").read_text(encoding="utf-8")
+    assert "task_state_fallback" in logs
+    assert '"goal_relation": "new_task"' in logs
+    assert '"chosen_intent": "create"' in logs
+
+
+def test_task_state_timeout_fallback_treats_html_follow_up_as_continuation_create_not_new_task(tmp_path):
+    logger = AgentLogger(tmp_path, "task-state-timeout-follow-up")
+    updater = TaskStateUpdater(ScriptedLLM(), logger=logger)
+    session = SessionState(
+        task="bau mir ein snake spiel in html und javascript",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="bau mir ein snake spiel in html und javascript",
+            previous_root_goal="Build a small Snake game in HTML and JavaScript.",
+            previous_active_goal="Create the first playable Snake implementation.",
+            previous_next_action="create",
+            previous_requested_outcome="Create a small runnable implementation with a conventional default artifact and minimal scope.",
+            target_paths=["snake.js"],
+            changed_files=["snake.js"],
+            read_files=["snake.js"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        "jetzt bau dazu eine html datei zum anzeigen des Spiels",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy(logger=logger).build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.root_goal == "Build a small Snake game in HTML and JavaScript."
+    assert task_state.goal_relation == "refine"
+    assert task_state.next_action == "create"
+    assert task_state.needs_clarification is False
+    assert task_state.active_artifacts[0].path == "snake.js"
+    assert route.intent == RouteIntent.CREATE
+    assert route.needs_clarification is False
+    assert "snake.js" not in route.entities.target_paths
+    assert route.action_plan[0].action == RouteActionName.INSPECT_WORKSPACE
+
+    logs = (tmp_path / "task-state-timeout-follow-up.jsonl").read_text(encoding="utf-8")
+    assert "task_state_fallback" in logs
+    assert '"goal_relation": "refine"' in logs
+    assert '"chosen_intent": "create"' in logs
+
+
+def test_task_state_timeout_fallback_treats_hardening_follow_up_as_targeted_update(tmp_path):
+    logger = AgentLogger(tmp_path, "task-state-timeout-hardening")
+    updater = TaskStateUpdater(ScriptedLLM(), logger=logger)
+    session = SessionState(
+        task="mach login",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="mach login",
+            previous_root_goal="Implement login for this app.",
+            previous_active_goal="Create a working login flow.",
+            previous_next_action="modify",
+            previous_requested_outcome="A working login flow.",
+            target_paths=["app/auth.py"],
+            changed_files=["app/auth.py"],
+            read_files=["app/auth.py"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        "mach es sicherer",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy(logger=logger).build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.root_goal == "Implement login for this app."
+    assert task_state.goal_relation == "refine"
+    assert task_state.current_user_intent == "harden"
+    assert task_state.execution_strategy == "hardening"
+    assert task_state.next_action == "modify"
+    assert task_state.needs_clarification is False
+    assert "safer" in task_state.output_expectation.lower() or "robust" in task_state.output_expectation.lower()
+    assert route.intent == RouteIntent.UPDATE
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+
+    logs = (tmp_path / "task-state-timeout-hardening.jsonl").read_text(encoding="utf-8")
+    assert "task_state_fallback" in logs
+    assert '"execution_strategy": "hardening"' in logs
+
+
+def test_task_state_timeout_fallback_treats_backend_only_follow_up_as_scope_change(tmp_path):
+    logger = AgentLogger(tmp_path, "task-state-timeout-backend-only")
+    updater = TaskStateUpdater(ScriptedLLM(), logger=logger)
+    session = SessionState(
+        task="bau login",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="bau login",
+            previous_root_goal="Add login to this app.",
+            previous_active_goal="Add login across frontend and backend.",
+            previous_next_action="modify",
+            previous_requested_outcome="A working full-stack login flow.",
+            target_paths=["frontend/login.html", "backend/auth.py"],
+            changed_files=["frontend/login.html", "backend/auth.py"],
+            read_files=["frontend/login.html", "backend/auth.py"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        "nein, nur im backend",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy(logger=logger).build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.root_goal == "Add login to this app."
+    assert task_state.goal_relation == "scope_change"
+    assert task_state.current_user_intent == "correct"
+    assert task_state.execution_strategy == "rollback_correction"
+    assert task_state.constraints == ["Backend only."]
+    assert [artifact.path for artifact in task_state.target_artifacts] == ["backend/auth.py"]
+    assert task_state.needs_clarification is False
+    assert "backend-scoped" in task_state.output_expectation.lower()
+    assert route.intent == RouteIntent.UPDATE
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+
+    logs = (tmp_path / "task-state-timeout-backend-only.jsonl").read_text(encoding="utf-8")
+    assert "task_state_fallback" in logs
+    assert '"goal_relation": "scope_change"' in logs
+
+
+def test_task_state_update_prompt_contains_prior_state_and_existing_evidence(tmp_path):
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": "das ist immer noch kaputt",
+                "root_goal": "Fix the backend auth flow.",
+                "active_goal": "Diagnose the backend auth failure.",
+                "goal_relation": "report_problem",
+                "output_expectation": "A diagnosis of the current auth failure.",
+                "open_problem": "401s after the auth refactor",
+                "verification_target": "Re-run the auth validation path.",
+                "target_artifacts": [
+                    {
+                        "path": "app/auth.py",
+                        "name": "app/auth.py",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.84,
+                    }
+                ],
+                "evidence": [
+                    {
+                        "kind": "diagnostic",
+                        "summary": "AssertionError in auth test",
+                        "source": "pytest",
+                        "artifact_path": "app/auth.py",
+                        "confidence": 0.9,
+                    }
+                ],
+                "relevant_context": ["Follow-up after an auth refactor."],
+                "constraints": ["Backend only."],
+                "assumptions": ["The auth module is still the active artifact."],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "medium",
+                "confidence": 0.88,
+                "next_action": "debug",
+                "execution_outline": ["Inspect auth.py", "Reproduce auth failure", "Fix and verify"],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+    updater = TaskStateUpdater(llm)
+    session = SessionState(
+        task="das ist immer noch kaputt",
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="mach es sicherer",
+            root_goal="Fix the backend auth flow.",
+            active_goal="Harden backend auth safely.",
+            goal_relation="continue",
+            output_expectation="A safer backend auth implementation.",
+            open_problem="401s after the auth refactor",
+            verification_target="Re-run the auth validation path.",
+            target_artifacts=[
+                TaskArtifact(path="app/auth.py", name="app/auth.py", kind="file", role="primary_target", confidence=0.8)
+            ],
+            evidence=[],
+            relevant_context=[],
+            constraints=["Backend only."],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.8,
+            next_action="modify",
+            execution_outline=["Inspect auth.py", "Update auth.py", "Verify auth tests"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+        follow_up_context=FollowUpContext(
+            previous_task="mach es sicherer",
+            previous_root_goal="Fix the backend auth flow.",
+            previous_active_goal="Harden backend auth safely.",
+            previous_next_action="modify",
+            target_paths=["app/auth.py"],
+            changed_files=["app/auth.py"],
+            last_error="AssertionError: unauthorized request",
+        ),
+    )
+
+    updater.update_task_state("das ist immer noch kaputt", snapshot=build_snapshot(tmp_path), session=session)
+    prompt = llm.generate_json_calls[0]["args"][0]
+
+    assert "Fix the backend auth flow." in prompt
+    assert "app/auth.py" in prompt
+    assert "AssertionError: unauthorized request" in prompt
+    assert "Backend only." in prompt
+
+
+def test_task_state_update_prompt_mentions_phase_two_strategy_fields(tmp_path):
+    prompt = task_state_update_prompt("fix the auth flow", snapshot=build_snapshot(tmp_path))
+
+    assert "execution_strategy" in prompt
+    assert "next_best_action" in prompt
+    assert "inspect current state and active artifacts" in prompt
+
+
+def test_task_state_contract_handles_backend_correction():
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": "nein, ich meinte das backend",
+                "root_goal": "Add auth to this app.",
+                "active_goal": "Move the auth change to the backend implementation instead of the UI.",
+                "goal_relation": "correct",
+                "output_expectation": "A backend-scoped auth change.",
+                "open_problem": "The last change targeted the wrong surface.",
+                "verification_target": "Only backend auth files should be updated and verified.",
+                "target_artifacts": [
+                    {
+                        "path": "app/api/auth.py",
+                        "name": "app/api/auth.py",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.9,
+                    }
+                ],
+                "evidence": [],
+                "relevant_context": ["Previous work touched the UI, but the user corrected the target."],
+                "constraints": ["Backend only."],
+                "assumptions": [],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "medium",
+                "confidence": 0.9,
+                "next_action": "modify",
+                "execution_outline": ["Inspect backend auth implementation", "Move the change to backend", "Verify backend path"],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+
+    state = TaskStateUpdater(llm).update_task_state("nein, ich meinte das backend")
+
+    assert state.goal_relation == "correct"
+    assert state.target_artifacts[0].path == "app/api/auth.py"
+    assert state.constraints == ["Backend only."]
+
+
+def test_execution_policy_uses_task_state_strategy_for_refactor_ordering(tmp_path):
+    task_state = TaskState(
+        latest_user_turn="make auth.py cleaner",
+        root_goal="Improve maintainability of the auth module.",
+        active_goal="Refactor the auth module to reduce duplication while preserving behavior.",
+        goal_relation="refine",
+        output_expectation="A behavior-preserving auth refactor.",
+        current_user_intent="refactor",
+        execution_strategy="refactor",
+        open_problem=None,
+        verification_target="Re-run the auth tests after the refactor.",
+        target_artifacts=[
+            TaskArtifact(
+                path="app/auth.py",
+                name="app/auth.py",
+                kind="file",
+                role="primary_target",
+                confidence=0.86,
+            )
+        ],
+        evidence=[],
+        supplied_evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.84,
+        next_action="modify",
+        next_best_action="modify",
+        execution_outline=["Inspect auth.py", "Refactor incrementally", "Re-run auth tests"],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task=task_state.latest_user_turn, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+    assert "behavior" in route.requested_outcome.lower()
+    assert any("preserving behavior" in step.reason.lower() for step in route.action_plan)
+
+
+def test_execution_policy_uses_task_state_strategy_for_scope_correction(tmp_path):
+    task_state = TaskState(
+        latest_user_turn="no, I meant the backend only",
+        root_goal="Add auth to this app.",
+        active_goal="Move the auth change to the backend implementation only.",
+        goal_relation="correct",
+        output_expectation="A backend-scoped auth change.",
+        current_user_intent="correct",
+        execution_strategy="rollback_correction",
+        open_problem="The last change targeted the wrong surface.",
+        verification_target="Only backend auth files should be updated and verified.",
+        target_artifacts=[
+            TaskArtifact(
+                path="app/api/auth.py",
+                name="app/api/auth.py",
+                kind="file",
+                role="primary_target",
+                confidence=0.9,
+            )
+        ],
+        evidence=[],
+        supplied_evidence=[],
+        relevant_context=[],
+        constraints=["Backend only."],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.9,
+        next_action="modify",
+        next_best_action="modify",
+        execution_outline=["Inspect backend auth implementation", "Move the change to backend", "Verify backend path"],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task=task_state.latest_user_turn, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+    assert "scope" in route.requested_outcome.lower() or "prior change" in route.requested_outcome.lower()
+    assert any("necessary part" in step.reason.lower() for step in route.action_plan)
+
+
+def test_planner_uses_task_state_before_any_other_interpretation(tmp_path):
+    target = tmp_path / "app" / "auth.py"
+    target.parent.mkdir()
+    target.write_text("print('auth')\n", encoding="utf-8")
+
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="I want the login to be safer",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="I want the login to be safer",
+            root_goal="Make the login safer.",
+            active_goal="Strengthen the login flow security without changing its main user journey.",
+            goal_relation="new_task",
+            output_expectation="A safer login implementation with verification.",
+            target_artifacts=[
+                TaskArtifact(
+                    path="app/auth.py",
+                    name="app/auth.py",
+                    kind="file",
+                    role="primary_target",
+                    confidence=0.82,
+                )
+            ],
+            evidence=[
+                EvidenceItem(
+                    kind="file",
+                    summary="The auth module is the most relevant backend artifact.",
+                    artifact_path="app/auth.py",
+                    confidence=0.7,
+                )
+            ],
+            relevant_context=["Auth module exists."],
+            constraints=[],
+            assumptions=["app/auth.py is the correct backend target."],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.8,
+            next_action="modify",
+            execution_outline=["Inspect auth.py", "Update auth.py", "Verify the change"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "read_file"
+    assert decision.tool_args["path"] == "app/auth.py"
+    assert llm.generate_json_calls == []
+
+
+def test_core_initialization_uses_task_state_as_only_semantic_source_in_main_path(tmp_path):
+    prompt = "I want the login to be safer"
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": prompt,
+                "root_goal": "Make the login safer.",
+                "active_goal": "Strengthen the login flow security without changing its main user journey.",
+                "goal_relation": "new_task",
+                "output_expectation": "A safer login implementation with verification.",
+                "open_problem": None,
+                "verification_target": "Inspect auth.py and verify the resulting login behavior.",
+                "target_artifacts": [
+                    {
+                        "path": "app/auth.py",
+                        "name": "app/auth.py",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.82,
+                    }
+                ],
+                "evidence": [
+                    {
+                        "kind": "file",
+                        "summary": "The auth module is the most relevant backend artifact.",
+                        "artifact_path": "app/auth.py",
+                        "confidence": 0.7,
+                    }
+                ],
+                "relevant_context": ["Auth module exists."],
+                "constraints": [],
+                "assumptions": ["app/auth.py is the correct backend target."],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "medium",
+                "confidence": 0.83,
+                "next_action": "modify",
+                "execution_outline": ["Inspect auth.py", "Update auth.py", "Verify the change"],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    config = AppConfig(workspace_root=str(tmp_path), state_root_override=str(tmp_path / ".state"))
+    core = AgentCore(config)
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+
+    core._initialize_session(prompt, session, planner)
+
+    assert session.task_state is not None
+    assert session.router_result is not None
+    assert session.router_result.intent == RouteIntent.UPDATE
+    assert session.router_result.entities.target_paths == ["app/auth.py"]
+    assert len(llm.generate_json_calls) == 1

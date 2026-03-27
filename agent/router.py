@@ -37,13 +37,21 @@ class IntentRouter:
         session: SessionState | None = None,
     ) -> RouterOutput:
         self._log("router_input", raw_user_input=user_input)
+        fast_path = self._fast_path_route(
+            user_input,
+            snapshot=snapshot,
+            session=session,
+        )
+        if fast_path is not None:
+            self._log("router_fast_path", router_result=fast_path.model_dump())
+            return fast_path
         payload: dict[str, Any] | None = None
         try:
             payload = self.llm.generate_json(
                 router_prompt(user_input, snapshot, session=session),
                 system=router_system_prompt(),
                 model=self.model_name,
-                retries=self.retries,
+                retries=0,
                 timeout=self.timeout,
                 num_ctx=self.num_ctx,
             )
@@ -64,6 +72,17 @@ class IntentRouter:
                 error=str(exc),
             )
             if self._is_timeout_error(exc):
+                fast_timeout_route = self._emergency_route(
+                    user_input,
+                    snapshot=snapshot,
+                    session=session,
+                )
+                if fast_timeout_route is not None and fast_timeout_route.intent == RouteIntent.CREATE:
+                    self._log(
+                        "router_timeout_fast_fallback",
+                        router_result=fast_timeout_route.model_dump(),
+                    )
+                    return fast_timeout_route
                 retried = self._retry_after_timeout(user_input)
                 if retried is not None:
                     return retried
@@ -90,7 +109,7 @@ class IntentRouter:
                 router_repair_prompt(invalid_payload, errors),
                 system=router_system_prompt(),
                 model=self.model_name,
-                retries=max(self.retries, 1),
+                retries=0,
                 timeout=max(self.timeout, 16),
                 num_ctx=self.num_ctx,
             )
@@ -118,7 +137,7 @@ class IntentRouter:
                 router_prompt(user_input, None, session=None),
                 system=router_system_prompt(),
                 model=self.model_name,
-                retries=max(self.retries, 1),
+                retries=0,
                 timeout=max(self.timeout + 8, 26),
                 num_ctx=min(self.num_ctx, 2048),
             )
@@ -185,6 +204,31 @@ class IntentRouter:
             relevant_extensions=[],
             direct_response=None,
         )
+
+    def _fast_path_route(
+        self,
+        user_input: str,
+        *,
+        snapshot: WorkspaceSnapshot | None = None,
+        session: SessionState | None = None,
+    ) -> RouterOutput | None:
+        trimmed = str(user_input or "").strip()
+        if not trimmed:
+            return None
+        emergency = self._emergency_route(trimmed, snapshot=snapshot, session=session)
+        if emergency is None:
+            return None
+        normalized = " ".join(trimmed.lower().split()).strip()
+        if emergency.intent == RouteIntent.CREATE and (
+            not self._follow_up_target_paths(session)
+            or self._has_explicit_new_artifact_request(normalized)
+        ):
+            return emergency
+        if emergency.intent == RouteIntent.DEBUG and self._has_follow_up_context(session):
+            return emergency
+        if emergency.intent == RouteIntent.UPDATE and self._follow_up_target_paths(session):
+            return emergency
+        return None
 
     def _fallback_direct_response(self, user_input: str) -> str | None:
         normalized = " ".join(str(user_input or "").lower().split()).strip("!?., ")
@@ -310,6 +354,30 @@ class IntentRouter:
                 relevant_extensions=relevant_extensions,
                 confidence=0.74,
             )
+
+        follow_up_debug = self._follow_up_debug_route(
+            user_input,
+            normalized=normalized,
+            path=path,
+            session=session,
+            target_name=target_name,
+            search_terms=search_terms,
+            relevant_extensions=relevant_extensions,
+        )
+        if follow_up_debug is not None:
+            return follow_up_debug
+
+        follow_up_update = self._follow_up_update_route(
+            user_input,
+            normalized=normalized,
+            path=path,
+            session=session,
+            target_name=target_name,
+            search_terms=search_terms,
+            relevant_extensions=relevant_extensions,
+        )
+        if follow_up_update is not None:
+            return follow_up_update
 
         if self._looks_like_update_request(normalized, path, session=session):
             target_paths = [path] if path else self._follow_up_target_paths(session)
@@ -453,16 +521,17 @@ class IntentRouter:
     def _extract_target_name(self, normalized: str, path: str | None) -> str | None:
         if path:
             return path
-        special_phrases = [
-            "tic tac toe",
-            "tick tack toe",
-            "todo app",
-            "rest api",
-            "auth middleware",
+        special_patterns = [
+            (r"\btic[\s_-]*tac[\s_-]*toe\b", "tic tac toe"),
+            (r"\btictactoe\b", "tic tac toe"),
+            (r"\btick[\s_-]*tack[\s_-]*toe\b", "tic tac toe"),
+            (r"\btodo[\s_-]*app\b", "todo app"),
+            (r"\brest[\s_-]*api\b", "rest api"),
+            (r"\bauth[\s_-]*middleware\b", "auth middleware"),
         ]
-        for phrase in special_phrases:
-            if phrase in normalized:
-                return phrase
+        for pattern, label in special_patterns:
+            if re.search(pattern, normalized):
+                return label
         match = re.search(r"(?:ein|eine|einen|a|an)\s+([a-z0-9 _-]{3,40})\s+(?:in|mit)\s+(python|javascript|typescript|react)\b", normalized)
         if match:
             return match.group(1).strip()
@@ -524,6 +593,22 @@ class IntentRouter:
         )
         if any(phrase in normalized for phrase in phrases):
             return path is not None or bool(self._follow_up_target_paths(session))
+        follow_up_change_phrases = (
+            "statt",
+            "instead",
+            "gegen einen computer",
+            "gegen den computer",
+            "gegen eine ki",
+            "gegen einen bot",
+            "singleplayer",
+            "single player",
+            "2 spieler",
+            "zwei spieler",
+            "nicht mit 2 spielern",
+            "nicht mit zwei spielern",
+        )
+        if any(phrase in normalized for phrase in follow_up_change_phrases):
+            return bool(self._follow_up_target_paths(session))
         if any(token in normalized for token in ("mach das anders", "mach es anders", "change that", "do it differently")):
             return bool(self._follow_up_target_paths(session))
         return False
@@ -572,13 +657,188 @@ class IntentRouter:
             return has_create_signal
         return has_create_signal and has_artifact_signal
 
+    def _looks_like_issue_follow_up(
+        self,
+        normalized: str,
+        *,
+        session: SessionState | None = None,
+    ) -> bool:
+        if not self._has_follow_up_context(session):
+            return False
+        markers = (
+            "fehler",
+            "error",
+            "bug",
+            "buggy",
+            "kaputt",
+            "komisch",
+            "wirkt komisch",
+            "stimmt da nicht",
+            "geht nicht",
+            "broken",
+            "weird",
+            "doesn't work",
+            "doesnt work",
+            "does not work",
+            "issue",
+            "problem",
+            "terminal",
+            "konsole",
+            "traceback",
+            "stacktrace",
+            "exception",
+            "crash",
+            "warnung",
+            "warning",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _follow_up_debug_route(
+        self,
+        user_input: str,
+        *,
+        normalized: str,
+        path: str | None,
+        session: SessionState | None,
+        target_name: str | None,
+        search_terms: list[str],
+        relevant_extensions: list[str],
+    ) -> RouterOutput | None:
+        if not self._looks_like_issue_follow_up(normalized, session=session):
+            return None
+        target_paths = [path] if path else self._follow_up_target_paths(session)
+        debug_extensions = list(relevant_extensions)
+        if not debug_extensions:
+            for target_path in target_paths:
+                suffix = "." + target_path.split(".")[-1] if "." in target_path else ""
+                if suffix and suffix not in debug_extensions:
+                    debug_extensions.append(suffix)
+        return self._build_route(
+            user_goal=user_input,
+            intent=RouteIntent.DEBUG,
+            requested_outcome="Diagnose the reported issue in the current task, then apply a focused fix if the evidence supports it.",
+            action_plan=[
+                (RouteActionName.READ_RELEVANT_FILES, "The active implementation should be inspected before diagnosing."),
+                (RouteActionName.DIAGNOSE_ISSUE, "The vague follow-up should be translated into concrete diagnostics before editing."),
+                (RouteActionName.UPDATE_ARTIFACT, "If diagnostics reveal the source, apply a focused fix to the active artifact."),
+                (RouteActionName.RUN_VALIDATION, "Rerun the most relevant validation after the fix."),
+                (RouteActionName.SUMMARIZE_RESULT, "Report what was diagnosed, changed, and verified."),
+            ],
+            repo_context_needed=True,
+            target_name=target_name or (target_paths[0] if target_paths else None),
+            target_paths=target_paths,
+            search_terms=search_terms or self._fallback_search_terms(normalized) or target_paths[:2],
+            relevant_extensions=debug_extensions,
+            confidence=0.82,
+        )
+
+    def _follow_up_update_route(
+        self,
+        user_input: str,
+        *,
+        normalized: str,
+        path: str | None,
+        session: SessionState | None,
+        target_name: str | None,
+        search_terms: list[str],
+        relevant_extensions: list[str],
+    ) -> RouterOutput | None:
+        if path is not None:
+            return None
+        target_paths = self._follow_up_target_paths(session)
+        if not target_paths:
+            return None
+        if self._has_explicit_new_artifact_request(normalized):
+            return None
+        return self._build_route(
+            user_goal=user_input,
+            intent=RouteIntent.UPDATE,
+            requested_outcome="Update the most relevant previously touched artifact.",
+            action_plan=[
+                (RouteActionName.READ_RELEVANT_FILES, "The current implementation should be inspected before editing."),
+                (RouteActionName.UPDATE_ARTIFACT, "The follow-up request most likely changes the previously touched artifact."),
+                (RouteActionName.RUN_VALIDATION, "The edited code should be validated before finishing."),
+                (RouteActionName.SUMMARIZE_RESULT, "Return the update outcome."),
+            ],
+            repo_context_needed=True,
+            target_name=target_name or target_paths[0],
+            target_paths=target_paths,
+            search_terms=search_terms or self._fallback_search_terms(normalized) or [target_paths[0]],
+            relevant_extensions=relevant_extensions,
+            confidence=0.68,
+        )
+
+    def _has_explicit_new_artifact_request(self, normalized: str) -> bool:
+        create_markers = (
+            "neu",
+            "new",
+            "another",
+            "zweite",
+            "zweiten",
+            "second",
+            "extra",
+            "zusatz",
+            "zusätzlich",
+            "additional",
+            "separate",
+            "separat",
+        )
+        artifact_markers = (
+            "datei",
+            "file",
+            "script",
+            "skript",
+            "app",
+            "tool",
+            "service",
+            "helper",
+            "modul",
+            "module",
+            "komponente",
+            "component",
+        )
+        return any(marker in normalized for marker in create_markers) and any(
+            marker in normalized for marker in artifact_markers
+        )
+
+    def _has_follow_up_context(self, session: SessionState | None) -> bool:
+        if session is None:
+            return False
+        if session.changed_files or session.candidate_files:
+            return True
+        follow_up = session.follow_up_context
+        if follow_up is None:
+            return False
+        return bool(
+            follow_up.target_paths
+            or follow_up.changed_files
+            or follow_up.read_files
+            or follow_up.validation_runs
+            or follow_up.diagnostics
+            or follow_up.last_error
+        )
+
     def _follow_up_target_paths(self, session: SessionState | None) -> list[str]:
         if session is None:
             return []
         paths = [item.path for item in session.changed_files[-4:] if getattr(item, "path", None)]
+        follow_up = session.follow_up_context
+        if follow_up is not None:
+            paths.extend(follow_up.target_paths[:6])
+            paths.extend(follow_up.changed_files[:6])
+            paths.extend(follow_up.read_files[:6])
         if paths:
-            return paths[:4]
-        return session.candidate_files[:4]
+            return self._unique_paths(paths)[:6]
+        return self._unique_paths(session.candidate_files[:6])
+
+    def _unique_paths(self, values: list[str]) -> list[str]:
+        unique: list[str] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text or text in unique:
+                continue
+            unique.append(text)
+        return unique
 
     def _fallback_search_terms(self, normalized: str) -> list[str]:
         stopwords = {

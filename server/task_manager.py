@@ -9,7 +9,7 @@ from threading import Event, Lock, Thread
 from typing import Any
 
 from agent.core import AgentCore
-from agent.models import SessionState, utc_now
+from agent.models import FollowUpContext, SessionState, utc_now
 from agent.session import SessionStore
 from config.settings import AccessMode, AppConfig
 from runtime.logger import AgentLogger
@@ -92,6 +92,23 @@ class TaskManager:
             )
             if existing is not None:
                 self._ensure_message_history(session)
+            follow_up_context: FollowUpContext | None = None
+            follow_up_candidates: list[str] = []
+            if existing is not None:
+                follow_up_context = self._build_follow_up_context(session)
+                diagnostic_paths = [
+                    path
+                    for item in follow_up_context.diagnostics[-6:]
+                    for path in item.file_hints
+                ]
+                follow_up_candidates = self._unique_strings(
+                    [
+                        *follow_up_context.target_paths,
+                        *follow_up_context.changed_files,
+                        *follow_up_context.read_files,
+                        *diagnostic_paths,
+                    ]
+                )
             preserved_title = session.title or self._derive_title(session.task)
             session.task = prompt
             session.title = preserved_title or self._derive_title(prompt)
@@ -99,8 +116,11 @@ class TaskManager:
             session.plan = []
             session.plan_summary = None
             session.task_analysis = None
+            session.task_state = None
+            session.task_understanding = None
             session.router_result = None
-            session.candidate_files = []
+            session.follow_up_context = follow_up_context
+            session.candidate_files = follow_up_candidates
             session.verification_commands = []
             session.completion_criteria = []
             session.helper_artifacts = []
@@ -116,6 +136,10 @@ class TaskManager:
             session.validation_plan = []
             session.validation_runs = []
             session.diagnostics = []
+            session.tool_calls = []
+            session.changed_files = []
+            session.executed_commands = []
+            session.notes = []
             session.report = None
             session.stop_requested = False
             session.access_mode = config.access_mode
@@ -499,6 +523,71 @@ class TaskManager:
         if session.final_response:
             session.append_message("assistant", session.final_response)
 
+    def _build_follow_up_context(self, session: SessionState) -> FollowUpContext:
+        router_result = session.router_result
+        task_state = session.task_state
+        understanding = session.task_understanding
+        target_paths = self._unique_strings(
+            [
+                *[
+                    str(item.path).strip()
+                    for item in (task_state.target_artifacts if task_state is not None else [])
+                    if getattr(item, "path", None)
+                ],
+                *[
+                    str(item.path).strip()
+                    for item in (understanding.target_artifacts if understanding is not None else [])
+                    if getattr(item, "path", None)
+                ],
+                *(router_result.entities.target_paths if router_result else []),
+                *[
+                    str(item.path).strip()
+                    for item in session.changed_files[-8:]
+                    if getattr(item, "path", None)
+                ],
+                *[
+                    str(item.tool_args.get("path") or "").strip()
+                    for item in session.tool_calls[-10:]
+                    if item.tool_name == "read_file" and str(item.tool_args.get("path") or "").strip()
+                ],
+                *session.candidate_files[-10:],
+            ]
+        )
+        return FollowUpContext(
+            previous_task=session.task,
+            previous_root_goal=task_state.root_goal if task_state else None,
+            previous_active_goal=task_state.active_goal if task_state else None,
+            previous_next_action=task_state.next_action if task_state else None,
+            previous_intent=router_result.intent.value if router_result else None,
+            previous_requested_outcome=router_result.requested_outcome if router_result else None,
+            previous_final_response=session.final_response,
+            previous_interpreted_goal=understanding.interpreted_goal if understanding else None,
+            previous_recommended_mode=understanding.recommended_mode if understanding else None,
+            previous_confidence=understanding.confidence if understanding else None,
+            previous_assumptions=list(understanding.assumptions[:8]) if understanding else [],
+            previous_constraints=list(understanding.constraints[:8]) if understanding else [],
+            target_paths=target_paths[:12],
+            changed_files=[
+                str(item.path).strip()
+                for item in session.changed_files[-8:]
+                if getattr(item, "path", None)
+            ],
+            read_files=[
+                str(item.tool_args.get("path") or "").strip()
+                for item in session.tool_calls[-10:]
+                if item.tool_name == "read_file" and str(item.tool_args.get("path") or "").strip()
+            ],
+            recent_commands=[
+                str(item).strip()
+                for item in session.executed_commands[-8:]
+                if str(item or "").strip()
+            ],
+            notes=[str(item).strip() for item in session.notes[-12:] if str(item or "").strip()],
+            diagnostics=session.diagnostics[-8:],
+            validation_runs=session.validation_runs[-8:],
+            last_error=session.last_error,
+        )
+
     def _normalize_session_workspace(self, session: SessionState) -> SessionState:
         if session.workspace_label and session.workspace_root:
             return session
@@ -624,3 +713,12 @@ class TaskManager:
             self.base_config.report_dir_path / f"{session_id}.json",
         ):
             target.unlink(missing_ok=True)
+
+    def _unique_strings(self, values: list[str]) -> list[str]:
+        unique: list[str] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text or text in unique:
+                continue
+            unique.append(text)
+        return unique

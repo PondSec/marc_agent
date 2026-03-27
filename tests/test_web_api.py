@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from agent.models import FileChangeRecord, ToolCallRecord
 from config.settings import AppConfig
 from server.app import _with_available_models, create_app
 
@@ -262,6 +263,23 @@ def test_workspace_crud_and_follow_up_messages_stay_in_same_chat(tmp_path):
     workspace_root = tmp_path / "workspace-a"
     assert workspace["name"] == "Workspace A"
 
+    def fake_run_task(self, task, session=None, *, should_stop=None):
+        del should_stop
+        assert session is not None
+        if task == "hallo wer bist du?":
+            session.final_response = "Ich bin dein lokaler Coding-Agent fuer diesen Workspace."
+        else:
+            session.final_response = "Ich kann hier Code analysieren, aendern, debuggen und validieren."
+        session.status = "completed"
+        session.append_message("assistant", session.final_response)
+        session.touch()
+        self.session_store.save(session)
+        (self.config.log_dir_path / f"{session.id}.jsonl").write_text(
+            '{"event":"task_finished"}\n',
+            encoding="utf-8",
+        )
+        return session
+
     rename_workspace_response = client.patch(
         f"/api/workspaces/{workspace['id']}",
         json={"name": "Workspace Renamed", "path": str(workspace_root)},
@@ -269,64 +287,65 @@ def test_workspace_crud_and_follow_up_messages_stay_in_same_chat(tmp_path):
     assert rename_workspace_response.status_code == 200
     assert rename_workspace_response.json()["name"] == "Workspace Renamed"
 
-    first_task_response = client.post(
-        "/api/tasks",
-        json={"prompt": "hallo wer bist du?", "workspace_id": workspace["id"]},
-    )
-    assert first_task_response.status_code == 202
-    session_id = first_task_response.json()["id"]
-
-    deadline = time.time() + 5
-    session_payload = None
-    while time.time() < deadline:
-        session_response = client.get(f"/api/sessions/{session_id}")
-        assert session_response.status_code == 200
-        session_payload = session_response.json()
-        if session_payload["status"] in {"completed", "partial", "failed"}:
-            break
-        time.sleep(0.1)
-
-    assert session_payload is not None
-    assert session_payload["title"] == "hallo wer bist du?"
-    assert session_payload["status"] == "completed"
-    assert session_payload["workspace_id"] == workspace["id"]
-    assert session_payload["workspace_label"] == "Workspace Renamed"
-    assert "Coding-Agent" in session_payload["final_response"]
-    assert len(session_payload["messages"]) >= 2
-    assert (
-        len(
-            [
-                message
-                for message in session_payload["messages"]
-                if message["role"] == "user" and message["content"] == "hallo wer bist du?"
-            ]
+    with patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        first_task_response = client.post(
+            "/api/tasks",
+            json={"prompt": "hallo wer bist du?", "workspace_id": workspace["id"]},
         )
-        == 1
-    )
-    first_message_count = len(session_payload["messages"])
-    assert (config.log_dir_path / f"{session_id}.jsonl").exists()
-    assert not (workspace_root / config.state_dir_name / "logs" / f"{session_id}.jsonl").exists()
+        assert first_task_response.status_code == 202
+        session_id = first_task_response.json()["id"]
 
-    follow_up_response = client.post(
-        "/api/tasks",
-        json={"prompt": "und was kannst du hier machen?", "session_id": session_id},
-    )
-    assert follow_up_response.status_code == 202
+        deadline = time.time() + 5
+        session_payload = None
+        while time.time() < deadline:
+            session_response = client.get(f"/api/sessions/{session_id}")
+            assert session_response.status_code == 200
+            session_payload = session_response.json()
+            if session_payload["status"] in {"completed", "partial", "failed"}:
+                break
+            time.sleep(0.1)
 
-    deadline = time.time() + 5
-    follow_up_payload = None
-    while time.time() < deadline:
-        session_response = client.get(f"/api/sessions/{session_id}")
-        assert session_response.status_code == 200
-        follow_up_payload = session_response.json()
-        if follow_up_payload["status"] in {"completed", "partial", "failed"}:
-            break
-        time.sleep(0.1)
+        assert session_payload is not None
+        assert session_payload["title"] == "hallo wer bist du?"
+        assert session_payload["status"] == "completed"
+        assert session_payload["workspace_id"] == workspace["id"]
+        assert session_payload["workspace_label"] == "Workspace Renamed"
+        assert "Coding-Agent" in session_payload["final_response"]
+        assert len(session_payload["messages"]) >= 2
+        assert (
+            len(
+                [
+                    message
+                    for message in session_payload["messages"]
+                    if message["role"] == "user" and message["content"] == "hallo wer bist du?"
+                ]
+            )
+            == 1
+        )
+        first_message_count = len(session_payload["messages"])
+        assert (config.log_dir_path / f"{session_id}.jsonl").exists()
+        assert not (workspace_root / config.state_dir_name / "logs" / f"{session_id}.jsonl").exists()
 
-    assert follow_up_payload is not None
-    assert follow_up_payload["id"] == session_id
-    assert follow_up_payload["title"] == "hallo wer bist du?"
-    assert follow_up_payload["status"] == "completed"
+        follow_up_response = client.post(
+            "/api/tasks",
+            json={"prompt": "und was kannst du hier machen?", "session_id": session_id},
+        )
+        assert follow_up_response.status_code == 202
+
+        deadline = time.time() + 5
+        follow_up_payload = None
+        while time.time() < deadline:
+            session_response = client.get(f"/api/sessions/{session_id}")
+            assert session_response.status_code == 200
+            follow_up_payload = session_response.json()
+            if follow_up_payload["status"] in {"completed", "partial", "failed"}:
+                break
+            time.sleep(0.1)
+
+        assert follow_up_payload is not None
+        assert follow_up_payload["id"] == session_id
+        assert follow_up_payload["title"] == "hallo wer bist du?"
+        assert follow_up_payload["status"] == "completed"
     assert len(follow_up_payload["messages"]) >= first_message_count + 2
     assert (
         len(
@@ -429,6 +448,97 @@ def test_stop_requested_updates_running_session(tmp_path):
         logs_response = client.get(f"/api/sessions/{session_id}/logs")
         assert logs_response.status_code == 200
         assert any(item["event"] == "task_stop_requested" for item in logs_response.json())
+
+
+def test_follow_up_task_clears_old_execution_state_but_keeps_last_paths(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        ollama_host="http://127.0.0.1:9",
+        max_iterations=1,
+        shell_timeout=1,
+    )
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = TestClient(app)
+
+    observed_states: list[dict] = []
+
+    def fake_run_task(self, task, session=None, *, should_stop=None):
+        assert session is not None
+        observed_states.append(
+            {
+                "task": task,
+                "candidate_files": list(session.candidate_files),
+                "changed_files": [item.path for item in session.changed_files],
+                "tool_calls": [item.tool_name for item in session.tool_calls],
+                "follow_up_context": (
+                    None
+                    if session.follow_up_context is None
+                    else {
+                        "previous_task": session.follow_up_context.previous_task,
+                        "target_paths": list(session.follow_up_context.target_paths),
+                    }
+                ),
+            }
+        )
+        if task == "erstelle etwas":
+            session.changed_files = [FileChangeRecord(path="demo.py", operation="create")]
+            session.tool_calls = [
+                ToolCallRecord(
+                    iteration=1,
+                    tool_name="create_file",
+                    tool_args={"path": "demo.py"},
+                    success=True,
+                    summary="Created demo.py.",
+                )
+            ]
+            session.final_response = "Erstellt"
+        else:
+            session.final_response = "Aktualisiert"
+        session.status = "completed"
+        session.touch()
+        self.session_store.save(session)
+        return session
+
+    with patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        workspace = create_test_workspace(client, tmp_path)
+
+        first_response = client.post(
+            "/api/tasks",
+            json={"prompt": "erstelle etwas", "workspace_id": workspace["id"]},
+        )
+        assert first_response.status_code == 202
+        session_id = first_response.json()["id"]
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            session_payload = client.get(f"/api/sessions/{session_id}").json()
+            if session_payload["status"] in {"completed", "partial", "failed"}:
+                break
+            time.sleep(0.1)
+
+        follow_up_response = client.post(
+            "/api/tasks",
+            json={"prompt": "mach es dunkler", "session_id": session_id},
+        )
+        assert follow_up_response.status_code == 202
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            session_payload = client.get(f"/api/sessions/{session_id}").json()
+            if session_payload["status"] in {"completed", "partial", "failed"}:
+                break
+            time.sleep(0.1)
+
+    assert observed_states[0]["task"] == "erstelle etwas"
+    assert observed_states[1]["task"] == "mach es dunkler"
+    assert observed_states[1]["changed_files"] == []
+    assert observed_states[1]["tool_calls"] == []
+    assert observed_states[1]["candidate_files"] == ["demo.py"]
+    assert observed_states[1]["follow_up_context"] == {
+        "previous_task": "erstelle etwas",
+        "target_paths": ["demo.py"],
+    }
 
 
 def test_delete_session_removes_chat_metadata_and_logs(tmp_path):

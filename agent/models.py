@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.task_state import TaskState
+from agent.task_schema import TaskUnderstanding
 from llm.schemas import RouterOutput
 
 
@@ -91,6 +93,29 @@ class DiagnosticRecord(StrictModel):
     excerpt: str | None = None
     iteration: int | None = None
     timestamp: str = Field(default_factory=utc_now)
+
+
+class FollowUpContext(StrictModel):
+    previous_task: str | None = None
+    previous_root_goal: str | None = None
+    previous_active_goal: str | None = None
+    previous_next_action: str | None = None
+    previous_intent: str | None = None
+    previous_requested_outcome: str | None = None
+    previous_final_response: str | None = None
+    previous_interpreted_goal: str | None = None
+    previous_recommended_mode: str | None = None
+    previous_confidence: float | None = None
+    previous_assumptions: list[str] = Field(default_factory=list)
+    previous_constraints: list[str] = Field(default_factory=list)
+    target_paths: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+    read_files: list[str] = Field(default_factory=list)
+    recent_commands: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    diagnostics: list[DiagnosticRecord] = Field(default_factory=list)
+    validation_runs: list[ValidationRunRecord] = Field(default_factory=list)
+    last_error: str | None = None
 
 
 class SessionReport(StrictModel):
@@ -185,6 +210,8 @@ class SessionState(StrictModel):
     edit_generation: int = 0
     plan_summary: str | None = None
     task_analysis: dict[str, Any] | None = None
+    task_state: TaskState | None = None
+    task_understanding: TaskUnderstanding | None = None
     router_result: RouterOutput | None = None
     plan: list[PlanItem] = Field(default_factory=list)
     candidate_files: list[str] = Field(default_factory=list)
@@ -200,6 +227,7 @@ class SessionState(StrictModel):
     diagnostics: list[DiagnosticRecord] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
+    follow_up_context: FollowUpContext | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
     runtime_options: dict[str, Any] = Field(default_factory=dict)
     stop_requested: bool = False

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import py_compile
 import subprocess
+from html.parser import HTMLParser
+from pathlib import Path
 
 from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
@@ -23,6 +27,8 @@ class ShellTools:
         return self._run_command(args.command, args.cwd, args.timeout)
 
     def run_tests(self, args: RunTestsArgs) -> dict:
+        if args.command.startswith("internal:"):
+            return self._run_internal_validation(args.command, args.cwd)
         result = self._run_command(args.command, args.cwd, args.timeout)
         result["message"] = (
             f"Validation command exited with {result['exit_code']}."
@@ -30,6 +36,40 @@ class ShellTools:
             else result["message"]
         )
         return result
+
+    def _run_internal_validation(self, command: str, cwd: str) -> dict:
+        working_dir = self.workspace.resolve_directory(cwd)
+        if not working_dir.exists():
+            return {
+                "success": False,
+                "message": f"Working directory does not exist: {working_dir}",
+                "risk_level": "low",
+                "blocked": True,
+                "command": command,
+            }
+
+        kind, _, payload = command.partition(":")
+        kind, _, payload = payload.partition(":")
+        try:
+            relative_paths = json.loads(payload or "[]")
+        except json.JSONDecodeError:
+            return {
+                "success": False,
+                "message": "Internal validation payload could not be decoded.",
+                "risk_level": "low",
+                "command": command,
+            }
+
+        if kind == "python_syntax":
+            return self._run_python_syntax_validation(command, working_dir, relative_paths)
+        if kind == "html_refs":
+            return self._run_html_reference_validation(command, working_dir, relative_paths)
+        return {
+            "success": False,
+            "message": f"Unknown internal validation kind: {kind}",
+            "risk_level": "low",
+            "command": command,
+        }
 
     def _run_command(self, command: str, cwd: str, timeout: int | None) -> dict:
         assessment = self.safety.assess_shell_command(command)
@@ -92,3 +132,76 @@ class ShellTools:
             "exit_code": completed.returncode,
             "command": command,
         }
+
+    def _run_python_syntax_validation(self, command: str, working_dir: Path, relative_paths: list[str]) -> dict:
+        failures: list[str] = []
+        checked = 0
+        for relative_path in relative_paths:
+            target = self.workspace.resolve_path(working_dir / relative_path)
+            if not target.exists():
+                failures.append(f"Missing file: {relative_path}")
+                continue
+            try:
+                py_compile.compile(str(target), doraise=True)
+                checked += 1
+            except py_compile.PyCompileError as exc:
+                failures.append(str(exc))
+
+        success = not failures and checked > 0
+        return {
+            "success": success,
+            "message": "Validation command exited with 0." if success else "Validation command exited with 1.",
+            "risk_level": "low",
+            "stdout": f"Checked {checked} Python file(s).",
+            "stderr": "\n".join(failures),
+            "exit_code": 0 if success else 1,
+            "command": command,
+        }
+
+    def _run_html_reference_validation(self, command: str, working_dir: Path, relative_paths: list[str]) -> dict:
+        parser = _HTMLReferenceParser()
+        missing_refs: list[str] = []
+        checked = 0
+        for relative_path in relative_paths:
+            target = self.workspace.resolve_path(working_dir / relative_path)
+            if not target.exists():
+                missing_refs.append(f"Missing HTML file: {relative_path}")
+                continue
+            parser.reset_refs()
+            parser.feed(target.read_text(encoding="utf-8"))
+            checked += 1
+            for reference in parser.references:
+                resolved = (target.parent / reference).resolve()
+                if not resolved.exists():
+                    missing_refs.append(f"{relative_path} -> {reference}")
+
+        success = not missing_refs and checked > 0
+        return {
+            "success": success,
+            "message": "Validation command exited with 0." if success else "Validation command exited with 1.",
+            "risk_level": "low",
+            "stdout": f"Checked {checked} HTML file(s).",
+            "stderr": "\n".join(missing_refs),
+            "exit_code": 0 if success else 1,
+            "command": command,
+        }
+
+
+class _HTMLReferenceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: list[str] = []
+
+    def reset_refs(self) -> None:
+        self.references = []
+        self.reset()
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        del tag
+        for key, value in attrs:
+            if key not in {"src", "href"} or not value:
+                continue
+            cleaned = str(value).split("#", 1)[0].split("?", 1)[0].strip()
+            if not cleaned or cleaned.startswith(("http://", "https://", "data:", "mailto:", "javascript:", "#")):
+                continue
+            self.references.append(cleaned)
