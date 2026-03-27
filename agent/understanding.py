@@ -3,7 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from agent.prompts import task_understanding_prompt, task_understanding_system_prompt
-from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
+from agent.semantic_guardrails import build_minimal_task_understanding
+from agent.semantic_runtime import (
+    annotate_semantic_record,
+    secondary_semantics_limited,
+    semantic_model_candidates,
+    semantic_resolution_from_attempt,
+)
+from agent.task_schema import TaskUnderstanding
 from llm.provider import LLMProvider
 from llm.runtime_resilience import (
     ExecutionRecoveryPolicy,
@@ -42,13 +49,18 @@ class TaskInterpreter:
         payload: dict[str, Any] | None = None
         prompt = task_understanding_prompt(user_input, snapshot=snapshot, session=session)
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
-        primary_model = self._primary_model_name()
+        model_candidates = self._model_candidates()
+        primary_model = model_candidates[0] if model_candidates else None
+        reserve_model = model_candidates[1] if len(model_candidates) > 1 else None
         policy = ExecutionRecoveryPolicy(
             task_class="task_understanding",
             allow_same_backend_retry=True,
+            allow_smaller_faster_model=bool(reserve_model),
+            allow_reduce_request_complexity=True,
+            allow_minimal_generation=True,
             allow_deterministic_fallback=True,
             max_same_backend_retries=1,
-            max_total_attempts=2,
+            max_total_attempts=4,
         )
         attempts = []
         outcome = invoke_model(
@@ -77,21 +89,27 @@ class TaskInterpreter:
         attempts.append(outcome.attempt)
         if outcome.exception is None:
             payload = outcome.value
-            understanding = TaskUnderstanding.model_validate(payload)
+            understanding = self._finalize_understanding(
+                TaskUnderstanding.model_validate(payload),
+                semantic_resolution="full_model",
+            )
             self._append_runtime_execution(
                 session,
-                build_execution_run_record(
-                    operation_name="task_understanding",
-                    task_class="task_understanding",
-                    final_state="completed",
-                    capability_tier="tier_a",
-                    recovery_strategy="primary_model_generation",
-                    degraded=False,
-                    honest_blocked=False,
-                    artifact_bytes_generated=0,
-                    validation_possible=False,
-                    summary="Task interpretation completed on the primary generation tier.",
-                    attempts=attempts,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_understanding",
+                        task_class="task_understanding",
+                        final_state="completed",
+                        capability_tier="tier_a",
+                        recovery_strategy="primary_model_generation",
+                        degraded=False,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="Task interpretation completed on the primary semantic model.",
+                        attempts=attempts,
+                    ),
+                    semantic_resolution="full_model",
                 ),
             )
             self._log("task_understanding", understanding=understanding.model_dump())
@@ -106,7 +124,7 @@ class TaskInterpreter:
         decisions = policy.plan_recovery(
             failure,
             primary_model=primary_model,
-            faster_model=None,
+            faster_model=reserve_model,
             history=attempts,
         ) if failure is not None else []
         for decision in decisions:
@@ -121,14 +139,20 @@ class TaskInterpreter:
                 continue
             if decision.candidate.local_only:
                 break
+            retry_prompt = task_understanding_prompt(
+                user_input,
+                snapshot=snapshot,
+                session=session,
+                mode="full" if decision.candidate.prompt_variant == "full" else "compact",
+            )
             retry_outcome = invoke_model(
-                lambda progress: self.llm.generate_json(
-                    prompt,
+                lambda progress, prompt_text=retry_prompt, model_name=decision.candidate.model_identifier: self.llm.generate_json(
+                    prompt_text,
                     system=task_understanding_system_prompt(),
-                    model=decision.candidate.model_identifier,
+                    model=model_name,
                     retries=0,
                     timeout=self.timeout,
-                    num_ctx=min(self.num_ctx, 2048),
+                    num_ctx=self.num_ctx if decision.candidate.prompt_variant == "full" else min(self.num_ctx, 2048),
                     progress_callback=progress,
                 ),
                 operation_name="task_understanding",
@@ -147,21 +171,37 @@ class TaskInterpreter:
             attempts.append(retry_outcome.attempt)
             if retry_outcome.exception is None:
                 payload = retry_outcome.value
-                understanding = TaskUnderstanding.model_validate(payload)
+                resolution = semantic_resolution_from_attempt(
+                    capability_tier=decision.candidate.capability_tier,
+                    prompt_variant=decision.candidate.prompt_variant,
+                    model_identifier=decision.candidate.model_identifier,
+                    primary_model=primary_model,
+                )
+                understanding = self._finalize_understanding(
+                    TaskUnderstanding.model_validate(payload),
+                    semantic_resolution=resolution,
+                )
                 self._append_runtime_execution(
                     session,
-                    build_execution_run_record(
-                        operation_name="task_understanding",
-                        task_class="task_understanding",
-                        final_state="completed",
-                        capability_tier=decision.candidate.capability_tier,
-                        recovery_strategy=decision.candidate.strategy,
-                        degraded=decision.candidate.capability_tier != "tier_a",
-                        honest_blocked=False,
-                        artifact_bytes_generated=0,
-                        validation_possible=False,
-                        summary="Task interpretation recovered after a runtime startup issue.",
-                        attempts=attempts,
+                    annotate_semantic_record(
+                        build_execution_run_record(
+                            operation_name="task_understanding",
+                            task_class="task_understanding",
+                            final_state="completed",
+                            capability_tier=decision.candidate.capability_tier,
+                            recovery_strategy=decision.candidate.strategy,
+                            degraded=decision.candidate.capability_tier != "tier_a",
+                            honest_blocked=False,
+                            artifact_bytes_generated=0,
+                            validation_possible=False,
+                            summary=(
+                                "Task interpretation recovered on a reserve semantic model."
+                                if resolution == "reserve_model"
+                                else "Task interpretation recovered through reduced semantic reconstruction."
+                            ),
+                            attempts=attempts,
+                        ),
+                        semantic_resolution=resolution,
                     ),
                 )
                 self._log("task_understanding", understanding=understanding.model_dump(), source="recovered_model")
@@ -179,61 +219,35 @@ class TaskInterpreter:
             error=str(outcome.exception),
             payload=payload or {},
         )
-        fallback = self._fallback_understanding(user_input, session=session)
+        fallback = self._fallback_understanding(user_input, snapshot=snapshot, session=session)
         self._append_runtime_execution(
             session,
-            build_execution_run_record(
-                operation_name="task_understanding",
-                task_class="task_understanding",
-                final_state="degraded_success",
-                capability_tier="tier_d",
-                recovery_strategy="deterministic_fallback",
-                degraded=True,
-                honest_blocked=False,
-                artifact_bytes_generated=0,
-                validation_possible=False,
-                summary="Task interpretation used the deterministic fallback because the backend could not start cleanly.",
-                attempts=attempts,
+            annotate_semantic_record(
+                build_execution_run_record(
+                    operation_name="task_understanding",
+                    task_class="task_understanding",
+                    final_state="degraded_success",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_fallback",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=False,
+                    summary="Task interpretation fell back to conservative minimal inference after model execution failed.",
+                    attempts=attempts,
+                ),
+                semantic_resolution="minimal_inference",
             ),
         )
         self._log("task_understanding", understanding=fallback.model_dump(), source="fallback")
         return fallback
 
-    def _fallback_understanding(self, user_input: str, *, session=None) -> TaskUnderstanding:
-        request = str(user_input or "").strip() or "Unclear request"
-        recent_paths: list[str] = []
-        if session is not None:
-            if getattr(session, "follow_up_context", None) is not None:
-                recent_paths.extend(session.follow_up_context.target_paths[:4])
-            recent_paths.extend(session.candidate_files[:4])
-        artifacts = [
-            TaskArtifact(path=path, name=path.split("/")[-1], kind="file", role="active_context", confidence=0.55)
-            for path in recent_paths[:4]
-        ]
-        plan = [
-            TaskPlanStep(step=1, summary="Inspect the most relevant context before acting.", action_hint="inspect"),
-            TaskPlanStep(step=2, summary="Choose the smallest safe implementation step.", action_hint="plan"),
-        ]
-        return TaskUnderstanding(
-            original_request=request,
-            interpreted_goal=request,
-            intent_category="unknown",
-            conversation_relation="same_task_follow_up" if session is not None else "unknown",
-            subgoals=["Clarify the immediate task and inspect context."],
-            target_artifacts=artifacts,
-            relevant_context=["Recent session context is available."] if session is not None else [],
-            constraints=[],
-            missing_info=["The exact target is still ambiguous."],
-            assumptions=["Continue from the current task unless the user clearly changed topic."],
-            user_observations=[],
-            supplied_evidence=[],
-            ambiguity_level="high",
-            risk_level="medium",
-            confidence=0.35,
-            recommended_mode="clarify",
-            execution_plan=plan,
-            needs_clarification=True,
-            clarification_questions=["Welchen konkreten Bereich soll ich als naechstes bearbeiten?"],
+    def _fallback_understanding(self, user_input: str, *, snapshot=None, session=None) -> TaskUnderstanding:
+        return build_minimal_task_understanding(
+            user_input,
+            session=session,
+            snapshot=snapshot,
+            semantic_resolution="minimal_inference",
         )
 
     def _log(self, event: str, **payload: Any) -> None:
@@ -247,14 +261,18 @@ class TaskInterpreter:
         session.runtime_executions.append(record)
         session.runtime_executions = session.runtime_executions[-20:]
 
-    def _primary_model_name(self) -> str | None:
-        candidate = str(self.model_name or "").strip()
-        if candidate:
-            return candidate
-        config = getattr(self.llm, "config", None)
-        if config is None:
-            return None
-        return str(getattr(config, "router_model_name", "") or getattr(config, "model_name", "") or "").strip() or None
+    def _finalize_understanding(
+        self,
+        understanding: TaskUnderstanding,
+        *,
+        semantic_resolution: str,
+    ) -> TaskUnderstanding:
+        understanding.semantic_resolution = semantic_resolution
+        understanding.secondary_semantics_limited = secondary_semantics_limited(semantic_resolution)
+        return understanding
+
+    def _model_candidates(self) -> list[str]:
+        return semantic_model_candidates(self.model_name, getattr(self.llm, "config", None))
 
     def _progress_logger(self, event: str):
         if self.logger is None:

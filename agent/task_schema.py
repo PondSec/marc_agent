@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agent.semantic_runtime import SemanticResolution
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -107,6 +109,8 @@ class TaskUnderstanding(StrictModel):
     execution_plan: list[TaskPlanStep] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_questions: list[str] = Field(default_factory=list)
+    semantic_resolution: SemanticResolution = "full_model"
+    secondary_semantics_limited: bool = False
 
     @model_validator(mode="after")
     def normalize(self) -> TaskUnderstanding:

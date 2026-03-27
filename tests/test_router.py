@@ -163,7 +163,7 @@ def test_router_fallback_still_answers_simple_intro_questions():
     assert "Coding-Agent" in (route.direct_response or "")
 
 
-def test_router_fast_paths_clear_create_request_without_calling_llm():
+def test_router_fallback_preserves_clear_create_request_after_model_failure():
     llm = ScriptedLLM(fail=True, fail_message="should not be called")
     router = IntentRouter(llm)
 
@@ -173,7 +173,7 @@ def test_router_fast_paths_clear_create_request_without_calling_llm():
     assert route.safe_to_execute is True
     assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
     assert route.entities.target_name == "tic tac toe"
-    assert llm.prompts == []
+    assert llm.prompts
 
 
 def test_router_recognizes_tictactoe_without_spaces():
@@ -182,7 +182,7 @@ def test_router_recognizes_tictactoe_without_spaces():
     route = router.interpret_user_request("schreib ein python TicTacToe spiel", None)
 
     assert route.intent == RouteIntent.CREATE
-    assert route.entities.target_name == "tic tac toe"
+    assert route.entities.target_name in {"tic tac toe", "tictactoe"}
 
 
 def test_router_treats_computer_opponent_follow_up_as_update():
@@ -200,7 +200,7 @@ def test_router_treats_computer_opponent_follow_up_as_update():
     assert route.entities.target_paths == ["tic_tac_toe.py"]
 
 
-def test_router_treats_generic_follow_up_as_update_without_new_artifact_request():
+def test_router_minimal_fallback_clarifies_unanchored_visual_follow_up():
     router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
     session = SessionState(task="vorheriger prompt", workspace_root=".")
     session.changed_files.append(FileChangeRecord(path="dashboard.py", operation="create"))
@@ -211,8 +211,9 @@ def test_router_treats_generic_follow_up_as_update_without_new_artifact_request(
         session=session,
     )
 
-    assert route.intent == RouteIntent.UPDATE
-    assert route.entities.target_paths == ["dashboard.py"]
+    assert route.intent == RouteIntent.UNKNOWN
+    assert route.needs_clarification is True
+    assert route.safe_to_execute is False
 
 
 def test_router_treats_vague_bug_follow_up_as_debug_route():
@@ -271,6 +272,21 @@ def test_router_timeout_fallback_classifies_clear_create_request_without_llm():
     assert route.needs_clarification is False
     assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
     assert ".py" in route.relevant_extensions
+
+
+def test_router_timeout_fallback_classifies_need_based_create_request_without_llm():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    route = router.interpret_user_request(
+        "ich brauche ein snake spiel in html",
+        None,
+    )
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.safe_to_execute is True
+    assert route.needs_clarification is False
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+    assert ".html" in route.relevant_extensions
 
 
 def test_router_schema_contains_core_contract_fields():

@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agent.semantic_runtime import SemanticResolution
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
 
 
@@ -59,6 +60,7 @@ NextAction = Literal[
     "clarify",
 ]
 EvidenceKind = Literal["message", "log", "diff", "diagnostic", "test", "command", "file", "unknown"]
+SemanticInferenceMode = Literal["full", "conservative"]
 
 
 def _compact_strings(values: list[str], *, limit: int | None = None) -> list[str]:
@@ -253,6 +255,67 @@ def _infer_execution_strategy(
     return "feature_implementation"
 
 
+def _infer_user_intent_conservative(
+    *,
+    goal_relation: GoalRelation,
+    next_best_action: NextAction,
+    open_problem: str | None,
+    evidence: list[EvidenceItem],
+) -> UserIntent:
+    evidence_kinds = {item.kind for item in evidence}
+    if goal_relation in {"correct", "rollback_request", "scope_change"}:
+        return "correct"
+    if next_best_action == "debug" or open_problem or evidence_kinds & {"diagnostic", "test", "log"}:
+        return "repair"
+    if goal_relation == "validation_request" or next_best_action == "test":
+        return "validate"
+    mapping: dict[NextAction, UserIntent] = {
+        "create": "implement",
+        "modify": "implement",
+        "inspect": "inspect",
+        "search": "search",
+        "explain": "explain",
+        "plan": "plan",
+        "clarify": "unknown",
+        "test": "validate",
+        "debug": "repair",
+    }
+    return mapping.get(next_best_action, "unknown")
+
+
+def _infer_execution_strategy_conservative(
+    *,
+    goal_relation: GoalRelation,
+    current_user_intent: UserIntent | None,
+    next_best_action: NextAction,
+    open_problem: str | None,
+    evidence: list[EvidenceItem],
+) -> ExecutionStrategy | None:
+    evidence_kinds = {item.kind for item in evidence}
+    if goal_relation in {"correct", "rollback_request", "scope_change"} or current_user_intent == "correct":
+        return "rollback_correction"
+    if (
+        current_user_intent == "repair"
+        or next_best_action == "debug"
+        or goal_relation == "report_problem"
+        or open_problem is not None
+        or evidence_kinds & {"diagnostic", "test", "log"}
+    ):
+        return "debug_repair"
+    if current_user_intent == "refactor":
+        return "refactor"
+    if current_user_intent == "harden":
+        return "hardening"
+    if current_user_intent in {"validate", "inspect", "explain", "search", "plan"} or (
+        goal_relation == "validation_request"
+        or next_best_action in {"test", "inspect", "search", "explain", "plan"}
+    ):
+        return "validation_inspection"
+    if current_user_intent == "implement" or next_best_action in {"create", "modify"}:
+        return "feature_implementation"
+    return None
+
+
 class EvidenceItem(StrictModel):
     kind: EvidenceKind = "unknown"
     summary: str
@@ -294,6 +357,9 @@ class TaskState(StrictModel):
     execution_outline: list[str] = Field(default_factory=list)
     needs_clarification: bool = False
     clarification_questions: list[str] = Field(default_factory=list)
+    semantic_inference_mode: SemanticInferenceMode = Field(default="full", exclude=True, repr=False)
+    semantic_resolution: SemanticResolution = "full_model"
+    secondary_semantics_limited: bool = False
 
     @model_validator(mode="after")
     def normalize(self) -> TaskState:
@@ -317,37 +383,6 @@ class TaskState(StrictModel):
         self.execution_outline = _compact_strings(self.execution_outline, limit=6)
         self.clarification_questions = _compact_strings(self.clarification_questions, limit=3)
         self.next_best_action = self.next_best_action or self.next_action
-        if self.current_user_intent is None:
-            self.current_user_intent = _infer_user_intent(
-                latest_user_turn=self.latest_user_turn,
-                goal_relation=self.goal_relation,
-                next_best_action=self.next_best_action,
-                root_goal=self.root_goal,
-                active_goal=self.active_goal,
-                output_expectation=self.output_expectation,
-                open_problem=self.open_problem,
-                verification_target=self.verification_target,
-                constraints=self.constraints,
-                assumptions=self.assumptions,
-                supplied_evidence=self.supplied_evidence,
-                evidence=self.evidence,
-            )
-        if self.execution_strategy is None:
-            self.execution_strategy = _infer_execution_strategy(
-                latest_user_turn=self.latest_user_turn,
-                goal_relation=self.goal_relation,
-                current_user_intent=self.current_user_intent,
-                next_best_action=self.next_best_action,
-                root_goal=self.root_goal,
-                active_goal=self.active_goal,
-                output_expectation=self.output_expectation,
-                open_problem=self.open_problem,
-                verification_target=self.verification_target,
-                constraints=self.constraints,
-                assumptions=self.assumptions,
-                supplied_evidence=self.supplied_evidence,
-                evidence=self.evidence,
-            )
         if self.needs_clarification and not self.clarification_questions:
             raise ValueError("clarification_questions must be present when needs_clarification is true")
         if not self.latest_user_turn:
@@ -400,7 +435,18 @@ class TaskState(StrictModel):
             }
             intent_category = intent_map.get(recommended_mode, "analyze")
         else:
-            intent_category = "build" if recommended_mode == "create" else "modify"
+            intent_map = {
+                "create": "build",
+                "modify": "modify",
+                "debug": "debug",
+                "test": "test",
+                "search": "search",
+                "inspect": "analyze",
+                "explain": "explain",
+                "plan": "plan",
+                "clarify": "unknown",
+            }
+            intent_category = intent_map.get(recommended_mode, "modify")
         plan = [
             TaskPlanStep(
                 step=index,
@@ -411,6 +457,13 @@ class TaskState(StrictModel):
             for index, summary in enumerate(self.execution_outline or [self.active_goal], start=1)
         ]
         artifacts = self.active_artifacts or self.target_artifacts
+        relevant_context = list(self.relevant_context)
+        if self.execution_strategy:
+            relevant_context.insert(0, f"Execution strategy: {self.execution_strategy}")
+        if self.current_user_intent:
+            relevant_context.insert(1 if self.execution_strategy else 0, f"Current user intent: {self.current_user_intent}")
+        if self.open_problem:
+            relevant_context.append(f"Open problem: {self.open_problem}")
         return TaskUnderstanding(
             original_request=self.latest_user_turn,
             interpreted_goal=self.active_goal,
@@ -418,12 +471,7 @@ class TaskState(StrictModel):
             conversation_relation=relation_map.get(self.goal_relation, "unknown"),
             subgoals=list(self.execution_outline[:6]),
             target_artifacts=artifacts,
-            relevant_context=[
-                f"Execution strategy: {self.execution_strategy}",
-                f"Current user intent: {self.current_user_intent}",
-                *self.relevant_context,
-                *([f"Open problem: {self.open_problem}"] if self.open_problem else []),
-            ],
+            relevant_context=relevant_context,
             constraints=[
                 *self.constraints,
                 *([f"Verification target: {self.verification_target}"] if self.verification_target else []),
@@ -439,4 +487,6 @@ class TaskState(StrictModel):
             execution_plan=plan,
             needs_clarification=self.needs_clarification,
             clarification_questions=self.clarification_questions,
+            semantic_resolution=self.semantic_resolution,
+            secondary_semantics_limited=self.secondary_semantics_limited,
         )

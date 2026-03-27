@@ -19,18 +19,52 @@ from runtime.logger import AgentLogger
 
 
 class ScriptedLLM:
-    def __init__(self, json_payloads=None):
+    def __init__(self, json_payloads=None, *, fail: bool = False, fail_times: int = 0, fail_message: str = "timed out"):
         self.json_payloads = list(json_payloads or [])
+        self.fail = fail
+        self.fail_times = fail_times
+        self.fail_message = fail_message
         self.generate_json_calls: list[dict] = []
 
     def generate_json(self, *args, **kwargs):
         self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if self.fail:
+            raise RuntimeError(self.fail_message)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError(self.fail_message)
         if not self.json_payloads:
             raise RuntimeError("No JSON payload configured")
         return self.json_payloads.pop(0)
 
     def generate(self, *args, **kwargs):
         raise RuntimeError("Text generation not configured for this test")
+
+
+class ModelSelectiveLLM(ScriptedLLM):
+    def __init__(
+        self,
+        payload_by_model: dict[str, dict],
+        *,
+        failing_models: set[str] | None = None,
+        fail_message: str = "timed out",
+        config=None,
+    ):
+        super().__init__(json_payloads=[])
+        self.payload_by_model = dict(payload_by_model)
+        self.failing_models = set(failing_models or set())
+        self.fail_message = fail_message
+        self.config = config
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        model = str(kwargs.get("model") or "")
+        if model in self.failing_models:
+            raise RuntimeError(self.fail_message)
+        payload = self.payload_by_model.get(model)
+        if payload is None:
+            raise RuntimeError(f"No JSON payload configured for model {model!r}")
+        return payload
 
 
 def build_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
@@ -459,7 +493,7 @@ def test_task_state_updater_tracks_continuation_with_evidence():
     assert task_state.evidence[0].artifact_path == "app/upload.py"
 
 
-def test_task_state_derives_phase_two_operational_fields_from_existing_signals():
+def test_task_state_normalize_does_not_infer_phase_two_operational_fields():
     state = TaskState(
         latest_user_turn="why is this failing?",
         root_goal="Fix the failing upload flow.",
@@ -499,8 +533,8 @@ def test_task_state_derives_phase_two_operational_fields_from_existing_signals()
         clarification_questions=[],
     )
 
-    assert state.current_user_intent == "repair"
-    assert state.execution_strategy == "debug_repair"
+    assert state.current_user_intent is None
+    assert state.execution_strategy is None
     assert state.next_best_action == "debug"
     assert state.active_artifacts[0].path == "app/upload.py"
     assert state.supplied_evidence == ["AttributeError in upload handler"]
@@ -540,6 +574,256 @@ def test_task_state_fallback_still_clarifies_vague_requests_without_active_conte
 
     assert task_state.next_action == "clarify"
     assert task_state.needs_clarification is True
+
+
+def test_task_state_timeout_fallback_preserves_clear_create_request_without_invented_specialization(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    session = SessionState(
+        task="mach login sicherer",
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="mach login sicherer",
+            root_goal="Improve login resilience.",
+            active_goal="Harden the login flow without broad rewrites.",
+            goal_relation="refine",
+            output_expectation="A safer login flow.",
+            current_user_intent="harden",
+            execution_strategy="hardening",
+            open_problem=None,
+            verification_target="Apply the highest-value hardening change and verify the intended behavior still works.",
+            target_artifacts=[
+                TaskArtifact(path="app/auth.py", name="app/auth.py", kind="file", role="primary_target", confidence=0.84)
+            ],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.86,
+            next_action="modify",
+            execution_outline=["Inspect auth.py", "Harden it", "Verify login path"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+        follow_up_context=FollowUpContext(
+            previous_task="mach login sicherer",
+            previous_root_goal="Improve login resilience.",
+            previous_active_goal="Harden the login flow without broad rewrites.",
+            previous_next_action="modify",
+            previous_requested_outcome="A safer login flow.",
+            target_paths=["app/auth.py"],
+            changed_files=["app/auth.py"],
+            read_files=["app/auth.py"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        "ich brauche ein snake spiel in html",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.needs_clarification is False
+    assert "hardening" not in task_state.output_expectation.lower()
+    assert "hardening" not in (task_state.verification_target or "").lower()
+    assert task_state.execution_strategy != "hardening"
+    assert task_state.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_primary_model_preserves_full_model_semantics_for_clear_create_request(tmp_path):
+    config = type("Cfg", (), {"router_model_name": "router-a", "model_name": "reserve-b"})()
+    llm = ModelSelectiveLLM(
+        {
+            "router-a": {
+                "latest_user_turn": "ich brauche ein snake spiel in html",
+                "root_goal": "Build a small Snake game in HTML.",
+                "active_goal": "Create the first playable Snake implementation.",
+                "goal_relation": "new_task",
+                "output_expectation": "Create a small runnable implementation with a conventional default artifact and minimal scope.",
+                "current_user_intent": "implement",
+                "execution_strategy": "feature_implementation",
+                "open_problem": None,
+                "verification_target": "Create the initial implementation and run the most relevant validation or entry command.",
+                "target_artifacts": [
+                    {
+                        "path": None,
+                        "name": "snake",
+                        "kind": ".html",
+                        "role": "primary_target",
+                        "confidence": 0.8,
+                    }
+                ],
+                "active_artifacts": [],
+                "evidence": [],
+                "relevant_context": [],
+                "constraints": [],
+                "assumptions": ["A conventional default artifact is acceptable."],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "low",
+                "confidence": 0.9,
+                "next_action": "create",
+                "next_best_action": "create",
+                "execution_outline": ["Choose a conventional default artifact.", "Implement the smallest runnable version."],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        },
+        config=config,
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        "ich brauche ein snake spiel in html",
+        snapshot=empty_snapshot(tmp_path),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.semantic_resolution == "full_model"
+
+
+def test_task_state_uses_reserve_model_before_minimal_inference_for_clear_create_request(tmp_path):
+    config = type("Cfg", (), {"router_model_name": "router-a", "model_name": "reserve-b"})()
+    reserve_payload = {
+        "latest_user_turn": "ich brauche ein snake spiel in html",
+        "root_goal": "Build a small Snake game in HTML.",
+        "active_goal": "Create the first playable Snake implementation.",
+        "goal_relation": "new_task",
+        "output_expectation": "Create a small runnable implementation with a conventional default artifact and minimal scope.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "Create the initial implementation and run the most relevant validation or entry command.",
+        "target_artifacts": [
+            {
+                "path": None,
+                "name": "snake",
+                "kind": ".html",
+                "role": "primary_target",
+                "confidence": 0.78,
+            }
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": ["A conventional default artifact is acceptable."],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.84,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": ["Choose a conventional default artifact.", "Implement the smallest runnable version."],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ModelSelectiveLLM(
+        {"reserve-b": reserve_payload},
+        failing_models={"router-a"},
+        config=config,
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        "ich brauche ein snake spiel in html",
+        snapshot=empty_snapshot(tmp_path),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.semantic_resolution == "reserve_model"
+    assert any(call["kwargs"].get("model") == "reserve-b" for call in llm.generate_json_calls)
+
+
+def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    task_state = updater.update_task_state(
+        "erklär mir wie die upload route funktioniert",
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "explain"
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.needs_clarification is False
+    assert task_state.semantic_resolution == "minimal_inference"
+
+
+def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_path):
+    interpreter = TaskInterpreter(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    understanding = interpreter.interpret(
+        "ich brauche ein snake spiel in html",
+        session=SessionState(task="ich brauche ein snake spiel in html", workspace_root=str(tmp_path)),
+    )
+
+    assert understanding.intent_category == "build"
+    assert understanding.conversation_relation == "new_task"
+    assert understanding.recommended_mode == "create"
+    assert understanding.needs_clarification is False
+    assert understanding.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_timeout_fallback_preserves_clear_debug_request(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    task_state = updater.update_task_state(
+        "fix den fehler in app/auth.py",
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.goal_relation == "report_problem"
+    assert task_state.current_user_intent == "repair"
+    assert task_state.execution_strategy == "debug_repair"
+    assert task_state.next_action == "debug"
+    assert task_state.target_artifacts[0].path == "app/auth.py"
+    assert route.intent == RouteIntent.DEBUG
+    assert route.needs_clarification is False
+    assert task_state.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_timeout_fallback_clarifies_vague_request_without_specialized_strategy(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    session = SessionState(
+        task="mach login sicherer",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="mach login sicherer",
+            previous_root_goal="Improve login resilience.",
+            previous_active_goal="Harden the login flow without broad rewrites.",
+            previous_next_action="modify",
+            previous_requested_outcome="A safer login flow.",
+            target_paths=["app/auth.py", "app/session.py"],
+            changed_files=["app/auth.py", "app/session.py"],
+            read_files=["app/auth.py", "app/session.py"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        "mach da was",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.next_action == "clarify"
+    assert task_state.needs_clarification is True
+    assert task_state.current_user_intent == "unknown"
+    assert task_state.execution_strategy is None
 
 
 def test_task_state_fallback_uses_existing_state_evidence_instead_of_prompt_text(tmp_path):
@@ -757,7 +1041,7 @@ def test_task_state_timeout_fallback_treats_html_follow_up_as_continuation_creat
     assert '"chosen_intent": "create"' in logs
 
 
-def test_task_state_timeout_fallback_treats_tic_tac_toe_menu_follow_up_as_refinement_update(tmp_path):
+def test_task_state_timeout_fallback_clarifies_ambiguous_follow_up_instead_of_claiming_same_task(tmp_path):
     logger = AgentLogger(tmp_path, "task-state-timeout-tictactoe-menu")
     updater = TaskStateUpdater(ScriptedLLM(), logger=logger)
     session = SessionState(
@@ -788,19 +1072,19 @@ def test_task_state_timeout_fallback_treats_tic_tac_toe_menu_follow_up_as_refine
         session=session,
     )
 
-    assert task_state.root_goal == "Build a Tic Tac Toe game in Python."
-    assert task_state.goal_relation == "refine"
-    assert task_state.next_action == "modify"
-    assert [artifact.path for artifact in task_state.target_artifacts[:1]] == ["tic_tac_toe.py"]
-    assert route.intent == RouteIntent.UPDATE
-    assert route.entities.target_paths == ["tic_tac_toe.py"]
-    assert route.entities.target_name == "tic_tac_toe.py"
-    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+    assert task_state.root_goal == session.task
+    assert task_state.goal_relation == "clarify"
+    assert task_state.current_user_intent == "unknown"
+    assert task_state.next_action == "clarify"
+    assert task_state.needs_clarification is True
+    assert route.intent == RouteIntent.UNKNOWN
+    assert route.needs_clarification is True
+    assert route.safe_to_execute is False
 
     logs = (tmp_path / "task-state-timeout-tictactoe-menu.jsonl").read_text(encoding="utf-8")
     assert "task_state_fallback" in logs
-    assert '"goal_relation": "refine"' in logs
-    assert '"chosen_intent": "update"' in logs
+    assert '"goal_relation": "clarify"' in logs
+    assert '"chosen_intent": "unknown"' in logs
 
 
 @pytest.mark.parametrize("path", ["snake.js", "tic_tac_toe.py"])
@@ -833,7 +1117,7 @@ def test_task_state_timeout_fallback_treats_generic_feature_extension_as_modify(
         session=session,
     )
 
-    assert task_state.goal_relation == "refine"
+    assert task_state.goal_relation in {"continue", "refine"}
     assert task_state.next_action == "modify"
     assert [artifact.path for artifact in task_state.target_artifacts[:1]] == [path]
     assert route.intent == RouteIntent.UPDATE
@@ -871,17 +1155,18 @@ def test_task_state_timeout_fallback_treats_hardening_follow_up_as_targeted_upda
 
     assert task_state.root_goal == "Implement login for this app."
     assert task_state.goal_relation == "refine"
-    assert task_state.current_user_intent == "harden"
-    assert task_state.execution_strategy == "hardening"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
     assert task_state.next_action == "modify"
     assert task_state.needs_clarification is False
-    assert "safer" in task_state.output_expectation.lower() or "robust" in task_state.output_expectation.lower()
+    assert "hardening" not in task_state.output_expectation.lower()
+    assert "hardening" not in (task_state.verification_target or "").lower()
     assert route.intent == RouteIntent.UPDATE
     assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
 
     logs = (tmp_path / "task-state-timeout-hardening.jsonl").read_text(encoding="utf-8")
     assert "task_state_fallback" in logs
-    assert '"execution_strategy": "hardening"' in logs
+    assert '"execution_strategy": "feature_implementation"' in logs
 
 
 def test_task_state_timeout_fallback_treats_backend_only_follow_up_as_scope_change(tmp_path):
@@ -916,12 +1201,13 @@ def test_task_state_timeout_fallback_treats_backend_only_follow_up_as_scope_chan
     assert task_state.root_goal == "Add login to this app."
     assert task_state.goal_relation == "scope_change"
     assert task_state.current_user_intent == "correct"
-    assert task_state.execution_strategy == "rollback_correction"
+    assert task_state.execution_strategy is None
     assert task_state.constraints == ["Backend only."]
     assert [artifact.path for artifact in task_state.target_artifacts] == ["backend/auth.py"]
     assert task_state.needs_clarification is False
     assert "backend-scoped" in task_state.output_expectation.lower()
     assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths[0] == "backend/auth.py"
     assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
 
     logs = (tmp_path / "task-state-timeout-backend-only.jsonl").read_text(encoding="utf-8")

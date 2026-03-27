@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from pathlib import Path
+from typing import Literal
+
+from agent.local_nlp import classify_fallback_intent
 
 
 _COMPOUND_REPLACEMENTS = (
@@ -36,6 +40,14 @@ _CREATE_SIGNALS = (
     "want",
 )
 
+_NEED_CREATE_SIGNALS = (
+    "bedarf",
+    "benoetig",
+    "benötig",
+    "brauch",
+    "need",
+)
+
 _IMPLEMENTATION_NOUNS = (
     "api",
     "app",
@@ -51,6 +63,7 @@ _IMPLEMENTATION_NOUNS = (
     "module",
     "oberflaeche",
     "oberfläche",
+    "page",
     "script",
     "service",
     "site",
@@ -157,6 +170,8 @@ _GENERIC_SCOPE_STOPWORDS = {
     "weiter",
     "want",
     "will",
+    "need",
+    "brauche",
     "write",
     "was",
     "zum",
@@ -225,6 +240,15 @@ _PROBLEM_REPORT_TOKENS = (
     "warning",
 )
 
+_DEBUG_REQUEST_TOKENS = (
+    "beheb",
+    "debug",
+    "fix",
+    "reparier",
+    "repair",
+    "resolve",
+)
+
 _VALIDATION_REQUEST_TOKENS = (
     "check",
     "lint",
@@ -234,6 +258,36 @@ _VALIDATION_REQUEST_TOKENS = (
     "test",
     "validier",
     "verify",
+)
+
+_EXPLANATION_REQUEST_TOKENS = (
+    "analysiere",
+    "erklär",
+    "erklaer",
+    "explain",
+    "review",
+    "warum",
+    "was macht",
+    "wie funktioniert",
+    "wieso",
+    "zusammen",
+)
+
+_UPDATE_REQUEST_TOKENS = (
+    "aender",
+    "änder",
+    "aktualis",
+    "anpass",
+    "change",
+    "clean up",
+    "cleanup",
+    "modify",
+    "optimi",
+    "refactor",
+    "rewrite",
+    "umbau",
+    "update",
+    "verbesser",
 )
 
 _CORRECTION_REQUEST_TOKENS = (
@@ -282,6 +336,17 @@ _FRONTEND_SCOPE_TOKENS = (
     "only frontend",
     "ui only",
 )
+
+
+PrimarySemanticIntent = Literal["create", "debug", "explain", "update"]
+
+
+@dataclass(frozen=True, slots=True)
+class ObviousRequestClassification:
+    intent: PrimarySemanticIntent
+    confidence: float
+    requested_extension: str | None = None
+    artifact_name_hint: str | None = None
 
 
 def normalize_text(text: str) -> str:
@@ -361,11 +426,27 @@ def is_clear_low_risk_build_request(text: str) -> bool:
     if not normalized:
         return False
     tokens = _text_tokens(normalized)
-    has_create_signal = _contains_term(normalized, tokens, _CREATE_SIGNALS, prefix=True)
+    has_create_signal = _contains_term(normalized, tokens, _CREATE_SIGNALS, prefix=True) or _contains_term(
+        normalized,
+        tokens,
+        _NEED_CREATE_SIGNALS,
+        prefix=True,
+    )
+    has_change_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True) or _contains_term(
+        normalized,
+        tokens,
+        _UPDATE_REQUEST_TOKENS,
+        prefix=True,
+    )
     has_delivery_signal = _contains_implementation_noun(normalized)
     has_medium_signal = infer_requested_extension(normalized) is not None
     has_named_scope = bool(infer_scope_tokens(normalized))
-    return has_create_signal and (has_delivery_signal or has_medium_signal) and has_named_scope
+    return (
+        has_create_signal
+        and not has_change_signal
+        and (has_delivery_signal or has_medium_signal)
+        and has_named_scope
+    )
 
 
 def has_follow_up_reference(text: str) -> bool:
@@ -402,6 +483,34 @@ def looks_like_problem_report(text: str) -> bool:
     return bool(normalized) and any(token in normalized for token in _PROBLEM_REPORT_TOKENS)
 
 
+def looks_like_debug_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    tokens = _text_tokens(normalized)
+    has_fix_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True)
+    has_problem_signal = looks_like_problem_report(text)
+    return has_fix_signal or has_problem_signal
+
+
+def looks_like_explanation_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    return bool(normalized) and any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
+
+
+def looks_like_update_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    tokens = _text_tokens(normalized)
+    if _contains_term(normalized, tokens, _UPDATE_REQUEST_TOKENS, prefix=True):
+        return True
+    existing_surface_markers = ("aus dem", "bestehend", "current", "existing", "in place")
+    if any(marker in normalized for marker in existing_surface_markers) and _contains_implementation_noun(normalized):
+        return True
+    return False
+
+
 def looks_like_validation_request(text: str) -> bool:
     normalized = normalize_text(text)
     return bool(normalized) and any(token in normalized for token in _VALIDATION_REQUEST_TOKENS)
@@ -415,6 +524,51 @@ def looks_like_correction_request(text: str) -> bool:
 def looks_like_hardening_request(text: str) -> bool:
     normalized = normalize_text(text)
     return bool(normalized) and any(token in normalized for token in _HARDENING_REQUEST_TOKENS)
+
+
+def classify_obvious_request(text: str) -> ObviousRequestClassification | None:
+    normalized = normalize_text(text)
+    if not normalized:
+        return None
+    requested_extension = infer_requested_extension(text)
+    artifact_name_hint = infer_artifact_name_hint(text)
+    if looks_like_explanation_request(text):
+        return ObviousRequestClassification(
+            intent="explain",
+            confidence=0.78,
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+        )
+    if looks_like_debug_request(text):
+        return ObviousRequestClassification(
+            intent="debug",
+            confidence=0.8,
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+        )
+    if looks_like_update_request(text):
+        return ObviousRequestClassification(
+            intent="update",
+            confidence=0.74,
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+        )
+    nlp_prediction = classify_fallback_intent(text)
+    if nlp_prediction.intent in {"create", "debug", "explain", "update"} and nlp_prediction.confidence >= 0.5:
+        return ObviousRequestClassification(
+            intent=nlp_prediction.intent,
+            confidence=max(nlp_prediction.confidence, 0.7),
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+        )
+    if is_clear_low_risk_build_request(text):
+        return ObviousRequestClassification(
+            intent="create",
+            confidence=0.84 if requested_extension is not None else 0.78,
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+        )
+    return None
 
 
 def looks_like_scope_narrowing_request(text: str) -> bool:

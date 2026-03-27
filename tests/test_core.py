@@ -4,6 +4,7 @@ from agent.core import AgentCore
 from agent.models import FileChangeRecord, SessionState, ValidationCommand, ValidationRunRecord
 from agent.task_state import TaskState
 from config.settings import AppConfig
+from llm.schemas import RouteActionName, RouteIntent, RouterOutput
 
 
 def test_core_marks_unvalidated_changed_files_as_partial(tmp_path):
@@ -58,6 +59,232 @@ def test_core_marks_model_start_failure_without_changes_as_partial(tmp_path):
     status = core._resolve_final_status(session, final_action=True)
 
     assert status == "partial"
+
+
+def test_core_marks_uncertain_degraded_semantic_fallback_as_partial_not_analysis_complete(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="mach da was",
+        workspace_root=str(tmp_path),
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="mach da was",
+            root_goal="mach da was",
+            active_goal="mach da was",
+            goal_relation="clarify",
+            output_expectation="Clarify the active target and decide the safest next step.",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=["The exact target is still ambiguous."],
+            ambiguity_level="high",
+            risk_level="medium",
+            confidence=0.3,
+            next_action="clarify",
+            execution_outline=["Ask for the concrete target artifact or area."],
+            needs_clarification=True,
+            clarification_questions=["Welchen konkreten Bereich oder welches Artefakt soll ich als naechstes bearbeiten?"],
+            semantic_inference_mode="conservative",
+        ),
+        router_result=RouterOutput(
+            user_goal="mach da was",
+            intent=RouteIntent.UNKNOWN,
+            requested_outcome="Clarify the user's exact target before doing any work.",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": RouteActionName.ASK_CLARIFICATION,
+                    "reason": "The degraded semantic fallback is not reliable enough to proceed.",
+                }
+            ],
+            needs_clarification=True,
+            clarification_questions=["Was genau soll ich fuer dich erreichen?"],
+            confidence=0.22,
+            safe_to_execute=False,
+            repo_context_needed=False,
+            search_terms=[],
+            relevant_extensions=[],
+            direct_response=None,
+        ),
+    )
+    session.runtime_executions.append(
+        {
+            "operation_name": "task_state_generation",
+            "task_class": "task_state_generation",
+            "final_state": "degraded_success",
+            "capability_tier": "tier_d",
+            "recovery_strategy": "deterministic_fallback",
+            "degraded": True,
+            "honest_blocked": False,
+            "artifact_bytes_generated": 0,
+            "validation_possible": False,
+            "summary": "Task understanding used the deterministic fallback after a startup timeout.",
+            "attempts": [],
+        }
+    )
+
+    stop_reason = core._derive_stop_reason(session)
+    status = core._resolve_final_status(session, final_action=True)
+
+    assert stop_reason == "clarification_required"
+    assert status == "partial"
+
+
+def test_core_distinguishes_safe_degraded_semantic_completion_from_full_analysis_complete(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="erklaer mir kurz die auth logik",
+        workspace_root=str(tmp_path),
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="erklaer mir kurz die auth logik",
+            root_goal="erklaer mir kurz die auth logik",
+            active_goal="erklaer mir kurz die auth logik",
+            goal_relation="new_task",
+            output_expectation="Explain the relevant behavior or code path clearly and honestly.",
+            current_user_intent="explain",
+            execution_strategy="validation_inspection",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.78,
+            next_action="explain",
+            execution_outline=["Explain the result in clear user-facing language."],
+            needs_clarification=False,
+            clarification_questions=[],
+            semantic_inference_mode="conservative",
+        ),
+        router_result=RouterOutput(
+            user_goal="erklaer mir kurz die auth logik",
+            intent=RouteIntent.EXPLAIN,
+            requested_outcome="Explain the relevant code or concept.",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": RouteActionName.RESPOND_DIRECTLY,
+                    "reason": "The interpreted request can be answered directly.",
+                }
+            ],
+            needs_clarification=False,
+            clarification_questions=[],
+            confidence=0.78,
+            safe_to_execute=True,
+            repo_context_needed=False,
+            search_terms=[],
+            relevant_extensions=[],
+            direct_response="Kurz erklaert.",
+        ),
+    )
+    session.runtime_executions.append(
+        {
+            "operation_name": "task_state_generation",
+            "task_class": "task_state_generation",
+            "final_state": "degraded_success",
+            "capability_tier": "tier_d",
+            "recovery_strategy": "deterministic_fallback",
+            "degraded": True,
+            "honest_blocked": False,
+            "artifact_bytes_generated": 0,
+            "validation_possible": False,
+            "summary": "Task understanding used the deterministic fallback after a startup timeout.",
+            "attempts": [],
+        }
+    )
+
+    stop_reason = core._derive_stop_reason(session)
+
+    assert stop_reason == "minimal_semantic_complete"
+
+
+def test_core_distinguishes_reduced_semantic_completion_from_full_analysis_complete(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="erklaer mir kurz die auth logik",
+        workspace_root=str(tmp_path),
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="erklaer mir kurz die auth logik",
+            root_goal="erklaer mir kurz die auth logik",
+            active_goal="erklaer mir kurz die auth logik",
+            goal_relation="new_task",
+            output_expectation="Explain the relevant behavior or code path clearly and honestly.",
+            current_user_intent="explain",
+            execution_strategy="validation_inspection",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.82,
+            next_action="explain",
+            execution_outline=["Explain the result in clear user-facing language."],
+            needs_clarification=False,
+            clarification_questions=[],
+            semantic_resolution="reserve_model",
+        ),
+        router_result=RouterOutput(
+            user_goal="erklaer mir kurz die auth logik",
+            intent=RouteIntent.EXPLAIN,
+            requested_outcome="Explain the relevant code or concept.",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": RouteActionName.RESPOND_DIRECTLY,
+                    "reason": "The interpreted request can be answered directly.",
+                }
+            ],
+            needs_clarification=False,
+            clarification_questions=[],
+            confidence=0.82,
+            safe_to_execute=True,
+            repo_context_needed=False,
+            search_terms=[],
+            relevant_extensions=[],
+            direct_response="Kurz erklaert.",
+        ),
+    )
+    session.runtime_executions.append(
+        {
+            "operation_name": "task_state_generation",
+            "task_class": "task_state_generation",
+            "final_state": "completed",
+            "capability_tier": "tier_b",
+            "recovery_strategy": "switch_to_faster_model",
+            "degraded": True,
+            "honest_blocked": False,
+            "artifact_bytes_generated": 0,
+            "validation_possible": False,
+            "summary": "Task understanding recovered on a reserve semantic model.",
+            "attempts": [],
+            "semantic_resolution": "reserve_model",
+        }
+    )
+
+    stop_reason = core._derive_stop_reason(session)
+
+    assert stop_reason == "reduced_semantic_complete"
 
 
 def test_core_marks_debug_follow_up_without_runtime_reproduction_as_partial(tmp_path):

@@ -2505,7 +2505,10 @@ class Planner:
             return False
         if task_state is None or task_state.goal_relation != "new_task":
             return False
-        if task_state.execution_strategy != "feature_implementation":
+        if (
+            task_state.execution_strategy is not None
+            and task_state.execution_strategy != "feature_implementation"
+        ):
             return False
         if route.repo_context_needed or route.needs_clarification or not route.safe_to_execute:
             return False

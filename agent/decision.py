@@ -465,8 +465,10 @@ class ExecutionDecisionPolicy:
             for item in understanding.target_artifacts
             if item.path and (intent != RouteIntent.CREATE or item.role in {"primary_target", "validation_target"})
         ]
-        if intent == RouteIntent.CREATE:
+        if candidates:
             return self._unique_paths(candidates)[:8]
+        if intent == RouteIntent.CREATE:
+            return []
         if session is not None:
             candidates.extend(session.candidate_files[:8])
             if session.follow_up_context is not None:

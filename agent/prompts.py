@@ -30,7 +30,8 @@ def router_system_prompt() -> str:
         "Return valid JSON only. "
         "Infer the user's true intent semantically, not from keyword matching. "
         "Be resilient to paraphrases, slang, typos, indirect wishes, and mixed German/English phrasing. "
-        "Resolve deictic follow-ups like 'that', 'there', 'the error', 'hier', 'da', and 'das' against the current task state and follow-up context. "
+        "Treat the current user turn as the primary evidence source. "
+        "Resolve deictic follow-ups like 'that', 'there', 'the error', 'hier', 'da', and 'das' against the current task state and follow-up context only when the turn actually points back to the same task. "
         "Focus on the user's end goal, the minimum safe action plan, missing information, and whether execution is safe. "
         f"Allowed action names are: {actions}. "
         "If information is missing or the request is risky, ask one to three precise clarification questions instead of guessing."
@@ -43,8 +44,9 @@ def task_understanding_system_prompt() -> str:
         "for a local coding agent. "
         "Return valid JSON only. "
         "Infer the user's real objective semantically, not from literal verbs or keyword routing. "
-        "Treat follow-up messages as continuing the current task unless the user clearly changes topic. "
-        "Resolve references like 'that', 'there', 'the bug', 'das', 'da', 'hier', and 'backend' against the current task state. "
+        "Treat the current turn as primary evidence, and use previous context only when it clearly belongs to the same active task and does not conflict. "
+        "Resolve references like 'that', 'there', 'the bug', 'das', 'da', 'hier', and 'backend' against the current task state only when the turn genuinely points back to it. "
+        "Do not invent secondary specializations such as hardening or refactor modes unless the request or evidence supports them directly. "
         "Prefer reasonable assumptions when the likely intent is strong. "
         "Ask for clarification only when the risk of acting on the wrong target is materially high. "
         "Produce a normalized task object that captures the goal, artifacts, assumptions, ambiguity, missing info, plan, and confidence."
@@ -57,9 +59,11 @@ def task_state_system_prompt() -> str:
         "Return valid JSON only. "
         "Your job is to update the agent's working task state from the latest user turn, prior task state, thread context, artifacts, diffs, diagnostics, and terminal evidence. "
         "Do not route by keywords. "
+        "Treat the latest user turn as the primary evidence source, and use earlier context only when it clearly belongs to the same task and does not conflict. "
         "Determine whether the user is continuing, refining, correcting, constraining, or replacing the current task. "
         "Bind references like 'that', 'this part', 'the bug', 'das', 'hier', and 'backend' to concrete artifacts whenever possible. "
-        "Always choose one execution strategy and one next_best_action that follow this discipline: inspect current state, gather evidence, act in the smallest sensible step, then verify."
+        "Keep primary semantics and secondary semantics separate: goal relation, active goal, open problem, artifacts, and next_best_action come first; secondary execution strategy should stay null unless the turn or evidence supports it directly. "
+        "If uncertainty remains material, preserve that uncertainty instead of inventing a specialization."
     )
 
 
@@ -67,6 +71,8 @@ def task_state_update_prompt(
     task: str,
     snapshot: WorkspaceSnapshot | None,
     session: SessionState | None = None,
+    *,
+    mode: str = "full",
 ) -> str:
     schema_shape = {
         "latest_user_turn": "string",
@@ -119,20 +125,18 @@ def task_state_update_prompt(
         "needs_clarification": False,
         "clarification_questions": ["string"],
     }
+    compact = mode != "full"
     lines = [
         "Update the central task state for this turn.",
-        f"Latest user request: {_trim_text(task, 900)}",
-        f"Recent conversation: {_format_objects(_compact_recent_messages(session))}",
-        f"Recent tool calls: {_format_objects(_compact_recent_calls(session))}",
+        f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
         f"Previous task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
-        f"Previous task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}",
-        f"Recent diagnostics: {_format_objects(_compact_recent_diagnostics(session))}",
-        f"Workspace context: {json.dumps(_compact_workspace_snapshot(snapshot, detail='router'), ensure_ascii=False)}",
+        f"Workspace context: {json.dumps(_compact_workspace_snapshot(snapshot, detail='router' if not compact else 'decision'), ensure_ascii=False)}",
         "State update rules:",
+        "- Current turn first: use previous context only when it clearly belongs to the same task and does not conflict.",
         "- First decide whether this turn continues or changes the active task.",
-        "- Choose one execution_strategy from the committed task state, not from raw prompt keywords.",
         "- current_user_intent should reflect what the user is trying to do at this phase of the task.",
+        "- execution_strategy is secondary semantics: leave it null if the request only supports a generic next action.",
         "- Extract concrete evidence from diagnostics, terminal errors, changed files, and referenced artifacts.",
         "- For bugs or regressions, prefer inspect/debug/test before modify.",
         "- For scope corrections or rollbacks, narrow or revert only the necessary part of the prior work.",
@@ -144,6 +148,11 @@ def task_state_update_prompt(
         "- Ask clarification only if acting now would likely hit the wrong artifact or cause destructive behavior.",
         f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
     ]
+    if not compact:
+        lines.insert(2, f"Recent conversation: {_format_objects(_compact_recent_messages(session))}")
+        lines.insert(3, f"Recent tool calls: {_format_objects(_compact_recent_calls(session))}")
+        lines.insert(6, f"Previous task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}")
+        lines.insert(7, f"Recent diagnostics: {_format_objects(_compact_recent_diagnostics(session))}")
     return "\n".join(lines)
 
 
@@ -151,6 +160,8 @@ def task_understanding_prompt(
     task: str,
     snapshot: WorkspaceSnapshot | None,
     session: SessionState | None = None,
+    *,
+    mode: str = "full",
 ) -> str:
     workspace = _compact_workspace_snapshot(snapshot, detail="router")
     prior_understanding = _compact_task_understanding(
@@ -192,26 +203,29 @@ def task_understanding_prompt(
         "needs_clarification": False,
         "clarification_questions": ["string"],
     }
+    compact = mode != "full"
     lines = [
         "Normalize the user's latest request into a task understanding object.",
-        f"Latest user request: {_trim_text(task, 900)}",
-        f"Recent conversation: {_format_objects(_compact_recent_messages(session))}",
-        f"Recent tool calls: {_format_objects(_compact_recent_calls(session))}",
+        f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
         f"Current task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
-        f"Previous task understanding: {json.dumps(prior_understanding, ensure_ascii=False)}",
         f"Workspace context: {json.dumps(workspace, ensure_ascii=False)}",
         "Interpretation rules:",
         "- Extract the user's actual end goal, not just the surface wording.",
-        "- Preserve continuity across turns when the user refines, corrects, or critiques earlier work.",
+        "- Current turn first: preserve continuity only when the latest turn clearly belongs to the same task and does not conflict.",
         "- Identify likely target artifacts even when the user names them indirectly.",
         "- Separate explicit constraints from assumptions.",
         "- If the user reports a vague problem, treat their message as an observation that should trigger diagnosis rather than blind fixing.",
+        "- Keep secondary specializations conservative: do not invent hardening, refactor, or repair submodes unless the request or evidence supports them directly.",
         "- Use low ambiguity only when the target and outcome are both materially clear.",
         "- Use low confidence or needs_clarification only when acting now would likely hit the wrong target or be destructive.",
         "- Prefer short, concrete execution steps that can guide planning.",
         f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
     ]
+    if not compact:
+        lines.insert(2, f"Recent conversation: {_format_objects(_compact_recent_messages(session))}")
+        lines.insert(3, f"Recent tool calls: {_format_objects(_compact_recent_calls(session))}")
+        lines.insert(5, f"Previous task understanding: {json.dumps(prior_understanding, ensure_ascii=False)}")
     return "\n".join(lines)
 
 
@@ -219,6 +233,8 @@ def router_prompt(
     task: str,
     snapshot: WorkspaceSnapshot | None,
     session: SessionState | None = None,
+    *,
+    mode: str = "full",
 ) -> str:
     workspace = _compact_workspace_snapshot(snapshot, detail="router")
     recent_messages = _compact_recent_messages(session)
@@ -303,20 +319,19 @@ def router_prompt(
         "relevant_extensions": [".py"],
         "direct_response": "string | null",
     }
+    compact = mode != "full"
     lines = [
         "Interpret the user's latest request.",
-        f"User request: {_trim_text(task, 600)}",
-        f"Recent conversation: {_format_objects(recent_messages)}",
-        f"Recent tool calls: {_format_objects(recent_calls)}",
-        f"Recently changed files: {_format_list(changed_files)}",
+        f"User request: {_trim_text(task, 600 if not compact else 400)}",
         f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}",
-        f"Recent diagnostics: {_format_objects(recent_diagnostics)}",
+        f"Recently changed files: {_format_list(changed_files)}",
         f"Workspace context: {json.dumps(workspace, ensure_ascii=False)}",
         f"Allowed actions: {json.dumps(action_catalog, ensure_ascii=False)}",
         "Routing rules:",
         "- Infer intent from meaning, not literal verbs.",
         "- Extract the user's end goal and likely target entities.",
-        "- Treat vague follow-ups like 'da', 'das', 'hier', 'der Fehler', 'kaputt', 'buggy', 'komisch', and 'geht nicht' as references to the current task unless the user clearly changes topic.",
+        "- Current turn first: treat previous context as supporting evidence, not as the controlling source.",
+        "- Treat vague follow-ups like 'da', 'das', 'hier', 'der Fehler', 'kaputt', 'buggy', 'komisch', and 'geht nicht' as references to the current task only when the latest turn genuinely points back to it.",
         "- When the user reports a vague bug or terminal issue and follow-up context exists, prefer a debug route with diagnosis before any update.",
         "- Map bug reports to evidence-seeking actions: inspect the active artifact, inspect diagnostics, rerun the most relevant validation or terminal command, then update only if the evidence supports it.",
         "- Detect when the request is ambiguous, unsafe, or missing a required parameter.",
@@ -327,6 +342,10 @@ def router_prompt(
         "- For executable requests, set needs_clarification=false and safe_to_execute=true only when enough information is present.",
         f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
     ]
+    if not compact:
+        lines.insert(2, f"Recent conversation: {_format_objects(recent_messages)}")
+        lines.insert(3, f"Recent tool calls: {_format_objects(recent_calls)}")
+        lines.insert(6, f"Recent diagnostics: {_format_objects(recent_diagnostics)}")
     return "\n".join(lines)
 
 

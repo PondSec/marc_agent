@@ -44,6 +44,7 @@ WRITE_TOOLS = {
     "git_create_branch",
 }
 VERIFY_TOOLS = {"run_tests", "run_shell"}
+SEMANTIC_RUNTIME_OPERATIONS = {"router_generation", "task_state_generation", "task_understanding"}
 
 
 class AgentCore:
@@ -657,6 +658,8 @@ class AgentCore:
     def _resolve_final_status(self, session: SessionState, *, final_action: bool = False) -> str:
         if session.stop_reason == "user_cancelled" or session.stop_requested:
             return "partial"
+        if self._semantic_fallback_uncertain(session):
+            return "partial"
         if self._debug_repair_incomplete(session):
             return "partial"
         if self._web_functional_validation_missing(session):
@@ -674,6 +677,13 @@ class AgentCore:
     def _derive_stop_reason(self, session: SessionState) -> str:
         if session.blockers:
             return "blocked"
+        if self._semantic_fallback_uncertain(session):
+            if (
+                (session.router_result is not None and session.router_result.needs_clarification)
+                or (session.task_state is not None and session.task_state.needs_clarification)
+            ):
+                return "clarification_required"
+            return "analysis_incomplete"
         if self._runtime_verification_missing(session):
             return "functional_validation_missing"
         if self._web_functional_validation_missing(session):
@@ -690,6 +700,12 @@ class AgentCore:
             return "validation_missing"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "validation_incomplete"
+        if self._safe_degraded_semantic_completion(session):
+            resolution = self._semantic_resolution(session)
+            if resolution in {"reserve_model", "reduced_model"}:
+                return "reduced_semantic_complete"
+            if resolution == "minimal_inference":
+                return "minimal_semantic_complete"
         return "analysis_complete"
 
     def _derive_limit_reason(self, session: SessionState) -> str:
@@ -754,6 +770,54 @@ class AgentCore:
         if session.task_state is None or session.task_state.execution_strategy != "debug_repair":
             return False
         return bool(session.diagnostics)
+
+    def _semantic_fallback_uncertain(self, session: SessionState) -> bool:
+        resolution = self._semantic_resolution(session)
+        if resolution == "full_model":
+            return False
+        if resolution == "blocked":
+            return True
+        route = session.router_result
+        if route is not None:
+            if route.needs_clarification or route.intent.value == "unknown" or route.confidence < 0.5:
+                return True
+        task_state = session.task_state
+        if task_state is None:
+            return True
+        if task_state.needs_clarification or task_state.next_action == "clarify":
+            return True
+        if task_state.goal_relation in {"unknown", "clarify"}:
+            return True
+        return task_state.confidence < 0.5
+
+    def _safe_degraded_semantic_completion(self, session: SessionState) -> bool:
+        if self._semantic_resolution(session) == "full_model":
+            return False
+        if self._semantic_fallback_uncertain(session):
+            return False
+        return not session.changed_files and not session.tool_calls
+
+    def _semantic_resolution(self, session: SessionState) -> str:
+        for item in reversed(session.runtime_executions):
+            if str(item.get("operation_name") or "").strip() not in SEMANTIC_RUNTIME_OPERATIONS:
+                continue
+            resolution = str(item.get("semantic_resolution") or "").strip()
+            if resolution:
+                return resolution
+            if str(item.get("final_state") or "").strip() == "degraded_success":
+                return "minimal_inference"
+        if session.task_state is not None:
+            resolution = str(getattr(session.task_state, "semantic_resolution", "") or "").strip()
+            if resolution:
+                return resolution
+        if session.task_understanding is not None:
+            resolution = str(getattr(session.task_understanding, "semantic_resolution", "") or "").strip()
+            if resolution:
+                return resolution
+        return "full_model"
+
+    def _has_degraded_semantic_execution(self, session: SessionState) -> bool:
+        return self._semantic_resolution(session) != "full_model"
 
     def _unique(self, values: Iterable[str]) -> list[str]:
         seen: set[str] = set()
