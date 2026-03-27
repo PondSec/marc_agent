@@ -6,11 +6,16 @@ from pathlib import Path
 import re
 import time
 
+from pydantic import ValidationError
+
 from agent.decision import ExecutionDecisionPolicy
 from agent.models import (
+    DiagnosticRecord,
     RepairAttemptRecord,
+    SemanticChangeReview,
     SessionState,
     ValidationFailureEvidence,
+    ValidationRunRecord,
     WorkspaceSnapshot,
 )
 from agent.prompts import (
@@ -20,6 +25,8 @@ from agent.prompts import (
     generate_content_continuation_prompt,
     generate_content_prompt,
     generate_content_retry_prompt,
+    semantic_change_review_prompt,
+    semantic_change_review_system_prompt,
 )
 from agent.router import IntentRouter
 from agent.state_updater import TaskStateUpdater
@@ -259,6 +266,18 @@ class Planner:
                 route.direct_response,
             )
 
+        if session.changed_files and self._has_pending_explicit_update_targets(route, session):
+            decision = self.execute_action_from_plan(route, session)
+            self._log(
+                "execution_plan_selected",
+                intent=route.intent,
+                safe_to_execute=route.safe_to_execute,
+                action_type=decision.action_type,
+                tool_name=decision.tool_name,
+                source="pending_explicit_targets",
+            )
+            return decision
+
         if session.changed_files:
             if session.validation_status == "failed":
                 repair_decision = self._repair_after_failed_validation(route, session)
@@ -270,6 +289,12 @@ class Planner:
                     "Changed files must go through the remaining validation plan.",
                     command,
                 )
+            if self._requirements_review_missing(session):
+                self._run_semantic_change_review(route, session)
+                if session.validation_status == "failed":
+                    repair_decision = self._repair_after_failed_validation(route, session)
+                    if repair_decision is not None:
+                        return repair_decision
             return self._final_decision(
                 "The routed mutation is complete and no validation command remains.",
                 self._compose_user_response(route, session),
@@ -373,7 +398,7 @@ class Planner:
                     return draft
 
             if step.action == RouteActionName.UPDATE_ARTIFACT:
-                target = self._primary_target_path(route, session)
+                target = self._next_update_target(route, session)
                 if target is None:
                     query = self._best_search_query(route)
                     if query and query not in searched_queries:
@@ -503,6 +528,12 @@ class Planner:
                 de="Ich habe die Aufgabe umgesetzt, aber nur statische oder strukturelle Checks bestaetigt und noch keinen funktionalen Abschluss erreicht.",
                 en="I implemented the task, but only static or structural checks were confirmed and I do not have a functional sign-off yet.",
             )
+        if session.changed_files and self._requirements_review_missing(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die Aufgabe umgesetzt, aber die allgemeine Anforderungspruefung ueber die geaenderten Artefakte ist noch nicht abgeschlossen.",
+                en="I implemented the task, but the general requirements review across the changed artifacts is not complete yet.",
+            )
         if session.changed_files and session.validation_status == "passed":
             return self._localized_text(
                 language,
@@ -565,6 +596,14 @@ class Planner:
                         language,
                         de="Validierung: nur statische oder strukturelle Checks wurden bestaetigt; ein funktionaler Smoke-Test fehlt noch.",
                         en="Validation: only static or structural checks were confirmed; a functional smoke test is still missing.",
+                    )
+                )
+            elif self._requirements_review_missing(session):
+                lines.append(
+                    self._localized_text(
+                        language,
+                        de="Validierung: die allgemeine Anforderungspruefung ueber die geaenderten Artefakte ist noch offen.",
+                        en="Validation: the general requirements review across the changed artifacts is still pending.",
                     )
                 )
             elif session.validation_status == "passed":
@@ -1460,6 +1499,33 @@ class Planner:
         candidates = self._candidate_paths(route, session)
         return candidates[0] if candidates else None
 
+    def _explicit_target_paths(self, route: RouterOutput) -> list[str]:
+        candidates = [path for path in route.entities.target_paths if path and Path(path).suffix]
+        if route.entities.target_name and self._looks_like_path(route.entities.target_name):
+            target_name = route.entities.target_name
+            if Path(target_name).suffix:
+                candidates.append(target_name)
+        return self._unique_paths(candidates)
+
+    def _next_update_target(self, route: RouterOutput, session: SessionState) -> str | None:
+        explicit_targets = self._explicit_target_paths(route)
+        if explicit_targets:
+            changed_paths = {item.path for item in session.changed_files}
+            for candidate in explicit_targets:
+                if candidate not in changed_paths:
+                    return candidate
+            return explicit_targets[0]
+        return self._primary_target_path(route, session)
+
+    def _has_pending_explicit_update_targets(self, route: RouterOutput, session: SessionState) -> bool:
+        if route.intent != RouteIntent.UPDATE:
+            return False
+        explicit_targets = self._explicit_target_paths(route)
+        if len(explicit_targets) <= 1:
+            return False
+        changed_paths = {item.path for item in session.changed_files}
+        return any(candidate not in changed_paths for candidate in explicit_targets)
+
     def _next_unread_candidate(
         self,
         candidates: list[str],
@@ -1635,6 +1701,20 @@ class Planner:
         repair_context: ValidationFailureEvidence | None = None,
         repair_strategy: str | None = None,
     ) -> ContentGenerationResult:
+        model_name = self._content_generation_model_name(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
+        prompt_variant = self._content_generation_prompt_variant(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            model_name=model_name,
+            repair_context=repair_context,
+        )
         prompt = generate_content_prompt(
             route,
             session,
@@ -1642,16 +1722,12 @@ class Planner:
             current_content=current_content,
             repair_context=repair_context,
             repair_strategy=repair_strategy,
-        )
-        model_name = self._content_generation_model_name(
-            route,
-            session,
-            path=path,
-            current_content=current_content,
+            mode=prompt_variant,
         )
         effective_model = model_name or self._primary_generation_model_name()
         timeout_seconds = max(self._llm_timeout(75), 75)
         total_timeout_seconds = max(self._llm_timeout(210), 210)
+        num_ctx = self._content_generation_num_ctx(prompt_variant)
         context_pressure = self._context_pressure_estimate(
             prompt=prompt,
             current_content=current_content,
@@ -1674,7 +1750,7 @@ class Planner:
                 model=model_name,
                 timeout=timeout_seconds,
                 total_timeout=total_timeout_seconds,
-                num_ctx=4096,
+                num_ctx=num_ctx,
                 retries=0,
                 progress_callback=progress,
             ),
@@ -1683,7 +1759,7 @@ class Planner:
             attempt_number=1,
             capability_tier=primary_tier,
             recovery_strategy=primary_strategy,
-            prompt_variant="full",
+            prompt_variant=prompt_variant,
             model_identifier=effective_model,
             backend_identifier=self._backend_identifier(),
             inactivity_timeout_seconds=timeout_seconds,
@@ -3254,9 +3330,268 @@ class Planner:
         if suffix not in {".html", ".css", ".js", ".jsx", ".mjs", ".cjs", ".md", ".json", ".toml", ".yaml", ".yml"}:
             return None
         target_paths = [item for item in route.entities.target_paths if item]
-        if target_paths and len(target_paths) > 1:
+        if target_paths and path not in target_paths:
             return None
         return lightweight
+
+    def _content_generation_prompt_variant(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        model_name: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str:
+        del session, repair_context
+        lightweight = self._lightweight_generation_model_name()
+        if current_content is None or model_name is None or model_name != lightweight:
+            return "full"
+        if route.intent != RouteIntent.UPDATE:
+            return "full"
+        if len(current_content) > 5_000:
+            return "full"
+        suffix = Path(path).suffix.lower()
+        if suffix not in {".html", ".css", ".js", ".jsx", ".mjs", ".cjs", ".md", ".json", ".toml", ".yaml", ".yml"}:
+            return "full"
+        return "compact"
+
+    def _content_generation_num_ctx(self, prompt_variant: str) -> int:
+        if prompt_variant == "compact":
+            return min(self._llm_num_ctx(2048), 2048)
+        return min(self._llm_num_ctx(4096), 4096)
+
+    def _run_semantic_change_review(self, route: RouterOutput, session: SessionState) -> None:
+        if not session.changed_files or self.validation_planner.has_semantic_review(session):
+            return
+
+        artifacts = self._semantic_review_artifacts(session)
+        prompt = semantic_change_review_prompt(route, session, artifacts=artifacts)
+        primary_model = self._primary_generation_model_name()
+        reserve_model = self._lightweight_generation_model_name()
+        attempts: list[ExecutionAttemptRecord] = []
+
+        self._log(
+            "semantic_change_review_started",
+            model=primary_model,
+            changed_files=[item.path for item in session.changed_files[-6:]],
+        )
+
+        review_attempts = [
+            (
+                primary_model,
+                "tier_a",
+                "primary_model_generation",
+                max(self._llm_timeout(24), 24),
+                min(self._llm_num_ctx(4096), 4096),
+            )
+        ]
+        if reserve_model is not None:
+            review_attempts.append(
+                (
+                    reserve_model,
+                    "tier_b",
+                    "reserve_model_generation",
+                    max(self._llm_timeout(18), 18),
+                    min(self._llm_num_ctx(2048), 2048),
+                )
+            )
+
+        for model_name, capability_tier, strategy, timeout, num_ctx in review_attempts:
+            outcome = invoke_model(
+                lambda progress, review_model=model_name: self.llm.generate_json(
+                    prompt,
+                    system=semantic_change_review_system_prompt(),
+                    model=review_model,
+                    retries=0,
+                    timeout=timeout,
+                    num_ctx=num_ctx,
+                    progress_callback=progress,
+                ),
+                operation_name="semantic_change_review",
+                task_class="semantic_change_review",
+                attempt_number=len(attempts) + 1,
+                capability_tier=capability_tier,
+                recovery_strategy=strategy,
+                prompt_variant="full",
+                model_identifier=model_name or self._primary_generation_model_name(),
+                backend_identifier=self._backend_identifier(),
+                inactivity_timeout_seconds=timeout,
+                total_timeout_seconds=max(timeout + 20, timeout * 2),
+                context_pressure_estimate=estimate_context_pressure(prompt_chars=len(prompt)),
+                event_callback=self._progress_logger("semantic_change_review_progress"),
+            )
+            attempts.append(outcome.attempt)
+            if outcome.exception is not None:
+                self._log(
+                    "semantic_change_review_error",
+                    error=str(outcome.exception),
+                    strategy=strategy,
+                    model=model_name,
+                )
+                continue
+            try:
+                review = SemanticChangeReview.model_validate(outcome.value)
+            except ValidationError as exc:
+                self._log(
+                    "semantic_change_review_invalid",
+                    errors=exc.errors(),
+                    payload=outcome.value,
+                    strategy=strategy,
+                    model=model_name,
+                )
+                continue
+
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="semantic_change_review",
+                    task_class="semantic_change_review",
+                    final_state="completed",
+                    capability_tier=capability_tier,
+                    recovery_strategy=strategy,
+                    degraded=capability_tier != "tier_a",
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="A cross-artifact semantic review checked whether the changed implementation satisfies the requested outcome.",
+                    attempts=attempts,
+                ),
+            )
+            self._record_semantic_change_review(session, review)
+            return
+
+        review = self._fallback_semantic_change_review(session)
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="semantic_change_review",
+                task_class="semantic_change_review",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=True,
+                summary="Semantic change review fell back to conservative local heuristics after model-backed review did not complete cleanly.",
+                attempts=attempts,
+            ),
+        )
+        self._record_semantic_change_review(session, review)
+
+    def _record_semantic_change_review(self, session: SessionState, review: SemanticChangeReview) -> None:
+        command = self.validation_planner.semantic_review_command([item.path for item in session.changed_files])
+        excerpt_parts: list[str] = []
+        if review.missing_requirements:
+            excerpt_parts.append(f"Missing requirements: {', '.join(review.missing_requirements[:4])}.")
+        if review.suspicious_issues:
+            excerpt_parts.append(f"Suspicious issues: {', '.join(review.suspicious_issues[:4])}.")
+        excerpt = " ".join(excerpt_parts).strip() or None
+
+        session.validation_runs.append(
+            ValidationRunRecord(
+                command=command,
+                cwd=".",
+                kind="check",
+                verification_scope="semantic",
+                status="passed" if review.requirements_satisfied else "failed",
+                edit_generation=session.edit_generation,
+                iteration=session.iterations,
+                summary=review.summary,
+                excerpt=excerpt,
+            )
+        )
+        session.validation_runs = session.validation_runs[-20:]
+        session.validation_status = self.validation_planner.rollup_status(session)
+
+        if review.requirements_satisfied:
+            session.active_repair_context = None
+            session.last_error = None
+            session.notes.append(f"Semantic review passed: {review.summary}")
+            session.notes = session.notes[-20:]
+            return
+
+        summary = review.summary or "Semantic review found unmet requested behavior."
+        session.diagnostics.append(
+            DiagnosticRecord(
+                source="semantic_change_review",
+                category="requirements_gap",
+                severity="error",
+                summary=summary,
+                tool_name="semantic_change_review",
+                command=command,
+                file_hints=review.file_hints[:6] or [item.path for item in session.changed_files[:4]],
+                action_hints=review.repair_hints[:4],
+                excerpt=excerpt,
+                iteration=session.iterations,
+            )
+        )
+        session.diagnostics = session.diagnostics[-20:]
+        failed_run = session.validation_runs[-1]
+        session.active_repair_context = self.validation_planner.build_failure_evidence(session, failed_run)
+        session.last_error = excerpt or summary
+
+    def _semantic_review_artifacts(self, session: SessionState) -> list[dict[str, object]]:
+        artifacts: list[dict[str, object]] = []
+        for change in session.changed_files[-6:]:
+            entry: dict[str, object] = {
+                "path": change.path,
+                "operation": change.operation,
+            }
+            if change.diff:
+                entry["diff_excerpt"] = self._clip_text(change.diff, 900)
+            current_content = self._current_file_content(session, change.path)
+            if current_content is not None:
+                entry["content_excerpt"] = self._clip_text(current_content, 1800)
+            artifacts.append(entry)
+        return artifacts
+
+    def _fallback_semantic_change_review(self, session: SessionState) -> SemanticChangeReview:
+        if session.validation_status == "failed":
+            return SemanticChangeReview(
+                requirements_satisfied=False,
+                summary="Existing validation already reports unresolved issues in the changed implementation.",
+                confidence=0.85,
+                repair_hints=["Inspect the last failing validation evidence before claiming the task is complete."],
+                file_hints=[item.path for item in session.changed_files[:4]],
+            )
+        if self._functional_validation_missing(session):
+            return SemanticChangeReview(
+                requirements_satisfied=False,
+                summary="The changed implementation still lacks a confirmed functional verification path.",
+                confidence=0.8,
+                missing_requirements=["Functional verification of the changed behavior"],
+                repair_hints=["Rerun the most relevant runtime or reproduction path for the changed behavior."],
+                file_hints=[item.path for item in session.changed_files[:4]],
+            )
+        if session.validation_status == "passed":
+            return SemanticChangeReview(
+                requirements_satisfied=True,
+                summary="Available project-aware validation passed and the fallback review found no additional concrete task-to-code mismatch.",
+                confidence=0.55,
+                file_hints=[item.path for item in session.changed_files[:4]],
+            )
+        return SemanticChangeReview(
+            requirements_satisfied=False,
+            summary="The semantic review fallback could not confirm that the changed artifacts satisfy the requested outcome.",
+            confidence=0.35,
+            missing_requirements=["Task-to-code coverage review of the changed artifacts"],
+            repair_hints=["Inspect the changed files against the explicit requested behavior before declaring completion."],
+            file_hints=[item.path for item in session.changed_files[:4]],
+        )
+
+    def _requirements_review_missing(self, session: SessionState) -> bool:
+        if not session.changed_files:
+            return False
+        return not self.validation_planner.has_semantic_review(session)
+
+    def _clip_text(self, text: str | None, limit: int) -> str:
+        normalized = str(text or "").strip()
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 1].rstrip() + "…"
 
     def _functional_validation_missing(self, session: SessionState) -> bool:
         if session.changed_files and self.validation_planner.runtime_verification_required(session):

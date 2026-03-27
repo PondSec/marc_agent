@@ -291,6 +291,12 @@ class SessionReporter:
                 de="Validierung: nur statische Checks wurden bestaetigt, ein funktionaler Repro- oder Smoke-Test fehlt noch.",
                 en="Validation: only static checks were confirmed, and a functional reproduction or smoke test is still missing.",
             )
+        if session.stop_reason == "requirements_review_missing":
+            return self._localized_text(
+                language,
+                de="Validierung: Projekt-Checks koennen vorliegen, aber die allgemeine Anforderungspruefung ueber die geaenderten Artefakte ist noch nicht abgeschlossen.",
+                en="Validation: project checks may exist, but the general requirements review across the changed artifacts is not complete yet.",
+            )
         if session.validation_status == "passed":
             if report.validation:
                 if strongest_scope == "runtime":
@@ -304,6 +310,12 @@ class SessionReporter:
                         language,
                         de=f"Validierung: strukturelle Web-Checks bestanden ({(strongest_run or report.validation[-1]).command}); funktionaler Smoke-Test fehlt noch.",
                         en=f"Validation: structural web checks passed ({(strongest_run or report.validation[-1]).command}); a functional smoke test is still missing.",
+                    )
+                if strongest_scope == "semantic":
+                    return self._localized_text(
+                        language,
+                        de=f"Validierung: allgemeine Anforderungspruefung bestanden ({(strongest_run or report.validation[-1]).command}).",
+                        en=f"Validation: general requirements review passed ({(strongest_run or report.validation[-1]).command}).",
                     )
                 if strongest_scope == "static":
                     return self._localized_text(
@@ -390,6 +402,8 @@ class SessionReporter:
         lowered = str(text or "").lower()
         validation_claim_markers = ("validiert", "validated", "validation: passed", "clean validated")
         if session.stop_reason == "functional_validation_missing" and any(marker in lowered for marker in validation_claim_markers):
+            return True
+        if session.stop_reason == "requirements_review_missing" and any(marker in lowered for marker in validation_claim_markers):
             return True
         if session.status == "partial" and any(marker in lowered for marker in validation_claim_markers):
             return True

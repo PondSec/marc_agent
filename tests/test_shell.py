@@ -118,3 +118,51 @@ def test_shell_structural_web_validation_checks_dom_refs_and_js(monkeypatch, tmp
     assert result["success"] is True
     assert "Structural web checks only" in result["stdout"]
     assert "expected features: menu, highscore" in result["stdout"]
+
+
+def test_shell_structural_web_validation_catches_dom_id_mismatch_across_referenced_files(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><head><link rel='stylesheet' href='styles.css'></head><body>"
+            "<label class='theme-switcher'><input type='checkbox' id='themeSwitch' /></label>"
+            "<p id='feedbackStatus' aria-live='polite'></p>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        "[data-theme='dark'] { color-scheme: dark; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const themeSwitcher = document.getElementById('themeSwitcher');\n"
+            "themeSwitcher?.addEventListener('change', (event) => {\n"
+            "  localStorage.setItem('theme', event.target.value);\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    monkeypatch.setattr("tools.shell.shutil.which", lambda name: "/usr/bin/node" if name == "node" else None)
+    monkeypatch.setattr(
+        "tools.shell.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr=""),
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_artifact:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is False
+    assert "missing DOM ids referenced by JS (themeSwitcher)" in result["stderr"]

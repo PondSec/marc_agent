@@ -48,7 +48,15 @@ class TaskStateUpdater:
         session=None,
     ) -> TaskState:
         payload: dict[str, Any] | None = None
-        prompt = task_state_update_prompt(user_input, snapshot=snapshot, session=session)
+        initial_mode = self._initial_prompt_mode(session)
+        prompt = task_state_update_prompt(
+            user_input,
+            snapshot=snapshot,
+            session=session,
+            mode=initial_mode,
+        )
+        initial_timeout = self.timeout if initial_mode == "full" else max(12, min(self.timeout, 18))
+        initial_num_ctx = self.num_ctx if initial_mode == "full" else min(self.num_ctx, 2048)
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
         model_candidates = self._model_candidates()
         primary_model = model_candidates[0] if model_candidates else None
@@ -70,8 +78,8 @@ class TaskStateUpdater:
                 system=task_state_system_prompt(),
                 model=primary_model,
                 retries=0,
-                timeout=self.timeout,
-                num_ctx=self.num_ctx,
+                timeout=initial_timeout,
+                num_ctx=initial_num_ctx,
                 progress_callback=progress,
             ),
             operation_name="task_state_generation",
@@ -79,11 +87,11 @@ class TaskStateUpdater:
             attempt_number=1,
             capability_tier="tier_a",
             recovery_strategy="primary_model_generation",
-            prompt_variant="full",
+            prompt_variant=initial_mode,
             model_identifier=primary_model,
             backend_identifier=self._backend_identifier(),
-            inactivity_timeout_seconds=self.timeout,
-            total_timeout_seconds=max(self.timeout * 2, self.timeout + 20),
+            inactivity_timeout_seconds=initial_timeout,
+            total_timeout_seconds=max(initial_timeout * 2, initial_timeout + 20),
             context_pressure_estimate=context_pressure,
             event_callback=self._progress_logger("task_state_generation_progress"),
         )
@@ -236,6 +244,21 @@ class TaskStateUpdater:
         )
         self._log("task_state_updated", task_state=state.model_dump(), source="fallback")
         return state
+
+    def _initial_prompt_mode(self, session) -> str:
+        if session is None:
+            return "compact"
+        if session.task_state is not None:
+            return "full"
+        if session.follow_up_context is not None:
+            return "full"
+        if session.tool_calls or session.diagnostics or session.changed_files or session.validation_runs:
+            return "full"
+        if session.messages:
+            if len(session.messages) == 1 and session.messages[0].role == "user":
+                return "compact"
+            return "full"
+        return "compact"
 
     def _fallback_state(self, user_input: str, *, snapshot=None, session=None) -> TaskState:
         return build_minimal_task_state(

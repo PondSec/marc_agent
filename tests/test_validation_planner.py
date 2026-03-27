@@ -193,6 +193,64 @@ def test_validation_planner_adds_structural_web_checks_with_expected_features():
     assert "highscore" in payload[0]["expected_features"]
 
 
+def test_validation_planner_does_not_infer_canvas_from_keyboard_accessible_copy():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"html": 1, "javascript": 1},
+        top_directories=[],
+        important_files=["index.html", "app.js"],
+        focus_files=["index.html"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small standalone web artifact.",
+    )
+
+    plan = planner.build_plan(
+        "Ergaenze einen keyboard-accessible Theme-Umschalter mit localStorage und Statusmeldung",
+        snapshot,
+        changed_files=["index.html", "app.js"],
+    )
+
+    structural = next(item for item in plan if item.command.startswith("internal:web_artifact:"))
+    payload = json.loads(structural.command.partition("internal:web_artifact:")[2])
+
+    assert "canvas" not in payload[0]["expected_features"]
+
+
+def test_validation_planner_tracks_semantic_review_runs_separately_from_runtime_checks():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Fix the Python CLI bug",
+        workspace_root="/tmp/demo",
+        edit_generation=2,
+    )
+    session.changed_files.append(FileChangeRecord(path="game.py", operation="modify"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:semantic_review:[{"path":"game.py"}]',
+            verification_scope="semantic",
+            status="passed",
+            edit_generation=2,
+        )
+    )
+
+    assert planner.has_semantic_review(session) is True
+    assert planner.has_semantic_review_success(session) is True
+    assert planner.semantic_review_command(["game.py", "game.py"]) == 'internal:semantic_review:[{"path":"game.py"}]'
+
+
 def test_validation_planner_builds_structured_failure_evidence_for_web_validation():
     planner = ValidationPlanner()
     session = SessionState(

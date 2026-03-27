@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 
@@ -13,16 +14,59 @@ SemanticResolution = Literal[
 
 
 def semantic_model_candidates(preferred_model: str | None, config: object | None) -> list[str]:
-    candidates: list[str] = []
+    primary = str(preferred_model or "").strip()
+    if not primary:
+        for raw in (
+            getattr(config, "router_model_name", None) if config is not None else None,
+            getattr(config, "model_name", None) if config is not None else None,
+        ):
+            text = str(raw or "").strip()
+            if text:
+                primary = text
+                break
+    if not primary:
+        return []
+
+    candidates = [primary]
+    alternatives: list[str] = []
     for raw in (
-        preferred_model,
         getattr(config, "router_model_name", None) if config is not None else None,
         getattr(config, "model_name", None) if config is not None else None,
     ):
         text = str(raw or "").strip()
-        if text and text not in candidates:
-            candidates.append(text)
+        if text and text != primary and text not in alternatives:
+            alternatives.append(text)
+
+    primary_size = _estimated_model_size_billions(primary)
+    ranked: list[tuple[float, str]] = []
+    unknown_size: list[str] = []
+    for candidate in alternatives:
+        candidate_size = _estimated_model_size_billions(candidate)
+        if (
+            primary_size is not None
+            and candidate_size is not None
+            and candidate_size > primary_size
+        ):
+            continue
+        if candidate_size is None:
+            unknown_size.append(candidate)
+            continue
+        ranked.append((candidate_size, candidate))
+
+    candidates.extend(candidate for _, candidate in sorted(ranked, key=lambda item: item[0]))
+    if primary_size is None:
+        candidates.extend(unknown_size)
     return candidates
+
+
+def _estimated_model_size_billions(model_name: str) -> float | None:
+    match = re.search(r"(\d+(?:\.\d+)?)b\b", str(model_name or "").lower())
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def semantic_resolution_from_attempt(
@@ -61,4 +105,3 @@ def annotate_semantic_record(
     record["semantic_resolution"] = semantic_resolution
     record["secondary_semantics_limited"] = secondary_semantics_limited(semantic_resolution)
     return record
-

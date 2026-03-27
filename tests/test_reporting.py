@@ -457,6 +457,60 @@ def test_reporter_ignores_overconfident_draft_when_validation_is_only_structural
     assert "cannot claim a clean validated completion yet" in response
 
 
+def test_reporter_explains_missing_general_requirements_review(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="Fix the Python CLI output",
+        workspace_root=str(tmp_path),
+        status="partial",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="passed",
+        stop_reason="requirements_review_missing",
+        task_state=TaskState(
+            latest_user_turn="Fix the Python CLI output",
+            root_goal="Fix the CLI output.",
+            active_goal="Update the CLI and verify the requested output path honestly.",
+            goal_relation="new_task",
+            output_expectation="The CLI prints the corrected status line.",
+            open_problem=None,
+            verification_target="Confirm the changed output path matches the request.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="medium",
+            confidence=0.84,
+            next_action="modify",
+            execution_outline=["Read the CLI", "Apply the output fix", "Review the changed behavior"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="app/main.py", operation="modify"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(
+        session,
+        draft_response="I implemented the task and validated it.",
+    )
+
+    assert "general requirements review" in response
+    assert "cannot claim a clean validated completion yet" in response
+
+
 def test_reporter_localizes_machine_summary_fallback_to_english(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

@@ -67,6 +67,18 @@ def task_state_system_prompt() -> str:
     )
 
 
+def semantic_change_review_system_prompt() -> str:
+    return (
+        f"You are {AGENT_NAME} ({AGENT_FULL_NAME}), the final semantic change-review model for a local coding agent. "
+        "Return valid JSON only. "
+        "Review whether the current changed artifacts really satisfy the user's explicit request and constraints. "
+        "Reason semantically across languages and frameworks, including HTML/CSS/JavaScript, Python, C/C++, Java, GDScript, config files, and tests. "
+        "Treat cross-file mismatches as failures when names, ids, symbols, imports, selectors, event hooks, config keys, paths, or interfaces no longer line up. "
+        "Fail the review when explicitly requested behavior is still missing, contradicted, or left dangling in the changed implementation, even if syntax or structural checks passed. "
+        "Do not fail for speculative improvements, style preferences, or unrequested polish."
+    )
+
+
 def task_state_update_prompt(
     task: str,
     snapshot: WorkspaceSnapshot | None,
@@ -80,10 +92,10 @@ def task_state_update_prompt(
         "active_goal": "string",
         "goal_relation": "new_task | continue | refine | correct | report_problem | scope_change | validation_request | rollback_request | approval | rejection | update_constraints | clarify | unknown",
         "output_expectation": "string",
-        "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null",
-        "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null",
-        "open_problem": "string | null",
-        "verification_target": "string | null",
+        "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null (optional)",
+        "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null (optional)",
+        "open_problem": "string | null (optional)",
+        "verification_target": "string | null (optional)",
         "target_artifacts": [
             {
                 "path": "string | null",
@@ -93,37 +105,21 @@ def task_state_update_prompt(
                 "confidence": 0.0,
             }
         ],
-        "active_artifacts": [
-            {
-                "path": "string | null",
-                "name": "string | null",
-                "kind": "file | module | feature | flow | command | test | doc | service | null",
-                "role": "primary_target | supporting_context | validation_target | active_context | null",
-                "confidence": 0.0,
-            }
-        ],
-        "evidence": [
-            {
-                "kind": "message | log | diff | diagnostic | test | command | file | unknown",
-                "summary": "string",
-                "source": "string | null",
-                "artifact_path": "string | null",
-                "confidence": 0.0,
-            }
-        ],
-        "supplied_evidence": ["string"],
-        "relevant_context": ["string"],
-        "constraints": ["string"],
-        "assumptions": ["string"],
-        "missing_info": ["string"],
+        "active_artifacts": "optional list[artifact]",
+        "evidence": "optional list[evidence]",
+        "supplied_evidence": "optional list[string]",
+        "relevant_context": "optional list[string]",
+        "constraints": "optional list[string]",
+        "assumptions": "optional list[string]",
+        "missing_info": "optional list[string]",
         "ambiguity_level": "low | medium | high",
         "risk_level": "low | medium | high",
         "confidence": 0.0,
         "next_action": "inspect | search | create | modify | debug | test | explain | plan | clarify",
-        "next_best_action": "inspect | search | create | modify | debug | test | explain | plan | clarify | null",
-        "execution_outline": ["string"],
-        "needs_clarification": False,
-        "clarification_questions": ["string"],
+        "next_best_action": "inspect | search | create | modify | debug | test | explain | plan | clarify | null (optional)",
+        "execution_outline": "optional list[string]",
+        "needs_clarification": "boolean (optional, default false)",
+        "clarification_questions": "optional list[string]",
     }
     compact = mode != "full"
     lines = [
@@ -146,6 +142,10 @@ def task_state_update_prompt(
         "- next_action and next_best_action should be the single best next move, not a full route tree.",
         "- Preserve the execution order: inspect current state and active artifacts, gather evidence, act in the smallest sensible step, then verify against verification_target.",
         "- Ask clarification only if acting now would likely hit the wrong artifact or cause destructive behavior.",
+        "- Be terse: use short phrases instead of full sentences and avoid repeating the user request verbatim across multiple fields.",
+        "- Keep root_goal, active_goal, output_expectation, and verification_target concise, ideally under 18 words each.",
+        "- Omit optional keys when they would only be null, empty, or duplicate another field.",
+        "- Keep lists to at most 3 concise items unless the user explicitly named more artifacts.",
         f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
     ]
     if not compact:
@@ -384,7 +384,36 @@ def generate_content_prompt(
     current_content: str | None = None,
     repair_context: ValidationFailureEvidence | None = None,
     repair_strategy: str | None = None,
+    mode: str = "full",
 ) -> str:
+    if mode != "full":
+        sections = [
+            "Produce the full file content for exactly one file.",
+            f"User goal: {_trim_text(route.user_goal, 240)}",
+            f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
+            f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}",
+            f"Related file hints: {_related_file_context(session, path)}",
+        ]
+        if repair_context is not None:
+            sections.extend(
+                [
+                    f"Validation-guided repair context: {json.dumps(_compact_repair_context(repair_context), ensure_ascii=False)}",
+                    _repair_rules(repair_strategy),
+                ]
+            )
+        if current_content is not None:
+            sections.extend(
+                [
+                    "Current file content:",
+                    current_content,
+                    "Update this file to satisfy the request. Return the full updated file content only.",
+                ]
+            )
+        else:
+            sections.append("Create the file from scratch. Return the full new file content only.")
+        sections.append("Do not add markdown fences or explanations.")
+        return "\n\n".join(sections)
+
     sections = [
         "Produce the full file content for the requested task.",
         f"Validated route: {json.dumps(_compact_route(route), ensure_ascii=False)}",
@@ -534,6 +563,57 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
             f"Context: {json.dumps(report_context, ensure_ascii=False)}",
             "Mention the main outcome, changed files or inspected files when relevant, and any blocker or validation status.",
             "Do not emit JSON.",
+        ]
+    )
+
+
+def semantic_change_review_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    artifacts: list[dict[str, object]],
+) -> str:
+    schema_shape = {
+        "requirements_satisfied": True,
+        "summary": "string",
+        "confidence": 0.0,
+        "missing_requirements": ["string"],
+        "suspicious_issues": ["string"],
+        "file_hints": ["string"],
+        "repair_hints": ["string"],
+    }
+    validation_context = [
+        {
+            "command": _trim_text(item.command, 140),
+            "scope": item.verification_scope,
+            "status": item.status,
+            "summary": _trim_text(item.summary or "", 160),
+            "excerpt": _trim_text(item.excerpt or "", 220),
+        }
+        for item in session.validation_runs[-6:]
+    ]
+    review_context = {
+        "route": _compact_route(route),
+        "task_state": _compact_task_state(session.task_state),
+        "task_understanding": _compact_task_understanding(session.task_understanding),
+        "changed_files": [item.path for item in session.changed_files[-8:]],
+        "artifacts": artifacts[:6],
+        "validation": validation_context,
+        "diagnostics": _compact_recent_diagnostics(session),
+        "follow_up_context": _compact_follow_up_context(session),
+    }
+    return "\n".join(
+        [
+            "Review the changed implementation before declaring the task complete.",
+            f"Context: {json.dumps(review_context, ensure_ascii=False)}",
+            "Review rules:",
+            "- Compare the explicit requested outcome, constraints, and verification target against the current changed artifacts.",
+            "- Use semantic reasoning, not hardcoded feature vocabularies tied to one stack or one task.",
+            "- Fail when requested behavior is still missing, when cross-file references no longer line up, or when the code contradicts the intended behavior.",
+            "- Catch obvious inconsistencies such as renamed ids or symbols, broken imports or selectors, config written but never consumed, UI hooks targeting the wrong element, or APIs changed in one file but not another.",
+            "- Base findings only on evidence present in the request, artifacts, diagnostics, and validation context.",
+            "- Do not fail for optional refactors, broader hardening ideas, or style-only concerns.",
+            f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
         ]
     )
 
@@ -746,6 +826,26 @@ def _compact_repair_context(context: ValidationFailureEvidence) -> dict[str, obj
     }
 
 
+def _compact_generation_focus(
+    route: RouterOutput,
+    session: SessionState,
+    path: str,
+) -> dict[str, object]:
+    related_targets = [item for item in route.entities.target_paths if item and item != path][:6]
+    task_state = session.task_state
+    return {
+        "target_path": path,
+        "active_goal": _trim_text(task_state.active_goal if task_state is not None else route.requested_outcome, 180),
+        "output_expectation": _trim_text(
+            task_state.output_expectation if task_state is not None else route.requested_outcome,
+            180,
+        ),
+        "verification_target": _trim_text(task_state.verification_target or "", 200) if task_state is not None else "",
+        "constraints": (task_state.constraints[:4] if task_state is not None else []) or route.entities.constraints[:4],
+        "related_targets": related_targets,
+    }
+
+
 def _repair_rules(repair_strategy: str | None) -> str:
     lines = [
         "Repair rules:",
@@ -775,6 +875,23 @@ def _inspected_context(session: SessionState) -> str:
             break
     if not sections and session.workspace_snapshot:
         sections.append(session.workspace_snapshot.repo_summary[:1000])
+    return "\n\n".join(sections) or "none"
+
+
+def _related_file_context(session: SessionState, target_path: str) -> str:
+    sections: list[str] = []
+    for item in session.tool_calls:
+        if item.tool_name != "read_file":
+            continue
+        path = str(item.tool_args.get("path", "")).strip()
+        if not path or path == target_path:
+            continue
+        excerpt = (item.output_excerpt or "").strip()
+        if not excerpt:
+            continue
+        sections.append(f"{path}:\n{excerpt[:400]}")
+        if len(sections) >= 2:
+            break
     return "\n\n".join(sections) or "none"
 
 

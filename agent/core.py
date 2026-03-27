@@ -670,6 +670,8 @@ class AgentCore:
             return "partial"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "partial"
+        if self._requirements_review_missing(session):
+            return "partial"
         if final_action or session.tool_calls:
             return "completed"
         return "failed"
@@ -695,11 +697,15 @@ class AgentCore:
         if self._repair_incomplete(session):
             return "repair_incomplete"
         if session.changed_files and session.validation_status == "passed":
+            if self._requirements_review_missing(session):
+                return "requirements_review_missing"
             return "validated"
         if session.changed_files and session.validation_status == "not_run":
             return "validation_missing"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "validation_incomplete"
+        if self._requirements_review_missing(session):
+            return "requirements_review_missing"
         if self._safe_degraded_semantic_completion(session):
             resolution = self._semantic_resolution(session)
             if resolution in {"reserve_model", "reduced_model"}:
@@ -749,6 +755,11 @@ class AgentCore:
         if not self.validation_planner.has_structural_web_success(session):
             return False
         return not self.validation_planner.has_runtime_success(session)
+
+    def _requirements_review_missing(self, session: SessionState) -> bool:
+        if not session.changed_files:
+            return False
+        return not self.validation_planner.has_semantic_review(session)
 
     def _reproduction_missing(self, session: SessionState) -> bool:
         if session.changed_files:

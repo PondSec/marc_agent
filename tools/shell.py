@@ -278,6 +278,7 @@ class ShellTools:
 
             missing_refs: list[str] = []
             script_texts: list[tuple[str, str]] = []
+            css_texts: list[tuple[str, str]] = []
             for reference in parser.references:
                 resolved = (target.parent / reference).resolve()
                 if not resolved.exists():
@@ -285,6 +286,8 @@ class ShellTools:
                     continue
                 if Path(reference).suffix.lower() in {".js", ".mjs", ".cjs"}:
                     script_texts.append((reference, resolved.read_text(encoding="utf-8")))
+                if Path(reference).suffix.lower() == ".css":
+                    css_texts.append((reference, resolved.read_text(encoding="utf-8")))
 
             if missing_refs:
                 failures.extend(f"{relative_path} -> {reference}" for reference in missing_refs)
@@ -297,11 +300,30 @@ class ShellTools:
             syntax_failures = self._javascript_syntax_failures(script_texts, node_binary=node_binary)
             failures.extend(f"{relative_path}: {message}" for message in syntax_failures)
 
-            token_space = parser.token_space
+            html_token_space = parser.token_space
+            script_token_space = self._normalized_web_token_space(content for _, content in script_texts)
+            css_token_space = self._normalized_web_token_space(content for _, content in css_texts)
+            token_space = self._normalized_web_token_space(
+                [html_token_space, script_token_space, css_token_space]
+            )
+            missing_dom_ids = self._missing_dom_ids(
+                html_ids=parser.ids,
+                script_texts=script_texts,
+            )
+            if missing_dom_ids:
+                failures.append(
+                    f"{relative_path}: missing DOM ids referenced by JS ({', '.join(missing_dom_ids)})"
+                )
             missing_features = [
                 feature
                 for feature in expected_features
-                if not self._web_feature_present(feature, token_space)
+                if not self._web_feature_present(
+                    feature,
+                    token_space,
+                    html_token_space=html_token_space,
+                    script_token_space=script_token_space,
+                    css_token_space=css_token_space,
+                )
             ]
             if missing_features:
                 failures.append(
@@ -337,6 +359,13 @@ class ShellTools:
             "exit_code": 0 if success else 1,
             "command": command,
         }
+
+    def _normalized_web_token_space(self, parts) -> str:
+        if not isinstance(parts, (list, tuple)):
+            parts = list(parts)
+        normalized = " ".join(str(part or "") for part in parts).lower()
+        normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+        return f" {normalized} "
 
     def _default_python_smoke_input(self, target: Path) -> str:
         try:
@@ -409,7 +438,15 @@ class ShellTools:
                 failures.append(f"{label}: {message}")
         return failures
 
-    def _web_feature_present(self, feature: str, token_space: str) -> bool:
+    def _web_feature_present(
+        self,
+        feature: str,
+        token_space: str,
+        *,
+        html_token_space: str = "",
+        script_token_space: str = "",
+        css_token_space: str = "",
+    ) -> bool:
         normalized = str(feature or "").strip().lower()
         if not normalized:
             return True
@@ -426,13 +463,42 @@ class ShellTools:
             "score": (" score ", " punkte ", " punktestand ", " scoreboard "),
             "start_controls": (" start ", " play ", " pause ", " resume ", " restart ", " reset "),
             "dialog": (" dialog ", " modal ", " popup ", " overlay "),
-            "canvas": (" canvas ", " spielfeld ", " board ", " game board "),
+            "canvas": (" canvas ", " spielfeld ", " game board "),
             "settings": (" settings ", " options ", " config ", " einstellungen "),
         }
         markers = keyword_groups.get(normalized)
         if markers is None:
             return f" {normalized} " in token_space
         return any(marker in token_space for marker in markers)
+
+    def _missing_dom_ids(
+        self,
+        *,
+        html_ids: list[str],
+        script_texts: list[tuple[str, str]],
+    ) -> list[str]:
+        known_ids = {
+            str(value or "").strip()
+            for value in html_ids
+            if str(value or "").strip()
+        }
+        if not known_ids or not script_texts:
+            return []
+
+        referenced: set[str] = set()
+        patterns = [
+            re.compile(r"""getElementById\(\s*["']([^"']+)["']\s*\)"""),
+            re.compile(r"""querySelector\(\s*["']#([^"']+)["']\s*\)"""),
+        ]
+        for _, content in script_texts:
+            source = str(content or "")
+            for pattern in patterns:
+                referenced.update(
+                    match.group(1).strip()
+                    for match in pattern.finditer(source)
+                    if match.group(1).strip()
+                )
+        return sorted(identifier for identifier in referenced if identifier not in known_ids)
 
 
 class _HTMLReferenceParser(HTMLParser):

@@ -6,7 +6,7 @@ import pytest
 
 from agent.core import AgentCore
 from agent.decision import ExecutionDecisionPolicy
-from agent.models import FollowUpContext, SessionState, WorkspaceSnapshot
+from agent.models import ChatMessage, FollowUpContext, SessionState, WorkspaceSnapshot
 from agent.planner import Planner
 from agent.prompts import task_state_update_prompt
 from agent.state_updater import TaskStateUpdater
@@ -357,6 +357,49 @@ def test_execution_policy_uses_follow_up_context_for_refinement(tmp_path):
     assert route.intent == RouteIntent.UPDATE
     assert route.entities.target_paths[0] == "app/auth.py"
     assert route.safe_to_execute is True
+
+
+def test_execution_policy_routes_implement_request_to_update_even_if_mode_is_inspect(tmp_path):
+    task_state = TaskState(
+        latest_user_turn="add a theme toggle to index.html, styles.css, and app.js",
+        root_goal="Add a theme toggle to the landing page.",
+        active_goal="Add a theme toggle to the landing page.",
+        goal_relation="new_task",
+        output_expectation="A working theme toggle integrated into the landing page.",
+        current_user_intent="implement",
+        execution_strategy=None,
+        open_problem=None,
+        verification_target="The theme toggle should work and persist.",
+        target_artifacts=[
+            TaskArtifact(path="index.html", name="index.html", kind="file", role="primary_target", confidence=0.9),
+            TaskArtifact(path="styles.css", name="styles.css", kind="file", role="primary_target", confidence=0.9),
+            TaskArtifact(path="app.js", name="app.js", kind="file", role="primary_target", confidence=0.9),
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=["Only modify the named files."],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.9,
+        next_action="inspect",
+        next_best_action="inspect",
+        execution_outline=["Inspect the existing files", "Implement the theme toggle", "Validate the result"],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task=task_state.latest_user_turn, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_paths == ["index.html", "styles.css", "app.js"]
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+    assert any(step.action == RouteActionName.UPDATE_ARTIFACT for step in route.action_plan)
 
 
 def test_execution_policy_requests_clarification_on_low_confidence_high_risk():
@@ -1312,6 +1355,46 @@ def test_task_state_update_prompt_mentions_phase_two_strategy_fields(tmp_path):
     assert "execution_strategy" in prompt
     assert "next_best_action" in prompt
     assert "inspect current state and active artifacts" in prompt
+    assert "Be terse" in prompt
+    assert "Omit optional keys" in prompt
+
+
+def test_task_state_updater_uses_compact_generation_for_fresh_session(tmp_path):
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": "add a theme toggle",
+                "root_goal": "Add a theme toggle to the landing page.",
+                "active_goal": "Add a theme toggle to the landing page.",
+                "output_expectation": "A working theme toggle for the landing page.",
+                "target_artifacts": [
+                    {
+                        "path": "index.html",
+                        "name": "index.html",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.8,
+                    }
+                ],
+                "confidence": 0.82,
+                "next_action": "modify",
+            }
+        ]
+    )
+    updater = TaskStateUpdater(llm)
+    session = SessionState(
+        task="add a theme toggle",
+        workspace_root=str(tmp_path),
+        messages=[ChatMessage(role="user", content="add a theme toggle")],
+    )
+
+    updater.update_task_state("add a theme toggle", snapshot=build_snapshot(tmp_path), session=session)
+
+    call = llm.generate_json_calls[0]
+    prompt = call["args"][0]
+    assert "Recent conversation:" not in prompt
+    assert call["kwargs"]["timeout"] == 18
+    assert call["kwargs"]["num_ctx"] == 2048
 
 
 def test_task_state_contract_handles_backend_correction():

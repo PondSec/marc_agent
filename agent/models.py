@@ -59,7 +59,7 @@ class ValidationCommand(StrictModel):
     command: str
     cwd: str = "."
     kind: str = "check"
-    verification_scope: Literal["syntax", "static", "structural", "runtime"] = "static"
+    verification_scope: Literal["syntax", "static", "structural", "semantic", "runtime"] = "static"
     source: str = "heuristic"
     priority: int = 100
     reason: str | None = None
@@ -70,7 +70,7 @@ class ValidationRunRecord(StrictModel):
     command: str
     cwd: str = "."
     kind: str | None = None
-    verification_scope: Literal["syntax", "static", "structural", "runtime"] = "static"
+    verification_scope: Literal["syntax", "static", "structural", "semantic", "runtime"] = "static"
     status: Literal["passed", "failed", "blocked", "timeout"]
     exit_code: int | None = None
     risk_level: str | None = None
@@ -83,7 +83,7 @@ class ValidationRunRecord(StrictModel):
 
 class ValidationFailureEvidence(StrictModel):
     command: str
-    verification_scope: Literal["syntax", "static", "structural", "runtime"] = "static"
+    verification_scope: Literal["syntax", "static", "structural", "semantic", "runtime"] = "static"
     status: Literal["failed", "blocked", "timeout"] = "failed"
     artifact_paths: list[str] = Field(default_factory=list)
     summary: str
@@ -96,6 +96,16 @@ class ValidationFailureEvidence(StrictModel):
     action_hints: list[str] = Field(default_factory=list)
     repair_requirements: list[str] = Field(default_factory=list)
     evidence_signature: str | None = None
+
+
+class SemanticChangeReview(StrictModel):
+    requirements_satisfied: bool
+    summary: str
+    confidence: float = 0.0
+    missing_requirements: list[str] = Field(default_factory=list)
+    suspicious_issues: list[str] = Field(default_factory=list)
+    file_hints: list[str] = Field(default_factory=list)
+    repair_hints: list[str] = Field(default_factory=list)
 
 
 class DiagnosticRecord(StrictModel):
@@ -117,7 +127,7 @@ class DiagnosticRecord(StrictModel):
 class RepairAttemptRecord(StrictModel):
     artifact_path: str | None = None
     validation_command: str | None = None
-    verification_scope: Literal["syntax", "static", "structural", "runtime"] | None = None
+    verification_scope: Literal["syntax", "static", "structural", "semantic", "runtime"] | None = None
     strategy: str
     result: Literal["mutation_planned", "no_effective_change", "generation_failed", "blocked"]
     reason: str

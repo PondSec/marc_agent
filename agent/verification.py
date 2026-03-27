@@ -33,7 +33,7 @@ class ValidationPlanner:
         "score": ("score", "punkte", "punktestand", "scoreboard"),
         "start_controls": ("start", "play", "pause", "resume", "restart", "reset"),
         "dialog": ("dialog", "modal", "popup", "overlay"),
-        "canvas": ("canvas", "spielfeld", "game board", "board"),
+        "canvas": ("canvas", "spielfeld", "game board"),
         "settings": ("settings", "options", "config", "einstellungen"),
     }
     DEFAULT_KIND_ORDER = {
@@ -181,7 +181,7 @@ class ValidationPlanner:
 
     def command_scope(self, command: ValidationCommand | str, *, kind: str | None = None) -> str:
         if isinstance(command, ValidationCommand):
-            if command.verification_scope in {"syntax", "structural", "runtime"}:
+            if command.verification_scope in {"syntax", "structural", "semantic", "runtime"}:
                 return command.verification_scope
             kind = command.kind
             text = command.command
@@ -196,6 +196,8 @@ class ValidationPlanner:
             return "syntax"
         if lowered.startswith("internal:web_artifact:"):
             return "structural"
+        if lowered.startswith("internal:semantic_review:"):
+            return "semantic"
         if lowered.startswith("internal:html_refs:"):
             return "static"
         if normalized_kind == "test":
@@ -247,7 +249,7 @@ class ValidationPlanner:
         *,
         current_generation_only: bool = True,
     ) -> str | None:
-        ranking = {"syntax": 1, "static": 2, "structural": 3, "runtime": 4}
+        ranking = {"syntax": 1, "static": 2, "structural": 3, "semantic": 4, "runtime": 5}
         strongest: str | None = None
         for run in self._runtime_runs(session, current_generation_only=current_generation_only):
             if run.status != "passed":
@@ -284,6 +286,32 @@ class ValidationPlanner:
             run.status == "passed" and run.verification_scope == "structural"
             for run in self._runtime_runs(session, current_generation_only=current_generation_only)
         )
+
+    def has_semantic_review(
+        self,
+        session: SessionState,
+        *,
+        current_generation_only: bool = True,
+    ) -> bool:
+        return any(
+            run.verification_scope == "semantic"
+            for run in self._runtime_runs(session, current_generation_only=current_generation_only)
+        )
+
+    def has_semantic_review_success(
+        self,
+        session: SessionState,
+        *,
+        current_generation_only: bool = True,
+    ) -> bool:
+        return any(
+            run.status == "passed" and run.verification_scope == "semantic"
+            for run in self._runtime_runs(session, current_generation_only=current_generation_only)
+        )
+
+    def semantic_review_command(self, changed_files: list[str]) -> str:
+        payload = [{"path": path} for path in self._unique_paths(changed_files)[:8]]
+        return f"internal:semantic_review:{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
 
     def latest_failed_run(
         self,
@@ -665,12 +693,17 @@ class ValidationPlanner:
         return unique
 
     def _expected_web_features(self, task: str) -> list[str]:
-        lowered = " ".join(str(task or "").lower().split())
+        token_space = self._normalized_keyword_space(task)
         expected: list[str] = []
         for feature, markers in self.WEB_FEATURE_KEYWORDS.items():
-            if any(marker in lowered for marker in markers):
+            if any(self._normalized_keyword_space(marker) in token_space for marker in markers):
                 expected.append(feature)
         return expected
+
+    def _normalized_keyword_space(self, value: str) -> str:
+        lowered = str(value or "").lower()
+        collapsed = re.sub(r"[^0-9a-zäöüß]+", " ", lowered)
+        return f" {collapsed.strip()} "
 
     def _related_diagnostics(
         self,
@@ -827,6 +860,13 @@ class ValidationPlanner:
         elif scope == "runtime":
             requirements.append(
                 f"Change {primary_target} so the failing runtime or test path can complete successfully."
+            )
+        elif scope == "semantic":
+            requirements.append(
+                f"Close the remaining task-to-code gaps reported by the semantic review for {primary_target}."
+            )
+            requirements.append(
+                f"Repair any dangling or inconsistent references implicated by the semantic review before claiming the task is complete."
             )
         else:
             requirements.append(

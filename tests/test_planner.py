@@ -267,6 +267,64 @@ def test_planner_returns_direct_response_from_router(tmp_path):
     assert "lokaler Agent" in (decision.final_response or "")
 
 
+def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": False,
+                "summary": "The Python CLI no longer prints the corrected status line the user requested.",
+                "confidence": 0.92,
+                "missing_requirements": ["Print the corrected status line after processing the command"],
+                "suspicious_issues": ["The updated function writes to result_message, but the CLI still prints old_message"],
+                "file_hints": ["app/main.py"],
+                "repair_hints": ["Reconnect the final CLI print path to the updated result_message value."],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the target."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the requested change."},
+            {"step": 3, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 4, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["app/main.py"],
+        target_name="app/main.py",
+    )
+    session = SessionState(
+        task="Fix the Python CLI output so it prints the corrected status line",
+        workspace_root=str(tmp_path),
+        validation_status="passed",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="Print the corrected status line.")
+    session.changed_files.append(FileChangeRecord(path="app/main.py", operation="modify"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").write_text("print(old_message)\n", encoding="utf-8")
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "read_file"
+    assert decision.tool_args == {"path": "app/main.py"}
+    assert session.validation_status == "failed"
+    assert session.active_repair_context is not None
+    assert session.active_repair_context.verification_scope == "semantic"
+    assert any(
+        "task-to-code gaps reported by the semantic review" in item
+        for item in session.active_repair_context.repair_requirements
+    )
+
+
 def test_planner_asks_for_clarification_when_router_requires_it(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -387,6 +445,118 @@ def test_planner_generates_write_after_update_target_is_read(tmp_path):
     assert decision.tool_name == "write_file"
     assert decision.tool_args["path"] == "app/main.py"
     assert "updated" in decision.tool_args["content"]
+
+
+def test_planner_updates_remaining_explicit_target_before_validation(tmp_path):
+    (tmp_path / "index.html").write_text("<!doctype html><button>Toggle</button>\n", encoding="utf-8")
+    (tmp_path / "app.js").write_text("console.log('old');\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { color: black; }\n", encoding="utf-8")
+
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=3,
+        language_counts={"html": 1, "javascript": 1, "css": 1},
+        top_directories=[],
+        important_files=["index.html", "app.js", "styles.css"],
+        focus_files=["index.html", "app.js", "styles.css"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small multi-file web workspace.",
+    )
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "read_relevant_files",
+                        "reason": "Inspect the current implementation before editing it.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested update.",
+                    },
+                    {
+                        "step": 3,
+                        "action": "run_validation",
+                        "reason": "Validate the changed files after the update is complete.",
+                    },
+                ],
+                target_paths=["index.html", "app.js", "styles.css"],
+                target_name="index.html",
+            )
+        ],
+        text_payloads=["console.log('theme enabled');\n"],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Ergaenze einen Theme-Umschalter mit localStorage und Statusmeldung.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Read index.html.",
+                output_excerpt=(tmp_path / "index.html").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "app.js"},
+                success=True,
+                summary="Read app.js.",
+                output_excerpt=(tmp_path / "app.js").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Read styles.css.",
+                output_excerpt=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+            ),
+        ]
+    )
+    session.changed_files.append(
+        FileChangeRecord(
+            path="index.html",
+            operation="write",
+            diff="--- a/index.html\n+++ b/index.html\n@@\n-<button>Toggle</button>\n+<button id='themeToggle'>Toggle</button>\n",
+        )
+    )
+    session.edit_generation = 1
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app.js"
+    assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
 
 
 def test_planner_marks_generation_failure_honestly_before_any_validation(tmp_path):
@@ -1795,6 +1965,9 @@ def test_planner_uses_lightweight_model_first_for_small_web_follow_up_updates(tm
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "write_file"
     assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert "Produce the full file content for exactly one file." in llm.generate_calls[0]["args"][0]
+    assert "Validated route:" not in llm.generate_calls[0]["args"][0]
 
 
 def test_planner_preserves_partial_progress_before_switching_models(tmp_path):

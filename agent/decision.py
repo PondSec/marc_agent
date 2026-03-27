@@ -147,8 +147,14 @@ class ExecutionDecisionPolicy:
         task_state: TaskState | None = None,
     ) -> RouteIntent:
         strategy = task_state.execution_strategy if task_state is not None else None
+        current_user_intent = task_state.current_user_intent if task_state is not None else None
+        goal_relation = task_state.goal_relation if task_state is not None else None
         mode = understanding.recommended_mode
         intent = understanding.intent_category
+        has_named_targets = any(
+            str(artifact.path or artifact.name or "").strip()
+            for artifact in understanding.target_artifacts
+        )
 
         if strategy == "debug_repair":
             return RouteIntent.DEBUG
@@ -156,6 +162,14 @@ class ExecutionDecisionPolicy:
             return RouteIntent.UPDATE
         if strategy == "feature_implementation":
             return RouteIntent.CREATE if mode == "create" or intent == "build" else RouteIntent.UPDATE
+        if current_user_intent == "repair" or goal_relation == "report_problem":
+            return RouteIntent.DEBUG
+        if current_user_intent == "correct" or goal_relation in {"correct", "scope_change", "rollback_request"}:
+            return RouteIntent.UPDATE
+        if current_user_intent == "implement":
+            if mode == "create" or intent == "build" or not has_named_targets:
+                return RouteIntent.CREATE
+            return RouteIntent.UPDATE
         if strategy == "validation_inspection":
             if mode == "test" or intent == "test":
                 return RouteIntent.DEBUG
