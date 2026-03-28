@@ -1894,10 +1894,7 @@ function renderSidebarThreadItem(session) {
     >
       <span class="thread-nav-main">
         <span class="thread-nav-title">${escapeHtml(shorten(title, 34))}</span>
-        ${renderStatusBadge(badgeLabel, badgeTone, {
-          compact: true,
-          live: isSessionRunning(session),
-        })}
+        <span class="thread-nav-status tone-${escapeHtml(badgeTone)}">${escapeHtml(badgeLabel)}</span>
       </span>
       <span class="thread-nav-preview">${escapeHtml(shorten(preview, 108))}</span>
       <span class="thread-nav-meta">
@@ -2178,11 +2175,8 @@ function renderTopBar() {
   const commitDisabled = !workspace || isSessionRunning(state.activeSession);
   const session = state.activeSession;
   const deleteDisabled = !session || isSessionRunning(session);
-  const statusMarkup = session
-    ? renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
-        live: isSessionRunning(session),
-      })
-    : renderStatusBadge("Bereit", "muted");
+  const statusTone = session ? sessionStatusTone(session) : "muted";
+  const statusText = session ? sessionBadgeText(session) : "Bereit";
   const title = session
     ? session.title || shorten(session.task, 84) || "Neuer Thread"
     : workspace?.name || "Projekt auswaehlen";
@@ -2196,7 +2190,7 @@ function renderTopBar() {
   if (session?.updated_at) {
     subtitleParts.push(`Aktualisiert ${formatSessionTimestamp(session.updated_at)}`);
   }
-  const subtitle = subtitleParts.join("  ·  ") || "Links ein Projekt waehlen oder einen neuen Thread starten.";
+  const subtitle = subtitleParts.join(" | ") || "Links ein Projekt waehlen oder einen neuen Thread starten.";
 
   return `
     <header class="thread-topbar">
@@ -2206,7 +2200,7 @@ function renderTopBar() {
           <p class="thread-topbar-subtitle">${escapeHtml(subtitle)}</p>
         </div>
         <div class="thread-toolbar">
-          ${statusMarkup}
+          <span class="thread-toolbar-status tone-${escapeHtml(statusTone)}">${escapeHtml(statusText)}</span>
           <button
             class="button-secondary"
             type="button"
@@ -2340,7 +2334,16 @@ function renderEmptyThreadState() {
 }
 
 function renderThreadView(session) {
-  return renderConversationPanel(session);
+  return `
+    <div class="thread-workbench">
+      <div class="thread-workbench-main">
+        ${renderConversationPanel(session)}
+      </div>
+      <aside class="thread-workbench-rail">
+        ${renderThreadSideRail(session, state.logs)}
+      </aside>
+    </div>
+  `;
 }
 
 function renderThreadHero(session) {
@@ -2396,31 +2399,46 @@ function renderMessageBubble(message, options = {}) {
 }
 
 function renderConversationPanel(session) {
-  const messages = conversationMessages(session);
+  const timeline = conversationTimeline(session, state.logs);
   const workspace = workspaceForSession(session);
   const overview = buildSessionOverview(session);
-  const validation = buildValidationSnapshot(session);
+  const title = session.title || shorten(session.task, 96) || "Neuer Thread";
+  const contextMeta = [
+    labelForAccessMode(session.access_mode),
+    workspace?.path ? shortenPath(workspace.path, 96) : "",
+    session.updated_at ? `Aktualisiert ${formatSessionTimestamp(session.updated_at)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
   return `
     <section class="thread-canvas">
       <div class="thread-context">
         <div class="thread-context-copy">
           <span class="thread-context-project">${escapeHtml(workspace?.name || "Projekt")}</span>
+          <h2 class="thread-context-title">${escapeHtml(title)}</h2>
           <p class="thread-context-summary">${escapeHtml(overview.summary)}</p>
         </div>
-        <div class="thread-context-chips">
-          ${renderMetaChip(labelForAccessMode(session.access_mode), "muted")}
-          ${renderMetaChip(countLabel(messages.length, "1 Nachricht", `${messages.length} Nachrichten`), "muted")}
-          ${renderMetaChip(countLabel(session.tool_calls?.length || 0, "1 Schritt", `${session.tool_calls?.length || 0} Schritte`), "muted")}
-          ${renderMetaChip(validation.statusLabel, validation.tone)}
-        </div>
+        ${contextMeta ? `<p class="thread-context-meta">${escapeHtml(contextMeta)}</p>` : ""}
       </div>
       <div class="thread-feed">
-        ${messages.length ? messages.map((message) => renderMessageBubble(message, { session })).join("") : `<div class="inline-note">Noch keine Nachrichten in diesem Thread.</div>`}
+        ${timeline.length ? timeline.map((entry) => renderTimelineEntry(entry, session)).join("") : `<div class="inline-note">Noch keine Nachrichten in diesem Thread.</div>`}
         ${isSessionRunning(session) ? renderRunningMessage(session) : ""}
-        ${renderWorklogPanel(session, state.logs)}
       </div>
     </section>
   `;
+}
+
+function renderTimelineEntry(entry, session) {
+  if (!entry) {
+    return "";
+  }
+  if (entry.type === "message") {
+    return renderMessageBubble(entry.message, { session });
+  }
+  if (entry.type === "activity") {
+    return renderActivityStreamItem(entry.record);
+  }
+  return "";
 }
 
 function renderWorklogPanel(session, logs) {
@@ -2428,137 +2446,19 @@ function renderWorklogPanel(session, logs) {
     return "";
   }
 
-  const overview = buildSessionOverview(session);
-  const validation = buildValidationSnapshot(session);
-  const changes = Array.isArray(session.changed_files) ? session.changed_files : [];
-  const issues = buildIssueItems(session);
-  const activity = buildActivityClusters(session, logs);
-  const highlights = buildRunHighlights(session);
+  const activity = [...buildActivityClusters(session, logs)].reverse();
+  const transcript = [
+    ...activity.map((item) => ({
+      author: "Agent",
+      tone: item.tone || "muted",
+      timestamp: item.timestamp || session.updated_at,
+      title: item.text,
+      content: item.meta || "",
+    })),
+    ...(isSessionRunning(session) ? [] : buildThreadTranscriptNotes(session)),
+  ];
 
-  return `
-    <details
-      class="worklog-card tone-${escapeHtml(sessionStatusTone(session))}"
-      data-preserve-open
-      id="worklog-${escapeHtml(session.id)}"
-      ${shouldOpenDetailPanel(sessionStatusTone(session), session) ? "open" : ""}
-    >
-      <summary class="worklog-summary">
-        <div class="worklog-summary-main">
-          <span class="worklog-chevron" aria-hidden="true">${icon("chevron-right")}</span>
-          <div>
-            <p class="panel-kicker">Review</p>
-            <h3>Aenderungen und Laufdetails</h3>
-          </div>
-        </div>
-        <div class="worklog-summary-meta">
-          ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
-            compact: true,
-            live: isSessionRunning(session),
-          })}
-          ${changes.length ? renderMetaChip(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`), changes.length ? "success" : "muted") : ""}
-          ${renderMetaChip(validation.statusLabel, validation.tone)}
-        </div>
-      </summary>
-      <div class="worklog-body">
-        <div class="worklog-highlight-grid">
-          ${highlights.map(renderStatCell).join("")}
-        </div>
-        <section class="worklog-section tone-${escapeHtml(overview.tone)}">
-          <div class="worklog-section-head">
-            <div>
-              <p class="panel-kicker">Lauf</p>
-              <strong class="worklog-section-title">${escapeHtml(overview.title)}</strong>
-            </div>
-            <span class="worklog-section-meta">${escapeHtml(labelForPhase(session.current_phase))}</span>
-          </div>
-          <p class="worklog-section-copy">${escapeHtml(overview.summary)}</p>
-          <div class="phase-track phase-track-inline">
-            ${buildPhaseSteps(session)
-              .map(
-                (step, index) => `
-                  <div class="phase-step ${escapeHtml(step.state)} compact">
-                    <span class="phase-step-index">${index + 1}</span>
-                    <span class="phase-step-label">${escapeHtml(step.label)}</span>
-                  </div>
-                `,
-              )
-              .join("")}
-          </div>
-        </section>
-
-        <section class="worklog-section tone-${escapeHtml(validation.tone)}">
-          <div class="worklog-section-head">
-            <div>
-              <p class="panel-kicker">Validierung</p>
-              <strong class="worklog-section-title">${escapeHtml(validation.title)}</strong>
-            </div>
-            ${renderStatusBadge(validation.statusLabel, validation.tone, { compact: true })}
-          </div>
-          <p class="worklog-section-copy">${escapeHtml(validation.summary)}</p>
-          ${validation.latest?.command ? `<code class="detail-code">${escapeHtml(validation.latest.command)}</code>` : ""}
-          ${
-            validation.runs.length
-              ? `<div class="validation-list">${validation.runs.map(renderValidationRun).join("")}</div>`
-              : ""
-          }
-        </section>
-
-        ${
-          changes.length
-            ? `
-              <section class="worklog-section">
-                <div class="worklog-section-head">
-                  <div>
-                    <p class="panel-kicker">Dateien</p>
-                    <strong class="worklog-section-title">${escapeHtml(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`))}</strong>
-                  </div>
-                </div>
-                <div class="file-change-list">
-                  ${changes.map(renderFileChangeRow).join("")}
-                </div>
-              </section>
-            `
-            : ""
-        }
-
-        ${
-          issues.length
-            ? `
-              <section class="worklog-section tone-${escapeHtml(issues.some((item) => item.tone === "danger") ? "danger" : "warning")}">
-                <div class="worklog-section-head">
-                  <div>
-                    <p class="panel-kicker">Hinweise</p>
-                    <strong class="worklog-section-title">${escapeHtml(issues.some((item) => item.label === "Blocker") ? "Blocker" : "Risiken")}</strong>
-                  </div>
-                </div>
-                <div class="issue-list">
-                  ${issues.map(renderIssueRow).join("")}
-                </div>
-              </section>
-            `
-            : ""
-        }
-
-        ${
-          activity.length
-            ? `
-              <section class="worklog-section">
-                <div class="worklog-section-head">
-                  <div>
-                    <p class="panel-kicker">Aktivitaet</p>
-                    <strong class="worklog-section-title">${escapeHtml(countLabel(activity.length, "1 Eintrag", `${activity.length} Eintraege`))}</strong>
-                  </div>
-                </div>
-                <div class="activity-feed">
-                  ${activity.map(renderActivityItem).join("")}
-                </div>
-              </section>
-            `
-            : ""
-        }
-      </div>
-    </details>
-  `;
+  return transcript.map(renderTranscriptNote).join("");
 }
 
 function renderRunSummaryCard(session) {
@@ -2742,20 +2642,133 @@ function renderRunningMessage(session = state.activeSession) {
     ? "Der aktuelle Schritt wird sauber beendet. Danach bleibt der Thread fuer den naechsten Auftrag offen."
     : currentThought() || "Der Agent arbeitet gerade im Hintergrund.";
 
+  return renderActivityStreamItem({
+    text: headline,
+    meta: copy,
+    tone,
+    timestamp: session?.updated_at || new Date().toISOString(),
+    count: 1,
+    live: true,
+  });
+}
+
+function renderThreadSideRail(session, logs) {
+  if (!session) {
+    return "";
+  }
+
+  const overview = buildSessionOverview(session);
+  const validation = buildValidationSnapshot(session);
+  const changes = Array.isArray(session.changed_files) ? session.changed_files : [];
+  const issues = buildIssueItems(session);
+  const activity = buildActivityClusters(session, logs).slice(0, 6);
+
   return `
-    <div class="run-notice tone-${escapeHtml(tone)}">
-      <div class="run-notice-head">
-        <span class="run-notice-label">Agent aktiv</span>
-        ${renderStatusBadge(headline, tone, {
-          compact: true,
-          live: !stopping,
-        })}
-      </div>
-      <strong class="run-notice-title">${escapeHtml(headline)}</strong>
-      <p class="run-notice-copy">${escapeHtml(copy)}</p>
-      <p class="run-notice-foot">
-        Fortschritt, Dateien und Validierung aktualisieren sich im Bereich darunter.
-      </p>
+    <div class="thread-side-rail">
+      <section class="thread-side-card tone-${escapeHtml(overview.tone)}">
+        <div class="thread-side-card-head">
+          <div>
+            <p class="panel-kicker">Thread</p>
+            <h3>${escapeHtml(sessionBadgeText(session))}</h3>
+          </div>
+          <span class="thread-side-card-status tone-${escapeHtml(sessionStatusTone(session))}">
+            ${escapeHtml(labelForPhase(session.current_phase))}
+          </span>
+        </div>
+        <p class="thread-side-card-copy">${escapeHtml(overview.summary)}</p>
+        <div class="thread-side-stat-grid">
+          <div class="thread-side-stat">
+            <span>Schritte</span>
+            <strong>${escapeHtml(String(session.tool_calls?.length || 0))}</strong>
+          </div>
+          <div class="thread-side-stat">
+            <span>Dateien</span>
+            <strong>${escapeHtml(String(changes.length))}</strong>
+          </div>
+          <div class="thread-side-stat">
+            <span>Checks</span>
+            <strong>${escapeHtml(validation.statusLabel)}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="thread-side-card">
+        <div class="thread-side-card-head">
+          <div>
+            <p class="panel-kicker">Validierung</p>
+            <h3>${escapeHtml(validation.title)}</h3>
+          </div>
+          <span class="thread-side-card-status tone-${escapeHtml(validation.tone)}">
+            ${escapeHtml(validation.statusLabel)}
+          </span>
+        </div>
+        <p class="thread-side-card-copy">${escapeHtml(validation.summary)}</p>
+        ${
+          validation.runs.length
+            ? `
+              <div class="thread-side-list">
+                ${validation.runs.slice(0, 3).map(renderRailValidationItem).join("")}
+              </div>
+            `
+            : ""
+        }
+      </section>
+
+      ${
+        changes.length
+          ? `
+            <section class="thread-side-card">
+              <div class="thread-side-card-head">
+                <div>
+                  <p class="panel-kicker">Aenderungen</p>
+                  <h3>${escapeHtml(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`))}</h3>
+                </div>
+              </div>
+              <div class="thread-side-list">
+                ${changes.slice(0, 8).map(renderRailFileItem).join("")}
+              </div>
+            </section>
+          `
+          : ""
+      }
+
+      ${
+        issues.length
+          ? `
+            <section class="thread-side-card tone-${escapeHtml(
+              issues.some((item) => item.tone === "danger") ? "danger" : "warning",
+            )}">
+              <div class="thread-side-card-head">
+                <div>
+                  <p class="panel-kicker">Hinweise</p>
+                  <h3>${escapeHtml(countLabel(issues.length, "1 Punkt", `${issues.length} Punkte`))}</h3>
+                </div>
+              </div>
+              <div class="thread-side-list">
+                ${issues.slice(0, 5).map(renderRailIssueItem).join("")}
+              </div>
+            </section>
+          `
+          : ""
+      }
+
+      ${
+        activity.length
+          ? `
+            <section class="thread-side-card">
+              <div class="thread-side-card-head">
+                <div>
+                  <p class="panel-kicker">Aktivitaet</p>
+                  <h3>Zuletzt</h3>
+                </div>
+              </div>
+              <div class="thread-side-list">
+                ${activity.map(renderRailActivityItem).join("")}
+              </div>
+            </section>
+          `
+          : ""
+      }
     </div>
   `;
 }
@@ -3166,6 +3179,208 @@ function renderMetaChip(label, tone = "muted") {
   return `<span class="meta-chip ${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
 }
 
+function renderActivityStreamItem(item) {
+  if (!item) {
+    return "";
+  }
+  const meta = String(item.meta || "").trim();
+  const tone = String(item.tone || "muted");
+  return `
+    <div class="activity-stream-item tone-${escapeHtml(tone)} ${item.live ? "live" : ""}">
+      <div class="activity-stream-marker" aria-hidden="true">
+        <span class="activity-stream-dot"></span>
+      </div>
+      <div class="activity-stream-body">
+        <div class="activity-stream-head">
+          <span class="activity-stream-kicker">Agent</span>
+          <span class="activity-stream-time">${escapeHtml(formatTime(item.timestamp))}</span>
+        </div>
+        <p class="activity-stream-title">${escapeHtml(item.text || "")}</p>
+        ${
+          meta
+            ? isLikelyCodeMeta(meta)
+              ? `<code class="activity-stream-pill">${escapeHtml(meta)}</code>`
+              : `<p class="activity-stream-copy">${escapeHtml(meta)}</p>`
+            : ""
+        }
+      </div>
+    </div>
+  `;
+}
+
+function renderRailValidationItem(run) {
+  const tone = validationRunTone(run);
+  const detail = shorten([run.command, run.summary || run.excerpt].filter(Boolean).join(" - "), 120);
+  return `
+    <article class="thread-side-item tone-${escapeHtml(tone)}">
+      <div class="thread-side-item-top">
+        <span class="thread-side-item-label">${escapeHtml(labelForValidationRunStatus(run.status))}</span>
+        <span class="thread-side-item-time">${escapeHtml(labelForVerificationScope(run.verification_scope))}</span>
+      </div>
+      <p class="thread-side-item-copy">${escapeHtml(detail || "Ohne Details")}</p>
+    </article>
+  `;
+}
+
+function renderRailFileItem(change) {
+  return `
+    <article class="thread-side-item">
+      <div class="thread-side-item-top">
+        <span class="thread-side-item-label">${escapeHtml(labelForFileOperation(change.operation))}</span>
+      </div>
+      <p class="thread-side-item-copy">${escapeHtml(shortenPath(change.path, 84))}</p>
+    </article>
+  `;
+}
+
+function renderRailIssueItem(issue) {
+  return `
+    <article class="thread-side-item tone-${escapeHtml(issue.tone)}">
+      <div class="thread-side-item-top">
+        <span class="thread-side-item-label">${escapeHtml(issue.label)}</span>
+        ${issue.meta ? `<span class="thread-side-item-time">${escapeHtml(issue.meta)}</span>` : ""}
+      </div>
+      <p class="thread-side-item-copy">${escapeHtml(issue.text)}</p>
+    </article>
+  `;
+}
+
+function renderRailActivityItem(item) {
+  return `
+    <article class="thread-side-item tone-${escapeHtml(item.tone || "muted")}">
+      <div class="thread-side-item-top">
+        <span class="thread-side-item-label">${escapeHtml(item.text)}</span>
+        <span class="thread-side-item-time">${escapeHtml(formatTime(item.timestamp))}</span>
+      </div>
+      ${item.meta ? `<p class="thread-side-item-copy">${escapeHtml(item.meta)}</p>` : ""}
+    </article>
+  `;
+}
+
+function isLikelyCodeMeta(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return false;
+  }
+  return /[\\/]|--|=>|\.|:\s|^npm\s|^python\s|^git\s|^rg\s|^sed\s|^cat\s|^Get-/.test(text);
+}
+
+function renderTranscriptNote(note) {
+  const title = String(note?.title || "").trim();
+  const content = String(note?.content || "").trim();
+  return `
+    <div class="message-row system transcript-note tone-${escapeHtml(note?.tone || "muted")}">
+      <article class="message-bubble system transcript-note-bubble">
+        <div class="message-head">
+          <span class="message-author">${escapeHtml(note?.author || "System")}</span>
+          <span class="message-time">${escapeHtml(formatTime(note?.timestamp))}</span>
+        </div>
+        ${title ? `<p class="transcript-note-title">${escapeHtml(title)}</p>` : ""}
+        ${content ? `<div class="message-body rich-text transcript-note-body">${renderRichText(content)}</div>` : ""}
+      </article>
+    </div>
+  `;
+}
+
+function buildThreadTranscriptNotes(session) {
+  const notes = [];
+  const validation = buildValidationSnapshot(session);
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+  const issues = buildIssueItems(session);
+  const issueTone = issues.some((item) => item.tone === "danger")
+    ? "danger"
+    : issues.some((item) => item.tone === "warning")
+      ? "warning"
+      : "muted";
+
+  if (shouldRenderValidationTranscript(session, validation)) {
+    notes.push({
+      author: "Validierung",
+      tone: validation.tone,
+      timestamp: validation.latest?.finished_at || validation.latest?.started_at || session?.updated_at,
+      title: validation.title,
+      content: buildValidationTranscriptContent(validation),
+    });
+  }
+
+  if (changes.length) {
+    notes.push({
+      author: "Aenderungen",
+      tone: "success",
+      timestamp: session?.updated_at,
+      title: countLabel(changes.length, "1 Datei geaendert", `${changes.length} Dateien geaendert`),
+      content: buildChangedFilesTranscriptContent(changes),
+    });
+  }
+
+  if (issues.length) {
+    notes.push({
+      author: "Hinweise",
+      tone: issueTone,
+      timestamp: session?.updated_at,
+      title: issueTone === "danger" ? "Offene Probleme" : "Wichtige Hinweise",
+      content: buildIssueTranscriptContent(issues),
+    });
+  }
+
+  return notes;
+}
+
+function shouldRenderValidationTranscript(session, validation) {
+  return Boolean(
+    validation?.runs?.length ||
+      session?.validation_status ||
+      (Array.isArray(session?.changed_files) && session.changed_files.length),
+  );
+}
+
+function buildValidationTranscriptContent(validation) {
+  const parts = [];
+  if (validation?.summary) {
+    parts.push(validation.summary);
+  }
+
+  const runs = Array.isArray(validation?.runs) ? validation.runs.slice(0, 3) : [];
+  if (runs.length) {
+    parts.push(
+      [
+        "Checks:",
+        ...runs.map((run) => {
+          const detail = shorten(
+            [run.command, run.summary || run.excerpt].filter(Boolean).join(" - ") || "Ohne Details",
+            160,
+          );
+          return `- ${labelForValidationRunStatus(run.status)}: ${detail}`;
+        }),
+      ].join("\n"),
+    );
+  }
+
+  return parts.join("\n\n");
+}
+
+function buildChangedFilesTranscriptContent(changes) {
+  const visible = changes.slice(0, 8).map((change) => {
+    return `- ${labelForFileOperation(change.operation)}: \`${shortenPath(change.path, 120)}\``;
+  });
+
+  if (changes.length > visible.length) {
+    visible.push(`- ... ${changes.length - visible.length} weitere Dateien`);
+  }
+
+  return visible.join("\n");
+}
+
+function buildIssueTranscriptContent(issues) {
+  return issues
+    .slice(0, 5)
+    .map((issue) => {
+      const meta = issue.meta ? ` (${issue.meta})` : "";
+      return `- ${issue.label}: ${issue.text}${meta}`;
+    })
+    .join("\n");
+}
+
 function hasWorklogContent(session, logs) {
   return Boolean(
     (Array.isArray(logs) && logs.length) ||
@@ -3332,16 +3547,10 @@ function threadPreview(session) {
 
 function messageDisplayState(message, session) {
   const raw = String(message?.content || "").trim();
-  if (!raw || message?.role !== "assistant" || !isLatestAssistantMessage(session, message) || !hasWorklogContent(session, state.logs)) {
+  if (!raw) {
     return { content: raw, note: "" };
   }
-
-  const cleaned = sanitizeAssistantMessageContent(raw);
-  const shortened = cleaned !== raw;
-  return {
-    content: cleaned || raw,
-    note: shortened ? "Weitere Arbeitsdetails stehen im aufklappbaren Bereich darunter." : "",
-  };
+  return { content: raw, note: "" };
 }
 
 function isLatestAssistantMessage(session, message) {
