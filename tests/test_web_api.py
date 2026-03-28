@@ -74,6 +74,40 @@ def build_test_client(app, *, authenticate: bool = True) -> TestClient:
     return client
 
 
+def complete_setup_flow(
+    client: TestClient,
+    workspace_root,
+    *,
+    admin_email: str = TEST_ADMIN_EMAIL,
+    admin_password: str = TEST_ADMIN_PASSWORD,
+    admin_display_name: str = "Setup Admin",
+) -> dict:
+    setup_status = client.get("/api/setup/status")
+    assert setup_status.status_code == 200
+    apply_csrf_headers(client)
+
+    response = client.post(
+        "/api/setup/complete",
+        json={
+            "admin_display_name": admin_display_name,
+            "admin_email": admin_email,
+            "admin_password": admin_password,
+            "admin_password_confirm": admin_password,
+            "initial_workspace_name": "Demo Project",
+            "initial_workspace_path": str(workspace_root),
+            "ollama_host": "http://127.0.0.1:11434",
+            "model_name": "qwen3-coder:30b",
+            "router_model_name": "qwen2.5-coder:14b",
+            "access_mode": "approval",
+            "auth_cookie_secure": True,
+            "public_base_url": "https://testserver",
+        },
+    )
+
+    assert response.status_code == 200
+    return response.json()
+
+
 def create_test_workspace(client: TestClient, root, name: str = "Workspace A") -> dict:
     workspace_root = root / name.lower().replace(" ", "-")
     workspace_root.mkdir()
@@ -213,6 +247,90 @@ def test_setup_completion_works_on_local_http_when_base_config_prefers_secure_co
 
     assert response.status_code == 200
     assert response.json()["workspace"]["name"] == "Demo Project"
+
+
+def test_deleted_env_reactivates_setup_and_blocks_console(tmp_path):
+    config = build_incomplete_setup_config(tmp_path)
+    app = create_app(config)
+    client = TestClient(app, base_url=TEST_ORIGIN)
+
+    workspace_root = tmp_path / "demo-project"
+    complete_setup_flow(client, workspace_root)
+
+    env_path = tmp_path / ".env"
+    env_path.unlink()
+
+    status_response = client.get("/api/setup/status")
+    blocked_response = client.get("/api/workspaces")
+
+    assert status_response.status_code == 200
+    payload = status_response.json()
+    assert payload["required"] is True
+    assert payload["reason"] == "missing_runtime_env"
+    assert payload["has_env_file"] is False
+    assert blocked_response.status_code == 503
+
+
+def test_setup_completion_recovers_admin_access_after_env_was_deleted(tmp_path):
+    config = build_incomplete_setup_config(tmp_path)
+    app = create_app(config)
+    client = TestClient(app, base_url=TEST_ORIGIN)
+
+    workspace_root = tmp_path / "demo-project"
+    complete_setup_flow(client, workspace_root)
+
+    env_path = tmp_path / ".env"
+    env_path.unlink()
+
+    status_response = client.get("/api/setup/status")
+    assert status_response.status_code == 200
+    assert status_response.json()["required"] is True
+    apply_csrf_headers(client)
+
+    recovered_password = "RecoveredVeryStrongPassword!2026"
+    response = client.post(
+        "/api/setup/complete",
+        json={
+            "admin_display_name": "Recovered Admin",
+            "admin_email": TEST_ADMIN_EMAIL,
+            "admin_password": recovered_password,
+            "admin_password_confirm": recovered_password,
+            "initial_workspace_name": "Demo Project",
+            "initial_workspace_path": str(workspace_root),
+            "ollama_host": "http://127.0.0.1:11434",
+            "model_name": "qwen3-coder:30b",
+            "router_model_name": "qwen2.5-coder:14b",
+            "access_mode": "approval",
+            "auth_cookie_secure": True,
+            "public_base_url": "https://testserver",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["auth"]["authenticated"] is True
+    assert env_path.exists()
+    assert recovered_password not in env_path.read_text(encoding="utf-8")
+
+    old_password_client = TestClient(app, base_url=TEST_ORIGIN)
+    old_password_session = old_password_client.get("/api/auth/session")
+    assert old_password_session.status_code == 200
+    apply_csrf_headers(old_password_client)
+    old_password_login = old_password_client.post(
+        "/api/auth/login",
+        json={"email": TEST_ADMIN_EMAIL, "password": TEST_ADMIN_PASSWORD},
+    )
+    assert old_password_login.status_code == 401
+
+    recovered_client = TestClient(app, base_url=TEST_ORIGIN)
+    recovered_session = recovered_client.get("/api/auth/session")
+    assert recovered_session.status_code == 200
+    apply_csrf_headers(recovered_client)
+    recovered_login = recovered_client.post(
+        "/api/auth/login",
+        json={"email": TEST_ADMIN_EMAIL, "password": recovered_password},
+    )
+    assert recovered_login.status_code == 200
+    assert recovered_login.json()["authenticated"] is True
 
 
 def test_new_chat_requires_explicit_workspace_selection(tmp_path):

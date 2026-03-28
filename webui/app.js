@@ -1593,6 +1593,9 @@ function setupModelCandidates() {
 }
 
 function setupReasonCopy(reason) {
+  if (reason === "missing_runtime_env") {
+    return "Die gespeicherte Laufzeitkonfiguration fehlt. Der Assistent legt die .env neu an und stellt den Administrator-Zugang wieder her.";
+  }
   if (reason === "missing_auth_secret_key") {
     return "Es wurde noch kein dauerhafter Security-Secret-Key eingerichtet. Der Assistent erzeugt ihn fuer dich und speichert ihn in der .env.";
   }

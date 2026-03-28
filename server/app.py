@@ -48,6 +48,7 @@ class RuntimeBundle:
     setup_service: SetupService
     setup_required: bool = False
     setup_reason: str | None = None
+    env_file_present_at_startup: bool = False
 
 
 def create_app(base_config: AppConfig | None = None) -> FastAPI:
@@ -62,7 +63,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
                 bundle.auth_service.store.purge_expired_sessions,
                 datetime.now(timezone.utc),
             )
-        if not bundle.setup_required:
+        setup_required, _ = _current_setup_state(bundle)
+        if not setup_required:
             await asyncio.to_thread(bundle.model_manager.ensure_recommended)
             if bundle.config.warmup_models_on_startup:
                 asyncio.create_task(asyncio.to_thread(bundle.model_manager.warmup_preferred_models))
@@ -89,7 +91,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     async def require_auth(request: Request, response: Response):
         bundle = current_runtime()
-        if bundle.setup_required:
+        setup_required, _ = _current_setup_state(bundle)
+        if setup_required:
             raise HTTPException(
                 status_code=503,
                 detail="Der Setup-Assistent muss zuerst abgeschlossen werden.",
@@ -100,7 +103,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     async def require_csrf(request: Request, response: Response):
         bundle = current_runtime()
-        if bundle.setup_required:
+        setup_required, _ = _current_setup_state(bundle)
+        if setup_required:
             raise HTTPException(
                 status_code=503,
                 detail="Der Setup-Assistent muss zuerst abgeschlossen werden.",
@@ -112,7 +116,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
 
     async def require_setup_csrf(request: Request, response: Response):
         bundle = current_runtime()
-        if not bundle.setup_required:
+        setup_required, _ = _current_setup_state(bundle)
+        if not setup_required:
             raise HTTPException(status_code=409, detail="Der Setup-Assistent wurde bereits abgeschlossen.")
         if bundle.auth_service is None:
             raise HTTPException(status_code=503, detail="Setup-Schutz konnte nicht initialisiert werden.")
@@ -150,7 +155,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         payload: LoginRequest,
     ) -> AuthStatusResponse:
         bundle = current_runtime()
-        if bundle.setup_required:
+        setup_required, _ = _current_setup_state(bundle)
+        if setup_required:
             raise HTTPException(
                 status_code=503,
                 detail="Der Setup-Assistent muss zuerst abgeschlossen werden.",
@@ -176,8 +182,10 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     async def setup_status(request: Request, response: Response) -> SetupStatusResponse:
         bundle = current_runtime()
         if bundle.auth_service is not None:
-            bundle.auth_service.ensure_csrf_cookie(request, response, None)
+            context = bundle.auth_service.resolve_session(request, response)
+            bundle.auth_service.ensure_csrf_cookie(request, response, context)
         catalog = bundle.model_manager.catalog()
+        setup_required, setup_reason = _current_setup_state(bundle)
         return bundle.setup_service.build_status(
             config=bundle.config,
             password_policy=(
@@ -185,8 +193,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
                 if bundle.auth_service is not None
                 else _default_password_policy()
             ),
-            setup_required=bundle.setup_required,
-            setup_reason=bundle.setup_reason,
+            setup_required=setup_required,
+            setup_reason=setup_reason,
             installed_models=catalog["installed_models"],
             recommended_models=catalog["recommended_models"],
         )
@@ -202,7 +210,8 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         payload: SetupCompleteRequest,
     ) -> SetupCompleteResponse:
         bundle = current_runtime()
-        if not bundle.setup_required:
+        setup_required, _ = _current_setup_state(bundle)
+        if not setup_required:
             raise HTTPException(status_code=409, detail="Der Setup-Assistent wurde bereits abgeschlossen.")
         if bundle.auth_service is None:
             raise HTTPException(status_code=503, detail="Der Setup-Modus ist nicht verfuegbar.")
@@ -227,11 +236,18 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         provisional_auth_service = AuthService(next_config)
 
         try:
-            provisional_auth_service.create_initial_admin(
-                email=payload.admin_email,
-                password=payload.admin_password,
-                display_name=payload.admin_display_name,
-            )
+            if provisional_auth_service.store.count_users() > 0:
+                provisional_auth_service.recover_admin_access(
+                    email=payload.admin_email,
+                    password=payload.admin_password,
+                    display_name=payload.admin_display_name,
+                )
+            else:
+                provisional_auth_service.create_initial_admin(
+                    email=payload.admin_email,
+                    password=payload.admin_password,
+                    display_name=payload.admin_display_name,
+                )
         except AuthBootstrapError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
@@ -475,6 +491,7 @@ def _build_runtime(base_config: AppConfig) -> RuntimeBundle:
     task_manager = TaskManager(config)
     model_manager = ModelManager(config)
     setup_service = SetupService(config.workspace_path / ".env")
+    env_file_present_at_startup = setup_service.has_env_file()
     auth_service: AuthService | None = None
     setup_required = False
     setup_reason: str | None = None
@@ -511,7 +528,37 @@ def _build_runtime(base_config: AppConfig) -> RuntimeBundle:
         setup_service=setup_service,
         setup_required=setup_required,
         setup_reason=setup_reason,
+        env_file_present_at_startup=env_file_present_at_startup,
     )
+
+
+def _current_setup_state(bundle: RuntimeBundle) -> tuple[bool, str | None]:
+    if not bundle.config.auth_enabled:
+        return False, None
+
+    has_env_file = bundle.setup_service.has_env_file()
+    has_users = bool(bundle.auth_service and bundle.auth_service.store.count_users() > 0)
+    missing_bootstrap_credentials = (
+        not bundle.config.auth_initial_admin_email or not bundle.config.auth_initial_admin_password
+    )
+
+    if (
+        bundle.env_file_present_at_startup
+        and not has_env_file
+        and has_users
+        and missing_bootstrap_credentials
+    ):
+        return True, "missing_runtime_env"
+
+    if not bundle.config.auth_secret_key:
+        if not has_env_file and has_users:
+            return True, "missing_runtime_env"
+        return True, bundle.setup_reason or "missing_auth_secret_key"
+
+    if bundle.setup_required:
+        return True, bundle.setup_reason
+
+    return False, None
 
 
 def _sse(event: str, payload: dict) -> str:

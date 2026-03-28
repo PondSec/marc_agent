@@ -189,6 +189,62 @@ class AuthService:
         )
         return user
 
+    def recover_admin_access(
+        self,
+        *,
+        email: str,
+        password: str,
+        display_name: str | None = None,
+    ) -> AuthUserRecord:
+        if not self.config.auth_enabled:
+            raise AuthBootstrapError("Authentication is disabled.")
+
+        normalized_email = self.normalize_email(email)
+        display = str(display_name or self.config.auth_initial_admin_name).strip() or self.config.auth_initial_admin_name
+        self.validate_password_policy(
+            password,
+            email=normalized_email,
+            display_name=display,
+        )
+
+        now = self.now().isoformat()
+        existing = self.store.get_user_by_email(normalized_email)
+        password_hash = self.password_hasher.hash(password)
+
+        if existing is None:
+            user = self.store.create_user(
+                user_id=uuid4().hex,
+                email=normalized_email,
+                display_name=display,
+                password_hash=password_hash,
+                role="admin",
+                totp_secret=None,
+                now=now,
+            )
+            outcome = "created_recovery_admin"
+        else:
+            self.store.recover_admin_access(
+                user_id=existing.id,
+                display_name=display,
+                password_hash=password_hash,
+                changed_at=now,
+            )
+            user = self.store.get_user_by_id(existing.id)
+            outcome = "recovered_admin_access"
+
+        self.store.revoke_all_sessions(now)
+        self.store.record_auth_event(
+            event_type="bootstrap_admin",
+            outcome=outcome,
+            occurred_at=now,
+            email=normalized_email,
+            user_id=user.id if user else None,
+            details={"mfa_reset": True, "source": "setup_recovery"},
+        )
+        if user is None:
+            raise AuthBootstrapError("Admin recovery could not be completed.")
+        return user
+
     def build_auth_status(
         self,
         context: AuthContext | None = None,

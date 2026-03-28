@@ -179,6 +179,37 @@ class AuthStore:
                 (password_hash, changed_at, changed_at, user_id),
             )
 
+    def recover_admin_access(
+        self,
+        *,
+        user_id: str,
+        display_name: str,
+        password_hash: str,
+        changed_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE users
+                SET display_name = ?,
+                    password_hash = ?,
+                    role = 'admin',
+                    is_active = 1,
+                    totp_secret = ?,
+                    updated_at = ?,
+                    password_changed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    display_name,
+                    password_hash,
+                    None,
+                    changed_at,
+                    changed_at,
+                    user_id,
+                ),
+            )
+
     def record_successful_login(self, *, user_id: str, logged_in_at: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -291,6 +322,18 @@ class AuthStore:
                 (revoked_at, session_id),
             )
         return cursor.rowcount > 0
+
+    def revoke_all_sessions(self, revoked_at: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sessions
+                SET revoked_at = COALESCE(revoked_at, ?)
+                WHERE revoked_at IS NULL
+                """,
+                (revoked_at,),
+            )
+        return int(cursor.rowcount or 0)
 
     def purge_expired_sessions(self, now: datetime) -> None:
         now_iso = now.astimezone(timezone.utc).isoformat()
