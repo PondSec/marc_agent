@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import mimetypes
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from config.settings import AGENT_NAME, AppConfig
 from llm.ollama_client import OllamaClient
@@ -30,11 +34,14 @@ from server.schemas import (
     WorkspaceUpdateRequest,
 )
 from server.task_manager import (
+    ExportArchive,
     SessionBusyError,
+    SessionNotFoundError,
     TaskAlreadyRunningError,
     TaskManager,
     WorkspaceBusyError,
     WorkspaceNotFoundError,
+    WorkspacePreviewUnavailableError,
     WorkspaceRequiredError,
 )
 
@@ -128,6 +135,72 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
     async def index() -> FileResponse:
         return FileResponse(
             static_dir / "index.html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+    @app.get("/preview/workspaces/{workspace_id}", include_in_schema=False, dependencies=[Depends(require_auth)])
+    async def open_workspace_preview(workspace_id: str) -> Response:
+        task_manager = current_runtime().task_manager
+        try:
+            preview = task_manager.detect_workspace_preview(workspace_id)
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspacePreviewUnavailableError as exc:
+            return HTMLResponse(
+                _render_preview_message_page(
+                    title="Keine Cloud-Vorschau verfuegbar",
+                    summary=str(exc),
+                    details=[],
+                    tone="warning",
+                ),
+                status_code=404,
+            )
+
+        if preview.kind == "static":
+            target = quote(preview.entry_path, safe="/")
+            return RedirectResponse(url=f"/preview/workspaces/{workspace_id}/{target}", status_code=307)
+
+        result = task_manager.run_python_preview(workspace_id)
+        return HTMLResponse(_render_python_preview_page(result))
+
+    @app.get(
+        "/preview/workspaces/{workspace_id}/{preview_path:path}",
+        include_in_schema=False,
+        dependencies=[Depends(require_auth)],
+    )
+    async def serve_workspace_preview_file(workspace_id: str, preview_path: str) -> Response:
+        task_manager = current_runtime().task_manager
+        try:
+            preview = task_manager.detect_workspace_preview(workspace_id)
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspacePreviewUnavailableError as exc:
+            return HTMLResponse(
+                _render_preview_message_page(
+                    title="Keine Cloud-Vorschau verfuegbar",
+                    summary=str(exc),
+                    details=[],
+                    tone="warning",
+                ),
+                status_code=404,
+            )
+
+        if preview.kind != "static":
+            raise HTTPException(status_code=404, detail="This workspace preview is not a static website.")
+
+        workspace_root = Path(preview.workspace_root).expanduser().resolve()
+        target = (workspace_root / preview_path).resolve(strict=False)
+        try:
+            target.relative_to(workspace_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Preview path escapes workspace root.") from exc
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="Preview file not found.")
+
+        media_type, _ = mimetypes.guess_type(str(target))
+        return FileResponse(
+            target,
+            media_type=media_type or "application/octet-stream",
             headers={"Cache-Control": "no-store, max-age=0"},
         )
 
@@ -358,6 +431,17 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace not found.")
         return workspace
 
+    @app.get(
+        "/api/workspaces/{workspace_id}/download",
+        dependencies=[Depends(require_auth)],
+    )
+    async def download_workspace(workspace_id: str) -> FileResponse:
+        try:
+            bundle = current_runtime().task_manager.build_workspace_export(workspace_id)
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _build_export_response(bundle, current_runtime().task_manager)
+
     @app.get("/api/sessions", response_model=list[SessionSummary], dependencies=[Depends(require_auth)])
     async def list_sessions(limit: int = Query(default=100, ge=1, le=500)) -> list[SessionSummary]:
         return current_runtime().task_manager.list_sessions(limit=limit)
@@ -375,6 +459,19 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         if task_manager.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="Session not found.")
         return [record.model_dump() for record in task_manager.get_logs(session_id)]
+
+    @app.get(
+        "/api/sessions/{session_id}/download",
+        dependencies=[Depends(require_auth)],
+    )
+    async def download_session_handoff(session_id: str) -> FileResponse:
+        try:
+            bundle = current_runtime().task_manager.build_session_handoff(session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspaceRequiredError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _build_export_response(bundle, current_runtime().task_manager)
 
     @app.post(
         "/api/tasks",
@@ -563,6 +660,199 @@ def _current_setup_state(bundle: RuntimeBundle) -> tuple[bool, str | None]:
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _build_export_response(bundle: ExportArchive, task_manager: TaskManager) -> FileResponse:
+    return FileResponse(
+        bundle.archive_path,
+        media_type="application/zip",
+        filename=bundle.download_name,
+        headers={"Cache-Control": "no-store, max-age=0"},
+        background=BackgroundTask(task_manager.cleanup_export_archive, bundle),
+    )
+
+
+def _render_preview_message_page(
+    *,
+    title: str,
+    summary: str,
+    details: list[str],
+    tone: str,
+) -> str:
+    accent = "#d97706" if tone == "warning" else "#2563eb"
+    detail_markup = "".join(f"<li>{html.escape(item)}</li>" for item in details)
+    return f"""<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{html.escape(title)}</title>
+    <style>
+      :root {{
+        color-scheme: dark;
+        --bg: #08111f;
+        --panel: rgba(10, 20, 36, 0.9);
+        --line: rgba(148, 163, 184, 0.18);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: {accent};
+      }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 32px;
+        background:
+          radial-gradient(circle at top, rgba(37, 99, 235, 0.18), transparent 38%),
+          linear-gradient(180deg, #07111d, #030712);
+        color: var(--text);
+        font: 16px/1.6 system-ui, sans-serif;
+      }}
+      main {{
+        width: min(760px, 100%);
+        padding: 28px;
+        border-radius: 24px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        box-shadow: 0 30px 70px rgba(2, 6, 23, 0.45);
+      }}
+      h1 {{ margin: 0 0 12px; font-size: clamp(28px, 4vw, 42px); }}
+      p {{ margin: 0; color: var(--muted); }}
+      ul {{ margin: 18px 0 0; padding-left: 22px; color: var(--text); }}
+      .badge {{
+        display: inline-flex;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(217, 119, 6, 0.14);
+        color: var(--accent);
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-size: 12px;
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="badge">Cloud-Vorschau</span>
+      <h1>{html.escape(title)}</h1>
+      <p>{html.escape(summary)}</p>
+      {"<ul>" + detail_markup + "</ul>" if detail_markup else ""}
+    </main>
+  </body>
+</html>"""
+
+
+def _render_python_preview_page(result: dict[str, object]) -> str:
+    success = bool(result.get("success"))
+    timeout = bool(result.get("timeout"))
+    title = f"{result.get('workspace_name') or 'Workspace'} | Python-Preview"
+    summary = "Der Python-Lauf wurde erfolgreich beendet." if success else "Der Python-Lauf ist fehlgeschlagen."
+    if timeout:
+        summary = "Der Python-Lauf wurde wegen Timeout abgebrochen."
+    stdout = str(result.get("stdout") or "").strip() or "(keine Ausgabe)"
+    stderr = str(result.get("stderr") or "").strip() or "(keine Fehlerausgabe)"
+    command = str(result.get("command") or "")
+    exit_code = result.get("exit_code")
+    details = [
+        f"Einstiegspunkt: {result.get('entry_path') or '-'}",
+        f"Befehl: {command or '-'}",
+        f"Exit-Code: {exit_code if exit_code is not None else 'timeout'}",
+    ]
+    return f"""<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{html.escape(title)}</title>
+    <style>
+      :root {{
+        color-scheme: dark;
+        --bg: #050816;
+        --panel: rgba(8, 15, 29, 0.92);
+        --line: rgba(148, 163, 184, 0.18);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: {"#22c55e" if success else "#f97316"};
+      }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        padding: 24px;
+        background:
+          radial-gradient(circle at top, rgba(34, 197, 94, 0.12), transparent 34%),
+          linear-gradient(180deg, #050816, #020617);
+        color: var(--text);
+        font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
+      }}
+      .shell {{
+        max-width: 1100px;
+        margin: 0 auto;
+        display: grid;
+        gap: 18px;
+      }}
+      .hero, .panel {{
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background: var(--panel);
+        box-shadow: 0 24px 60px rgba(2, 6, 23, 0.36);
+      }}
+      .hero {{
+        padding: 26px 28px;
+      }}
+      .panel {{
+        padding: 22px;
+      }}
+      h1 {{ margin: 10px 0 8px; font-size: clamp(28px, 4vw, 40px); }}
+      p, li {{ color: var(--muted); }}
+      ul {{ margin: 16px 0 0; padding-left: 20px; }}
+      pre {{
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }}
+      .badge {{
+        display: inline-flex;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.65);
+        color: var(--accent);
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-size: 12px;
+      }}
+      .grid {{
+        display: grid;
+        gap: 18px;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      }}
+      h2 {{ margin: 0 0 14px; font-size: 18px; }}
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="hero">
+        <span class="badge">Cloud-Run</span>
+        <h1>{html.escape(title)}</h1>
+        <p>{html.escape(summary)}</p>
+        <ul>{"".join(f"<li>{html.escape(item)}</li>" for item in details)}</ul>
+      </section>
+      <section class="grid">
+        <article class="panel">
+          <h2>Stdout</h2>
+          <pre>{html.escape(stdout)}</pre>
+        </article>
+        <article class="panel">
+          <h2>Stderr</h2>
+          <pre>{html.escape(stderr)}</pre>
+        </article>
+      </section>
+    </div>
+  </body>
+</html>"""
 
 
 def _fetch_installed_ollama_models(config: AppConfig) -> list[dict]:

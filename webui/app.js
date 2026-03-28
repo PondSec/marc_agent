@@ -608,6 +608,69 @@ function requestCommitAndPush() {
   });
 }
 
+function triggerBrowserDownload(url) {
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.rel = "noopener";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+function downloadSessionHandoff(sessionId) {
+  const session =
+    (state.activeSession && state.activeSession.id === sessionId ? state.activeSession : null) ||
+    state.sessions.find((item) => item.id === sessionId);
+  if (!session) {
+    showToast("Es ist noch kein Thread fuer den Handoff ausgewaehlt.", "error");
+    return;
+  }
+  if (isSessionRunning(session)) {
+    showToast("Warte bitte, bis der aktuelle Lauf abgeschlossen ist.", "error");
+    return;
+  }
+  if (!Array.isArray(session.changed_files) || !session.changed_files.length) {
+    showToast("Dieser Thread hat aktuell keine geaenderten Dateien fuer ein Handoff-Bundle.", "error");
+    return;
+  }
+  triggerBrowserDownload(`/api/sessions/${session.id}/download`);
+  showToast("Handoff-Bundle wird heruntergeladen.", "success");
+}
+
+function downloadWorkspaceExport(workspaceId) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId) || selectedWorkspace();
+  if (!workspace) {
+    showToast("Waehle zuerst ein Projekt fuer den Export aus.", "error");
+    return;
+  }
+  if (state.activeSession && isSessionRunning(state.activeSession)) {
+    showToast("Warte bitte, bis der aktuelle Lauf abgeschlossen ist.", "error");
+    return;
+  }
+  triggerBrowserDownload(`/api/workspaces/${workspace.id}/download`);
+  showToast("Workspace-Export wird vorbereitet.", "success");
+}
+
+function openWorkspacePreview(workspaceId) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId) || selectedWorkspace();
+  if (!workspace) {
+    showToast("Waehle zuerst ein Projekt fuer die Cloud-Vorschau aus.", "error");
+    return;
+  }
+  if (state.activeSession && isSessionRunning(state.activeSession)) {
+    showToast("Starte die Vorschau bitte erst nach dem aktuellen Lauf.", "error");
+    return;
+  }
+  const previewUrl = `/preview/workspaces/${workspace.id}`;
+  const opened = window.open(previewUrl, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    window.location.href = previewUrl;
+    return;
+  }
+  showToast("Cloud-Vorschau in neuem Tab geoeffnet.", "success");
+}
+
 async function deleteSession(sessionId) {
   const session = state.sessions.find((item) => item.id === sessionId);
   if (!session) {
@@ -895,6 +958,21 @@ function handleClick(event) {
 
   if (action === "commit-push") {
     requestCommitAndPush();
+    return;
+  }
+
+  if (action === "download-session-handoff") {
+    downloadSessionHandoff(target.dataset.sessionId);
+    return;
+  }
+
+  if (action === "download-workspace-export") {
+    downloadWorkspaceExport(target.dataset.workspaceId);
+    return;
+  }
+
+  if (action === "open-workspace-preview") {
+    openWorkspacePreview(target.dataset.workspaceId);
     return;
   }
 
@@ -2175,9 +2253,13 @@ function renderExecutionProfileOptions() {
 
 function renderTopBar() {
   const workspace = workspaceForSession(state.activeSession) || selectedWorkspace();
-  const commitDisabled = !workspace || isSessionRunning(state.activeSession);
   const session = state.activeSession;
+  const commitDisabled = !workspace || isSessionRunning(state.activeSession);
   const deleteDisabled = !session || isSessionRunning(session);
+  const previewDisabled = !workspace || isSessionRunning(session);
+  const handoffDisabled =
+    !session || isSessionRunning(session) || !Array.isArray(session.changed_files) || !session.changed_files.length;
+  const exportDisabled = !workspace || isSessionRunning(session);
   const statusTone = session ? sessionStatusTone(session) : "muted";
   const statusText = session ? sessionBadgeText(session) : "Bereit";
   const title = session
@@ -2205,12 +2287,56 @@ function renderTopBar() {
         <div class="thread-toolbar">
           <span class="thread-toolbar-status tone-${escapeHtml(statusTone)}">${escapeHtml(statusText)}</span>
           <button
+            class="icon-button top-bar-icon"
+            type="button"
+            data-action="open-workspace-preview"
+            data-workspace-id="${escapeHtml(workspace?.id || "")}"
+            aria-label="Workspace in der Cloud starten"
+            title="${escapeAttribute(
+              previewDisabled
+                ? "Die Vorschau ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
+                : "Workspace direkt auf dem Agent-Server testen",
+            )}"
+            ${previewDisabled ? "disabled" : ""}
+          >
+            ${icon("play")}
+          </button>
+          <button
+            class="button-secondary"
+            type="button"
+            data-action="download-session-handoff"
+            data-session-id="${escapeHtml(session?.id || "")}"
+            title="${escapeAttribute(
+              handoffDisabled
+                ? "Der Handoff ist verfuegbar, sobald ein abgeschlossener Thread Dateien geaendert hat."
+                : "Nur die geaenderten Dateien, Report und Logs herunterladen",
+            )}"
+            ${handoffDisabled ? "disabled" : ""}
+          >
+            Aenderungen laden
+          </button>
+          <button
             class="button-secondary"
             type="button"
             data-action="${workspace ? "new-chat" : "open-workspace-modal"}"
             ${workspace ? `data-workspace-id="${escapeHtml(workspace.id)}"` : ""}
           >
             Neuer Thread
+          </button>
+          <button
+            class="icon-button top-bar-icon"
+            type="button"
+            data-action="download-workspace-export"
+            data-workspace-id="${escapeHtml(workspace?.id || "")}"
+            aria-label="Kompletten Workspace herunterladen"
+            title="${escapeAttribute(
+              exportDisabled
+                ? "Der Workspace-Export ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
+                : "Kompletten Workspace als Zip herunterladen",
+            )}"
+            ${exportDisabled ? "disabled" : ""}
+          >
+            ${icon("download")}
           </button>
           <button
             class="icon-button top-bar-icon"
@@ -5606,6 +5732,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M3.5 14.5V16.5h2l8.9-8.9-2-2zM12.6 4.6l2 2 1-1a1.4 1.4 0 1 0-2-2z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     arrow:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 10h10M10.5 4.5 16 10l-5.5 5.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"/></svg>',
+    play:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M7 5.5v9l7-4.5z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     stop:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor"/></svg>',
     close:
@@ -5614,6 +5742,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5.5 6.5h9M8 6.5V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M7 8.5v6M10 8.5v6M13 8.5v6M6.5 6.5l.6 9a1.8 1.8 0 0 0 1.8 1.5h2.2a1.8 1.8 0 0 0 1.8-1.5l.6-9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     "git-push":
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 14.5h8a2 2 0 0 0 2-2V9.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><path d="M10 12.5V4.5M6.8 7.7 10 4.5l3.2 3.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
+    download:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M10 4.5v7.5M6.8 9.8 10 13l3.2-3.2M4.5 14.5h11" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     sliders:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 5.5h12M4 10h12M4 14.5h12" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.6"/><circle cx="7" cy="5.5" r="1.6" fill="currentColor"/><circle cx="12.5" cy="10" r="1.6" fill="currentColor"/><circle cx="9" cy="14.5" r="1.6" fill="currentColor"/></svg>',
     "chevron-right":

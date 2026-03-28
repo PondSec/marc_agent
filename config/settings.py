@@ -121,6 +121,7 @@ class AppConfig:
     ollama_num_ctx: int = 8_192
     router_num_ctx: int = 2_048
     ollama_temperature: float = 0.1
+    auto_install_recommended_models: bool = True
     warmup_models_on_startup: bool = True
     warmup_timeout: int = 45
     auth_enabled: bool = True
@@ -260,6 +261,13 @@ class AppConfig:
                 pick("OLLAMA_TEMPERATURE", defaults.ollama_temperature),
                 defaults.ollama_temperature,
             ),
+            auto_install_recommended_models=_parse_bool(
+                pick(
+                    "AUTO_INSTALL_RECOMMENDED_MODELS",
+                    defaults.auto_install_recommended_models,
+                ),
+                defaults.auto_install_recommended_models,
+            ),
             warmup_models_on_startup=_parse_bool(
                 pick("WARMUP_MODELS_ON_STARTUP", defaults.warmup_models_on_startup),
                 defaults.warmup_models_on_startup,
@@ -315,7 +323,10 @@ class AppConfig:
                 defaults.auth_min_password_length,
             ),
             security_allowed_hosts=_parse_csv_list(
-                pick("ALLOWED_HOSTS", defaults.security_allowed_hosts),
+                pick(
+                    "SECURITY_ALLOWED_HOSTS",
+                    pick("ALLOWED_HOSTS", defaults.security_allowed_hosts),
+                ),
                 defaults.security_allowed_hosts,
             ),
             cors_allowed_origins=_parse_csv_list(

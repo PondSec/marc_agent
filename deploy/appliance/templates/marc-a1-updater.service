@@ -1,0 +1,10 @@
+[Unit]
+Description=MARC A1 autonomous updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/marc-a1-updater
+StandardOutput=journal
+StandardError=journal

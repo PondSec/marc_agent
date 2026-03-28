@@ -1,0 +1,32 @@
+[Unit]
+Description=MARC A1 coding appliance
+After=network-online.target marc-a1-network-fallback.service ollama.service
+Wants=network-online.target marc-a1-network-fallback.service ollama.service
+
+[Service]
+Type=simple
+User=@@INSTALL_USERNAME@@
+Group=@@INSTALL_USERNAME@@
+WorkingDirectory=/opt/marc-a1/app
+Environment=PYTHONUNBUFFERED=1
+Environment=MARC_A1_AUTO_START_OLLAMA=0
+ExecStartPre=/bin/sh -c 'until curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; do sleep 1; done'
+ExecStart=/usr/bin/python3 /opt/marc-a1/app/main.py --host 0.0.0.0 --port 8000 --workspace @@WORKSPACE_ROOT@@ --access-mode @@ACCESS_MODE@@
+Restart=always
+RestartSec=3
+Nice=-5
+OOMScoreAdjust=-700
+CPUWeight=800
+IOWeight=800
+TasksMax=infinity
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

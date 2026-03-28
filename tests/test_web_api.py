@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
 import time
+import zipfile
 from threading import Event
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from agent.models import FileChangeRecord, ToolCallRecord
+from agent.models import FileChangeRecord, SessionState, ToolCallRecord
 from config.settings import AppConfig
 from server.app import _with_available_models, create_app
 
@@ -887,3 +890,134 @@ def test_delete_workspace_removes_workspace_and_associated_chats(tmp_path):
     sessions_response = client.get("/api/sessions")
     assert sessions_response.status_code == 200
     assert sessions_response.json() == []
+
+
+def test_session_handoff_download_contains_changed_files_and_metadata(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    source_dir = workspace_root / "src"
+    source_dir.mkdir()
+    (source_dir / "game.py").write_text("print('ahoy')\n", encoding="utf-8")
+
+    session = SessionState(
+        task="baue ein spiel",
+        title="Battleship",
+        status="completed",
+        workspace_root=str(workspace_root),
+        workspace_id=workspace["id"],
+        workspace_label=workspace["name"],
+        final_response="Fertig",
+    )
+    session.changed_files = [
+        FileChangeRecord(path="src/game.py", operation="modify"),
+        FileChangeRecord(path="missing.txt", operation="delete"),
+    ]
+    session.touch()
+    app.state.task_manager.session_store.save(session)
+    (config.log_dir_path / f"{session.id}.jsonl").write_text(
+        '{"event":"task_finished"}\n',
+        encoding="utf-8",
+    )
+    (config.report_dir_path / f"{session.id}.json").write_text(
+        json.dumps({"summary": "ok"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    response = client.get(f"/api/sessions/{session.id}/download")
+
+    assert response.status_code == 200
+    assert "attachment" in response.headers.get("content-disposition", "")
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = set(archive.namelist())
+        assert "src/game.py" in names
+        assert "_marc_export/manifest.json" in names
+        assert "_marc_export/session.json" in names
+        assert "_marc_export/report.json" in names
+        assert "_marc_export/logs.jsonl" in names
+
+        manifest = json.loads(archive.read("_marc_export/manifest.json"))
+        assert manifest["bundle_type"] == "session_handoff"
+        assert any(item["path"] == "src/game.py" and item["included"] for item in manifest["changes"])
+        assert any(
+            item["path"] == "missing.txt" and item.get("reason") == "deleted"
+            for item in manifest["changes"]
+        )
+
+
+def test_workspace_export_download_includes_workspace_files_without_ignored_dirs(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    (workspace_root / "index.html").write_text("<h1>Preview</h1>\n", encoding="utf-8")
+    assets_dir = workspace_root / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "app.js").write_text("console.log('ready');\n", encoding="utf-8")
+    ignored_dir = workspace_root / "node_modules" / "pkg"
+    ignored_dir.mkdir(parents=True)
+    (ignored_dir / "index.js").write_text("ignored\n", encoding="utf-8")
+
+    response = client.get(f"/api/workspaces/{workspace['id']}/download")
+
+    assert response.status_code == 200
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = set(archive.namelist())
+        assert "index.html" in names
+        assert "assets/app.js" in names
+        assert "_marc_export/manifest.json" in names
+        assert "node_modules/pkg/index.js" not in names
+
+
+def test_workspace_preview_redirects_to_static_entry_and_serves_assets(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    (workspace_root / "index.html").write_text(
+        "<!doctype html><html><head><link rel='stylesheet' href='style.css'></head><body><h1>Cloud Preview</h1></body></html>",
+        encoding="utf-8",
+    )
+    (workspace_root / "style.css").write_text("body { color: red; }\n", encoding="utf-8")
+
+    redirect_response = client.get(f"/preview/workspaces/{workspace['id']}", follow_redirects=False)
+    assert redirect_response.status_code == 307
+    location = redirect_response.headers["location"]
+    assert location.endswith("/preview/workspaces/" + workspace["id"] + "/index.html")
+
+    html_response = client.get(location)
+    css_response = client.get(f"/preview/workspaces/{workspace['id']}/style.css")
+
+    assert html_response.status_code == 200
+    assert "Cloud Preview" in html_response.text
+    assert css_response.status_code == 200
+    assert "color: red" in css_response.text
+
+
+def test_workspace_preview_runs_python_entrypoint_when_no_static_site_exists(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    (workspace_root / "main.py").write_text("print('Hallo aus der Cloud')\n", encoding="utf-8")
+
+    response = client.get(f"/preview/workspaces/{workspace['id']}")
+
+    assert response.status_code == 200
+    assert "Python-Preview" in response.text
+    assert "Hallo aus der Cloud" in response.text

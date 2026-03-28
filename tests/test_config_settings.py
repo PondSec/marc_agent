@@ -35,3 +35,19 @@ def test_from_sources_allows_override_dict_to_replace_state_root(tmp_path, monke
 
     assert config.state_root_override == str(override_state_root)
     assert config.state_root == override_state_root.resolve()
+
+
+def test_from_sources_prefers_security_allowed_hosts_and_auto_install_flag(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    monkeypatch.chdir(workspace_root)
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace_root))
+    monkeypatch.setenv("ALLOWED_HOSTS", "legacy.example")
+    monkeypatch.setenv("SECURITY_ALLOWED_HOSTS", "agent.pondsec.com,192.168.30.33")
+    monkeypatch.setenv("AUTO_INSTALL_RECOMMENDED_MODELS", "0")
+
+    config = AppConfig.from_sources()
+
+    assert config.security_allowed_hosts == ("agent.pondsec.com", "192.168.30.33")
+    assert config.auto_install_recommended_models is False
