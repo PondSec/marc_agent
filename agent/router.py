@@ -76,6 +76,7 @@ class IntentRouter:
         payload: dict[str, Any] | None = None
         prompt = router_prompt(user_input, snapshot, session=session, mode="full")
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
+        initial_total_timeout = max(self.timeout + 18, self.timeout * 2)
         model_candidates = self._model_candidates()
         primary_model = model_candidates[0] if model_candidates else None
         reserve_model = model_candidates[1] if len(model_candidates) > 1 else None
@@ -87,6 +88,7 @@ class IntentRouter:
                 model=primary_model,
                 retries=0,
                 timeout=self.timeout,
+                total_timeout=initial_total_timeout,
                 num_ctx=self.num_ctx,
                 progress_callback=progress,
             ),
@@ -99,7 +101,7 @@ class IntentRouter:
             model_identifier=primary_model,
             backend_identifier="ollama",
             inactivity_timeout_seconds=self.timeout,
-            total_timeout_seconds=max(self.timeout + 18, self.timeout * 2),
+            total_timeout_seconds=initial_total_timeout,
             context_pressure_estimate=context_pressure,
             event_callback=self._progress_logger("router_generation_progress"),
         )
@@ -260,13 +262,16 @@ class IntentRouter:
     ) -> RouterOutput | None:
         try:
             repair_prompt = router_repair_prompt(invalid_payload, errors)
+            repair_timeout = max(self.timeout, 16)
+            repair_total_timeout = max(self.timeout + 18, 32)
             outcome = invoke_model(
                 lambda progress: self.llm.generate_json(
                     repair_prompt,
                     system=router_system_prompt(),
                     model=self._primary_model_name(),
                     retries=0,
-                    timeout=max(self.timeout, 16),
+                    timeout=repair_timeout,
+                    total_timeout=repair_total_timeout,
                     num_ctx=self.num_ctx,
                     progress_callback=progress,
                 ),
@@ -278,8 +283,8 @@ class IntentRouter:
                 prompt_variant="repair",
                 model_identifier=self._primary_model_name(),
                 backend_identifier="ollama",
-                inactivity_timeout_seconds=max(self.timeout, 16),
-                total_timeout_seconds=max(self.timeout + 18, 32),
+                inactivity_timeout_seconds=repair_timeout,
+                total_timeout_seconds=repair_total_timeout,
                 context_pressure_estimate=estimate_context_pressure(prompt_chars=len(repair_prompt)),
                 event_callback=self._progress_logger("router_generation_progress"),
             )
@@ -328,6 +333,7 @@ class IntentRouter:
         prompt_variant: str = "compact",
     ) -> tuple[RouterOutput, list[Any]] | None:
         retry_timeout = max(self.timeout + 8, 26)
+        retry_total_timeout = max(retry_timeout + 22, retry_timeout * 2)
         retry_num_ctx = self.num_ctx if prompt_variant == "full" else min(self.num_ctx, 2048)
         self._log(
             "router_retry_started",
@@ -350,6 +356,7 @@ class IntentRouter:
                     model=retry_model,
                     retries=0,
                     timeout=retry_timeout,
+                    total_timeout=retry_total_timeout,
                     num_ctx=retry_num_ctx,
                     progress_callback=progress,
                 ),
@@ -362,7 +369,7 @@ class IntentRouter:
                 model_identifier=retry_model,
                 backend_identifier="ollama",
                 inactivity_timeout_seconds=retry_timeout,
-                total_timeout_seconds=max(retry_timeout + 22, retry_timeout * 2),
+                total_timeout_seconds=retry_total_timeout,
                 context_pressure_estimate=estimate_context_pressure(prompt_chars=len(retry_prompt)),
                 event_callback=self._progress_logger("router_generation_progress"),
             )

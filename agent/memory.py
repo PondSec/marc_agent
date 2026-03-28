@@ -178,6 +178,7 @@ class RepoMemoryStore:
 
         validation_commands, workflow_commands = self._detect_commands(
             manifests=manifests,
+            test_files=test_files,
             build_files=build_files,
             deploy_files=deploy_files,
         )
@@ -351,6 +352,7 @@ class RepoMemoryStore:
         self,
         *,
         manifests: list[str],
+        test_files: list[str],
         build_files: list[str],
         deploy_files: list[str],
     ) -> tuple[list[ValidationCommand], list[ValidationCommand]]:
@@ -393,6 +395,10 @@ class RepoMemoryStore:
                         reason="Python repository detected.",
                     ),
                 )
+        if not any(item.kind == "test" for item in validation):
+            inferred_test_command = self._infer_python_test_command_from_test_files(test_files)
+            if inferred_test_command is not None:
+                self._add_command(validation, inferred_test_command)
 
         build_signal = any(
             token in item.lower()
@@ -427,6 +433,56 @@ class RepoMemoryStore:
         validation.sort(key=lambda item: (item.priority, item.command))
         workflow.sort(key=lambda item: (item.priority, item.command))
         return validation[:8], workflow[:8]
+
+    def _infer_python_test_command_from_test_files(
+        self,
+        test_files: list[str],
+    ) -> ValidationCommand | None:
+        python_tests = [
+            path
+            for path in test_files
+            if Path(path).suffix.lower() == ".py"
+        ]
+        if not python_tests:
+            return None
+
+        saw_pytest_signal = False
+        saw_unittest_signal = False
+        for relative_path in python_tests[:12]:
+            target = self.workspace.resolve_path(relative_path)
+            try:
+                content = target.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            snippet = content[:4_000]
+            lowered = snippet.lower()
+            if "import pytest" in lowered or "from pytest" in lowered or "@pytest." in lowered:
+                saw_pytest_signal = True
+            if (
+                "import unittest" in lowered
+                or "from unittest" in lowered
+                or "unittest.testcase" in lowered
+                or "(unittest.testcase)" in lowered
+            ):
+                saw_unittest_signal = True
+
+        if saw_pytest_signal:
+            return ValidationCommand(
+                command="python -m pytest",
+                kind="test",
+                source="python-test-files",
+                priority=10,
+                reason="pytest-style Python tests detected in the repository.",
+            )
+        if saw_unittest_signal:
+            return ValidationCommand(
+                command="python -m unittest",
+                kind="test",
+                source="python-test-files",
+                priority=10,
+                reason="unittest-style Python tests detected in the repository.",
+            )
+        return None
 
     def _collect_package_json_commands(
         self,

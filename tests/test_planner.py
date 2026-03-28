@@ -15,6 +15,7 @@ from agent.models import (
     WorkspaceSnapshot,
 )
 from agent.planner import Planner
+from agent.prompts import _artifact_scoped_focus, generate_content_prompt, proposed_update_review_prompt
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
 from config.settings import AppConfig
@@ -325,6 +326,306 @@ def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
     )
 
 
+def test_planner_prefers_lightweight_semantic_review_for_small_validated_change_set(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "The requested CLI, docs, and tests changes are aligned.",
+                "confidence": 0.88,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": ["cli.py", "README.md", "tests/test_cli.py", "tests/__init__.py"],
+                "repair_hints": [],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the target."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the requested change."},
+            {"step": 3, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 4, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["cli.py", "README.md", "tests/test_cli.py"],
+        target_name="cli.py",
+    )
+    session = SessionState(
+        task="Fuege --state-root hinzu, aktualisiere README und erweitere den unittest.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        validation_status="passed",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest")
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="cli.py", operation="modify"),
+            FileChangeRecord(path="README.md", operation="modify"),
+            FileChangeRecord(path="tests/test_cli.py", operation="modify"),
+            FileChangeRecord(path="tests/__init__.py", operation="create"),
+        ]
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "cli.py").write_text("print('cli')\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_cli.py").write_text("print('tests')\n", encoding="utf-8")
+    (tmp_path / "tests" / "__init__.py").write_text("", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    prompt = llm.generate_json_calls[0]["args"][0]
+
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert "adds unrequested new sections, paragraphs, examples, commands, tests, or guidance" in prompt
+    assert "Treat explicit literal examples from the request as hard constraints" in prompt
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+
+
+def test_planner_keeps_primary_semantic_review_for_large_change_sets(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "The broader change set is internally consistent.",
+                "confidence": 0.81,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the targets."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the requested change."},
+            {"step": 3, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 4, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=[f"module_{index}.py" for index in range(7)],
+        target_name="module_0.py",
+    )
+    session = SessionState(
+        task="Implement a wider multi-file update.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        validation_status="passed",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest")
+    session.changed_files.extend(
+        FileChangeRecord(path=f"module_{index}.py", operation="modify")
+        for index in range(7)
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+    for index in range(7):
+        (tmp_path / f"module_{index}.py").write_text("value = 1\n", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3-coder:30b"
+
+
+def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+                "confidence": 0.84,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the target."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the requested change."},
+            {"step": 3, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 4, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["cli.py", "README.md", "tests/test_cli.py"],
+        target_name="cli.py",
+    )
+    session = SessionState(
+        task="Fuege eine kleine CLI-Option hinzu und halte die bestehenden Optionen stabil.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest")
+    session.changed_files.append(FileChangeRecord(path="README.md", operation="modify", diff="+ usage\n"))
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "tests/test_cli.py"},
+            success=True,
+            summary="Read tests/test_cli.py.",
+            output_excerpt="from cli import build_parser\n",
+        )
+    )
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="cli.py",
+        current_content="def build_parser():\n    return None\n",
+        proposed_content="def build_parser():\n    parser = None\n    return parser\n",
+    )
+
+    prompt = llm.generate_json_calls[0]["args"][0]
+
+    assert review.safe_to_write is True
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert '"task_understanding"' not in prompt
+    assert '"follow_up_context"' not in prompt
+
+
+def test_planner_prefers_lightweight_retry_after_review_rejection_for_small_updates(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": False,
+                "summary": "The proposal broadens scope by rewriting unrelated README guidance.",
+                "confidence": 0.61,
+                "blocking_issues": ["The draft adds unrelated guidance instead of only fixing the example order."],
+                "preservation_risks": [],
+                "repair_hints": ["Only reorder the existing usage example."],
+            },
+            {
+                "safe_to_write": True,
+                "summary": "The retry stays focused on the requested README example order.",
+                "confidence": 0.89,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            },
+        ],
+        text_payloads=[
+            "# Demo\n\n```bash\npython cli.py --config settings.json --verbose --state-root /tmp/state\n```\n",
+            "# Demo\n\n```bash\npython cli.py --config settings.json --state-root /tmp/state --verbose\n```\n",
+        ],
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested change."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 3, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["README.md", "tests/test_cli.py"],
+        target_name="README.md",
+    )
+    session = SessionState(
+        task="Korrigiere nur die Beispielreihenfolge in der README.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest")
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="README.md",
+        current_content="# Demo\n\n```bash\npython cli.py --config settings.json --verbose --state-root /tmp/state\n```\n",
+    )
+
+    retry_prompt = llm.generate_calls[1]["args"][0]
+
+    assert result.content is not None
+    assert "--state-root /tmp/state --verbose" in result.content
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] == 120
+    assert "Task understanding:" not in retry_prompt
+    assert "Follow-up context:" not in retry_prompt
+    assert "Task focus:" in retry_prompt
+    assert "Self-review feedback on the previous proposal:" in retry_prompt
+
+
+def test_planner_keeps_primary_retry_first_for_large_review_repair_updates(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": False,
+                "summary": "The proposal rewrites unrelated sections.",
+                "confidence": 0.58,
+                "blocking_issues": ["The change is too broad."],
+                "preservation_risks": [],
+                "repair_hints": ["Keep the wider document structure intact."],
+            },
+            {
+                "safe_to_write": True,
+                "summary": "The retry is now scoped appropriately.",
+                "confidence": 0.83,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            },
+        ],
+        text_payloads=[
+            "section = 'bad rewrite'\n",
+            "section = 'narrower rewrite'\n",
+        ],
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested change."},
+        ],
+        target_paths=["docs/guide.py"],
+        target_name="docs/guide.py",
+    )
+    session = SessionState(
+        task="Aktualisiere die groessere Guide-Datei.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    large_content = "\n".join(f"line_{index} = {index}" for index in range(400))
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="docs/guide.py",
+        current_content=large_content,
+    )
+
+    assert result.content == "section = 'narrower rewrite'"
+    assert llm.generate_calls[1]["kwargs"]["model"] == "qwen3-coder:30b"
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] == 180
+
+
 def test_planner_asks_for_clarification_when_router_requires_it(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -445,6 +746,1110 @@ def test_planner_generates_write_after_update_target_is_read(tmp_path):
     assert decision.tool_name == "write_file"
     assert decision.tool_args["path"] == "app/main.py"
     assert "updated" in decision.tool_args["content"]
+
+
+def test_planner_updates_after_all_explicit_targets_are_read_before_touching_snapshot_candidates(tmp_path):
+    (tmp_path / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_cli.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=3,
+        language_counts={"python": 2, "markdown": 1},
+        top_directories=["tests"],
+        important_files=["cli.py", "README.md", "tests/test_cli.py"],
+        focus_files=["cli.py", "README.md", "tests/test_cli.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["cli.py"],
+        repo_map=["tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m pytest"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI project with a supporting README and test file.",
+    )
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "read_relevant_files",
+                        "reason": "Inspect the explicit targets before editing them.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested update.",
+                    },
+                ],
+                target_paths=["cli.py", "README.md"],
+                target_name="cli.py",
+            )
+        ],
+        text_payloads=["def main():\n    return 1\n"],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Fuege eine neue CLI-Option hinzu und aktualisiere die README.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "cli.py"},
+                success=True,
+                summary="Read cli.py.",
+                output_excerpt=(tmp_path / "cli.py").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "README.md"},
+                success=True,
+                summary="Read README.md.",
+                output_excerpt=(tmp_path / "README.md").read_text(encoding="utf-8"),
+            ),
+        ]
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "cli.py"
+    assert "return 1" in decision.tool_args["content"]
+
+
+def test_planner_prefers_lightweight_model_for_low_risk_small_python_update(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    target = app_dir / "main.py"
+    original = "def main():\n    return 'old'\n"
+    updated = "def main():\n    return 'updated'\n"
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The update is focused and preserves the rest of the small Python file.",
+                "confidence": 0.88,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        text_payloads=[updated],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Aktualisiere die Python-Funktion in app/main.py fokussiert.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the current implementation before editing it.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Apply the focused Python change.",
+            },
+        ],
+        target_paths=["app/main.py"],
+        target_name="app/main.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.risk_level = "low"
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app/main.py"},
+            success=True,
+            summary="Read app/main.py.",
+            output_excerpt=original,
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app/main.py"
+    assert decision.tool_args["content"].strip() == updated.strip()
+    assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_calls[0]["kwargs"]["timeout"] >= 60
+
+
+def test_planner_keeps_primary_generation_for_high_risk_python_update(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    target = app_dir / "main.py"
+    original = "def main():\n    return 'old'\n"
+    updated = "def main():\n    return 'updated'\n"
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The update is acceptable.",
+                "confidence": 0.83,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        text_payloads=[updated],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Aendere app/main.py mit hoeherem Risiko.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the current implementation before editing it.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Apply the requested Python change.",
+            },
+        ],
+        target_paths=["app/main.py"],
+        target_name="app/main.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.risk_level = "high"
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app/main.py"},
+            success=True,
+            summary="Read app/main.py.",
+            output_excerpt=original,
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app/main.py"
+    assert decision.tool_args["content"].strip() == updated.strip()
+    assert llm.generate_calls[0]["kwargs"]["model"] is None
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 4096
+
+
+def test_planner_review_prompt_includes_recent_changed_file_evidence_for_cross_file_update(tmp_path):
+    cli_path = tmp_path / "cli.py"
+    readme_path = tmp_path / "README.md"
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_cli.py"
+    cli_path.write_text(
+        "def build_parser():\n"
+        "    parser.add_argument('--config')\n"
+        "    parser.add_argument('--state-root')\n"
+        "    parser.add_argument('--verbose', action='store_true')\n",
+        encoding="utf-8",
+    )
+    readme_path.write_text(
+        "# Demo\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    test_path.write_text("def test_cli_options():\n    assert True\n", encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The README update matches the already changed CLI behavior.",
+                "confidence": 0.84,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        text_payloads=[
+            "# Demo\n\n"
+            "```bash\n"
+            "python cli.py --config settings.json --state-root .marc --verbose\n"
+            "```\n"
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Aktualisiere die README passend zur neuen CLI-Option.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the README before editing it.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Document the already changed CLI behavior.",
+            },
+        ],
+        target_paths=["README.md"],
+        target_name="README.md",
+    )
+    payload["entities"]["target_paths"] = ["cli.py", "README.md", "tests/test_cli.py"]
+    payload["entities"]["constraints"] = [
+        "CLI functionality should remain unchanged",
+        "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required",
+        "Update README.md with correct example order",
+    ]
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.constraints = [
+        "CLI functionality should remain unchanged",
+        "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required",
+        "Update README.md with correct example order",
+    ]
+    session.changed_files.append(FileChangeRecord(path="cli.py", operation="write"))
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "cli.py"},
+                success=True,
+                summary="Read cli.py.",
+                output_excerpt=cli_path.read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "README.md"},
+                success=True,
+                summary="Read README.md.",
+                output_excerpt=readme_path.read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_cli.py"},
+                success=True,
+                summary="Read tests/test_cli.py.",
+                output_excerpt=test_path.read_text(encoding="utf-8"),
+            ),
+        ]
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    review_prompt = llm.generate_json_calls[0]["args"][0]
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert "Supporting artifact evidence:" in review_prompt
+    assert "Changed supporting artifacts already written:" in review_prompt
+    assert "Recent supporting context (may still be pending updates):" in review_prompt
+    assert "Judge whether writing this file now is safe as one step in the task" in review_prompt
+    assert "adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance" in review_prompt
+    assert "Treat explicit literal examples from the request as hard constraints" in review_prompt
+    assert "Use path_scope.current_write_requirements as the hard requirements for this file" in review_prompt
+    assert "Treat path_scope.other_pending_requirements as non-blocking for this file" in review_prompt
+    assert "Treat documentation command examples as illustrative usage" in review_prompt
+    assert '"path_scope"' in review_prompt
+    assert '"current_write_requirements"' in review_prompt
+    assert '"other_pending_requirements"' in review_prompt
+    assert "pending_target_artifacts" in review_prompt
+    assert "cli.py" in review_prompt
+    assert "--state-root" in review_prompt
+    assert "Update README.md with correct example order" in review_prompt
+    assert "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required" in review_prompt
+    assert '"task_understanding"' not in review_prompt
+    assert '"follow_up_context"' not in review_prompt
+
+
+def test_planner_surfaces_explicit_constraints_in_compact_generation_prompt(tmp_path):
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text(
+        "# Demo\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /path/to/state/root\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The README update stays narrowly focused.",
+                "confidence": 0.88,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        text_payloads=[
+            "# Demo\n\n"
+            "```bash\n"
+            "python cli.py --config settings.json --state-root /path/to/state/root --verbose\n"
+            "```\n"
+        ],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Korrigiere die Reihenfolge im README-Beispiel.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the focused README change."},
+        ],
+        target_paths=["README.md"],
+        target_name="README.md",
+    )
+    payload["entities"]["constraints"] = [
+        "README example order should be updated to --config settings.json --state-root /path/to/state/root --verbose.",
+        "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required.",
+    ]
+    payload["entities"]["target_paths"] = ["README.md", "tests/test_cli.py"]
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.constraints = [
+        "README example order should be updated to --config settings.json --state-root /path/to/state/root --verbose.",
+        "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required.",
+    ]
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "README.md"},
+            success=True,
+            summary="Read README.md.",
+            output_excerpt=readme_path.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    prompt = llm.generate_calls[0]["args"][0]
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert "Explicit constraints:" in prompt
+    assert "File-scoped focus:" in prompt
+    assert '"current_write_requirements"' in prompt
+    assert '"other_pending_requirements"' in prompt
+    assert "--config settings.json --state-root /path/to/state/root --verbose" in prompt
+    assert "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required." in prompt
+
+
+def test_planner_extracts_user_literal_examples_into_file_scoped_focus(tmp_path):
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text(
+        "# Demo\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /path/to/state/root\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The README update stays narrowly focused.",
+                "confidence": 0.88,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        text_payloads=[
+            "# Demo\n\n"
+            "```bash\n"
+            "python cli.py --config settings.json --state-root /path/to/state/root --verbose\n"
+            "```\n"
+        ],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task=(
+            "Bitte belasse die CLI-Funktionalitaet wie sie ist, "
+            "ergaenze aber einen unittest, der parser.parse_args(['--state-root', '/tmp/state']) prueft, "
+            "korrigiere die README-Beispielreihenfolge zu --config settings.json --state-root /path/to/state/root --verbose "
+            "und fuehre danach wieder python -m unittest aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the focused README change."},
+        ],
+        target_paths=["README.md", "tests/test_cli.py"],
+        target_name="README.md",
+    )
+    payload["entities"]["constraints"] = [
+        "CLI functionality should remain unchanged.",
+        "Update README.md with correct example order.",
+    ]
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.constraints = [
+        "CLI functionality should remain unchanged.",
+        "Update README.md with correct example order.",
+    ]
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "README.md"},
+            success=True,
+            summary="Read README.md.",
+            output_excerpt=readme_path.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    prompt = llm.generate_calls[0]["args"][0]
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert "File-scoped focus:" in prompt
+    assert '"literal_constraints"' in prompt
+    assert "--config settings.json --state-root /path/to/state/root --verbose" in prompt
+
+
+def test_artifact_scoped_focus_prefers_primary_target_and_derives_behavior_requirements(tmp_path):
+    current = (
+        "from __future__ import annotations\n\n\n"
+        "def normalize_name(value: str) -> str:\n"
+        "    cleaned = value.strip().lower()\n"
+        '    return "".join(char for char in cleaned if char.isalnum())\n'
+    )
+    (tmp_path / "text_utils.py").write_text(current, encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_text_utils.py").write_text(
+        "from text_utils import normalize_name\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Fix normalize_name in text_utils.py so it trims outer whitespace, lowercases text, "
+            "converts internal whitespace runs to single hyphens, and preserves existing hyphens. "
+            "Add or update unit tests. Validate with python -m unittest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the active implementation before editing it."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the focused change implied by the interpreted goal."},
+        ],
+        target_paths=["text_utils.py", "tests/test_text_utils.py"],
+        target_name="text_utils.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest")
+    session.task_state.output_expectation = (
+        "normalize_name function updated to trim outer whitespace, lowercase text, "
+        "convert internal whitespace runs to single hyphens, and preserve existing hyphens. "
+        "Unit tests added/updated."
+    )
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="text_utils.py", name="normalize_name", kind="function", role="primary_target", confidence=1.0),
+        TaskArtifact(path="tests/test_text_utils.py", name="unit tests for normalize_name", kind="test", role="validation_target", confidence=1.0),
+        TaskArtifact(path="text_utils.py", name="normalize_name", kind="function", role="primary_context", confidence=1.0),
+        TaskArtifact(path="tests/test_text_utils.py", name="unit tests for normalize_name", kind="test", role="supporting_context", confidence=1.0),
+    ]
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "text_utils.py",
+        current_content=current,
+    )
+
+    assert focus["artifact_role"] == "primary_target"
+    assert any("trim outer whitespace" in item.lower() for item in focus["current_write_requirements"])
+    assert any("lowercase text" in item.lower() for item in focus["current_write_requirements"])
+    assert any("single hyphens" in item.lower() for item in focus["current_write_requirements"])
+    assert any("unit tests" in item.lower() for item in focus["other_pending_requirements"])
+
+
+def test_compact_prompts_keep_latest_request_details_for_behavior_change_updates(tmp_path):
+    current = (
+        "from __future__ import annotations\n\n\n"
+        "def normalize_name(value: str) -> str:\n"
+        "    cleaned = value.strip().lower()\n"
+        '    return "".join(char for char in cleaned if char.isalnum())\n'
+    )
+    (tmp_path / "text_utils.py").write_text(current, encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_text_utils.py").write_text(
+        "from text_utils import normalize_name\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Fix normalize_name in text_utils.py so it trims outer whitespace, lowercases text, "
+            "converts internal whitespace runs to single hyphens, and preserves existing hyphens. "
+            "Add or update unit tests. Validate with python -m unittest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the focused change implied by the interpreted goal."},
+        ],
+        target_paths=["text_utils.py", "tests/test_text_utils.py"],
+        target_name="text_utils.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest")
+    session.task_state.output_expectation = (
+        "normalize_name function updated to trim outer whitespace, lowercase text, "
+        "convert internal whitespace runs to single hyphens, and preserve existing hyphens. "
+        "Unit tests added/updated."
+    )
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="text_utils.py", name="normalize_name", kind="function", role="primary_target", confidence=1.0),
+        TaskArtifact(path="tests/test_text_utils.py", name="unit tests for normalize_name", kind="test", role="validation_target", confidence=1.0),
+        TaskArtifact(path="text_utils.py", name="normalize_name", kind="function", role="primary_context", confidence=1.0),
+        TaskArtifact(path="tests/test_text_utils.py", name="unit tests for normalize_name", kind="test", role="supporting_context", confidence=1.0),
+    ]
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "text_utils.py"},
+            success=True,
+            summary="Read text_utils.py.",
+            output_excerpt=current,
+        )
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="text_utils.py",
+        current_content=current,
+        mode="compact",
+    )
+    review_prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="text_utils.py",
+        supporting_artifact_context="none",
+        current_excerpt=current,
+        proposed_excerpt=current,
+        diff_excerpt="fake diff",
+        mode="compact",
+    )
+
+    assert "Latest user request:" in prompt
+    assert "converts internal whitespace runs to single hyphens" in prompt
+    assert '"current_write_requirements"' in prompt
+    assert "lowercase text" in prompt
+    assert "Latest user request:" in review_prompt
+    assert "Do not treat an explicitly requested behavior change for this file as scope broadening" in review_prompt
+    assert "trim outer whitespace" in review_prompt
+
+
+def test_planner_blocks_missing_explicit_literal_constraint_before_write(tmp_path):
+    readme_path = tmp_path / "README.md"
+    current = (
+        "# Demo\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /path/to/state/root\n"
+        "```\n"
+    )
+    readme_path.write_text(current, encoding="utf-8")
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Bitte belasse die CLI-Funktionalitaet wie sie ist, "
+            "ergaenze aber einen unittest, der parser.parse_args(['--state-root', '/tmp/state']) prueft, "
+            "korrigiere die README-Beispielreihenfolge zu --config settings.json --state-root /path/to/state/root --verbose "
+            "und fuehre danach wieder python -m unittest aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the focused README change."},
+        ],
+        target_paths=["README.md", "tests/test_cli.py"],
+        target_name="README.md",
+    )
+    payload["entities"]["constraints"] = ["Update README.md with correct example order."]
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.constraints = ["Update README.md with correct example order."]
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "README.md"},
+            success=True,
+            summary="Read README.md.",
+            output_excerpt=current,
+        )
+    )
+
+    review = planner._explicit_constraint_integrity_review(
+        session.router_result,
+        session,
+        path="README.md",
+        current_content=current,
+        proposed_content=(
+            "# Demo\n\n"
+            "```bash\n"
+            "python cli.py --state-root /tmp/state --config settings.json --verbose\n"
+            "```\n"
+        ),
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "--config settings.json --state-root /path/to/state/root --verbose" in review.blocking_issues[0]
+
+
+def test_planner_blocks_unrequested_markdown_heading_before_write(tmp_path):
+    current = (
+        "# Demo\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /path/to/state/root\n"
+        "```\n"
+    )
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Korrigiere nur das README-Beispiel und sonst nichts.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the focused README change."},
+        ],
+        target_paths=["README.md"],
+        target_name="README.md",
+    )
+    payload["entities"]["constraints"] = [
+        "README example order should be updated to --config settings.json --state-root /path/to/state/root --verbose."
+    ]
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.constraints = [
+        "README example order should be updated to --config settings.json --state-root /path/to/state/root --verbose."
+    ]
+
+    review = planner._explicit_constraint_integrity_review(
+        session.router_result,
+        session,
+        path="README.md",
+        current_content=current,
+        proposed_content=(
+            "# Demo\n\n"
+            "```bash\n"
+            "python cli.py --config settings.json --state-root /path/to/state/root --verbose\n"
+            "```\n\n"
+            "## Unit Tests\n\n"
+            "Run `python -m unittest`.\n"
+        ),
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "markdown headings" in review.blocking_issues[0].lower()
+
+
+def test_planner_retries_update_after_prewrite_review_rejects_broad_rewrite(tmp_path):
+    target = tmp_path / "cli.py"
+    original = (
+        "import argparse\n"
+        "\n"
+        "from bootstrap_runtime import ensure_runtime_dependencies\n"
+        "\n"
+        "\n"
+        "def build_parser():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--config')\n"
+        "    parser.add_argument('--verbose', action='store_true')\n"
+        "    return parser\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    ensure_runtime_dependencies()\n"
+        "    parser = build_parser()\n"
+        "    return parser.parse_args()\n"
+    )
+    bad_rewrite = (
+        "import argparse\n"
+        "\n"
+        "\n"
+        "def build_parser():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--state-root')\n"
+        "    return parser\n"
+    )
+    focused_update = (
+        "import argparse\n"
+        "\n"
+        "from bootstrap_runtime import ensure_runtime_dependencies\n"
+        "\n"
+        "\n"
+        "def build_parser():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--config')\n"
+        "    parser.add_argument('--state-root')\n"
+        "    parser.add_argument('--verbose', action='store_true')\n"
+        "    return parser\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    ensure_runtime_dependencies()\n"
+        "    parser = build_parser()\n"
+        "    return parser.parse_args()\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": False,
+                "summary": "The proposal removes existing config and runtime bootstrap behavior unrelated to the requested CLI flag addition.",
+                "confidence": 0.92,
+                "blocking_issues": [
+                    "Existing --config option was removed without request evidence.",
+                ],
+                "preservation_risks": [
+                    "Runtime bootstrap import and call disappeared from the proposed rewrite.",
+                ],
+                "repair_hints": [
+                    "Keep existing CLI options and bootstrap behavior while adding the new flag.",
+                ],
+            },
+            {
+                "safe_to_write": True,
+                "summary": "The second proposal adds the new CLI flag while preserving the existing behavior.",
+                "confidence": 0.88,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            },
+        ],
+        text_payloads=[bad_rewrite, focused_update],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Fuege --state-root zur CLI hinzu, aber lasse bestehendes Verhalten intakt.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the current CLI implementation first.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Add the requested flag without regressing existing behavior.",
+            },
+        ],
+        target_paths=["cli.py"],
+        target_name="cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "cli.py"},
+            success=True,
+            summary="Read cli.py.",
+            output_excerpt=original,
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "cli.py"
+    assert decision.tool_args["content"].strip() == focused_update.strip()
+    assert len(llm.generate_calls) == 2
+    assert "Self-review feedback on the previous proposal" in llm.generate_calls[1]["args"][0]
+    assert "Keep existing CLI options and bootstrap behavior" in llm.generate_calls[1]["args"][0]
+
+
+def test_planner_retries_markdown_update_when_generated_file_has_unclosed_fence(tmp_path):
+    readme_path = tmp_path / "README.md"
+    original = (
+        "# Demo\n\n"
+        "## Usage\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose\n"
+        "```\n"
+    )
+    malformed = (
+        "# Demo\n\n"
+        "## Usage\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /tmp/state\n"
+    )
+    repaired = (
+        "# Demo\n\n"
+        "## Usage\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /tmp/state\n"
+        "```\n"
+    )
+    readme_path.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The repaired README update is safe to write.",
+                "confidence": 0.9,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        text_payloads=[malformed, repaired],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Aktualisiere die README fuer die neue state-root Option.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the README before editing it.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Document the new CLI option.",
+            },
+        ],
+        target_paths=["README.md"],
+        target_name="README.md",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "README.md"},
+            success=True,
+            summary="Read README.md.",
+            output_excerpt=original,
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "README.md"
+    assert decision.tool_args["content"].strip() == repaired.strip()
+    assert len(llm.generate_calls) == 2
+    assert len(llm.generate_json_calls) == 1
+    assert "unclosed fenced code block" in llm.generate_calls[1]["args"][0]
+
+
+def test_strip_code_fences_preserves_markdown_internal_fences():
+    planner = Planner(ScriptedLLM(), "")
+    markdown = (
+        "# Demo\n\n"
+        "## Usage\n\n"
+        "```bash\n"
+        "python cli.py --config settings.json --verbose --state-root /tmp/state\n"
+        "```\n"
+    )
+
+    cleaned = planner._strip_code_fences(markdown)
+
+    assert cleaned == markdown.strip()
+
+
+def test_planner_blocks_update_when_prewrite_review_keeps_finding_regression_risk(tmp_path):
+    target = tmp_path / "cli.py"
+    original = (
+        "import argparse\n"
+        "\n"
+        "from bootstrap_runtime import ensure_runtime_dependencies\n"
+        "\n"
+        "\n"
+        "def build_parser():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--config')\n"
+        "    parser.add_argument('--verbose', action='store_true')\n"
+        "    return parser\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    ensure_runtime_dependencies()\n"
+        "    parser = build_parser()\n"
+        "    return parser.parse_args()\n"
+    )
+    bad_rewrite = (
+        "import argparse\n"
+        "\n"
+        "\n"
+        "def build_parser():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--state-root')\n"
+        "    return parser\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": False,
+                "summary": "The proposal removes unrelated existing CLI behavior and bootstrap handling.",
+                "confidence": 0.91,
+                "blocking_issues": [
+                    "Existing --config option disappeared.",
+                ],
+                "preservation_risks": [
+                    "Bootstrap handling was removed from the file.",
+                ],
+                "repair_hints": [
+                    "Preserve current options and startup behavior while adding the new flag.",
+                ],
+            },
+            {
+                "safe_to_write": False,
+                "summary": "The retry is still too broad and still drops unrelated behavior.",
+                "confidence": 0.86,
+                "blocking_issues": [
+                    "The retry still rewrites the file into a stripped-down variant.",
+                ],
+                "preservation_risks": [
+                    "Unrelated existing behavior remains missing.",
+                ],
+                "repair_hints": [
+                    "Make a smaller mutation instead of rewriting the file.",
+                ],
+            },
+        ],
+        text_payloads=[bad_rewrite, bad_rewrite],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Fuege --state-root zur CLI hinzu, aber ohne Regressions.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the current CLI implementation first.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Add the requested flag without regressing existing behavior.",
+            },
+        ],
+        target_paths=["cli.py"],
+        target_name="cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "cli.py"},
+            success=True,
+            summary="Read cli.py.",
+            output_excerpt=original,
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "ai review" in decision.final_response.lower().replace("-", " ")
+    assert session.diagnostics[-1].category == "preservation_risk"
+    assert session.diagnostics[-1].file_hints == ["cli.py"]
+    assert session.stop_reason == "update_review_rejected"
 
 
 def test_planner_updates_remaining_explicit_target_before_validation(tmp_path):
@@ -1370,6 +2775,216 @@ def test_planner_blocks_instead_of_reverifying_when_failed_validation_has_no_rep
     assert decision.action_type == AgentActionType.FINAL
     assert session.blockers
     assert "repairable target" in session.blockers[-1]
+
+
+def test_planner_creates_missing_validation_support_artifact_from_failure_evidence(tmp_path):
+    cli = tmp_path / "cli.py"
+    cli.write_text("def main():\n    return 'ok'\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_cli = tests_dir / "test_cli.py"
+    test_cli.write_text(
+        "import unittest\n\nfrom cli import main\n\n\nclass CliTests(unittest.TestCase):\n    def test_main(self):\n        self.assertEqual(main(), 'ok')\n",
+        encoding="utf-8",
+    )
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Repair the CLI implementation.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "run_validation",
+                        "reason": "Rerun python -m unittest.",
+                    },
+                ],
+                target_paths=["cli.py"],
+                target_name="cli.py",
+            )
+        ],
+        text_payloads=["# Package marker for unittest discovery.\n"],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="fix the CLI so python -m unittest works",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["cli.py", "tests/test_cli.py", "README.md"],
+                "focus_files": ["cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest"],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest and fix the failing discovery path.",
+    )
+    session.changed_files.append(FileChangeRecord(path="cli.py", operation="write"))
+    session.changed_files.append(FileChangeRecord(path="tests/test_cli.py", operation="write"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            iteration=2,
+            summary="Validation command exited with 5.",
+            excerpt="NO TESTS RAN",
+        )
+    )
+
+    first_decision = planner.decide_next_action(session.task, session)
+
+    assert first_decision.action_type == AgentActionType.CALL_TOOL
+    assert first_decision.tool_name == "read_file"
+    assert first_decision.tool_args["path"] == "tests/test_cli.py"
+    assert session.active_repair_context is not None
+    assert "tests/__init__.py" in session.active_repair_context.repair_requirements[1]
+
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=3,
+            tool_name="read_file",
+            tool_args={"path": "tests/test_cli.py"},
+            success=True,
+            summary="Read tests/test_cli.py.",
+            output_excerpt=test_cli.read_text(encoding="utf-8"),
+        )
+    )
+
+    second_decision = planner.decide_next_action(session.task, session)
+
+    assert second_decision.action_type == AgentActionType.CALL_TOOL
+    assert second_decision.tool_name == "create_file"
+    assert second_decision.tool_args["path"] == "tests/__init__.py"
+    assert second_decision.tool_args["overwrite"] is False
+    assert second_decision.tool_args["content"].strip()
+
+
+def test_planner_prefers_lightweight_model_for_missing_validation_support_artifact(tmp_path):
+    cli = tmp_path / "cli.py"
+    cli.write_text("def main():\n    return 'ok'\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_cli = tests_dir / "test_cli.py"
+    test_cli.write_text(
+        "import unittest\n\nfrom cli import main\n\n\nclass CliTests(unittest.TestCase):\n    def test_main(self):\n        self.assertEqual(main(), 'ok')\n",
+        encoding="utf-8",
+    )
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Repair the CLI implementation.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "run_validation",
+                        "reason": "Rerun python -m unittest.",
+                    },
+                ],
+                target_paths=["cli.py"],
+                target_name="cli.py",
+            )
+        ],
+        text_payloads=["# Package marker for unittest discovery.\n"],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="fix the CLI so python -m unittest works",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["cli.py", "tests/test_cli.py", "README.md"],
+                "focus_files": ["cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest"],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest and fix the failing discovery path.",
+    )
+    session.changed_files.append(FileChangeRecord(path="cli.py", operation="write"))
+    session.changed_files.append(FileChangeRecord(path="tests/test_cli.py", operation="write"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            iteration=2,
+            summary="Validation command exited with 5.",
+            excerpt="NO TESTS RAN",
+        )
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=3,
+            tool_name="read_file",
+            tool_args={"path": "tests/test_cli.py"},
+            success=True,
+            summary="Read tests/test_cli.py.",
+            output_excerpt=test_cli.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "tests/__init__.py"
+    assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
 
 
 def test_planner_includes_diagnostics_in_update_prompt_for_debug_follow_up(tmp_path):

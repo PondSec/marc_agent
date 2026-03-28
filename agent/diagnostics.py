@@ -27,7 +27,7 @@ class FailureAnalyzer:
         summary = self._summarize(result.message, text)
         file_hints, line_hints = self._extract_file_hints(text)
         category, severity = self._categorize(result, command)
-        action_hints = self._action_hints(category, command)
+        action_hints = self._action_hints(category, command, text=text)
 
         diagnostic = DiagnosticRecord(
             source=result.tool_name,
@@ -115,7 +115,7 @@ class FailureAnalyzer:
             return self.workspace.display_path(self.workspace.root / path)
         return self.workspace.display_path(path)
 
-    def _action_hints(self, category: str, command: str) -> list[str]:
+    def _action_hints(self, category: str, command: str, *, text: str = "") -> list[str]:
         hints = {
             "test_failure": [
                 "Read the failing test output and inspect the hinted source files before editing.",
@@ -140,6 +140,14 @@ class FailureAnalyzer:
                 "Narrow the command scope or raise the timeout if the command is expected to be slow.",
             ],
         }.get(category, [])
+
+        lowered_text = str(text or "").lower()
+        if category == "test_failure" and any(
+            marker in lowered_text for marker in ("ran 0 tests", "collected 0 items", "no tests ran")
+        ):
+            hints.append(
+                "Inspect test discovery or package layout and ensure the requested command actually executes the intended tests."
+            )
 
         if not hints and command:
             hints = [

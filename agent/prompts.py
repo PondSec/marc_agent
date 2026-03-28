@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import re
 
-from agent.models import SessionState, ValidationFailureEvidence, WorkspaceSnapshot
+from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
 from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
@@ -75,7 +77,27 @@ def semantic_change_review_system_prompt() -> str:
         "Reason semantically across languages and frameworks, including HTML/CSS/JavaScript, Python, C/C++, Java, GDScript, config files, and tests. "
         "Treat cross-file mismatches as failures when names, ids, symbols, imports, selectors, event hooks, config keys, paths, or interfaces no longer line up. "
         "Fail the review when explicitly requested behavior is still missing, contradicted, or left dangling in the changed implementation, even if syntax or structural checks passed. "
+        "Fail the review when a narrow update removed or rewrote unrelated existing behavior without evidence that the task required it. "
+        "Treat unexplained loss of existing CLI options, imports, config handling, startup code, routes, public interfaces, or docs as a likely regression unless the request clearly called for that removal. "
+        "Treat unrequested additive scope growth as a likely failure too: new sections, examples, commands, tests, or explanatory guidance are not harmless supporting edits unless the request or visible code evidence clearly requires them. "
+        "When the request includes an explicit command example, path placeholder, argument order, code snippet, or literal value to preserve or update, deviations from that concrete example are likely failures unless visible code or validation evidence clearly requires the change. "
         "Do not fail for speculative improvements, style preferences, or unrequested polish."
+    )
+
+
+def proposed_update_review_system_prompt() -> str:
+    return (
+        f"You are {AGENT_NAME} ({AGENT_FULL_NAME}), the pre-write update review model for a local coding agent. "
+        "Return valid JSON only. "
+        "Review whether a proposed update to one existing file is safe to write. "
+        "Approve only when the proposal is aligned with the explicit request and preserves unrelated existing behavior. "
+        "Use semantic reasoning across languages and frameworks, not hardcoded task vocabularies. "
+        "When the explicit request requires changing current behavior in the target file, treat that requested behavior change as in scope instead of calling it broadening solely because the current implementation behaves differently. "
+        "Fail when the proposal broadens scope without evidence, removes working behavior the request did not ask to remove, or changes names, config keys, selectors, imports, commands, or interfaces without keeping dependent references coherent. "
+        "Treat additive scope growth as broadening too: new sections, examples, commands, tests, or explanatory prose are not harmless supporting edits unless the request or visible evidence clearly requires them. "
+        "When the request includes an explicit command example, path placeholder, argument order, code snippet, or literal value to preserve or update, deviations from that concrete example are failures unless visible code or validation evidence clearly requires the change. "
+        "Treat documentation command examples as illustrative usage, not as evidence that an option is required or has a default value, unless the text explicitly states that behavior or the code evidence enforces it. "
+        "Do not fail for harmless formatting shifts or clearly necessary supporting edits."
     )
 
 
@@ -384,14 +406,18 @@ def generate_content_prompt(
     current_content: str | None = None,
     repair_context: ValidationFailureEvidence | None = None,
     repair_strategy: str | None = None,
+    review_feedback: ProposedUpdateReview | None = None,
     mode: str = "full",
 ) -> str:
     if mode != "full":
         sections = [
             "Produce the full file content for exactly one file.",
+            f"Latest user request: {_trim_text(session.task, 420)}",
             f"User goal: {_trim_text(route.user_goal, 240)}",
             f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
+            f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
             f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}",
+            f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
             f"Related file hints: {_related_file_context(session, path)}",
         ]
         if repair_context is not None:
@@ -402,6 +428,18 @@ def generate_content_prompt(
                 ]
             )
         if current_content is not None:
+            sections.extend(
+                [
+                    _update_rules(),
+                ]
+            )
+            if review_feedback is not None:
+                sections.extend(
+                    [
+                        f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+                        "Use that feedback to make a smaller, safer update while preserving unrelated existing behavior.",
+                    ]
+                )
             sections.extend(
                 [
                     "Current file content:",
@@ -416,10 +454,13 @@ def generate_content_prompt(
 
     sections = [
         "Produce the full file content for the requested task.",
+        f"Latest user request: {_trim_text(session.task, 700)}",
         f"Validated route: {json.dumps(_compact_route(route), ensure_ascii=False)}",
         f"Task state: {json.dumps(_compact_task_state(session.task_state), ensure_ascii=False)}",
         f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding), ensure_ascii=False)}",
         f"Target path: {path}",
+        f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
+        f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
         f"Workspace context: {json.dumps(_compact_workspace_snapshot(session.workspace_snapshot, detail='decision'), ensure_ascii=False)}",
         f"Inspected context: {_inspected_context(session)}",
         f"Diagnostic context: {_diagnostic_context(session)}",
@@ -433,6 +474,18 @@ def generate_content_prompt(
             ]
         )
     if current_content is not None:
+        sections.extend(
+            [
+                _update_rules(),
+            ]
+        )
+        if review_feedback is not None:
+            sections.extend(
+                [
+                    f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+                    "Use that feedback to make a smaller, safer update while preserving unrelated existing behavior.",
+                ]
+            )
         sections.extend(
             [
                 "Current file content:",
@@ -453,14 +506,71 @@ def generate_content_retry_prompt(
     current_content: str | None = None,
     repair_context: ValidationFailureEvidence | None = None,
     repair_strategy: str | None = None,
+    review_feedback: ProposedUpdateReview | None = None,
+    mode: str = "full",
 ) -> str:
+    if mode != "full":
+        task_focus = (
+            _compact_generation_focus(route, session, path)
+            if session is not None
+            else {
+                "target_path": path,
+                "active_goal": _trim_text(route.requested_outcome, 180),
+                "output_expectation": _trim_text(route.requested_outcome, 180),
+                "verification_target": "",
+                "constraints": route.entities.constraints[:4],
+                "related_targets": [item for item in route.entities.target_paths if item and item != path][:6],
+            }
+        )
+        sections = [
+            "Produce the full file content for exactly one file.",
+            f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
+            f"User goal: {_trim_text(route.user_goal, 240)}",
+            f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
+            f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
+            f"Task focus: {json.dumps(task_focus, ensure_ascii=False)}",
+            f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
+        ]
+        if session is not None:
+            sections.append(f"Related file hints: {_related_file_context(session, path)}")
+        if repair_context is not None:
+            sections.extend(
+                [
+                    f"Validation-guided repair context: {json.dumps(_compact_repair_context(repair_context), ensure_ascii=False)}",
+                    _repair_rules(repair_strategy),
+                ]
+            )
+        if current_content is not None:
+            sections.append(_update_rules())
+            if review_feedback is not None:
+                sections.extend(
+                    [
+                        f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+                        "Address that feedback directly with a smaller, safer update that preserves unrelated existing behavior.",
+                    ]
+                )
+            sections.extend(
+                [
+                    "Current file content:",
+                    current_content,
+                    "Update this file to satisfy the request. Return the full updated file content only.",
+                ]
+            )
+        else:
+            sections.append("Create the file from scratch. Return the full new file content only.")
+        sections.append("Do not add markdown fences or explanations.")
+        return "\n\n".join(sections)
+
     sections = [
         "Produce the full file content for exactly one file.",
+        f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 700)}",
         f"User goal: {_trim_text(route.user_goal, 240)}",
         f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
+        f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
         f"Task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
         f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}",
         f"Target path: {path}",
+        f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
         f"Search hints: {_format_list(route.search_terms[:6])}",
     ]
     if session is not None:
@@ -478,6 +588,18 @@ def generate_content_retry_prompt(
             ]
         )
     if current_content is not None:
+        sections.extend(
+            [
+                _update_rules(),
+            ]
+        )
+        if review_feedback is not None:
+            sections.extend(
+                [
+                    f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+                    "Address the review feedback directly and keep the update tightly scoped.",
+                ]
+            )
         sections.extend(
             [
                 "Current file content:",
@@ -500,10 +622,12 @@ def generate_content_continuation_prompt(
     current_content: str | None = None,
     repair_context: ValidationFailureEvidence | None = None,
     repair_strategy: str | None = None,
+    review_feedback: ProposedUpdateReview | None = None,
 ) -> str:
     sections = [
         "Finish the full file content for exactly one file.",
         "A previous slow generation already produced a partial draft. Use that progress instead of starting over blindly.",
+        f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 700)}",
         f"User goal: {_trim_text(route.user_goal, 240)}",
         f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
         f"Task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
@@ -526,6 +650,18 @@ def generate_content_continuation_prompt(
             ]
         )
     if current_content is not None:
+        sections.extend(
+            [
+                _update_rules(),
+            ]
+        )
+        if review_feedback is not None:
+            sections.extend(
+                [
+                    f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+                    "Use the feedback to preserve unrelated existing behavior while completing the update.",
+                ]
+            )
         sections.extend(
             [
                 "Current file content:",
@@ -572,7 +708,9 @@ def semantic_change_review_prompt(
     session: SessionState,
     *,
     artifacts: list[dict[str, object]],
+    mode: str = "full",
 ) -> str:
+    compact = mode != "full"
     schema_shape = {
         "requirements_satisfied": True,
         "summary": "string",
@@ -584,24 +722,25 @@ def semantic_change_review_prompt(
     }
     validation_context = [
         {
-            "command": _trim_text(item.command, 140),
+            "command": _trim_text(item.command, 140 if not compact else 100),
             "scope": item.verification_scope,
             "status": item.status,
-            "summary": _trim_text(item.summary or "", 160),
-            "excerpt": _trim_text(item.excerpt or "", 220),
+            "summary": _trim_text(item.summary or "", 160 if not compact else 100),
+            "excerpt": _trim_text(item.excerpt or "", 220 if not compact else 120),
         }
         for item in session.validation_runs[-6:]
     ]
     review_context = {
         "route": _compact_route(route),
         "task_state": _compact_task_state(session.task_state),
-        "task_understanding": _compact_task_understanding(session.task_understanding),
         "changed_files": [item.path for item in session.changed_files[-8:]],
         "artifacts": artifacts[:6],
         "validation": validation_context,
-        "diagnostics": _compact_recent_diagnostics(session),
-        "follow_up_context": _compact_follow_up_context(session),
     }
+    if not compact:
+        review_context["task_understanding"] = _compact_task_understanding(session.task_understanding)
+        review_context["diagnostics"] = _compact_recent_diagnostics(session)
+        review_context["follow_up_context"] = _compact_follow_up_context(session)
     return "\n".join(
         [
             "Review the changed implementation before declaring the task complete.",
@@ -611,8 +750,101 @@ def semantic_change_review_prompt(
             "- Use semantic reasoning, not hardcoded feature vocabularies tied to one stack or one task.",
             "- Fail when requested behavior is still missing, when cross-file references no longer line up, or when the code contradicts the intended behavior.",
             "- Catch obvious inconsistencies such as renamed ids or symbols, broken imports or selectors, config written but never consumed, UI hooks targeting the wrong element, or APIs changed in one file but not another.",
+            "- Fail when an otherwise narrow update removed or rewrote unrelated existing behavior without evidence that the task required that broader change.",
+            "- Fail when an otherwise narrow update adds unrequested new sections, paragraphs, examples, commands, tests, or guidance that the visible evidence does not require.",
+            "- Treat explicit literal examples from the request as hard constraints when they are clearly part of the requested outcome; wrong placeholders, argument order, command shape, or snippet content are failures unless visible evidence contradicts them.",
             "- Base findings only on evidence present in the request, artifacts, diagnostics, and validation context.",
             "- Do not fail for optional refactors, broader hardening ideas, or style-only concerns.",
+            f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
+        ]
+    )
+
+
+def proposed_update_review_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    supporting_artifact_context: str,
+    current_excerpt: str,
+    proposed_excerpt: str,
+    diff_excerpt: str,
+    mode: str = "full",
+) -> str:
+    compact = mode != "full"
+    changed_paths: list[str] = []
+    for item in session.changed_files:
+        candidate = str(item.path or "").strip()
+        if candidate and candidate not in changed_paths:
+            changed_paths.append(candidate)
+
+    explicit_target_paths: list[str] = []
+    task_state = session.task_state
+    if task_state is not None:
+        for artifact in task_state.target_artifacts:
+            candidate = str(artifact.path or "").strip()
+            if candidate and candidate not in explicit_target_paths:
+                explicit_target_paths.append(candidate)
+    for candidate in route.entities.target_paths:
+        normalized = str(candidate or "").strip()
+        if normalized and normalized not in explicit_target_paths:
+            explicit_target_paths.append(normalized)
+
+    pending_target_paths = [
+        candidate
+        for candidate in explicit_target_paths
+        if candidate != path and candidate not in changed_paths
+    ]
+    schema_shape = {
+        "safe_to_write": True,
+        "summary": "string",
+        "confidence": 0.0,
+        "blocking_issues": ["string"],
+        "preservation_risks": ["string"],
+        "repair_hints": ["string"],
+    }
+    review_context = {
+        "route": _compact_route(route),
+        "task_state": _compact_task_state(session.task_state),
+        "target_path": path,
+        "path_scope": _artifact_scoped_focus(route, session, path, current_content=current_excerpt),
+        "already_changed_artifacts": changed_paths[:6],
+        "pending_target_artifacts": pending_target_paths[:6],
+        "current_write_is_partial_step": bool(pending_target_paths),
+    }
+    if not compact:
+        review_context["task_understanding"] = _compact_task_understanding(session.task_understanding)
+        review_context["diagnostics"] = _compact_recent_diagnostics(session)
+        review_context["follow_up_context"] = _compact_follow_up_context(session)
+    return "\n".join(
+        [
+            "Review the proposed file update before it is written to disk.",
+            f"Latest user request: {_trim_text(session.task, 700 if not compact else 420)}",
+            f"Context: {json.dumps(review_context, ensure_ascii=False)}",
+            "Review rules:",
+            "- Judge whether writing this file now is safe as one step in the task, not whether the entire multi-file task is already finished.",
+            "- Approve only when the proposal is tightly aligned with the explicit request and keeps unrelated existing behavior intact.",
+            "- Do not treat an explicitly requested behavior change for this file as scope broadening just because the current implementation behaves differently.",
+            "- Fail when the proposal broadens scope without evidence, or removes working behavior, imports, config handling, startup code, public interfaces, commands, docs, or tests that the request did not ask to remove.",
+            "- Fail when a narrow request adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance unless the visible evidence clearly requires that extra content.",
+            "- Treat explicit literal examples from the request as hard constraints when they are clearly part of the requested outcome; wrong placeholders, argument order, command shape, or snippet content are failures unless visible evidence contradicts them.",
+            "- Use path_scope.current_write_requirements as the hard requirements for this file when that list is non-empty.",
+            "- Treat path_scope.other_pending_requirements as non-blocking for this file unless the proposal directly contradicts them or falsely claims to complete them here.",
+            "- Fail when names, config keys, selectors, imports, commands, or interfaces change without the visible evidence showing the required dependent updates.",
+            "- Treat changed supporting artifacts as completed evidence and unchanged recent context as reference only.",
+            "- Do not block solely because other explicit target artifacts are still pending in the same task when the current proposal is a coherent partial step and remains consistent with the visible evidence.",
+            "- Treat documentation command examples as illustrative usage unless the surrounding text explicitly claims they are required defaults or mandatory arguments.",
+            "- Use semantic reasoning, not hardcoded feature vocabularies tied to one stack or one task.",
+            "- Base findings only on the request, current excerpt, proposed excerpt, diff excerpt, supporting artifact evidence, diagnostics, and follow-up context.",
+            "- Do not fail for harmless formatting shifts unless they conceal a behavioral regression.",
+            "Supporting artifact evidence:",
+            supporting_artifact_context,
+            "Current file excerpt:",
+            current_excerpt,
+            "Proposed file excerpt:",
+            proposed_excerpt,
+            "Unified diff excerpt:",
+            diff_excerpt,
             f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
         ]
     )
@@ -826,6 +1058,17 @@ def _compact_repair_context(context: ValidationFailureEvidence) -> dict[str, obj
     }
 
 
+def _compact_proposed_update_review(review: ProposedUpdateReview) -> dict[str, object]:
+    return {
+        "safe_to_write": review.safe_to_write,
+        "summary": _trim_text(review.summary, 220),
+        "confidence": review.confidence,
+        "blocking_issues": [_trim_text(item, 180) for item in review.blocking_issues[:4]],
+        "preservation_risks": [_trim_text(item, 180) for item in review.preservation_risks[:4]],
+        "repair_hints": [_trim_text(item, 180) for item in review.repair_hints[:4]],
+    }
+
+
 def _compact_generation_focus(
     route: RouterOutput,
     session: SessionState,
@@ -846,6 +1089,361 @@ def _compact_generation_focus(
     }
 
 
+def _artifact_scoped_focus(
+    route: RouterOutput,
+    session: SessionState | None,
+    path: str,
+    *,
+    current_content: str | None = None,
+) -> dict[str, object]:
+    task_state = session.task_state if session is not None else None
+    current_markers = _artifact_scope_markers(path)
+    current_artifact_kind = ""
+    current_artifact_role = ""
+    current_role_priority = -1
+    explicit_targets = [str(item or "").strip() for item in route.entities.target_paths if str(item or "").strip()]
+    is_explicit_target = any(_artifact_matches_path(path, candidate, candidate) for candidate in explicit_targets)
+    other_markers: set[str] = set()
+
+    if task_state is not None:
+        for artifact in task_state.target_artifacts:
+            artifact_path = str(artifact.path or "").strip()
+            artifact_name = str(artifact.name or "").strip()
+            if _artifact_matches_path(path, artifact_path, artifact_name):
+                if artifact_path:
+                    current_markers.update(_artifact_scope_markers(artifact_path))
+                if artifact_name:
+                    current_markers.update(_artifact_scope_markers(artifact_name))
+                artifact_role = str(artifact.role or "").strip()
+                artifact_priority = _artifact_role_priority(artifact_role)
+                if artifact_priority >= current_role_priority:
+                    current_role_priority = artifact_priority
+                    current_artifact_kind = str(artifact.kind or "").strip()
+                    current_artifact_role = artifact_role
+            else:
+                if artifact_path:
+                    other_markers.update(_artifact_scope_markers(artifact_path))
+                if artifact_name:
+                    other_markers.update(_artifact_scope_markers(artifact_name))
+
+    for candidate in explicit_targets:
+        if _artifact_matches_path(path, candidate, candidate):
+            current_markers.update(_artifact_scope_markers(candidate))
+        else:
+            other_markers.update(_artifact_scope_markers(candidate))
+
+    if current_artifact_kind:
+        current_markers.add(current_artifact_kind.lower())
+    if current_artifact_role:
+        current_markers.add(current_artifact_role.lower())
+
+    constraints: list[str] = []
+    if task_state is not None:
+        for candidate in task_state.constraints[:8]:
+            text = _trim_text(candidate, 220)
+            if text and text not in constraints:
+                constraints.append(text)
+    for candidate in route.entities.constraints[:8]:
+        text = _trim_text(candidate, 220)
+        if text and text not in constraints:
+            constraints.append(text)
+
+    current_requirements: list[str] = []
+    other_requirements: list[str] = []
+    general_constraints: list[str] = []
+    for constraint in constraints:
+        current_score = _scope_relevance_score(constraint, current_markers)
+        other_score = _scope_relevance_score(constraint, other_markers)
+        if current_score > 0 and current_score >= other_score:
+            current_requirements.append(constraint)
+            continue
+        if other_score > current_score:
+            other_requirements.append(constraint)
+            continue
+        general_constraints.append(constraint)
+
+    for requirement_sentence in _derived_requirement_sentences(route, session):
+        current_score = _scope_relevance_score(requirement_sentence, current_markers)
+        other_score = _scope_relevance_score(requirement_sentence, other_markers)
+        if current_score > 0 and current_score >= other_score:
+            for requirement in _split_requirement_clauses(requirement_sentence):
+                if requirement not in current_requirements:
+                    current_requirements.append(requirement)
+            continue
+        if other_score > current_score:
+            for requirement in _split_requirement_clauses(requirement_sentence):
+                if requirement not in other_requirements:
+                    other_requirements.append(requirement)
+            continue
+        for requirement in _split_requirement_clauses(requirement_sentence):
+            if requirement not in general_constraints:
+                general_constraints.append(requirement)
+
+    literal_constraints = _target_literal_constraints(
+        route,
+        session,
+        path=path,
+        current_content=current_content,
+    )
+    for candidate in literal_constraints:
+        if candidate not in current_requirements:
+            current_requirements.append(candidate)
+
+    if not current_requirements:
+        if len(explicit_targets) <= 1 or current_artifact_role == "primary_target" or is_explicit_target:
+            fallback = _trim_text(
+                (
+                    task_state.output_expectation
+                    if task_state is not None and task_state.output_expectation
+                    else route.requested_outcome
+                ),
+                220,
+            )
+            if fallback:
+                current_requirements.append(fallback)
+
+    return {
+        "target_path": path,
+        "artifact_kind": current_artifact_kind,
+        "artifact_role": current_artifact_role,
+        "literal_constraints": literal_constraints[:4],
+        "current_write_requirements": current_requirements[:4],
+        "other_pending_requirements": other_requirements[:4],
+        "general_constraints": general_constraints[:4],
+    }
+
+
+def _explicit_generation_constraints(
+    route: RouterOutput,
+    session: SessionState | None,
+) -> str:
+    items: list[str] = []
+    task_state = session.task_state if session is not None else None
+    if task_state is not None:
+        for candidate in task_state.constraints[:6]:
+            text = _trim_text(candidate, 220)
+            if text and text not in items:
+                items.append(text)
+    for candidate in route.entities.constraints[:6]:
+        text = _trim_text(candidate, 220)
+        if text and text not in items:
+            items.append(text)
+    request_text = _request_text_for_literals(route, session)
+    for candidate in _request_literal_candidates(request_text):
+        text = _trim_text(candidate, 220)
+        if text and text not in items:
+            items.append(text)
+    return _format_list(items[:6])
+
+
+def _request_text_for_literals(route: RouterOutput, session: SessionState | None) -> str:
+    task_state = session.task_state if session is not None else None
+    parts = [
+        task_state.latest_user_turn if task_state is not None else "",
+        route.user_goal,
+        route.requested_outcome,
+    ]
+    return "\n".join(str(part or "").strip() for part in parts if str(part or "").strip())
+
+
+def _request_literal_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    normalized = str(text or "")
+    if not normalized:
+        return candidates
+
+    command_pattern = re.compile(
+        r"(?:--[a-z0-9][\w-]*(?:\s+(?!und\b|and\b|then\b|dann\b|wieder\b)[^\s,;]+)?\s*){2,8}",
+        re.IGNORECASE,
+    )
+    call_pattern = re.compile(r"[A-Za-z_][\w.]{1,80}\([^()\n]{1,180}\)")
+
+    for pattern in (command_pattern, call_pattern):
+        for match in pattern.finditer(normalized):
+            candidate = " ".join(str(match.group(0) or "").split()).strip()
+            candidate = re.sub(r"\s+(und|and|then|dann|wieder)$", "", candidate, flags=re.IGNORECASE).strip()
+            if len(candidate) < 8 or candidate in candidates:
+                continue
+            candidates.append(candidate)
+    return candidates[:8]
+
+
+def _target_literal_constraints(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None = None,
+) -> list[str]:
+    reference = str(current_content or "").strip()
+    if not reference and session is not None:
+        reference = _last_read_excerpt(session, path)
+    if not reference:
+        return []
+
+    current_tokens = _literal_reference_tokens(reference)
+    if not current_tokens:
+        return []
+
+    literals: list[str] = []
+    request_text = _request_text_for_literals(route, session)
+    for candidate in _request_literal_candidates(request_text):
+        if _literal_matches_reference(candidate, current_tokens):
+            literals.append(candidate)
+    return literals[:4]
+
+
+def _literal_matches_reference(candidate: str, reference_tokens: set[str]) -> bool:
+    normalized = str(candidate or "").strip()
+    if not normalized:
+        return False
+    if "--" in normalized:
+        candidate_tokens = _literal_reference_tokens(normalized)
+        return len(candidate_tokens & reference_tokens) >= 3
+    identifier_tokens = _literal_identifier_tokens(normalized)
+    return bool(identifier_tokens & reference_tokens)
+
+
+def _literal_reference_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in re.split(r"[^a-z0-9]+", str(text or "").lower()):
+        token = raw.strip()
+        if len(token) >= 4:
+            tokens.add(token)
+    return tokens
+
+
+def _literal_identifier_tokens(text: str) -> set[str]:
+    if "(" not in text:
+        return set()
+    callee = str(text.split("(", 1)[0] or "").strip().lower()
+    return {token for token in re.split(r"[^a-z0-9]+", callee) if len(token) >= 4}
+
+
+def _artifact_role_priority(role: str | None) -> int:
+    normalized = str(role or "").strip().lower()
+    priorities = {
+        "primary_target": 5,
+        "validation_target": 4,
+        "active_context": 3,
+        "primary_context": 3,
+        "supporting_context": 2,
+    }
+    return priorities.get(normalized, 1 if normalized else 0)
+
+
+def _derived_requirement_sentences(
+    route: RouterOutput,
+    session: SessionState | None,
+) -> list[str]:
+    task_state = session.task_state if session is not None else None
+    sentences: list[str] = []
+    sources: list[str] = []
+    if task_state is not None and task_state.output_expectation:
+        sources.append(task_state.output_expectation)
+    if task_state is not None and task_state.latest_user_turn:
+        sources.append(task_state.latest_user_turn)
+    if route.requested_outcome:
+        sources.append(route.requested_outcome)
+
+    for source in sources:
+        for sentence in _requirement_sentences(source):
+            if sentence not in sentences:
+                sentences.append(sentence)
+    return sentences[:8]
+
+
+def _requirement_sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])|\n+|;", normalized)
+    sentences: list[str] = []
+    for part in parts:
+        cleaned = str(part or "").strip(" .")
+        if len(cleaned) >= 8 and cleaned not in sentences:
+            sentences.append(cleaned)
+    return sentences
+
+
+def _split_requirement_clauses(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip(" .")
+    if not normalized:
+        return []
+    fragments = re.split(r",\s+|\s+(?:and|und)\s+", normalized)
+    clauses: list[str] = []
+    for fragment in fragments:
+        cleaned = str(fragment or "").strip(" .")
+        cleaned = re.sub(r"^(?:and|und|then|dann)\s+", "", cleaned, flags=re.IGNORECASE).strip(" .")
+        if len(cleaned) < 8 or cleaned in clauses:
+            continue
+        clauses.append(cleaned)
+    return clauses or [normalized]
+
+
+def _last_read_excerpt(session: SessionState, path: str) -> str:
+    target = str(path or "").strip()
+    for item in reversed(session.tool_calls):
+        if item.tool_name != "read_file":
+            continue
+        candidate = str(item.tool_args.get("path") or "").strip()
+        if candidate == target:
+            return str(item.output_excerpt or "").strip()
+    return ""
+
+
+def _artifact_matches_path(path: str, artifact_path: str, artifact_name: str) -> bool:
+    normalized_path = str(path or "").strip().lower()
+    if not normalized_path:
+        return False
+    normalized_artifact_path = str(artifact_path or "").strip().lower()
+    normalized_artifact_name = str(artifact_name or "").strip().lower()
+    target_name = Path(normalized_path).name
+    return bool(
+        normalized_artifact_path == normalized_path
+        or normalized_artifact_name == normalized_path
+        or (normalized_artifact_path and Path(normalized_artifact_path).name == target_name)
+        or (normalized_artifact_name and normalized_artifact_name == target_name)
+    )
+
+
+def _artifact_scope_markers(path_or_name: str) -> set[str]:
+    normalized = str(path_or_name or "").strip().lower()
+    if not normalized:
+        return set()
+    markers: set[str] = {normalized}
+    path_obj = Path(normalized)
+    if path_obj.name:
+        markers.add(path_obj.name)
+    if path_obj.stem:
+        markers.add(path_obj.stem)
+    for part in path_obj.parts:
+        part = str(part or "").strip().lower()
+        if part:
+            markers.add(part)
+    expanded = set(markers)
+    for marker in markers:
+        for token in re.split(r"[^a-z0-9]+", marker):
+            token = token.strip().lower()
+            if len(token) >= 3:
+                expanded.add(token)
+    return expanded
+
+
+def _scope_relevance_score(text: str, markers: set[str]) -> int:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return 0
+    score = 0
+    for marker in markers:
+        candidate = str(marker or "").strip().lower()
+        if len(candidate) < 3:
+            continue
+        if candidate in normalized:
+            score += 3 if "/" in candidate or "." in candidate else 1
+    return score
+
+
 def _repair_rules(repair_strategy: str | None) -> str:
     lines = [
         "Repair rules:",
@@ -859,6 +1457,21 @@ def _repair_rules(repair_strategy: str | None) -> str:
             "- A previous repair attempt produced no effective change. Tighten the repair and change the file materially."
         )
     return "\n".join(lines)
+
+
+def _update_rules() -> str:
+    return "\n".join(
+        [
+            "Update rules:",
+            "- When the request explicitly changes the target file's behavior, implement that requested behavior change while preserving unrelated surrounding behavior.",
+            "- Preserve unrelated existing behavior, imports, exports, config handling, startup code, interfaces, and tests unless the request or evidence requires changing them.",
+            "- Prefer the smallest coherent diff that satisfies the requested outcome.",
+            "- Do not simplify, rewrite, or reorganize the file unless that broader change is necessary for the request.",
+            "- If you change names, config keys, selectors, commands, or interfaces, keep all dependent references aligned.",
+            "- When the current file already contains working behavior not mentioned by the request, keep it intact.",
+            "- Return a structurally complete file: do not leave truncated blocks, unterminated strings, invalid JSON/TOML, or unclosed markdown code fences.",
+        ]
+    )
 
 
 def _inspected_context(session: SessionState) -> str:

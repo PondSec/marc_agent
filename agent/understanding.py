@@ -49,6 +49,7 @@ class TaskInterpreter:
         payload: dict[str, Any] | None = None
         prompt = task_understanding_prompt(user_input, snapshot=snapshot, session=session)
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
+        initial_total_timeout = max(self.timeout * 2, self.timeout + 20)
         model_candidates = self._model_candidates()
         primary_model = model_candidates[0] if model_candidates else None
         reserve_model = model_candidates[1] if len(model_candidates) > 1 else None
@@ -70,6 +71,7 @@ class TaskInterpreter:
                 model=primary_model,
                 retries=0,
                 timeout=self.timeout,
+                total_timeout=initial_total_timeout,
                 num_ctx=self.num_ctx,
                 progress_callback=progress,
             ),
@@ -82,7 +84,7 @@ class TaskInterpreter:
             model_identifier=primary_model,
             backend_identifier="ollama",
             inactivity_timeout_seconds=self.timeout,
-            total_timeout_seconds=max(self.timeout * 2, self.timeout + 20),
+            total_timeout_seconds=initial_total_timeout,
             context_pressure_estimate=context_pressure,
             event_callback=self._progress_logger("task_understanding_generation_progress"),
         )
@@ -145,14 +147,18 @@ class TaskInterpreter:
                 session=session,
                 mode="full" if decision.candidate.prompt_variant == "full" else "compact",
             )
+            retry_timeout = self.timeout if decision.candidate.prompt_variant == "full" else max(12, min(self.timeout, 18))
+            retry_total_timeout = max(retry_timeout * 2, retry_timeout + 20)
+            retry_num_ctx = self.num_ctx if decision.candidate.prompt_variant == "full" else min(self.num_ctx, 2048)
             retry_outcome = invoke_model(
                 lambda progress, prompt_text=retry_prompt, model_name=decision.candidate.model_identifier: self.llm.generate_json(
                     prompt_text,
                     system=task_understanding_system_prompt(),
                     model=model_name,
                     retries=0,
-                    timeout=self.timeout,
-                    num_ctx=self.num_ctx if decision.candidate.prompt_variant == "full" else min(self.num_ctx, 2048),
+                    timeout=retry_timeout,
+                    total_timeout=retry_total_timeout,
+                    num_ctx=retry_num_ctx,
                     progress_callback=progress,
                 ),
                 operation_name="task_understanding",
@@ -163,8 +169,8 @@ class TaskInterpreter:
                 prompt_variant=decision.candidate.prompt_variant,
                 model_identifier=decision.candidate.model_identifier,
                 backend_identifier="ollama",
-                inactivity_timeout_seconds=self.timeout,
-                total_timeout_seconds=max(self.timeout * 2, self.timeout + 20),
+                inactivity_timeout_seconds=retry_timeout,
+                total_timeout_seconds=retry_total_timeout,
                 context_pressure_estimate=context_pressure,
                 event_callback=self._progress_logger("task_understanding_generation_progress"),
             )

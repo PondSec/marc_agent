@@ -44,6 +44,7 @@ class FakeStreamingResponse:
 class FakeReadlineStreamingResponse:
     def __init__(self, events):
         self.events = list(events)
+        self.read_calls = 0
 
     def __enter__(self):
         return self
@@ -52,6 +53,7 @@ class FakeReadlineStreamingResponse:
         return False
 
     def readline(self):
+        self.read_calls += 1
         if not self.events:
             return b""
         event = self.events.pop(0)
@@ -189,6 +191,30 @@ def test_ollama_client_uses_longer_initial_response_timeout_for_slow_local_model
 
     assert result == "ok"
     assert captured[0] > 25
+
+
+def test_ollama_client_stops_streaming_json_once_object_is_complete(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    client = OllamaClient(config)
+    response = FakeReadlineStreamingResponse(
+        [
+            (json.dumps({"response": "{\"ok\":", "done": False}) + "\n").encode("utf-8"),
+            (json.dumps({"response": " true}", "done": False}) + "\n").encode("utf-8"),
+            (json.dumps({"response": "   ", "done": False}) + "\n").encode("utf-8"),
+        ]
+    )
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["format"] == "json"
+        return response
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    payload = client.generate_json("route this", retries=0)
+
+    assert payload == {"ok": True}
+    assert response.read_calls == 2
 
 
 def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progress(monkeypatch, tmp_path):

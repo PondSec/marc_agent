@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import py_compile
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,17 @@ from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
 from runtime.workspace import WorkspaceManager
 from tools.safety import SafetyManager
+
+
+ZERO_TEST_OUTPUT_PATTERNS = (
+    re.compile(r"\bran\s+0\s+tests?\b", re.IGNORECASE),
+    re.compile(r"\bcollected\s+0\s+items\b", re.IGNORECASE),
+    re.compile(r"\bno\s+tests\s+ran\b", re.IGNORECASE),
+)
+RUNTIME_PYTHON_PREFIX = re.compile(
+    r"^(?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s]+)\s+)*)"
+    r"(?P<python>python(?:3)?)\b"
+)
 
 
 class ShellTools:
@@ -34,6 +46,22 @@ class ShellTools:
         if args.command.startswith("internal:"):
             return self._run_internal_validation(args.command, args.cwd)
         result = self._run_command(args.command, args.cwd, args.timeout)
+        insufficient_reason = self._insufficient_test_execution_reason(
+            args.command,
+            stdout=str(result.get("stdout") or ""),
+            stderr=str(result.get("stderr") or ""),
+        )
+        if result.get("success") and insufficient_reason:
+            stderr = str(result.get("stderr") or "").strip()
+            result["success"] = False
+            result["message"] = insufficient_reason
+            result["stderr"] = (
+                f"{stderr}\n{insufficient_reason}".strip()
+                if stderr
+                else insufficient_reason
+            )
+            result["insufficient_verification"] = True
+            return result
         result["message"] = (
             f"Validation command exited with {result['exit_code']}."
             if "exit_code" in result
@@ -111,9 +139,10 @@ class ShellTools:
             }
 
         effective_timeout = timeout or self.config.shell_timeout
+        resolved_command = self._resolve_runtime_command(command)
         try:
             completed = subprocess.run(
-                ["/bin/bash", "-lc", command],
+                ["/bin/bash", "-lc", resolved_command],
                 cwd=working_dir,
                 text=True,
                 capture_output=True,
@@ -139,7 +168,38 @@ class ShellTools:
             "stderr": stderr,
             "exit_code": completed.returncode,
             "command": command,
+            "resolved_command": resolved_command,
         }
+
+    def _insufficient_test_execution_reason(
+        self,
+        command: str,
+        *,
+        stdout: str,
+        stderr: str,
+    ) -> str | None:
+        lowered = str(command or "").lower()
+        if not any(token in lowered for token in ("pytest", "unittest", "go test", "cargo test")):
+            return None
+        combined = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if not combined:
+            return None
+        if any(pattern.search(combined) for pattern in ZERO_TEST_OUTPUT_PATTERNS):
+            return "Validation command did not execute any tests."
+        return None
+
+    def _resolve_runtime_command(self, command: str) -> str:
+        raw_command = str(command or "").strip()
+        if not raw_command:
+            return raw_command
+        match = RUNTIME_PYTHON_PREFIX.match(raw_command)
+        if match is None:
+            return raw_command
+
+        prefix = match.group("prefix") or ""
+        suffix = raw_command[match.end("python") :]
+        runtime_python = shlex.quote(sys.executable)
+        return f"{prefix}{runtime_python}{suffix}"
 
     def _run_python_syntax_validation(self, command: str, working_dir: Path, relative_paths: list[str]) -> dict:
         failures: list[str] = []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 
 from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
@@ -166,3 +167,64 @@ def test_shell_structural_web_validation_catches_dom_id_mismatch_across_referenc
 
     assert result["success"] is False
     assert "missing DOM ids referenced by JS (themeSwitcher)" in result["stderr"]
+
+
+def test_shell_marks_zero_test_unittest_run_as_insufficient_validation(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+    monkeypatch.setattr(
+        shell,
+        "_run_command",
+        lambda command, cwd, timeout: {
+            "success": True,
+            "message": "Command exited with 0.",
+            "risk_level": "low",
+            "stdout": "Ran 0 tests in 0.000s\n\nOK\n",
+            "stderr": "",
+            "exit_code": 0,
+            "command": command,
+        },
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command="python -m unittest",
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is False
+    assert result["insufficient_verification"] is True
+    assert "did not execute any tests" in result["message"]
+    assert "Ran 0 tests" in result["stdout"]
+
+
+def test_shell_runs_python_module_commands_with_current_runtime_interpreter(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+    called: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        called["args"] = args
+        called["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("tools.shell.subprocess.run", fake_run)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command="python -m unittest",
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["resolved_command"].startswith(sys.executable)
+    assert called["args"][0:2] == ["/bin/bash", "-lc"]
+    assert sys.executable in called["args"][2]

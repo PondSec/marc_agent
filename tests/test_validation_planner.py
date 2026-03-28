@@ -11,6 +11,7 @@ from agent.models import (
     ValidationRunRecord,
     WorkspaceSnapshot,
 )
+from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 
 
@@ -138,6 +139,55 @@ def test_validation_planner_prefers_runtime_smoke_for_small_python_entry_artifac
     syntax_checks = [item for item in plan if item.command.startswith("internal:python_syntax:")]
     assert syntax_checks
     assert syntax_checks[0].required is False
+
+
+def test_validation_planner_includes_explicit_user_requested_validation_command():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["tests"],
+        important_files=["cli.py", "README.md", "tests/test_cli.py"],
+        focus_files=["cli.py", "tests/test_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI project with unittest coverage.",
+    )
+    session = SessionState(
+        task="Fuege --state-root hinzu und fuehre danach python -m unittest aus.",
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn="Fuege --state-root hinzu und fuehre danach python -m unittest aus.",
+            root_goal="Extend the CLI safely.",
+            active_goal="Add the new option and keep existing behavior.",
+            goal_relation="continue",
+            output_expectation="Updated CLI and tests.",
+            verification_target="python -m unittest",
+            next_action="modify",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["cli.py", "tests/test_cli.py"],
+        session=session,
+    )
+
+    assert plan[0].command == "python -m unittest"
+    assert plan[0].verification_scope == "runtime"
+    assert plan[0].required is True
 
 
 def test_validation_planner_does_not_mark_unchecked_changes_as_passed():
@@ -291,3 +341,45 @@ def test_validation_planner_builds_structured_failure_evidence_for_web_validatio
     assert "snake.html is missing validation-required features" in evidence.failure_summary
     assert any("Add or restore the structural features" in item for item in evidence.repair_requirements)
     assert any("Do not stop at an equivalent" in item for item in evidence.repair_requirements)
+
+
+def test_validation_planner_prioritizes_test_artifacts_for_no_test_execution_failures():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Fuege --state-root zur CLI hinzu und fuehre danach python -m unittest aus.",
+        workspace_root="/tmp/demo",
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn="Fuege --state-root zur CLI hinzu und fuehre danach python -m unittest aus.",
+            root_goal="Extend the CLI safely.",
+            active_goal="Add the new option and update tests.",
+            goal_relation="continue",
+            output_expectation="Updated CLI, docs, and tests.",
+            verification_target="python -m unittest",
+            next_action="modify",
+            target_artifacts=[
+                {"path": "cli.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_cli.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="cli.py", operation="modify"))
+    session.changed_files.append(FileChangeRecord(path="README.md", operation="modify"))
+    session.changed_files.append(FileChangeRecord(path="tests/test_cli.py", operation="modify"))
+    failed_run = ValidationRunRecord(
+        command="python -m unittest",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 5.",
+        excerpt="Ran 0 tests in 0.000s\n\nNO TESTS RAN",
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "tests/test_cli.py"
+    assert "tests/__init__.py" in evidence.file_hints
+    assert any("test discovery" in item for item in evidence.repair_requirements)
+    assert any("tests/__init__.py" in item for item in evidence.repair_requirements)
+    assert not any(item == "Change cli.py so the failing runtime or test path can complete successfully." for item in evidence.repair_requirements)

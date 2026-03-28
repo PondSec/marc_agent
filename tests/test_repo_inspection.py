@@ -64,3 +64,26 @@ def test_repo_snapshot_ignores_external_symlinked_virtualenv(tmp_path, tmp_path_
 
     assert snapshot.file_count == 1
     assert snapshot.important_files == ["src/app.py"]
+
+
+def test_repo_snapshot_detects_unittest_command_from_python_test_files_without_manifest(tmp_path):
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (tmp_path / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_cli.py").write_text(
+        (
+            "import unittest\n\n"
+            "class CliTests(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    memory = RepoMemoryStore(config, WorkspaceManager(tmp_path))
+
+    snapshot = memory.build_snapshot("cli unittest")
+
+    assert any(item.command == "python -m unittest" for item in snapshot.validation_commands)

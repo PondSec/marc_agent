@@ -108,6 +108,15 @@ class SemanticChangeReview(StrictModel):
     repair_hints: list[str] = Field(default_factory=list)
 
 
+class ProposedUpdateReview(StrictModel):
+    safe_to_write: bool
+    summary: str
+    confidence: float = 0.0
+    blocking_issues: list[str] = Field(default_factory=list)
+    preservation_risks: list[str] = Field(default_factory=list)
+    repair_hints: list[str] = Field(default_factory=list)
+
+
 class DiagnosticRecord(StrictModel):
     source: str
     category: str

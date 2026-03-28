@@ -26,3 +26,24 @@ def test_failure_analyzer_extracts_category_and_file_hints(tmp_path):
     assert diagnostic.file_hints == ["tests/test_api.py"]
     assert diagnostic.line_hints == [12]
     assert diagnostic.severity == "error"
+
+
+def test_failure_analyzer_adds_discovery_hint_when_no_tests_ran(tmp_path):
+    analyzer = FailureAnalyzer(WorkspaceManager(tmp_path))
+    result = ToolRunResult(
+        tool_name="run_tests",
+        success=False,
+        message="Validation command did not execute any tests.",
+        data={
+            "command": "python -m unittest",
+            "stdout": "Ran 0 tests in 0.000s\n\nOK\n",
+            "stderr": "Validation command did not execute any tests.",
+            "exit_code": 0,
+        },
+    )
+
+    diagnostics = analyzer.analyze(result, iteration=4)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].category == "test_failure"
+    assert any("test discovery" in hint for hint in diagnostics[0].action_hints)

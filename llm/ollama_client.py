@@ -200,6 +200,7 @@ class OllamaClient:
                         startup_timeout=startup_timeout,
                         inactivity_timeout=inactivity_timeout,
                         total_timeout=overall_timeout,
+                        expect_json=expect_json,
                         progress_callback=progress_callback,
                     )
             except error.HTTPError as exc:
@@ -254,6 +255,7 @@ class OllamaClient:
         startup_timeout: int,
         inactivity_timeout: int,
         total_timeout: int,
+        expect_json: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         if not hasattr(response, "readline"):
@@ -437,6 +439,10 @@ class OllamaClient:
                             "model": model_name,
                         }
                     )
+                if expect_json and "}" in piece:
+                    completed_json = self._try_coerce_json_object("".join(streamed_parts))
+                    if completed_json is not None:
+                        return json.dumps(completed_json, ensure_ascii=False)
             if payload.get("done") is True:
                 break
 
@@ -543,6 +549,13 @@ class OllamaClient:
             if isinstance(data, dict):
                 return data
         raise OllamaClientError(f"Model did not return valid JSON: {text[:500]}")
+
+    @staticmethod
+    def _try_coerce_json_object(text: str) -> dict[str, Any] | None:
+        try:
+            return OllamaClient._coerce_json_object(text)
+        except OllamaClientError:
+            return None
 
     def pull_model_events(self, model_name: str) -> Iterator[dict[str, Any]]:
         payload = {

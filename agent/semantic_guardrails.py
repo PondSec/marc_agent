@@ -18,6 +18,7 @@ from agent.semantic_defaults import (
     has_follow_up_reference,
     infer_artifact_name_hint,
     infer_requested_extension,
+    infer_scope_tokens,
     is_clear_low_risk_build_request,
     looks_like_additive_request,
     looks_like_correction_request,
@@ -113,13 +114,24 @@ def build_minimal_task_state(
     snapshot=None,
     semantic_resolution: SemanticResolution = "minimal_inference",
 ) -> TaskState:
-    del snapshot
     request = str(user_input or "").strip() or "Unclear request"
     context = _context_anchor(session)
     signal = _minimal_semantic_signal(request, context=context)
+    inferred_snapshot_targets = _snapshot_target_artifacts(request, snapshot)
+    if signal.intent == "update" and signal.needs_clarification and inferred_snapshot_targets:
+        signal = MinimalSemanticSignal(
+            intent=signal.intent,
+            goal_relation=signal.goal_relation,
+            confidence=max(signal.confidence, 0.6),
+            use_context=signal.use_context,
+            needs_clarification=False,
+            requested_extension=signal.requested_extension,
+            artifact_name_hint=signal.artifact_name_hint,
+            explicit_path=signal.explicit_path,
+        )
     anchor_artifacts = context["artifacts"]
     active_artifacts = anchor_artifacts[:6] if signal.use_context else []
-    target_artifacts = _target_artifacts_for_signal(
+    target_artifacts = inferred_snapshot_targets or _target_artifacts_for_signal(
         request,
         signal=signal,
         anchor_artifacts=anchor_artifacts,
@@ -151,6 +163,8 @@ def build_minimal_task_state(
         relevant_context.append(f"Existing root goal: {context['root_goal']}")
     if signal.use_context and active_artifacts:
         assumptions.append("Current-turn wording is treated as a same-task reference only because there is one safe active anchor.")
+    elif inferred_snapshot_targets:
+        assumptions.append("The target artifacts were inferred conservatively from strong lexical overlap between the request and workspace filenames.")
 
     if signal.needs_clarification:
         current_user_intent = "unknown"
@@ -428,6 +442,17 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
     single_anchor = len(anchor_paths) == 1
     multiple_anchors = len(anchor_paths) > 1
 
+    create_like = is_clear_low_risk_build_request(request)
+    update_like = (
+        looks_like_update_request(request)
+        or looks_like_hardening_request(request)
+        or looks_like_additive_request(request)
+        or scope_change
+        or correction
+        or (single_anchor and _has_explicit_change_marker(normalized))
+    )
+    validate_like = looks_like_validation_request(request) and not looks_like_debug_request(request)
+
     intent: GuardrailPrimaryIntent
     if looks_like_explanation_request(request):
         intent = "explain"
@@ -435,21 +460,14 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
         intent = "plan"
     elif _looks_like_search_request(normalized):
         intent = "search"
-    elif looks_like_validation_request(request) and not looks_like_debug_request(request):
-        intent = "validate"
     elif looks_like_debug_request(request):
         intent = "debug"
-    elif is_clear_low_risk_build_request(request):
+    elif create_like:
         intent = "create"
-    elif (
-        looks_like_update_request(request)
-        or looks_like_hardening_request(request)
-        or looks_like_additive_request(request)
-        or scope_change
-        or correction
-        or (single_anchor and _has_explicit_change_marker(normalized))
-    ):
+    elif update_like:
         intent = "update"
+    elif validate_like:
+        intent = "validate"
     else:
         intent = "unknown"
 
@@ -827,6 +845,79 @@ def _extract_explicit_path(text: str) -> str | None:
 def _extract_explicit_name(text: str) -> str | None:
     candidate = infer_artifact_name_hint(text)
     return candidate if candidate and len(candidate) >= 3 else None
+
+
+def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
+    if snapshot is None:
+        return []
+
+    request_tokens = [token for token in infer_scope_tokens(request) if len(token) >= 3]
+    if not request_tokens:
+        return []
+
+    candidate_paths: list[str] = []
+    for group in (
+        getattr(snapshot, "focus_files", []),
+        getattr(snapshot, "important_files", []),
+        getattr(snapshot, "manifests", []),
+        getattr(snapshot, "test_files", []),
+        getattr(snapshot, "entrypoints", []),
+    ):
+        for item in group[:12]:
+            path = str(item or "").strip()
+            if path and path not in candidate_paths:
+                candidate_paths.append(path)
+
+    scored: list[tuple[float, str]] = []
+    for path in candidate_paths:
+        normalized_path = normalize_text(path).replace("_", " ")
+        path_tokens = [token for token in re.split(r"[^a-z0-9äöüß]+", normalized_path) if token]
+        score = 0.0
+        for request_token in request_tokens:
+            for path_token in path_tokens:
+                if request_token == path_token:
+                    score += 2.0
+                elif len(request_token) >= 4 and (request_token in path_token or path_token in request_token):
+                    score += 1.0
+        if score >= 1.0:
+            scored.append((score, path))
+
+    if not scored:
+        return []
+
+    best_score = max(score for score, _ in scored)
+    entrypoints = set(getattr(snapshot, "entrypoints", []) or [])
+    manifests = set(getattr(snapshot, "manifests", []) or [])
+    test_files = set(getattr(snapshot, "test_files", []) or [])
+
+    def path_priority(path: str) -> tuple[int, str]:
+        suffix = Path(path).suffix.lower()
+        if path in entrypoints:
+            return (0, path)
+        if path in manifests or suffix in {".md", ".rst", ".txt"}:
+            return (1, path)
+        if path in test_files or "/tests/" in f"/{path}":
+            return (2, path)
+        return (0, path)
+
+    selected = [
+        path
+        for score, path in sorted(scored, key=lambda item: (*path_priority(item[1]), -item[0]))
+        if score >= max(1.0, best_score - 1.0)
+    ][:4]
+    artifacts: list[TaskArtifact] = []
+    for path in selected:
+        confidence = 0.58
+        artifacts.append(
+            TaskArtifact(
+                path=path,
+                name=Path(path).name,
+                kind=Path(path).suffix.lower() or "file",
+                role="primary_target",
+                confidence=confidence,
+            )
+        )
+    return artifacts
 
 
 def _default_artifact_name(extension: str | None) -> str | None:

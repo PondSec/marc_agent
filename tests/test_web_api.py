@@ -11,6 +11,7 @@ from config.settings import AppConfig
 from server.app import _with_available_models, create_app
 
 TEST_ORIGIN = "https://testserver"
+TEST_LOCAL_ORIGIN = "http://127.0.0.1:8000"
 TEST_AUTH_SECRET = "test-auth-secret-please-change"
 TEST_ADMIN_EMAIL = "operator@example.com"
 TEST_ADMIN_PASSWORD = "VeryStrongPassword!2026"
@@ -29,15 +30,16 @@ def build_test_config(root, **overrides) -> AppConfig:
 
 
 def build_incomplete_setup_config(root, **overrides) -> AppConfig:
-    return AppConfig(
-        workspace_root=str(root),
-        ollama_host="http://127.0.0.1:9",
-        auth_secret_key=None,
-        auth_initial_admin_email=None,
-        auth_initial_admin_password=None,
-        auth_cookie_secure=False,
-        **overrides,
-    )
+    values = {
+        "workspace_root": str(root),
+        "ollama_host": "http://127.0.0.1:9",
+        "auth_secret_key": None,
+        "auth_initial_admin_email": None,
+        "auth_initial_admin_password": None,
+        "auth_cookie_secure": False,
+    }
+    values.update(overrides)
+    return AppConfig(**values)
 
 
 def current_csrf_token(client: TestClient) -> str:
@@ -174,6 +176,43 @@ def test_setup_completion_creates_env_admin_and_workspace(tmp_path):
     workspaces_response = client.get("/api/workspaces")
     assert workspaces_response.status_code == 200
     assert workspaces_response.json()[0]["name"] == "Demo Project"
+
+
+def test_setup_completion_works_on_local_http_when_base_config_prefers_secure_cookies(tmp_path):
+    config = build_incomplete_setup_config(tmp_path, auth_cookie_secure=True)
+    app = create_app(config)
+    client = TestClient(app, base_url=TEST_LOCAL_ORIGIN)
+
+    setup_status = client.get("/api/setup/status")
+    assert setup_status.status_code == 200
+    client.headers.update(
+        {
+            "Origin": TEST_LOCAL_ORIGIN,
+            "X-CSRF-Token": current_csrf_token(client),
+        }
+    )
+
+    workspace_root = tmp_path / "demo-project"
+    response = client.post(
+        "/api/setup/complete",
+        json={
+            "admin_display_name": "Setup Admin",
+            "admin_email": TEST_ADMIN_EMAIL,
+            "admin_password": TEST_ADMIN_PASSWORD,
+            "admin_password_confirm": TEST_ADMIN_PASSWORD,
+            "initial_workspace_name": "Demo Project",
+            "initial_workspace_path": str(workspace_root),
+            "ollama_host": "http://127.0.0.1:11434",
+            "model_name": "qwen3-coder:30b",
+            "router_model_name": "qwen2.5-coder:14b",
+            "access_mode": "approval",
+            "auth_cookie_secure": False,
+            "public_base_url": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workspace"]["name"] == "Demo Project"
 
 
 def test_new_chat_requires_explicit_workspace_selection(tmp_path):

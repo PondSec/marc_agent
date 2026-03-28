@@ -181,6 +181,10 @@ class AppConfig:
             model_name=str(pick("MODEL_NAME", defaults.model_name)),
             router_model_name=pick("ROUTER_MODEL_NAME", defaults.router_model_name),
             workspace_root=str(pick("WORKSPACE_ROOT", defaults.workspace_root)),
+            state_root_override=str(
+                pick("STATE_ROOT_OVERRIDE", defaults.state_root_override) or ""
+            ).strip()
+            or None,
             access_mode=access_mode.value,
             max_iterations=_parse_int(
                 pick("MAX_ITERATIONS", defaults.max_iterations),

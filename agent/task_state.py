@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -62,6 +62,46 @@ NextAction = Literal[
 EvidenceKind = Literal["message", "log", "diff", "diagnostic", "test", "command", "file", "unknown"]
 SemanticInferenceMode = Literal["full", "conservative"]
 
+GOAL_RELATION_ALIASES: dict[str, GoalRelation] = {
+    "same_task_follow_up": "continue",
+    "refinement": "refine",
+    "correction": "correct",
+    "problem_report": "report_problem",
+    "constraint_update": "scope_change",
+    "validation": "validation_request",
+}
+USER_INTENT_ALIASES: dict[str, UserIntent] = {
+    "update": "implement",
+    "modify": "implement",
+    "create": "implement",
+    "build": "implement",
+    "debug": "repair",
+    "test": "validate",
+    "analyze": "inspect",
+}
+NEXT_ACTION_ALIASES: dict[str, NextAction] = {
+    "update": "modify",
+    "modify_file": "modify",
+    "create_file": "create",
+    "build": "create",
+    "validate": "test",
+    "analyze": "inspect",
+}
+EXECUTION_STRATEGY_ALIASES: dict[str, ExecutionStrategy] = {
+    "update": "feature_implementation",
+    "modify": "feature_implementation",
+    "create": "feature_implementation",
+    "implement": "feature_implementation",
+    "repair": "debug_repair",
+    "debug": "debug_repair",
+    "test": "validation_inspection",
+    "validate": "validation_inspection",
+    "inspect": "validation_inspection",
+    "search": "validation_inspection",
+    "explain": "validation_inspection",
+    "plan": "validation_inspection",
+}
+
 
 def _compact_strings(values: list[str], *, limit: int | None = None) -> list[str]:
     unique: list[str] = []
@@ -116,6 +156,13 @@ def _signal_text(
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
+
+
+def _normalize_alias(value: Any, aliases: dict[str, str]) -> Any:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    return aliases.get(text, text)
 
 
 def _infer_user_intent(
@@ -217,8 +264,7 @@ def _infer_execution_strategy(
     if goal_relation in {"correct", "rollback_request", "scope_change"} or current_user_intent == "correct":
         return "rollback_correction"
     if (
-        current_user_intent == "repair"
-        or next_best_action == "debug"
+        next_best_action == "debug"
         or goal_relation == "report_problem"
         or open_problem is not None
         or evidence_kinds & {"diagnostic", "test", "log"}
@@ -252,6 +298,8 @@ def _infer_execution_strategy(
         or next_best_action in {"test", "inspect", "search", "explain", "plan"}
     ):
         return "validation_inspection"
+    if current_user_intent in {"repair", "implement"} or next_best_action in {"create", "modify"}:
+        return "feature_implementation"
     return "feature_implementation"
 
 
@@ -295,8 +343,7 @@ def _infer_execution_strategy_conservative(
     if goal_relation in {"correct", "rollback_request", "scope_change"} or current_user_intent == "correct":
         return "rollback_correction"
     if (
-        current_user_intent == "repair"
-        or next_best_action == "debug"
+        next_best_action == "debug"
         or goal_relation == "report_problem"
         or open_problem is not None
         or evidence_kinds & {"diagnostic", "test", "log"}
@@ -311,7 +358,7 @@ def _infer_execution_strategy_conservative(
         or next_best_action in {"test", "inspect", "search", "explain", "plan"}
     ):
         return "validation_inspection"
-    if current_user_intent == "implement" or next_best_action in {"create", "modify"}:
+    if current_user_intent in {"repair", "implement"} or next_best_action in {"create", "modify"}:
         return "feature_implementation"
     return None
 
@@ -322,6 +369,20 @@ class EvidenceItem(StrictModel):
     source: str | None = None
     artifact_path: str | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_shorthand(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {"summary": "", "confidence": 0.0}
+            return {
+                "kind": "unknown",
+                "summary": text,
+                "confidence": 0.35,
+            }
+        return value
 
     @model_validator(mode="after")
     def normalize(self) -> EvidenceItem:
@@ -361,6 +422,34 @@ class TaskState(StrictModel):
     semantic_resolution: SemanticResolution = "full_model"
     secondary_semantics_limited: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        if "goal_relation" in payload:
+            normalized = _normalize_alias(payload.get("goal_relation"), GOAL_RELATION_ALIASES)
+            if normalized:
+                payload["goal_relation"] = normalized
+        if "current_user_intent" in payload:
+            normalized = _normalize_alias(payload.get("current_user_intent"), USER_INTENT_ALIASES)
+            if normalized:
+                payload["current_user_intent"] = normalized
+        if "next_action" in payload:
+            normalized = _normalize_alias(payload.get("next_action"), NEXT_ACTION_ALIASES)
+            if normalized:
+                payload["next_action"] = normalized
+        if "next_best_action" in payload:
+            normalized = _normalize_alias(payload.get("next_best_action"), NEXT_ACTION_ALIASES)
+            if normalized:
+                payload["next_best_action"] = normalized
+        if "execution_strategy" in payload:
+            normalized = _normalize_alias(payload.get("execution_strategy"), EXECUTION_STRATEGY_ALIASES)
+            if normalized:
+                payload["execution_strategy"] = normalized
+        return payload
+
     @model_validator(mode="after")
     def normalize(self) -> TaskState:
         self.latest_user_turn = str(self.latest_user_turn or "").strip()
@@ -383,6 +472,37 @@ class TaskState(StrictModel):
         self.execution_outline = _compact_strings(self.execution_outline, limit=6)
         self.clarification_questions = _compact_strings(self.clarification_questions, limit=3)
         self.next_best_action = self.next_best_action or self.next_action
+        if (
+            self.execution_strategy is None
+            and self.current_user_intent in {
+                "repair",
+                "implement",
+                "refactor",
+                "harden",
+                "validate",
+                "inspect",
+                "explain",
+                "search",
+                "plan",
+            }
+            and self.goal_relation not in {"correct", "scope_change", "rollback_request", "clarify"}
+            and self.next_best_action != "clarify"
+        ):
+            self.execution_strategy = _infer_execution_strategy(
+                latest_user_turn=self.latest_user_turn,
+                goal_relation=self.goal_relation,
+                current_user_intent=self.current_user_intent,
+                next_best_action=self.next_best_action,
+                root_goal=self.root_goal,
+                active_goal=self.active_goal,
+                output_expectation=self.output_expectation,
+                open_problem=self.open_problem,
+                verification_target=self.verification_target,
+                constraints=self.constraints,
+                assumptions=self.assumptions,
+                supplied_evidence=self.supplied_evidence,
+                evidence=self.evidence,
+            )
         if self.needs_clarification and not self.clarification_questions:
             raise ValueError("clarification_questions must be present when needs_clarification is true")
         if not self.latest_user_turn:

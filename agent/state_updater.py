@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from pydantic import ValidationError
+
 from agent.prompts import task_state_system_prompt, task_state_update_prompt
 from agent.semantic_guardrails import build_minimal_task_state
 from agent.semantic_runtime import (
@@ -56,6 +58,7 @@ class TaskStateUpdater:
             mode=initial_mode,
         )
         initial_timeout = self.timeout if initial_mode == "full" else max(12, min(self.timeout, 18))
+        initial_total_timeout = max(initial_timeout * 2, initial_timeout + 20)
         initial_num_ctx = self.num_ctx if initial_mode == "full" else min(self.num_ctx, 2048)
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
         model_candidates = self._model_candidates()
@@ -79,6 +82,7 @@ class TaskStateUpdater:
                 model=primary_model,
                 retries=0,
                 timeout=initial_timeout,
+                total_timeout=initial_total_timeout,
                 num_ctx=initial_num_ctx,
                 progress_callback=progress,
             ),
@@ -91,35 +95,43 @@ class TaskStateUpdater:
             model_identifier=primary_model,
             backend_identifier=self._backend_identifier(),
             inactivity_timeout_seconds=initial_timeout,
-            total_timeout_seconds=max(initial_timeout * 2, initial_timeout + 20),
+            total_timeout_seconds=initial_total_timeout,
             context_pressure_estimate=context_pressure,
             event_callback=self._progress_logger("task_state_generation_progress"),
         )
         attempts.append(outcome.attempt)
         if outcome.exception is None:
             payload = outcome.value
-            state = self._finalize_state(TaskState.model_validate(payload), semantic_resolution="full_model")
-            self._append_runtime_execution(
-                session,
-                annotate_semantic_record(
-                    build_execution_run_record(
-                        operation_name="task_state_generation",
-                        task_class="task_state_generation",
-                        final_state="completed",
-                        capability_tier="tier_a",
-                        recovery_strategy="primary_model_generation",
-                        degraded=False,
-                        honest_blocked=False,
-                        artifact_bytes_generated=0,
-                        validation_possible=False,
-                        summary="Task understanding completed on the primary semantic model.",
-                        attempts=attempts,
+            try:
+                state = self._finalize_state(TaskState.model_validate(payload), semantic_resolution="full_model")
+            except ValidationError as exc:
+                self._log(
+                    "task_state_validation_failed",
+                    raw_task_state=payload or {},
+                    errors=exc.errors(),
+                )
+            else:
+                self._append_runtime_execution(
+                    session,
+                    annotate_semantic_record(
+                        build_execution_run_record(
+                            operation_name="task_state_generation",
+                            task_class="task_state_generation",
+                            final_state="completed",
+                            capability_tier="tier_a",
+                            recovery_strategy="primary_model_generation",
+                            degraded=False,
+                            honest_blocked=False,
+                            artifact_bytes_generated=0,
+                            validation_possible=False,
+                            summary="Task understanding completed on the primary semantic model.",
+                            attempts=attempts,
+                        ),
+                        semantic_resolution="full_model",
                     ),
-                    semantic_resolution="full_model",
-                ),
-            )
-            self._log("task_state_updated", task_state=state.model_dump())
-            return state
+                )
+                self._log("task_state_updated", task_state=state.model_dump())
+                return state
 
         failure = outcome.attempt.failure
         self._log(
@@ -154,6 +166,7 @@ class TaskStateUpdater:
                 mode="full" if decision.candidate.prompt_variant == "full" else "compact",
             )
             retry_timeout = self.timeout if decision.candidate.prompt_variant == "full" else max(12, min(self.timeout, 18))
+            retry_total_timeout = max(retry_timeout * 2, retry_timeout + 20)
             retry_num_ctx = self.num_ctx if decision.candidate.prompt_variant == "full" else min(self.num_ctx, 2048)
             retry_outcome = invoke_model(
                 lambda progress, prompt_text=retry_prompt, model_name=decision.candidate.model_identifier: self.llm.generate_json(
@@ -162,6 +175,7 @@ class TaskStateUpdater:
                     model=model_name,
                     retries=0,
                     timeout=retry_timeout,
+                    total_timeout=retry_total_timeout,
                     num_ctx=retry_num_ctx,
                     progress_callback=progress,
                 ),
@@ -174,7 +188,7 @@ class TaskStateUpdater:
                 model_identifier=decision.candidate.model_identifier,
                 backend_identifier=self._backend_identifier(),
                 inactivity_timeout_seconds=retry_timeout,
-                total_timeout_seconds=max(retry_timeout * 2, retry_timeout + 20),
+                total_timeout_seconds=retry_total_timeout,
                 context_pressure_estimate=context_pressure,
                 event_callback=self._progress_logger("task_state_generation_progress"),
             )
@@ -187,32 +201,40 @@ class TaskStateUpdater:
                     model_identifier=decision.candidate.model_identifier,
                     primary_model=primary_model,
                 )
-                state = self._finalize_state(TaskState.model_validate(payload), semantic_resolution=resolution)
-                self._append_runtime_execution(
-                    session,
-                    annotate_semantic_record(
-                        build_execution_run_record(
-                            operation_name="task_state_generation",
-                            task_class="task_state_generation",
-                            final_state="completed",
-                            capability_tier=decision.candidate.capability_tier,
-                            recovery_strategy=decision.candidate.strategy,
-                            degraded=decision.candidate.capability_tier != "tier_a",
-                            honest_blocked=False,
-                            artifact_bytes_generated=0,
-                            validation_possible=False,
-                            summary=(
-                                "Task understanding recovered on a reserve semantic model."
-                                if resolution == "reserve_model"
-                                else "Task understanding recovered through reduced semantic reconstruction."
+                try:
+                    state = self._finalize_state(TaskState.model_validate(payload), semantic_resolution=resolution)
+                except ValidationError as exc:
+                    self._log(
+                        "task_state_validation_failed",
+                        raw_task_state=payload or {},
+                        errors=exc.errors(),
+                    )
+                else:
+                    self._append_runtime_execution(
+                        session,
+                        annotate_semantic_record(
+                            build_execution_run_record(
+                                operation_name="task_state_generation",
+                                task_class="task_state_generation",
+                                final_state="completed",
+                                capability_tier=decision.candidate.capability_tier,
+                                recovery_strategy=decision.candidate.strategy,
+                                degraded=decision.candidate.capability_tier != "tier_a",
+                                honest_blocked=False,
+                                artifact_bytes_generated=0,
+                                validation_possible=False,
+                                summary=(
+                                    "Task understanding recovered on a reserve semantic model."
+                                    if resolution == "reserve_model"
+                                    else "Task understanding recovered through reduced semantic reconstruction."
+                                ),
+                                attempts=attempts,
                             ),
-                            attempts=attempts,
+                            semantic_resolution=resolution,
                         ),
-                        semantic_resolution=resolution,
-                    ),
-                )
-                self._log("task_state_updated", task_state=state.model_dump(), source="recovered_model")
-                return state
+                    )
+                    self._log("task_state_updated", task_state=state.model_dump(), source="recovered_model")
+                    return state
             self._log(
                 "task_state_generation_retry_error",
                 error=str(retry_outcome.exception),

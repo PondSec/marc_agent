@@ -27,6 +27,83 @@ MUTATION_TOOL_NAMES = {
 
 
 class ValidationPlanner:
+    EXPLICIT_VALIDATION_COMMAND_SPECS = (
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 5,
+            "pattern": re.compile(r"(?P<command>python(?:3)?\s+-m\s+pytest\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 5,
+            "pattern": re.compile(r"(?P<command>python(?:3)?\s+-m\s+unittest\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 6,
+            "pattern": re.compile(r"(?P<command>pytest\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "lint",
+            "verification_scope": "static",
+            "priority": 8,
+            "pattern": re.compile(r"(?P<command>ruff(?:\s+check)?\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "typecheck",
+            "verification_scope": "static",
+            "priority": 10,
+            "pattern": re.compile(r"(?P<command>mypy\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "typecheck",
+            "verification_scope": "static",
+            "priority": 10,
+            "pattern": re.compile(r"(?P<command>pyright\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "check",
+            "verification_scope": "static",
+            "priority": 12,
+            "pattern": re.compile(r"(?P<command>node\s+--check\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 7,
+            "pattern": re.compile(
+                r"(?P<command>(?:npm|pnpm|yarn)\s+(?:test|run\s+(?:test|lint|build|typecheck))\b[^`\n]*)",
+                re.IGNORECASE,
+            ),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 7,
+            "pattern": re.compile(r"(?P<command>go\s+test\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 7,
+            "pattern": re.compile(r"(?P<command>cargo\s+(?:test|check)\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 9,
+            "pattern": re.compile(r"(?P<command>make\s+(?:test|check|lint|build)\b[^`\n]*)", re.IGNORECASE),
+        },
+    )
+    EXPLICIT_COMMAND_TRAILING_STOPWORDS = re.compile(
+        r"(?i)\s+(?:"
+        r"then|after|afterward|until|and|danach|danachmals|danachhin|"
+        r"und|bis|aus|ausfuehren|ausführen"
+        r")\b.*$"
+    )
     WEB_FEATURE_KEYWORDS = {
         "menu": ("menu", "menue", "menü", "navigation", "nav"),
         "highscore": ("highscore", "high score", "scoreboard", "leaderboard", "best score", "bestenliste"),
@@ -51,6 +128,11 @@ class ValidationPlanner:
         re.IGNORECASE,
     )
     MISSING_REF_PATTERN = re.compile(r"(?P<path>[\w./\\-]+\.(?:html|htm))\s*->\s*(?P<ref>[^\s]+)")
+    NO_TESTS_RAN_PATTERNS = (
+        re.compile(r"\bran\s+0\s+tests?\b", re.IGNORECASE),
+        re.compile(r"\bno\s+tests\s+ran\b", re.IGNORECASE),
+        re.compile(r"\bcollected\s+0\s+items\b", re.IGNORECASE),
+    )
 
     def build_plan(
         self,
@@ -77,6 +159,7 @@ class ValidationPlanner:
             )
             for item in snapshot.likely_commands
         ]
+        commands = self._merge_explicit_validation_commands(commands, session=session)
         if changed_paths and not any(self.command_scope(command) == "runtime" for command in commands):
             commands.extend(self._default_commands(snapshot, changed_paths, task=task))
         synthesized = self._synthesized_runtime_commands(
@@ -202,7 +285,18 @@ class ValidationPlanner:
             return "static"
         if normalized_kind == "test":
             return "runtime"
-        if any(token in lowered for token in ("pytest", "python -m unittest", "go test", "cargo test")):
+        if any(
+            token in lowered
+            for token in (
+                "pytest",
+                "python -m unittest",
+                "python3 -m unittest",
+                "python -m pytest",
+                "python3 -m pytest",
+                "go test",
+                "cargo test",
+            )
+        ):
             return "runtime"
         if any(
             token in lowered
@@ -210,6 +304,124 @@ class ValidationPlanner:
         ):
             return "static"
         return "static"
+
+    def _merge_explicit_validation_commands(
+        self,
+        commands: list[ValidationCommand],
+        *,
+        session: SessionState | None,
+    ) -> list[ValidationCommand]:
+        explicit = self._explicit_validation_commands(session)
+        if not explicit:
+            return commands
+
+        merged: list[ValidationCommand] = []
+        seen: set[str] = set()
+        for item in [*explicit, *commands]:
+            identity = self.command_identity(item.command)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            merged.append(item)
+        return merged
+
+    def _explicit_validation_commands(
+        self,
+        session: SessionState | None,
+    ) -> list[ValidationCommand]:
+        if session is None:
+            return []
+
+        texts: list[tuple[str, str]] = []
+        task_state = session.task_state
+        if task_state is not None:
+            if task_state.verification_target:
+                texts.append(("task_state", task_state.verification_target))
+            if task_state.latest_user_turn:
+                texts.append(("user_request", task_state.latest_user_turn))
+        elif session.task:
+            texts.append(("user_request", session.task))
+
+        extracted: list[ValidationCommand] = []
+        for source, text in texts:
+            normalized_text = " ".join(str(text or "").split())
+            if not normalized_text:
+                continue
+            for spec in self.EXPLICIT_VALIDATION_COMMAND_SPECS:
+                for match in spec["pattern"].finditer(normalized_text):
+                    command = self._normalize_explicit_validation_command(match.group("command"))
+                    if not command:
+                        continue
+                    extracted.append(
+                        ValidationCommand(
+                            command=command,
+                            kind=str(spec["kind"]),
+                            verification_scope=str(spec["verification_scope"]),
+                            source=source,
+                            priority=int(spec["priority"]),
+                            reason="Explicit validation command requested in the active task.",
+                            required=True,
+                        )
+                    )
+        unique: list[ValidationCommand] = []
+        seen: set[str] = set()
+        for item in extracted:
+            identity = self.command_identity(item.command)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(item)
+        return unique
+
+    def _normalize_explicit_validation_command(self, raw: str) -> str | None:
+        command = " ".join(str(raw or "").strip().split())
+        if not command:
+            return None
+        command = command.strip("`'\"")
+        command = self.EXPLICIT_COMMAND_TRAILING_STOPWORDS.sub("", command).strip()
+        command = command.rstrip(".,;:!?")
+        if not command:
+            return None
+        lowered = command.lower()
+        for spec in self.EXPLICIT_VALIDATION_COMMAND_SPECS:
+            if spec["pattern"].fullmatch(command):
+                return command
+        if any(
+            lowered.startswith(prefix)
+            for prefix in (
+                "python -m pytest",
+                "python3 -m pytest",
+                "python -m unittest",
+                "python3 -m unittest",
+                "pytest",
+                "ruff",
+                "mypy",
+                "pyright",
+                "node --check",
+                "npm test",
+                "npm run test",
+                "npm run lint",
+                "npm run build",
+                "npm run typecheck",
+                "pnpm test",
+                "pnpm lint",
+                "pnpm build",
+                "pnpm typecheck",
+                "yarn test",
+                "yarn lint",
+                "yarn build",
+                "yarn typecheck",
+                "go test",
+                "cargo test",
+                "cargo check",
+                "make test",
+                "make check",
+                "make lint",
+                "make build",
+            )
+        ):
+            return command
+        return None
 
     def runtime_verification_required(self, session: SessionState) -> bool:
         task_state = session.task_state
@@ -336,11 +548,17 @@ class ValidationPlanner:
     ) -> ValidationFailureEvidence:
         artifact_paths = self._artifact_paths_for_failed_run(session, failed_run)
         diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
+        missing_unittest_package_inits = self._missing_unittest_package_inits(
+            session,
+            failed_run,
+            artifact_paths,
+        )
         expected_features = self._expected_features_from_command(failed_run.command)
         missing_features = self._missing_features_from_failure(failed_run, diagnostics)
         file_hints = self._unique_paths(
             [
                 *artifact_paths,
+                *missing_unittest_package_inits,
                 *(path for diagnostic in diagnostics for path in diagnostic.file_hints),
             ]
         )
@@ -364,6 +582,7 @@ class ValidationPlanner:
             artifact_paths=artifact_paths,
             expected_features=expected_features,
             missing_features=missing_features,
+            missing_unittest_package_inits=missing_unittest_package_inits,
         )
         evidence_signature = json.dumps(
             {
@@ -729,6 +948,24 @@ class ValidationPlanner:
         failed_run: ValidationRunRecord,
     ) -> list[str]:
         paths: list[str] = []
+        if self._no_tests_executed(failed_run):
+            task_state = session.task_state
+            if task_state is not None:
+                paths.extend(
+                    artifact.path
+                    for artifact in task_state.target_artifacts
+                    if artifact.path
+                    and (
+                        artifact.role == "validation_target"
+                        or artifact.kind == "test"
+                    )
+                )
+            paths.extend(
+                item.path
+                for item in session.changed_files
+                if self._is_test_path(item.path)
+            )
+            paths.extend(self._missing_unittest_package_inits(session, failed_run, paths))
         paths.extend(self._paths_from_validation_command(failed_run.command))
         if session.active_repair_context is not None:
             paths.extend(session.active_repair_context.artifact_paths)
@@ -833,10 +1070,12 @@ class ValidationPlanner:
         artifact_paths: list[str],
         expected_features: list[str],
         missing_features: list[str],
+        missing_unittest_package_inits: list[str] | None = None,
     ) -> list[str]:
         requirements: list[str] = []
         scope = failed_run.verification_scope
         primary_target = artifact_paths[0] if artifact_paths else "the implicated artifact"
+        missing_unittest_package_inits = missing_unittest_package_inits or []
         if scope == "structural":
             if missing_features:
                 requirements.append(
@@ -858,9 +1097,21 @@ class ValidationPlanner:
                 f"Fix the syntax error or parse failure reported for {primary_target} before rerunning validation."
             )
         elif scope == "runtime":
-            requirements.append(
-                f"Change {primary_target} so the failing runtime or test path can complete successfully."
-            )
+            if self._no_tests_executed(failed_run, diagnostics):
+                requirements.append(
+                    "Ensure the requested test command actually discovers and executes the intended tests; repair test discovery, package layout, or validation wiring before changing unrelated production code."
+                )
+                for init_path in missing_unittest_package_inits[:2]:
+                    requirements.append(
+                        f"Consider adding or restoring {init_path} so the unittest discovery path can import the affected test package."
+                    )
+                requirements.append(
+                    f"Update {primary_target} or adjacent test-discovery files only if that is what will make the requested test command execute real tests."
+                )
+            else:
+                requirements.append(
+                    f"Change {primary_target} so the failing runtime or test path can complete successfully."
+                )
         elif scope == "semantic":
             requirements.append(
                 f"Close the remaining task-to-code gaps reported by the semantic review for {primary_target}."
@@ -893,6 +1144,48 @@ class ValidationPlanner:
         texts.extend(str(item.excerpt or "").strip() for item in diagnostics)
         texts.extend(str(item.summary or "").strip() for item in diagnostics)
         return any(self.MISSING_REF_PATTERN.search(text) for text in texts if text)
+
+    def _no_tests_executed(
+        self,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord] | None = None,
+    ) -> bool:
+        texts = [
+            str(failed_run.summary or "").strip(),
+            str(failed_run.excerpt or "").strip(),
+        ]
+        if diagnostics:
+            texts.extend(str(item.summary or "").strip() for item in diagnostics)
+            texts.extend(str(item.excerpt or "").strip() for item in diagnostics)
+        return any(
+            pattern.search(text)
+            for text in texts
+            if text
+            for pattern in self.NO_TESTS_RAN_PATTERNS
+        )
+
+    def _missing_unittest_package_inits(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        artifact_paths: list[str],
+    ) -> list[str]:
+        lowered_command = str(failed_run.command or "").lower()
+        if "python -m unittest" not in lowered_command and "python3 -m unittest" not in lowered_command:
+            return []
+
+        workspace_root = Path(session.workspace_root)
+        candidates: list[str] = []
+        for artifact_path in artifact_paths:
+            if not self._is_test_path(artifact_path):
+                continue
+            parent = Path(artifact_path).parent
+            if str(parent) in {"", "."}:
+                continue
+            init_relative = (parent / "__init__.py").as_posix()
+            if not (workspace_root / init_relative).exists():
+                candidates.append(init_relative)
+        return self._unique_paths(candidates)
 
     def _decoded_internal_validation_payload(self, command: str) -> tuple[str | None, object]:
         normalized = str(command or "").strip()

@@ -536,6 +536,62 @@ def test_task_state_updater_tracks_continuation_with_evidence():
     assert task_state.evidence[0].artifact_path == "app/upload.py"
 
 
+def test_task_state_updater_accepts_string_evidence_items_from_model():
+    prompt = "add a state-root option without removing existing CLI behavior"
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": prompt,
+                "root_goal": "Add a CLI state-root option safely.",
+                "active_goal": "Add a state-root override without regressing the CLI.",
+                "goal_relation": "new_task",
+                "output_expectation": "A focused CLI update with preserved behavior.",
+                "open_problem": None,
+                "verification_target": "CLI options should keep existing behavior while adding the override.",
+                "target_artifacts": [
+                    {
+                        "path": "cli.py",
+                        "name": "cli.py",
+                        "kind": "file",
+                        "role": "primary_target",
+                        "confidence": 0.88,
+                    }
+                ],
+                "evidence": [
+                    "The existing configuration flow should be preserved while introducing new CLI parameters."
+                ],
+                "relevant_context": [],
+                "constraints": ["Preserve existing CLI behavior."],
+                "assumptions": [],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "medium",
+                "confidence": 0.84,
+                "next_action": "modify",
+                "execution_outline": [
+                    "Inspect the CLI entry point.",
+                    "Add the override in the smallest coherent change.",
+                    "Verify the CLI behavior.",
+                ],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(prompt)
+
+    assert task_state.target_artifacts[0].path == "cli.py"
+    assert task_state.evidence[0].summary == (
+        "The existing configuration flow should be preserved while introducing new CLI parameters."
+    )
+    assert task_state.evidence[0].kind == "unknown"
+    assert task_state.supplied_evidence == [
+        "The existing configuration flow should be preserved while introducing new CLI parameters."
+    ]
+
+
 def test_task_state_normalize_does_not_infer_phase_two_operational_fields():
     state = TaskState(
         latest_user_turn="why is this failing?",
@@ -838,6 +894,145 @@ def test_task_state_timeout_fallback_preserves_clear_debug_request(tmp_path):
     assert route.intent == RouteIntent.DEBUG
     assert route.needs_clarification is False
     assert task_state.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_timeout_fallback_prioritizes_update_over_validation_for_compound_change_request(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["tests"],
+        important_files=["cli.py", "README.md", "tests/test_cli.py", "bootstrap_runtime.py"],
+        focus_files=["cli.py", "README.md", "tests/test_cli.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["cli.py"],
+        repo_map=["tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI project with README and unittest coverage.",
+    )
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Bitte fuege --state-root zur CLI hinzu. "
+        "Behalte --config und --verbose unveraendert bei, aktualisiere README, "
+        "erweitere den unittest fuer die neue Option und fuehre danach python -m unittest aus."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "modify"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts[0].path == "cli.py"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {"cli.py", "README.md", "tests/test_cli.py"}
+    assert "Apply the requested change" in (task_state.verification_target or "")
+    assert route.intent == RouteIntent.UPDATE
+    assert route.needs_clarification is False
+
+
+def test_task_state_model_normalizes_route_style_aliases():
+    state = TaskState.model_validate(
+        {
+            "latest_user_turn": "Update README.md only.",
+            "root_goal": "Update the README example.",
+            "active_goal": "Modify README.md with the requested command.",
+            "goal_relation": "same_task_follow_up",
+            "output_expectation": "README.md contains the exact requested example command.",
+            "current_user_intent": "update",
+            "execution_strategy": "update",
+            "next_action": "update",
+            "next_best_action": "update",
+            "ambiguity_level": "low",
+            "risk_level": "low",
+            "confidence": 0.92,
+        }
+    )
+
+    assert state.goal_relation == "continue"
+    assert state.current_user_intent == "implement"
+    assert state.execution_strategy == "feature_implementation"
+    assert state.next_action == "modify"
+    assert state.next_best_action == "modify"
+
+
+def test_task_state_updater_routes_explicit_repair_contract_to_update_flow(tmp_path):
+    payload = {
+        "latest_user_turn": (
+            "Fix normalize_name in text_utils.py so it trims outer whitespace, lowercases text, "
+            "converts internal whitespace runs to single hyphens, and preserves existing hyphens. "
+            "Add or update unit tests. Validate with python -m unittest."
+        ),
+        "root_goal": "Implement the requested normalize_name behavior.",
+        "active_goal": "Modify text_utils.py and tests/test_text_utils.py for the requested behavior.",
+        "goal_relation": "new_task",
+        "output_expectation": "normalize_name matches the requested behavior and unit tests pass.",
+        "current_user_intent": "repair",
+        "execution_strategy": None,
+        "verification_target": "python -m unittest",
+        "target_artifacts": [
+            {"path": "text_utils.py", "name": "normalize_name", "kind": "function", "role": "primary_target", "confidence": 1.0},
+            {"path": "tests/test_text_utils.py", "name": "unit tests", "kind": "test", "role": "validation_target", "confidence": 1.0},
+        ],
+        "relevant_context": ["Update the implementation directly and rerun the tests."],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.98,
+        "next_action": "modify",
+        "next_best_action": "modify",
+        "execution_outline": [
+            "Read the target implementation and test.",
+            "Apply the requested behavior change.",
+            "Run python -m unittest.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.current_user_intent == "repair"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert route.intent == RouteIntent.UPDATE
+    assert route.action_plan[1].action.value == "update_artifact"
+
+
+def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
+    invalid_payload = {
+        "latest_user_turn": "Update README.md to document the CLI.",
+        "root_goal": "Update the README.",
+        "active_goal": "Modify README.md with the new CLI usage.",
+        "goal_relation": "new_task",
+        "output_expectation": "README.md reflects the updated CLI.",
+        "current_user_intent": "nonsense",
+        "next_action": "modify",
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.8,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[invalid_payload])).update_task_state(
+        "Update README.md to document the CLI.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "modify"
 
 
 def test_task_state_timeout_fallback_clarifies_vague_request_without_specialized_strategy(tmp_path):
@@ -1394,6 +1589,7 @@ def test_task_state_updater_uses_compact_generation_for_fresh_session(tmp_path):
     prompt = call["args"][0]
     assert "Recent conversation:" not in prompt
     assert call["kwargs"]["timeout"] == 18
+    assert call["kwargs"]["total_timeout"] == 38
     assert call["kwargs"]["num_ctx"] == 2048
 
 

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
+import difflib
 import json
 from pathlib import Path
 import re
 import time
+import tomllib
 
 from pydantic import ValidationError
 
 from agent.decision import ExecutionDecisionPolicy
 from agent.models import (
     DiagnosticRecord,
+    ProposedUpdateReview,
     RepairAttemptRecord,
     SemanticChangeReview,
     SessionState,
@@ -20,11 +24,14 @@ from agent.models import (
 )
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
+    _artifact_scoped_focus,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
     generate_content_prompt,
     generate_content_retry_prompt,
+    proposed_update_review_prompt,
+    proposed_update_review_system_prompt,
     semantic_change_review_prompt,
     semantic_change_review_system_prompt,
 )
@@ -66,6 +73,52 @@ WRITE_TOOL_NAMES = {
 }
 TARGETED_REPAIR_STRATEGY = "validation_targeted"
 ESCALATED_REPAIR_STRATEGY = "validation_escalated"
+LIGHTWEIGHT_UPDATE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cfg",
+    ".conf",
+    ".cpp",
+    ".css",
+    ".cxx",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".ini",
+    ".java",
+    ".js",
+    ".json",
+    ".jsx",
+    ".kt",
+    ".less",
+    ".lua",
+    ".md",
+    ".mjs",
+    ".php",
+    ".py",
+    ".pyi",
+    ".rb",
+    ".rs",
+    ".rst",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+MAX_LIGHTWEIGHT_UPDATE_CHARS = 8_000
+MAX_LIGHTWEIGHT_UPDATE_LINES = 260
+MAX_LIGHTWEIGHT_UPDATE_TARGETS = 6
+MAX_LIGHTWEIGHT_UPDATE_WORKSPACE_FILES = 60
+MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES = 6
+MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE = 0.72
+
 
 @dataclass(slots=True)
 class GenerationRecoveryAttempt:
@@ -79,6 +132,15 @@ class GenerationRecoveryAttempt:
 class GenerationRetryResult:
     content: str | None = None
     attempts: list[ExecutionAttemptRecord] = field(default_factory=list)
+    capability_tier: str | None = None
+    recovery_strategy: str | None = None
+
+
+@dataclass(slots=True)
+class UpdateReviewRetryResult:
+    content: str | None = None
+    attempts: list[ExecutionAttemptRecord] = field(default_factory=list)
+    review: ProposedUpdateReview | None = None
     capability_tier: str | None = None
     recovery_strategy: str | None = None
 
@@ -319,6 +381,7 @@ class Planner:
         searched_queries = set(self._searched_queries(session))
         inspected = any(item.tool_name == "inspect_workspace" for item in session.tool_calls)
         candidate_paths = self._candidate_paths(route, session)
+        read_candidates = self._read_candidates(route, session, candidate_paths)
 
         for step in route.action_plan:
             if step.action == RouteActionName.ASK_CLARIFICATION:
@@ -356,7 +419,7 @@ class Planner:
                     )
 
             if step.action == RouteActionName.READ_RELEVANT_FILES:
-                candidate = self._next_unread_candidate(candidate_paths, read_paths)
+                candidate = self._next_unread_candidate(read_candidates, read_paths)
                 if candidate is not None:
                     return AgentDecision(
                         thought_summary=step.reason,
@@ -425,13 +488,30 @@ class Planner:
                             session=session,
                         ),
                     )
-                if target not in read_paths:
+                repair_context = self._repair_context_for_target(route, session, target)
+                current_content = self._current_file_content(session, target)
+                if current_content is not None and target not in read_paths:
                     return AgentDecision(
                         thought_summary="Read the target file before generating an update.",
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
                         tool_args={"path": target},
                         expected_outcome="Inspect the current implementation before editing it.",
+                        final_response=None,
+                    )
+                bootstrap = self._repair_bootstrap_candidate(
+                    session,
+                    target,
+                    read_paths,
+                    repair_context,
+                )
+                if bootstrap is not None:
+                    return AgentDecision(
+                        thought_summary="Read the most relevant supporting artifact before creating the repair.",
+                        action_type=AgentActionType.CALL_TOOL,
+                        tool_name="read_file",
+                        tool_args={"path": bootstrap},
+                        expected_outcome="Inspect the surrounding validation context before creating the repair artifact.",
                         final_response=None,
                     )
                 draft = self._draft_update_decision(route, session, target)
@@ -706,10 +786,21 @@ class Planner:
         session: SessionState,
         target: str,
     ) -> AgentDecision | None:
+        repair_context = self._repair_context_for_target(route, session, target)
         current_content = self._current_file_content(session, target)
         if current_content is None:
-            return None
-        repair_context = self._repair_context_for_target(route, session, target)
+            if repair_context is None or not self._repair_target_can_be_created(
+                session,
+                target,
+                repair_context,
+            ):
+                return None
+            return self._draft_missing_repair_artifact_decision(
+                route,
+                session,
+                target,
+                repair_context,
+            )
         strategies = self._repair_generation_strategies(session, repair_context, target)
         if repair_context is not None and not strategies:
             final_failure_reason = (
@@ -847,6 +938,124 @@ class Planner:
             final_user_message,
         )
 
+    def _draft_missing_repair_artifact_decision(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        target: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> AgentDecision:
+        strategies = self._repair_generation_strategies(session, repair_context, target)
+        if not strategies:
+            final_failure_reason = (
+                f"The validation-guided repair for {target} already exhausted the targeted and escalated strategies without new evidence."
+            )
+            self._record_generation_blocker(
+                session,
+                final_failure_reason,
+                stop_reason="repair_blocked_after_validation_failure",
+                failure_class="repair_blocked_after_validation_failure",
+            )
+            return self._final_decision(
+                "The current validation-guided repair is blocked until new evidence is gathered.",
+                "Ich habe bereits einen gezielten und einen verschaerften Repair-Versuch ohne wirksame Mutation ausgeschoepft. Ohne neue Evidenz kann ich keinen ehrlichen weiteren Fix ableiten.",
+            )
+
+        final_failure_reason = f"No reliable repair content could be generated for missing artifact {target}."
+        final_stop_reason = "generation_failed"
+        final_failure_class = "generation_failed"
+        final_user_message = self._localized_text(
+            self._session_language(session),
+            de="Ich konnte noch keinen belastbaren Reparaturinhalt fuer das fehlende Zielartefakt erzeugen.",
+            en="I could not produce reliable repair content for the missing target artifact yet.",
+        )
+
+        for strategy in strategies:
+            generation = self._generate_file_content(
+                route,
+                session,
+                path=target,
+                current_content=None,
+                repair_context=repair_context,
+                repair_strategy=strategy,
+            )
+            if not generation.content:
+                failure = generation.failure or self._build_content_generation_failure(
+                    route,
+                    session,
+                    path=target,
+                    current_content=None,
+                    repair_context=repair_context,
+                    attempts=[],
+                )
+                final_failure_reason = failure.blocker_message
+                final_stop_reason = failure.stop_reason
+                final_failure_class = failure.failure_class
+                final_user_message = failure.user_message
+                self._record_repair_attempt(
+                    session,
+                    repair_context,
+                    target=target,
+                    strategy=strategy,
+                    result="generation_failed",
+                    reason=failure.blocker_message,
+                )
+                if strategy != strategies[-1]:
+                    continue
+                break
+
+            content = generation.content
+            if content.strip() == REPAIR_BLOCKED_SENTINEL:
+                final_failure_reason = (
+                    f"The validation-guided repair for {target} could not derive a concrete fix from the current evidence."
+                )
+                final_stop_reason = "repair_blocked_after_validation_failure"
+                final_failure_class = "repair_blocked_after_validation_failure"
+                final_user_message = self._localized_text(
+                    self._session_language(session),
+                    de="Ich konnte aus der aktuellen Validierungs-Evidenz keinen ehrlichen weiteren Fix ableiten.",
+                    en="I could not derive an honest follow-up fix from the current validation evidence.",
+                )
+                self._record_repair_attempt(
+                    session,
+                    repair_context,
+                    target=target,
+                    strategy=strategy,
+                    result="blocked",
+                    reason=final_failure_reason,
+                )
+                if strategy != strategies[-1]:
+                    continue
+                break
+
+            self._record_repair_attempt(
+                session,
+                repair_context,
+                target=target,
+                strategy=strategy,
+                result="mutation_planned",
+                reason=f"Prepared missing repair artifact {target} from validation evidence.",
+            )
+            return AgentDecision(
+                thought_summary=f"Create the validation-guided repair artifact in {target}.",
+                action_type=AgentActionType.CALL_TOOL,
+                tool_name="create_file",
+                tool_args={"path": target, "content": content, "overwrite": False},
+                expected_outcome="Add the missing artifact required to repair the failed validation.",
+                final_response=None,
+            )
+
+        self._record_generation_blocker(
+            session,
+            final_failure_reason,
+            stop_reason=final_stop_reason,
+            failure_class=final_failure_class,
+        )
+        return self._final_decision(
+            "The repair content for the missing artifact could not be generated reliably.",
+            final_user_message,
+        )
+
     def _repair_context_for_target(
         self,
         route: RouterOutput,
@@ -864,7 +1073,8 @@ class Planner:
                 return None
             context = self.validation_planner.build_failure_evidence(session, failed_run)
             session.active_repair_context = context
-        if context.artifact_paths and target not in context.artifact_paths:
+        implicated_paths = self._unique_paths([*context.artifact_paths, *context.file_hints])
+        if implicated_paths and target not in implicated_paths:
             return None
         return context
 
@@ -1129,33 +1339,58 @@ class Planner:
         failed_run,
         repair_context: ValidationFailureEvidence,
     ) -> RouterOutput | None:
-        target = self._repair_target_after_failed_validation(route, session, failed_run)
+        target = self._repair_target_after_failed_validation(
+            route,
+            session,
+            failed_run,
+            repair_context,
+        )
         if target is None:
             return None
 
         target_name = Path(target).name
-        action_plan = [
-            RouteActionStep(
-                step=1,
-                action=RouteActionName.READ_RELEVANT_FILES,
-                reason="Inspect the changed artifact again after the failed validation before repairing it.",
-            ),
-            RouteActionStep(
-                step=2,
-                action=RouteActionName.UPDATE_ARTIFACT,
-                reason="Repair the changed artifact using the failed validation evidence.",
-            ),
-            RouteActionStep(
-                step=3,
-                action=RouteActionName.RUN_VALIDATION,
-                reason="Rerun the validation after the repair step.",
-            ),
-            RouteActionStep(
-                step=4,
-                action=RouteActionName.SUMMARIZE_RESULT,
-                reason="Report the repair result and remaining validation state honestly.",
-            ),
-        ]
+        absolute_target = Path(session.workspace_root, target)
+        if absolute_target.exists() and absolute_target.is_file():
+            action_plan = [
+                RouteActionStep(
+                    step=1,
+                    action=RouteActionName.READ_RELEVANT_FILES,
+                    reason="Inspect the changed artifact again after the failed validation before repairing it.",
+                ),
+                RouteActionStep(
+                    step=2,
+                    action=RouteActionName.UPDATE_ARTIFACT,
+                    reason="Repair the changed artifact using the failed validation evidence.",
+                ),
+                RouteActionStep(
+                    step=3,
+                    action=RouteActionName.RUN_VALIDATION,
+                    reason="Rerun the validation after the repair step.",
+                ),
+                RouteActionStep(
+                    step=4,
+                    action=RouteActionName.SUMMARIZE_RESULT,
+                    reason="Report the repair result and remaining validation state honestly.",
+                ),
+            ]
+        else:
+            action_plan = [
+                RouteActionStep(
+                    step=1,
+                    action=RouteActionName.UPDATE_ARTIFACT,
+                    reason="Create or restore the missing artifact implicated by the failed validation.",
+                ),
+                RouteActionStep(
+                    step=2,
+                    action=RouteActionName.RUN_VALIDATION,
+                    reason="Rerun the validation after the repair step.",
+                ),
+                RouteActionStep(
+                    step=3,
+                    action=RouteActionName.SUMMARIZE_RESULT,
+                    reason="Report the repair result and remaining validation state honestly.",
+                ),
+            ]
         failure_scope = repair_context.verification_scope
         failure_summary = repair_context.failure_summary
         constraint_lines = self._unique_paths(
@@ -1206,8 +1441,11 @@ class Planner:
         route: RouterOutput,
         session: SessionState,
         failed_run,
+        repair_context: ValidationFailureEvidence | None = None,
     ) -> str | None:
         candidates: list[str] = []
+        if repair_context is not None:
+            candidates.extend(self._prioritized_repair_target_candidates(session, repair_context))
         candidates.extend(self._paths_from_internal_validation_command(str(failed_run.command or "")))
         for item in reversed(session.diagnostics):
             candidates.extend(item.file_hints)
@@ -1218,7 +1456,109 @@ class Planner:
             absolute = Path(session.workspace_root, candidate)
             if absolute.exists() and absolute.is_file():
                 return candidate
+            if repair_context is not None and self._repair_target_can_be_created(
+                session,
+                candidate,
+                repair_context,
+            ):
+                return candidate
         return None
+
+    def _prioritized_repair_target_candidates(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+    ) -> list[str]:
+        candidates = self._unique_paths([*repair_context.artifact_paths, *repair_context.file_hints])
+        explicitly_referenced = [
+            candidate
+            for candidate in candidates
+            if self._repair_candidate_is_explicitly_referenced(candidate, repair_context)
+        ]
+        explicitly_referenced_missing = [
+            candidate
+            for candidate in explicitly_referenced
+            if self._repair_target_can_be_created(session, candidate, repair_context)
+        ]
+        explicitly_referenced_existing = [
+            candidate
+            for candidate in explicitly_referenced
+            if candidate not in explicitly_referenced_missing
+        ]
+        creatable_missing = [
+            candidate
+            for candidate in candidates
+            if self._repair_target_can_be_created(session, candidate, repair_context)
+        ]
+        existing = self._repair_related_existing_context_paths(session, repair_context)
+        return self._unique_paths(
+            [
+                *explicitly_referenced_missing,
+                *explicitly_referenced_existing,
+                *creatable_missing,
+                *existing,
+                *candidates,
+            ]
+        )
+
+    def _repair_candidate_is_explicitly_referenced(
+        self,
+        candidate: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        text = str(candidate or "").strip()
+        if not text:
+            return False
+        basename = Path(text).name
+        evidence_texts = [
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+            str(repair_context.excerpt or "").strip(),
+            *(str(item or "").strip() for item in repair_context.repair_requirements),
+            *(str(item or "").strip() for item in repair_context.action_hints),
+        ]
+        return any(
+            item and (text in item or (basename and basename in item))
+            for item in evidence_texts
+        )
+
+    def _repair_related_existing_context_paths(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        *,
+        exclude: str | None = None,
+    ) -> list[str]:
+        existing: list[str] = []
+        for candidate in self._unique_paths([*repair_context.file_hints, *repair_context.artifact_paths]):
+            if exclude is not None and candidate == exclude:
+                continue
+            absolute = Path(session.workspace_root, candidate)
+            if absolute.exists() and absolute.is_file():
+                existing.append(candidate)
+        return existing
+
+    def _repair_target_can_be_created(
+        self,
+        session: SessionState,
+        candidate: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        text = str(candidate or "").strip()
+        if not text or repair_context is None:
+            return False
+        if text not in repair_context.artifact_paths and text not in repair_context.file_hints:
+            return False
+        absolute = Path(session.workspace_root, text)
+        if absolute.exists() or absolute.is_dir():
+            return False
+        return bool(
+            self._repair_related_existing_context_paths(
+                session,
+                repair_context,
+                exclude=text,
+            )
+        )
 
     def _paths_from_internal_validation_command(self, command: str) -> list[str]:
         text = str(command or "").strip()
@@ -1281,7 +1621,12 @@ class Planner:
     ) -> str:
         language = self._session_language(session)
         command = str(getattr(failed_run, "command", "") or "").strip() or "the last validation command"
-        target = self._repair_target_after_failed_validation(route, session, failed_run)
+        target = self._repair_target_after_failed_validation(
+            route,
+            session,
+            failed_run,
+            repair_context,
+        )
         failure_summary = (
             str(repair_context.failure_summary or "").strip()
             if repair_context is not None
@@ -1495,6 +1840,22 @@ class Planner:
             candidates.extend(session.workspace_snapshot.important_files[:12])
         return self._unique_paths(candidates)
 
+    def _read_candidates(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        candidate_paths: list[str],
+    ) -> list[str]:
+        explicit_targets = self._explicit_target_paths(route)
+        if explicit_targets and route.intent in {
+            RouteIntent.UPDATE,
+            RouteIntent.DEBUG,
+            RouteIntent.DELETE,
+            RouteIntent.EXPLAIN,
+        }:
+            return explicit_targets
+        return candidate_paths
+
     def _primary_target_path(self, route: RouterOutput, session: SessionState) -> str | None:
         candidates = self._candidate_paths(route, session)
         return candidates[0] if candidates else None
@@ -1542,6 +1903,16 @@ class Planner:
         session: SessionState,
         read_paths: set[str],
     ) -> str | None:
+        for target in self._explicit_target_paths(route):
+            repair_context = self._repair_context_for_target(route, session, target)
+            bootstrap = self._repair_bootstrap_candidate(
+                session,
+                target,
+                read_paths,
+                repair_context,
+            )
+            if bootstrap is not None:
+                return bootstrap
         snapshot = session.workspace_snapshot
         if snapshot is None or snapshot.file_count == 0:
             return None
@@ -1555,6 +1926,28 @@ class Planner:
             if candidate not in read_paths and absolute.exists():
                 return candidate
         return None
+
+    def _repair_bootstrap_candidate(
+        self,
+        session: SessionState,
+        target: str,
+        read_paths: set[str],
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str | None:
+        if repair_context is None:
+            return None
+        if self._current_file_content(session, target) is not None:
+            return None
+        related_existing = self._repair_related_existing_context_paths(
+            session,
+            repair_context,
+            exclude=target,
+        )
+        if not related_existing:
+            return None
+        if any(candidate in read_paths for candidate in related_existing):
+            return None
+        return related_existing[0]
 
     def _best_search_query(self, route: RouterOutput) -> str | None:
         for candidate in [
@@ -1706,6 +2099,7 @@ class Planner:
             session,
             path=path,
             current_content=current_content,
+            repair_context=repair_context,
         )
         prompt_variant = self._content_generation_prompt_variant(
             route,
@@ -1722,11 +2116,16 @@ class Planner:
             current_content=current_content,
             repair_context=repair_context,
             repair_strategy=repair_strategy,
+            review_feedback=None,
             mode=prompt_variant,
         )
         effective_model = model_name or self._primary_generation_model_name()
-        timeout_seconds = max(self._llm_timeout(75), 75)
-        total_timeout_seconds = max(self._llm_timeout(210), 210)
+        if prompt_variant == "compact":
+            timeout_seconds = max(self._llm_timeout(60), 60)
+            total_timeout_seconds = max(self._llm_timeout(150), 150)
+        else:
+            timeout_seconds = max(self._llm_timeout(75), 75)
+            total_timeout_seconds = max(self._llm_timeout(210), 210)
         num_ctx = self._content_generation_num_ctx(prompt_variant)
         context_pressure = self._context_pressure_estimate(
             prompt=prompt,
@@ -1775,10 +2174,76 @@ class Planner:
         if outcome.exception is None:
             cleaned = self._strip_code_fences(str(outcome.value or "")).strip()
             if cleaned:
+                approved_content = cleaned
+                if current_content is not None:
+                    review = self._generated_content_integrity_review(path=path, proposed_content=cleaned)
+                    if review is None:
+                        review = self._explicit_constraint_integrity_review(
+                            route,
+                            session,
+                            path=path,
+                            current_content=current_content,
+                            proposed_content=cleaned,
+                        )
+                    if review is None:
+                        review = self._review_generated_update(
+                            route,
+                            session,
+                            path=path,
+                            current_content=current_content,
+                            proposed_content=cleaned,
+                        )
+                    if not review.safe_to_write:
+                        self._log(
+                            "proposed_update_review_rejected",
+                            path=path,
+                            summary=review.summary,
+                            blocking_issues=review.blocking_issues[:4],
+                        )
+                        review_retry = self._retry_update_after_review_failure(
+                            route,
+                            session,
+                            path=path,
+                            current_content=current_content,
+                            review_feedback=review,
+                            repair_context=repair_context,
+                            repair_strategy=repair_strategy,
+                            prior_attempts=attempts,
+                        )
+                        attempts.extend(review_retry.attempts)
+                        if review_retry.content is None:
+                            final_review = review_retry.review or review
+                            failure = self._build_update_review_failure(session, path, final_review)
+                            self._record_proposed_update_review_failure(
+                                session,
+                                path=path,
+                                review=final_review,
+                            )
+                            self._append_runtime_execution(
+                                session,
+                                build_execution_run_record(
+                                    operation_name="content_generation",
+                                    task_class="content_generation",
+                                    final_state="blocked",
+                                    capability_tier="tier_c",
+                                    recovery_strategy="quality_review_blocked_write",
+                                    degraded=False,
+                                    honest_blocked=True,
+                                    artifact_bytes_generated=0,
+                                    validation_possible=False,
+                                    summary=failure.blocker_message,
+                                    attempts=attempts,
+                                ),
+                            )
+                            return ContentGenerationResult(
+                                source="failed",
+                                failure=failure,
+                            )
+                        approved_content = review_retry.content
                 self._log(
                     "content_generation_finished",
                     path=path,
-                    characters=len(cleaned),
+                    characters=len(approved_content),
                     update=current_content is not None,
                 )
                 self._append_runtime_execution(
@@ -1791,13 +2256,13 @@ class Planner:
                         recovery_strategy=primary_strategy,
                         degraded=primary_tier != "tier_a",
                         honest_blocked=False,
-                        artifact_bytes_generated=len(cleaned),
-                        validation_possible=bool(cleaned),
+                        artifact_bytes_generated=len(approved_content),
+                        validation_possible=bool(approved_content),
                         summary="Artifact generation completed on the selected model tier.",
                         attempts=attempts,
                     ),
                 )
-                return ContentGenerationResult(content=cleaned)
+                return ContentGenerationResult(content=approved_content)
             attempts[-1] = self._empty_response_attempt(
                 base_attempt=outcome.attempt,
                 context_pressure=context_pressure,
@@ -1829,10 +2294,79 @@ class Planner:
         )
         attempts.extend(retry_result.attempts)
         if retry_result.content is not None:
+            approved_content = retry_result.content
+            if current_content is not None:
+                review = self._generated_content_integrity_review(
+                    path=path,
+                    proposed_content=retry_result.content,
+                )
+                if review is None:
+                    review = self._explicit_constraint_integrity_review(
+                        route,
+                        session,
+                        path=path,
+                        current_content=current_content,
+                        proposed_content=retry_result.content,
+                    )
+                if review is None:
+                    review = self._review_generated_update(
+                        route,
+                        session,
+                        path=path,
+                        current_content=current_content,
+                        proposed_content=retry_result.content,
+                    )
+                if not review.safe_to_write:
+                    self._log(
+                        "proposed_update_review_rejected",
+                        path=path,
+                        summary=review.summary,
+                        blocking_issues=review.blocking_issues[:4],
+                    )
+                    review_retry = self._retry_update_after_review_failure(
+                        route,
+                        session,
+                        path=path,
+                        current_content=current_content,
+                        review_feedback=review,
+                        repair_context=repair_context,
+                        repair_strategy=repair_strategy,
+                        prior_attempts=attempts,
+                    )
+                    attempts.extend(review_retry.attempts)
+                    if review_retry.content is None:
+                        final_review = review_retry.review or review
+                        failure = self._build_update_review_failure(session, path, final_review)
+                        self._record_proposed_update_review_failure(
+                            session,
+                            path=path,
+                            review=final_review,
+                        )
+                        self._append_runtime_execution(
+                            session,
+                            build_execution_run_record(
+                                operation_name="content_generation",
+                                task_class="content_generation",
+                                final_state="blocked",
+                                capability_tier="tier_c",
+                                recovery_strategy="quality_review_blocked_write",
+                                degraded=False,
+                                honest_blocked=True,
+                                artifact_bytes_generated=0,
+                                validation_possible=False,
+                                summary=failure.blocker_message,
+                                attempts=attempts,
+                            ),
+                        )
+                        return ContentGenerationResult(
+                            source="failed",
+                            failure=failure,
+                        )
+                    approved_content = review_retry.content
             self._log(
                 "content_generation_finished",
                 path=path,
-                characters=len(retry_result.content),
+                characters=len(approved_content),
                 update=current_content is not None,
                 source=retry_result.recovery_strategy or "retry",
             )
@@ -1846,14 +2380,14 @@ class Planner:
                     recovery_strategy=retry_result.recovery_strategy or "retry_content_generation",
                     degraded=(retry_result.capability_tier or "tier_b") != "tier_a",
                     honest_blocked=False,
-                    artifact_bytes_generated=len(retry_result.content),
-                    validation_possible=bool(retry_result.content),
+                    artifact_bytes_generated=len(approved_content),
+                    validation_possible=bool(approved_content),
                     summary="Artifact generation recovered after a runtime startup or stall issue.",
                     attempts=attempts,
                 ),
             )
             return ContentGenerationResult(
-                content=retry_result.content,
+                content=approved_content,
                 source="retry",
             )
         if self._startup_failure_exhausted(attempts):
@@ -2234,6 +2768,7 @@ class Planner:
         partial_text: str,
         repair_context: ValidationFailureEvidence | None,
         repair_strategy: str | None,
+        review_feedback: ProposedUpdateReview | None = None,
     ) -> str:
         if attempt.prompt_kind == "resume":
             return generate_content_continuation_prompt(
@@ -2244,6 +2779,7 @@ class Planner:
                 current_content=current_content,
                 repair_context=repair_context,
                 repair_strategy=repair_strategy,
+                review_feedback=review_feedback,
             )
         if attempt.prompt_kind == "compact":
             return generate_content_retry_prompt(
@@ -2253,8 +2789,18 @@ class Planner:
                 current_content=current_content,
                 repair_context=repair_context,
                 repair_strategy=repair_strategy,
+                review_feedback=review_feedback,
             )
-        return prompt
+        return generate_content_prompt(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
+            review_feedback=review_feedback,
+            mode="full",
+        )
 
     def _content_generation_runtime_for_attempt(
         self,
@@ -3276,11 +3822,15 @@ class Planner:
 
     def _strip_code_fences(self, text: str) -> str:
         cleaned = str(text or "").strip()
-        if cleaned.startswith("```"):
-            cleaned = "\n".join(cleaned.splitlines()[1:])
-        if cleaned.endswith("```"):
-            cleaned = "\n".join(cleaned.splitlines()[:-1])
-        return cleaned.strip()
+        lines = cleaned.splitlines()
+        if len(lines) >= 2:
+            opening = lines[0].strip()
+            closing = lines[-1].strip()
+            if re.fullmatch(r"(```+|~~~+)[A-Za-z0-9_.+-]*", opening) and (
+                closing == "```" or closing == "~~~"
+            ):
+                return "\n".join(lines[1:-1]).strip()
+        return cleaned
 
     def _llm_timeout(self, minimum: int) -> int:
         configured = getattr(getattr(self.llm, "config", None), "llm_timeout", minimum)
@@ -3317,22 +3867,26 @@ class Planner:
         *,
         path: str,
         current_content: str | None,
+        repair_context: ValidationFailureEvidence | None = None,
     ) -> str | None:
-        del session
         lightweight = self._lightweight_generation_model_name()
-        if lightweight is None or current_content is None:
+        if lightweight is None:
             return None
-        if route.intent != RouteIntent.UPDATE:
-            return None
-        if len(current_content) > 5_000:
-            return None
-        suffix = Path(path).suffix.lower()
-        if suffix not in {".html", ".css", ".js", ".jsx", ".mjs", ".cjs", ".md", ".json", ".toml", ".yaml", ".yml"}:
-            return None
-        target_paths = [item for item in route.entities.target_paths if item]
-        if target_paths and path not in target_paths:
-            return None
-        return lightweight
+        if current_content is None and self._should_prefer_lightweight_missing_artifact_generation(
+            route,
+            session,
+            path=path,
+            repair_context=repair_context,
+        ):
+            return lightweight
+        if self._should_prefer_lightweight_update_generation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        ):
+            return lightweight
+        return None
 
     def _content_generation_prompt_variant(
         self,
@@ -3344,50 +3898,1017 @@ class Planner:
         model_name: str | None,
         repair_context: ValidationFailureEvidence | None,
     ) -> str:
-        del session, repair_context
         lightweight = self._lightweight_generation_model_name()
-        if current_content is None or model_name is None or model_name != lightweight:
-            return "full"
-        if route.intent != RouteIntent.UPDATE:
-            return "full"
-        if len(current_content) > 5_000:
-            return "full"
+        if (
+            model_name is not None
+            and model_name == lightweight
+            and (
+                (
+                    current_content is not None
+                    and self._should_prefer_lightweight_update_generation(
+                        route,
+                        session,
+                        path=path,
+                        current_content=current_content,
+                    )
+                )
+                or (
+                    current_content is None
+                    and self._should_prefer_lightweight_missing_artifact_generation(
+                        route,
+                        session,
+                        path=path,
+                        repair_context=repair_context,
+                    )
+                )
+            )
+        ):
+            return "compact"
+        return "full"
+
+    def _should_prefer_lightweight_missing_artifact_generation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        lightweight = self._lightweight_generation_model_name()
+        if lightweight is None or repair_context is None:
+            return False
+        if route.needs_clarification or not route.safe_to_execute:
+            return False
+        if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.CREATE}:
+            return False
+
+        implicated_paths = self._unique_paths([*repair_context.artifact_paths, *repair_context.file_hints])
+        if implicated_paths and path not in implicated_paths:
+            return False
+
+        absolute = Path(session.workspace_root, path)
+        if absolute.exists() or absolute.is_dir():
+            return False
+
         suffix = Path(path).suffix.lower()
-        if suffix not in {".html", ".css", ".js", ".jsx", ".mjs", ".cjs", ".md", ".json", ".toml", ".yaml", ".yml"}:
-            return "full"
-        return "compact"
+        if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
+            return False
+        if len(session.changed_files) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
+            return False
+
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count > MAX_LIGHTWEIGHT_UPDATE_WORKSPACE_FILES:
+            return False
+        if not self._repair_related_existing_context_paths(session, repair_context, exclude=path):
+            return False
+
+        task_state = session.task_state
+        if task_state is not None:
+            if task_state.needs_clarification:
+                return False
+            if task_state.ambiguity_level == "high" or task_state.risk_level == "high":
+                return False
+            if float(task_state.confidence or 0.0) < MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE:
+                return False
+
+        return True
+
+    def _should_prefer_lightweight_update_generation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+    ) -> bool:
+        lightweight = self._lightweight_generation_model_name()
+        if lightweight is None or current_content is None:
+            return False
+        if route.intent != RouteIntent.UPDATE or route.needs_clarification or not route.safe_to_execute:
+            return False
+
+        target_paths = self._explicit_target_paths(route)
+        if target_paths and path not in target_paths:
+            return False
+        if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+            return False
+
+        suffix = Path(path).suffix.lower()
+        if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
+            return False
+        if len(current_content) > MAX_LIGHTWEIGHT_UPDATE_CHARS:
+            return False
+        if current_content.count("\n") + 1 > MAX_LIGHTWEIGHT_UPDATE_LINES:
+            return False
+        if len(session.changed_files) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
+            return False
+
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count > MAX_LIGHTWEIGHT_UPDATE_WORKSPACE_FILES:
+            return False
+
+        task_state = session.task_state
+        if task_state is not None:
+            if task_state.needs_clarification:
+                return False
+            if task_state.ambiguity_level == "high" or task_state.risk_level == "high":
+                return False
+            if float(task_state.confidence or 0.0) < MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE:
+                return False
+
+        return True
 
     def _content_generation_num_ctx(self, prompt_variant: str) -> int:
         if prompt_variant == "compact":
             return min(self._llm_num_ctx(2048), 2048)
         return min(self._llm_num_ctx(4096), 4096)
 
+    def _should_prefer_lightweight_semantic_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        artifacts: list[dict[str, object]],
+    ) -> bool:
+        lightweight = self._lightweight_generation_model_name()
+        if lightweight is None:
+            return False
+        if route.needs_clarification or not route.safe_to_execute:
+            return False
+        if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.CREATE}:
+            return False
+        if not session.changed_files or len(session.changed_files) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
+            return False
+        if len(artifacts) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
+            return False
+        if session.validation_status != "passed" and not self.validation_planner.has_runtime_success(session):
+            return False
+
+        target_paths = self._explicit_target_paths(route)
+        if target_paths and len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+            return False
+
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count > MAX_LIGHTWEIGHT_UPDATE_WORKSPACE_FILES:
+            return False
+
+        task_state = session.task_state
+        if task_state is not None:
+            if task_state.needs_clarification:
+                return False
+            if task_state.ambiguity_level == "high" or task_state.risk_level == "high":
+                return False
+            if float(task_state.confidence or 0.0) < MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE:
+                return False
+
+        for change in session.changed_files:
+            path = str(change.path or "").strip()
+            if not path:
+                return False
+            suffix = Path(path).suffix.lower()
+            if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
+                return False
+            current_content = self._current_file_content(session, path)
+            if current_content is None:
+                continue
+            if len(current_content) > MAX_LIGHTWEIGHT_UPDATE_CHARS:
+                return False
+            if current_content.count("\n") + 1 > MAX_LIGHTWEIGHT_UPDATE_LINES:
+                return False
+
+        return True
+
+    def _review_generated_update(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview:
+        compact_review = self._should_prefer_lightweight_update_generation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
+        full_prompt = proposed_update_review_prompt(
+            route,
+            session,
+            path=path,
+            supporting_artifact_context=self._supporting_artifact_review_context(
+                session,
+                target_path=path,
+            ),
+            current_excerpt=self._review_excerpt(current_content, limit=5_200),
+            proposed_excerpt=self._review_excerpt(proposed_content, limit=5_200),
+            diff_excerpt=self._review_diff_excerpt(
+                path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                limit=5_200,
+            ),
+        )
+        compact_prompt: str | None = None
+        if compact_review:
+            compact_prompt = proposed_update_review_prompt(
+                route,
+                session,
+                path=path,
+                supporting_artifact_context=self._supporting_artifact_review_context(
+                    session,
+                    target_path=path,
+                    excerpt_limit=650,
+                    max_sections=2,
+                ),
+                current_excerpt=self._review_excerpt(current_content, limit=2_400),
+                proposed_excerpt=self._review_excerpt(proposed_content, limit=2_400),
+                diff_excerpt=self._review_diff_excerpt(
+                    path,
+                    current_content=current_content,
+                    proposed_content=proposed_content,
+                    limit=1_800,
+                ),
+                mode="compact",
+            )
+        reserve_model = self._lightweight_generation_model_name()
+        primary_model = self._primary_generation_model_name()
+        review_attempts: list[tuple[str | None, str, str]] = []
+        if reserve_model is not None:
+            review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
+        review_attempts.append((primary_model, "tier_a", "primary_model_review"))
+
+        attempts: list[ExecutionAttemptRecord] = []
+        self._log(
+            "proposed_update_review_started",
+            path=path,
+            model=review_attempts[0][0] or primary_model,
+        )
+
+        seen_models: set[str] = set()
+        for model_name, capability_tier, strategy in review_attempts:
+            normalized_model = str(model_name or "").strip()
+            model_key = normalized_model or "__default__"
+            if model_key in seen_models:
+                continue
+            seen_models.add(model_key)
+
+            use_compact_prompt = (
+                compact_prompt is not None
+                and reserve_model is not None
+                and model_name == reserve_model
+                and capability_tier == "tier_b"
+            )
+            prompt = compact_prompt if use_compact_prompt else full_prompt
+            timeout = max(self._llm_timeout(18), 18)
+            total_timeout = 45 if use_compact_prompt else max(timeout + 12, timeout * 2)
+            num_ctx = min(self._llm_num_ctx(2048), 2048) if use_compact_prompt else min(self._llm_num_ctx(6144), 6144)
+            prompt_variant = "compact" if use_compact_prompt else "full"
+            outcome = invoke_model(
+                lambda progress, review_model=model_name: self.llm.generate_json(
+                    prompt,
+                    system=proposed_update_review_system_prompt(),
+                    model=review_model,
+                    retries=0,
+                    timeout=timeout,
+                    total_timeout=total_timeout,
+                    num_ctx=num_ctx,
+                    progress_callback=progress,
+                ),
+                operation_name="proposed_update_review",
+                task_class="proposed_update_review",
+                attempt_number=len(attempts) + 1,
+                capability_tier=capability_tier,
+                recovery_strategy=strategy,
+                prompt_variant=prompt_variant,
+                model_identifier=model_name or primary_model,
+                backend_identifier=self._backend_identifier(),
+                inactivity_timeout_seconds=timeout,
+                total_timeout_seconds=total_timeout,
+                context_pressure_estimate=estimate_context_pressure(prompt_chars=len(prompt)),
+                event_callback=self._progress_logger("proposed_update_review_progress", path=path),
+            )
+            attempts.append(outcome.attempt)
+            if outcome.exception is not None:
+                self._log(
+                    "proposed_update_review_error",
+                    path=path,
+                    error=str(outcome.exception),
+                    strategy=strategy,
+                    model=model_name,
+                )
+                continue
+            try:
+                review = ProposedUpdateReview.model_validate(outcome.value)
+            except ValidationError as exc:
+                self._log(
+                    "proposed_update_review_invalid",
+                    path=path,
+                    errors=exc.errors(),
+                    payload=outcome.value,
+                    strategy=strategy,
+                    model=model_name,
+                )
+                continue
+
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="proposed_update_review",
+                    task_class="proposed_update_review",
+                    final_state="completed",
+                    capability_tier=capability_tier,
+                    recovery_strategy=strategy,
+                    degraded=capability_tier != "tier_a",
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="An AI pre-write review checked whether the proposed file update stayed focused and preserved unrelated behavior.",
+                    attempts=attempts,
+                ),
+            )
+            return review
+
+        review = self._fallback_proposed_update_review(
+            route,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="proposed_update_review",
+                task_class="proposed_update_review",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=True,
+                summary="The AI pre-write review fell back to conservative local heuristics after model-backed review did not complete cleanly.",
+                attempts=attempts,
+            ),
+        )
+        return review
+
+    def _retry_update_after_review_failure(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        review_feedback: ProposedUpdateReview,
+        repair_context: ValidationFailureEvidence | None,
+        repair_strategy: str | None,
+        prior_attempts: list[ExecutionAttemptRecord],
+    ) -> UpdateReviewRetryResult:
+        retry_attempts: list[ExecutionAttemptRecord] = []
+        last_review = review_feedback
+        primary_model = self._primary_generation_model_name()
+        reserve_model = self._lightweight_generation_model_name()
+        prefer_lightweight_retry = self._should_prefer_lightweight_update_generation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
+
+        full_prompt = generate_content_retry_prompt(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
+            review_feedback=last_review,
+            mode="full",
+        )
+        compact_prompt: str | None = None
+        if prefer_lightweight_retry:
+            compact_prompt = generate_content_retry_prompt(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                repair_strategy=repair_strategy,
+                review_feedback=last_review,
+                mode="compact",
+            )
+
+        retry_models: list[tuple[str | None, str, str, int, int, int, str]] = []
+        if prefer_lightweight_retry and reserve_model is not None:
+            retry_models.append(
+                (
+                    reserve_model,
+                    "tier_b",
+                    "review_guided_retry",
+                    max(self._llm_timeout(45), 45),
+                    max(self._llm_timeout(120), 120),
+                    min(self._llm_num_ctx(2048), 2048),
+                    "compact",
+                )
+            )
+        retry_models.append(
+            (
+                primary_model,
+                "tier_a",
+                "review_guided_retry" if not prefer_lightweight_retry else "review_guided_primary_fallback",
+                max(self._llm_timeout(60), 60),
+                max(self._llm_timeout(180), 180),
+                min(self._llm_num_ctx(4096), 4096),
+                "full",
+            )
+        )
+        if reserve_model is not None and not prefer_lightweight_retry:
+            retry_models.append(
+                (
+                    reserve_model,
+                    "tier_b",
+                    "review_guided_fallback_model",
+                    max(self._llm_timeout(45), 45),
+                    max(self._llm_timeout(120), 120),
+                    min(self._llm_num_ctx(2048), 2048),
+                    "compact",
+                )
+            )
+
+        seen_models: set[str] = set()
+        for (
+            model_name,
+            capability_tier,
+            strategy,
+            timeout_seconds,
+            total_timeout_seconds,
+            num_ctx,
+            prompt_variant,
+        ) in retry_models:
+            normalized_model = str(model_name or "").strip()
+            model_key = normalized_model or "__default__"
+            if model_key in seen_models:
+                continue
+            seen_models.add(model_key)
+
+            prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
+            self._log(
+                "content_generation_retry_started",
+                path=path,
+                strategy=strategy,
+                model=model_name or primary_model,
+                reason="proposed_update_review_rejected",
+                capability_tier=capability_tier,
+                prompt_variant=prompt_variant,
+            )
+            outcome = invoke_model(
+                lambda progress, retry_model=model_name: self.llm.generate(
+                    prompt,
+                    model=retry_model,
+                    timeout=timeout_seconds,
+                    total_timeout=total_timeout_seconds,
+                    num_ctx=num_ctx,
+                    retries=0,
+                    progress_callback=progress,
+                ),
+                operation_name="content_generation",
+                task_class="content_generation",
+                attempt_number=len(prior_attempts) + len(retry_attempts) + 1,
+                capability_tier=capability_tier,
+                recovery_strategy=strategy,
+                prompt_variant=prompt_variant,
+                model_identifier=model_name or primary_model,
+                backend_identifier=self._backend_identifier(),
+                inactivity_timeout_seconds=timeout_seconds,
+                total_timeout_seconds=total_timeout_seconds,
+                context_pressure_estimate=self._context_pressure_estimate(
+                    prompt=prompt,
+                    current_content=current_content,
+                    exc=None,
+                ),
+                event_callback=self._progress_logger(
+                    "content_generation_progress",
+                    path=path,
+                    update=True,
+                    strategy=strategy,
+                ),
+            )
+            retry_attempts.append(outcome.attempt)
+            if outcome.exception is not None:
+                retry_issue = outcome.attempt.failure
+                self._log(
+                    "content_generation_retry_error",
+                    path=path,
+                    strategy=strategy,
+                    error=str(outcome.exception),
+                    reason=retry_issue.reason if retry_issue is not None else "runtime_error",
+                    had_progress=retry_issue.had_progress if retry_issue is not None else False,
+                    partial_characters=retry_issue.characters if retry_issue is not None else 0,
+                    failure_class=retry_issue.classification if retry_issue is not None else "generation_failed",
+                    capability_tier=capability_tier,
+                )
+                continue
+
+            cleaned = self._strip_code_fences(str(outcome.value or "")).strip()
+            if not cleaned:
+                retry_attempts[-1] = self._empty_response_attempt(
+                    base_attempt=outcome.attempt,
+                    context_pressure=self._context_pressure_estimate(
+                        prompt=prompt,
+                        current_content=current_content,
+                        exc=None,
+                    ),
+                )
+                self._log(
+                    "content_generation_retry_error",
+                    path=path,
+                    strategy=strategy,
+                    error="empty model response",
+                    reason="empty_response",
+                    had_progress=False,
+                    partial_characters=0,
+                    failure_class="empty_response",
+                    capability_tier=capability_tier,
+                )
+                continue
+
+            self._log(
+                "content_generation_retry_finished",
+                path=path,
+                strategy=strategy,
+                characters=len(cleaned),
+            )
+            review = self._review_generated_update(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=cleaned,
+            )
+            if review.safe_to_write:
+                return UpdateReviewRetryResult(
+                    content=cleaned,
+                    attempts=retry_attempts,
+                    review=review,
+                    capability_tier=capability_tier,
+                    recovery_strategy=strategy,
+                )
+            self._log(
+                "proposed_update_review_rejected",
+                path=path,
+                summary=review.summary,
+                blocking_issues=review.blocking_issues[:4],
+                strategy=strategy,
+            )
+            last_review = review
+
+        return UpdateReviewRetryResult(
+            attempts=retry_attempts,
+            review=last_review,
+        )
+
+    def _build_update_review_failure(
+        self,
+        session: SessionState,
+        path: str,
+        review: ProposedUpdateReview,
+    ) -> ContentGenerationFailure:
+        language = self._session_language(session)
+        blocker_message = f"Pre-write review rejected the proposed update for {path}: {review.summary}"
+        user_message = self._localized_text(
+            language,
+            de=(
+                f"Ich habe die vorgeschlagene Aktualisierung fuer {path} verworfen, "
+                "weil der AI-Review einen zu breiten oder regressiven Eingriff erkannt hat. "
+                "Ich konnte noch keine belastbare, engere Mutation ableiten."
+            ),
+            en=(
+                f"I rejected the proposed update for {path} because the AI review flagged it as too broad or regressive. "
+                "I could not derive a reliable narrower mutation yet."
+            ),
+        )
+        return ContentGenerationFailure(
+            stop_reason="update_review_rejected",
+            failure_class="update_review_rejected",
+            blocker_message=blocker_message,
+            user_message=user_message,
+        )
+
+    def _record_proposed_update_review_failure(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        review: ProposedUpdateReview,
+    ) -> None:
+        excerpt_parts: list[str] = []
+        if review.blocking_issues:
+            excerpt_parts.append(f"Blocking issues: {', '.join(review.blocking_issues[:4])}.")
+        if review.preservation_risks:
+            excerpt_parts.append(f"Preservation risks: {', '.join(review.preservation_risks[:4])}.")
+        excerpt = " ".join(excerpt_parts).strip() or None
+        session.diagnostics.append(
+            DiagnosticRecord(
+                source="proposed_update_review",
+                category="preservation_risk",
+                severity="error",
+                summary=review.summary,
+                tool_name="proposed_update_review",
+                command=f"internal:proposed_update_review:{path}",
+                file_hints=[path],
+                action_hints=review.repair_hints[:4],
+                excerpt=excerpt,
+                iteration=session.iterations,
+            )
+        )
+        session.diagnostics = session.diagnostics[-20:]
+        session.last_error = excerpt or review.summary
+
+    def _fallback_proposed_update_review(
+        self,
+        route: RouterOutput,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview:
+        current_length = max(len(current_content), 1)
+        proposed_length = max(len(proposed_content), 1)
+        current_lines = max(len(current_content.splitlines()), 1)
+        proposed_lines = max(len(proposed_content.splitlines()), 1)
+        if proposed_length < int(current_length * 0.6) and proposed_lines < int(current_lines * 0.7):
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary=(
+                    f"The proposed update for {path} appears to remove a large amount of existing content without a model-backed confirmation that the broader rewrite is required."
+                ),
+                confidence=0.72,
+                blocking_issues=[
+                    "Large unexplained reduction in existing file content during an update",
+                ],
+                preservation_risks=[
+                    "Unrelated existing behavior may have been dropped by the proposed rewrite.",
+                ],
+                repair_hints=[
+                    "Produce a smaller focused update that preserves unrelated existing behavior.",
+                ],
+            )
+        return ProposedUpdateReview(
+            safe_to_write=True,
+            summary=(
+                f"Model-backed pre-write review was unavailable, but the fallback preservation check did not detect an obvious destructive rewrite for {path}."
+            ),
+            confidence=0.32,
+            repair_hints=[
+                "Keep unrelated existing behavior intact while applying the requested change.",
+            ],
+        )
+
+    def _review_excerpt(self, text: str, *, limit: int) -> str:
+        normalized = str(text or "")
+        if len(normalized) <= limit:
+            return normalized
+        marker = "\n...\n[omitted middle for review]\n...\n"
+        if limit <= len(marker) + 20:
+            return normalized[:limit]
+        head = (limit - len(marker)) // 2
+        tail = limit - len(marker) - head
+        return normalized[:head].rstrip() + marker + normalized[-tail:].lstrip()
+
+    def _supporting_artifact_review_context(
+        self,
+        session: SessionState,
+        *,
+        target_path: str,
+        excerpt_limit: int = 1_000,
+        max_sections: int = 3,
+    ) -> str:
+        changed_by_path = {
+            str(item.path or "").strip(): item
+            for item in reversed(session.changed_files)
+            if str(item.path or "").strip()
+        }
+
+        candidates: list[str] = []
+        candidates.extend(changed_by_path.keys())
+        for item in reversed(session.tool_calls):
+            if item.tool_name != "read_file":
+                continue
+            candidates.append(str(item.tool_args.get("path") or "").strip())
+
+        changed_sections: list[str] = []
+        recent_sections: list[str] = []
+        seen = {target_path}
+        for candidate in candidates:
+            path = str(candidate or "").strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+
+            excerpt = self._current_or_last_read_excerpt(session, path=path)
+            if not excerpt:
+                continue
+
+            changed_record = changed_by_path.get(path)
+            if changed_record is not None:
+                change_evidence = str(changed_record.diff or "").strip()
+                if not change_evidence:
+                    change_evidence = excerpt
+                changed_sections.append(
+                    f"{path} (already changed in this task):\n"
+                    f"{self._review_excerpt(change_evidence, limit=excerpt_limit)}"
+                )
+            else:
+                recent_sections.append(
+                    f"{path} (recent context only, may still be pending):\n"
+                    f"{self._review_excerpt(excerpt, limit=excerpt_limit)}"
+                )
+
+            if len(changed_sections) + len(recent_sections) >= max_sections:
+                break
+
+        sections: list[str] = []
+        if changed_sections:
+            sections.append("Changed supporting artifacts already written:\n" + "\n\n".join(changed_sections))
+        if recent_sections:
+            sections.append(
+                "Recent supporting context (may still be pending updates):\n"
+                + "\n\n".join(recent_sections)
+            )
+
+        return "\n\n".join(sections) or "none"
+
+    def _generated_content_integrity_review(
+        self,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        normalized = str(proposed_content or "")
+        suffix = Path(path).suffix.lower()
+
+        if suffix in {".py", ".pyi"}:
+            try:
+                ast.parse(normalized)
+            except SyntaxError as exc:
+                detail = "The proposed file does not parse as valid Python."
+                if exc.lineno is not None:
+                    detail += f" Syntax error near line {exc.lineno}."
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed update is structurally incomplete and cannot be written safely.",
+                    confidence=0.99,
+                    blocking_issues=[detail],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Return the complete Python file with valid syntax and no truncated blocks.",
+                    ],
+                )
+
+        if suffix == ".json":
+            try:
+                json.loads(normalized)
+            except json.JSONDecodeError as exc:
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed update is structurally incomplete and cannot be written safely.",
+                    confidence=0.99,
+                    blocking_issues=[
+                        f"The proposed JSON is invalid near line {exc.lineno}, column {exc.colno}.",
+                    ],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Return complete valid JSON with balanced braces, brackets, and quoted strings.",
+                    ],
+                )
+
+        if suffix == ".toml":
+            try:
+                tomllib.loads(normalized)
+            except tomllib.TOMLDecodeError:
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed update is structurally incomplete and cannot be written safely.",
+                    confidence=0.99,
+                    blocking_issues=["The proposed TOML is invalid or truncated."],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Return complete valid TOML with closed strings, arrays, and tables.",
+                    ],
+                )
+
+        if suffix in {".md", ".markdown"}:
+            if self._has_unclosed_markdown_fence(normalized):
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed update is structurally incomplete and cannot be written safely.",
+                    confidence=0.99,
+                    blocking_issues=[
+                        "The proposed Markdown contains an unclosed fenced code block.",
+                    ],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Return the complete Markdown file with balanced fenced code blocks.",
+                    ],
+                )
+
+        return None
+
+    def _explicit_constraint_integrity_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        scope = _artifact_scoped_focus(
+            route,
+            session,
+            path,
+            current_content=current_content,
+        )
+        literal_constraints = [
+            str(item or "").strip()
+            for item in scope.get("literal_constraints", [])
+            if str(item or "").strip()
+        ]
+        for literal in literal_constraints:
+            if literal not in proposed_content:
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed update does not preserve an explicit literal constraint from the request.",
+                    confidence=0.99,
+                    blocking_issues=[
+                        f"The exact requested literal is missing from {path}: {literal}",
+                    ],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+                    ],
+                )
+
+        if Path(path).suffix.lower() == ".md":
+            added_headings = self._unexpected_markdown_headings(
+                route,
+                session,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+            if added_headings:
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed markdown update adds unrequested documentation sections.",
+                    confidence=0.92,
+                    blocking_issues=[
+                        f"The proposal adds new markdown headings without request evidence: {', '.join(added_headings[:3])}",
+                    ],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Limit the markdown edit to the explicitly requested section or example and avoid adding new headings unless the request asks for them.",
+                    ],
+                )
+
+        return None
+
+    def _unexpected_markdown_headings(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        current_content: str,
+        proposed_content: str,
+    ) -> list[str]:
+        current_headings = self._markdown_headings(current_content)
+        proposed_headings = self._markdown_headings(proposed_content)
+        if not proposed_headings:
+            return []
+        request_text = " ".join(
+            part.strip().lower()
+            for part in [
+                route.user_goal,
+                route.requested_outcome,
+                str(session.task_state.latest_user_turn if session.task_state is not None else ""),
+                *(
+                    session.task_state.constraints
+                    if session.task_state is not None
+                    else []
+                ),
+            ]
+            if str(part or "").strip()
+        )
+        unexpected: list[str] = []
+        for heading in proposed_headings:
+            if heading in current_headings:
+                continue
+            normalized = heading.lower()
+            if normalized and normalized not in request_text:
+                unexpected.append(heading)
+        return unexpected
+
+    def _markdown_headings(self, content: str) -> set[str]:
+        headings: set[str] = set()
+        for raw_line in str(content or "").splitlines():
+            line = raw_line.strip()
+            if not line.startswith("#"):
+                continue
+            heading = line.lstrip("#").strip()
+            if heading:
+                headings.add(heading)
+        return headings
+
+    def _has_unclosed_markdown_fence(self, text: str) -> bool:
+        active_fence: str | None = None
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.lstrip()
+            match = re.match(r"(```+|~~~+)", line)
+            if match is None:
+                continue
+            marker = match.group(1)
+            if active_fence is None:
+                active_fence = marker
+                continue
+            if marker[0] == active_fence[0] and len(marker) >= len(active_fence):
+                active_fence = None
+        return active_fence is not None
+
+    def _current_or_last_read_excerpt(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> str:
+        absolute = Path(session.workspace_root, path)
+        if absolute.exists() and absolute.is_file():
+            try:
+                return absolute.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        for item in reversed(session.tool_calls):
+            if item.tool_name != "read_file":
+                continue
+            candidate = str(item.tool_args.get("path") or "").strip()
+            if candidate != path:
+                continue
+            excerpt = (item.output_excerpt or "").strip()
+            if excerpt:
+                return excerpt
+        return ""
+
+    def _review_diff_excerpt(
+        self,
+        path: str,
+        *,
+        current_content: str,
+        proposed_content: str,
+        limit: int,
+    ) -> str:
+        diff = "".join(
+            difflib.unified_diff(
+                current_content.splitlines(keepends=True),
+                proposed_content.splitlines(keepends=True),
+                fromfile=f"{path}:current",
+                tofile=f"{path}:proposed",
+                n=3,
+            )
+        )
+        if not diff.strip():
+            return "(no diff)"
+        return self._review_excerpt(diff, limit=limit)
+
     def _run_semantic_change_review(self, route: RouterOutput, session: SessionState) -> None:
         if not session.changed_files or self.validation_planner.has_semantic_review(session):
             return
 
         artifacts = self._semantic_review_artifacts(session)
-        prompt = semantic_change_review_prompt(route, session, artifacts=artifacts)
         primary_model = self._primary_generation_model_name()
         reserve_model = self._lightweight_generation_model_name()
         attempts: list[ExecutionAttemptRecord] = []
-
-        self._log(
-            "semantic_change_review_started",
-            model=primary_model,
-            changed_files=[item.path for item in session.changed_files[-6:]],
+        prefer_lightweight = self._should_prefer_lightweight_semantic_review(
+            route,
+            session,
+            artifacts=artifacts,
         )
-
-        review_attempts = [
-            (
-                primary_model,
-                "tier_a",
-                "primary_model_generation",
-                max(self._llm_timeout(24), 24),
-                min(self._llm_num_ctx(4096), 4096),
+        full_prompt = semantic_change_review_prompt(route, session, artifacts=artifacts)
+        compact_prompt: str | None = None
+        if prefer_lightweight:
+            compact_prompt = semantic_change_review_prompt(
+                route,
+                session,
+                artifacts=self._semantic_review_artifacts(
+                    session,
+                    content_limit=1_000,
+                    diff_limit=500,
+                ),
+                mode="compact",
             )
-        ]
-        if reserve_model is not None:
+
+        review_attempts: list[tuple[str | None, str, str, int, int, str]] = []
+        if prefer_lightweight and reserve_model is not None:
             review_attempts.append(
                 (
                     reserve_model,
@@ -3395,10 +4916,42 @@ class Planner:
                     "reserve_model_generation",
                     max(self._llm_timeout(18), 18),
                     min(self._llm_num_ctx(2048), 2048),
+                    "compact",
+                )
+            )
+        review_attempts.append(
+            (
+                primary_model,
+                "tier_a",
+                "primary_model_generation",
+                max(self._llm_timeout(24), 24),
+                min(self._llm_num_ctx(4096), 4096),
+                "full",
+            )
+        )
+        if reserve_model is not None and not prefer_lightweight:
+            review_attempts.append(
+                (
+                    reserve_model,
+                    "tier_b",
+                    "reserve_model_generation",
+                    max(self._llm_timeout(18), 18),
+                    min(self._llm_num_ctx(2048), 2048),
+                    "full",
                 )
             )
 
-        for model_name, capability_tier, strategy, timeout, num_ctx in review_attempts:
+        self._log(
+            "semantic_change_review_started",
+            model=review_attempts[0][0] or primary_model,
+            preferred_strategy=review_attempts[0][2] if review_attempts else "primary_model_generation",
+            prompt_variant=review_attempts[0][5] if review_attempts else "full",
+            changed_files=[item.path for item in session.changed_files[-6:]],
+        )
+
+        for model_name, capability_tier, strategy, timeout, num_ctx, prompt_variant in review_attempts:
+            prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
+            total_timeout = 40 if prompt_variant == "compact" else max(timeout + 20, timeout * 2)
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,
@@ -3406,6 +4959,7 @@ class Planner:
                     model=review_model,
                     retries=0,
                     timeout=timeout,
+                    total_timeout=total_timeout,
                     num_ctx=num_ctx,
                     progress_callback=progress,
                 ),
@@ -3414,11 +4968,11 @@ class Planner:
                 attempt_number=len(attempts) + 1,
                 capability_tier=capability_tier,
                 recovery_strategy=strategy,
-                prompt_variant="full",
+                prompt_variant=prompt_variant,
                 model_identifier=model_name or self._primary_generation_model_name(),
                 backend_identifier=self._backend_identifier(),
                 inactivity_timeout_seconds=timeout,
-                total_timeout_seconds=max(timeout + 20, timeout * 2),
+                total_timeout_seconds=total_timeout,
                 context_pressure_estimate=estimate_context_pressure(prompt_chars=len(prompt)),
                 event_callback=self._progress_logger("semantic_change_review_progress"),
             )
@@ -3430,6 +4984,13 @@ class Planner:
                     strategy=strategy,
                     model=model_name,
                 )
+                if (
+                    prefer_lightweight
+                    and strategy == "reserve_model_generation"
+                    and attempts[-1].failure is not None
+                    and attempts[-1].failure.no_start_failure
+                ):
+                    break
                 continue
             try:
                 review = SemanticChangeReview.model_validate(outcome.value)
@@ -3533,7 +5094,13 @@ class Planner:
         session.active_repair_context = self.validation_planner.build_failure_evidence(session, failed_run)
         session.last_error = excerpt or summary
 
-    def _semantic_review_artifacts(self, session: SessionState) -> list[dict[str, object]]:
+    def _semantic_review_artifacts(
+        self,
+        session: SessionState,
+        *,
+        content_limit: int = 1_800,
+        diff_limit: int = 900,
+    ) -> list[dict[str, object]]:
         artifacts: list[dict[str, object]] = []
         for change in session.changed_files[-6:]:
             entry: dict[str, object] = {
@@ -3541,10 +5108,10 @@ class Planner:
                 "operation": change.operation,
             }
             if change.diff:
-                entry["diff_excerpt"] = self._clip_text(change.diff, 900)
+                entry["diff_excerpt"] = self._clip_text(change.diff, diff_limit)
             current_content = self._current_file_content(session, change.path)
             if current_content is not None:
-                entry["content_excerpt"] = self._clip_text(current_content, 1800)
+                entry["content_excerpt"] = self._clip_text(current_content, content_limit)
             artifacts.append(entry)
         return artifacts
 

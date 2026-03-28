@@ -483,7 +483,11 @@ def _build_runtime(base_config: AppConfig) -> RuntimeBundle:
         auth_config = config
         missing_secret = not config.auth_secret_key
         if missing_secret:
-            auth_config = replace(config, auth_secret_key=setup_service.generate_secret_key())
+            auth_config = replace(
+                config,
+                auth_secret_key=setup_service.generate_secret_key(),
+                auth_cookie_secure=bool(config.auth_cookie_secure and config.public_base_url),
+            )
         auth_service = AuthService(auth_config)
         has_users = auth_service.store.count_users() > 0
         if missing_secret and not has_users:
