@@ -118,6 +118,9 @@ class ModelManager:
         }
 
     def ensure_recommended(self) -> dict[str, Any]:
+        if not self.config.auto_install_recommended_models:
+            return self.catalog()
+
         if not self.client.is_available():
             return self.catalog()
 

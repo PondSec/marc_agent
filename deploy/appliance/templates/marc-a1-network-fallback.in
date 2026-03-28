@@ -1,0 +1,57 @@
+#!/bin/sh
+set -eu
+
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+CONFIG_FILE="/etc/marc-a1/appliance.env"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "Missing appliance config: $CONFIG_FILE" >&2
+  exit 1
+fi
+
+. "$CONFIG_FILE"
+
+sleep 12
+
+if ip -4 route show default | awk 'NR == 1 {exit 0} END {exit 1}'; then
+  exit 0
+fi
+
+PRIMARY_IFACE=""
+for path in /sys/class/net/*; do
+  iface="${path##*/}"
+  case "$iface" in
+    lo|docker*|veth*|virbr*|br-*|zt*|tailscale*|wg*)
+      continue
+      ;;
+  esac
+  if [ -f "$path/carrier" ] && [ "$(cat "$path/carrier")" = "1" ]; then
+    PRIMARY_IFACE="$iface"
+    break
+  fi
+done
+
+if [ -z "$PRIMARY_IFACE" ]; then
+  for path in /sys/class/net/*; do
+    iface="${path##*/}"
+    case "$iface" in
+      lo|docker*|veth*|virbr*|br-*|zt*|tailscale*|wg*)
+        continue
+        ;;
+    esac
+    PRIMARY_IFACE="$iface"
+    break
+  done
+fi
+
+if [ -z "$PRIMARY_IFACE" ]; then
+  echo "No suitable network interface found for DMZ fallback." >&2
+  exit 0
+fi
+
+ip addr flush dev "$PRIMARY_IFACE" scope global || true
+ip link set "$PRIMARY_IFACE" up || true
+ip addr add "$STATIC_IP/$STATIC_PREFIX_LENGTH" dev "$PRIMARY_IFACE"
+ip route replace default via "$STATIC_GATEWAY" dev "$PRIMARY_IFACE"
+printf 'nameserver %s\n' "$STATIC_DNS" > /etc/resolv.conf

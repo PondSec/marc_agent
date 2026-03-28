@@ -25,6 +25,7 @@
   "ollama_num_ctx": 32768,
   "router_num_ctx": 2048,
   "ollama_temperature": 0.1,
+  "auto_install_recommended_models": true,
   "warmup_models_on_startup": true,
   "warmup_timeout": 45
 }

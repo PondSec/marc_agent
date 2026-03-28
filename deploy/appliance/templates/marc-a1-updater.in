@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+CONFIG_FILE="/etc/marc-a1/updater.env"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "Missing updater config: $CONFIG_FILE" >&2
+  exit 1
+fi
+
+. "$CONFIG_FILE"
+
+mkdir -p "$(dirname "$LOCK_FILE")" "$BACKUP_DIR"
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "MARC A1 updater is already running."
+  exit 0
+fi
+
+WORK_DIR="$(mktemp -d /var/lib/marc-a1-updater/work.XXXXXX)"
+cleanup() {
+  rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -d "$CACHE_REPO_DIR/.git" ]; then
+  rm -rf "$CACHE_REPO_DIR"
+  git clone --branch "$REPO_BRANCH" --single-branch --depth 1 "$REPO_URL" "$CACHE_REPO_DIR"
+else
+  git -C "$CACHE_REPO_DIR" remote set-url origin "$REPO_URL"
+  git -C "$CACHE_REPO_DIR" fetch --depth 1 origin "$REPO_BRANCH"
+  git -C "$CACHE_REPO_DIR" checkout -q "$REPO_BRANCH"
+  git -C "$CACHE_REPO_DIR" reset --hard "origin/$REPO_BRANCH"
+fi
+
+TARGET_REF="$(git -C "$CACHE_REPO_DIR" rev-parse "origin/$REPO_BRANCH" 2>/dev/null || git -C "$CACHE_REPO_DIR" rev-parse HEAD)"
+
+CURRENT_REF=""
+if [ -f "$CURRENT_REF_FILE" ]; then
+  CURRENT_REF="$(cat "$CURRENT_REF_FILE")"
+fi
+
+if [ "$CURRENT_REF" = "$TARGET_REF" ]; then
+  echo "MARC A1 already up to date on $REPO_BRANCH ($TARGET_REF)"
+  exit 0
+fi
+
+git -C "$CACHE_REPO_DIR" archive "$TARGET_REF" | tar -xf - -C "$WORK_DIR"
+
+if [ ! -f "$WORK_DIR/main.py" ]; then
+  echo "Downloaded update does not look like a valid MARC A1 repo." >&2
+  exit 1
+fi
+
+rm -rf "$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
+if [ -d "$APP_DIR" ]; then
+  rsync -a --delete --exclude '.env' --exclude '.marc_a1' "$APP_DIR/" "$BACKUP_DIR/"
+fi
+
+systemctl stop marc-a1.service || true
+rsync -a --delete --exclude '.env' --exclude '.marc_a1' "$WORK_DIR/" "$APP_DIR/"
+chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
+systemctl start marc-a1.service
+sleep 8
+
+if systemctl is-active --quiet marc-a1.service; then
+  printf '%s\n' "$TARGET_REF" >"$CURRENT_REF_FILE"
+  echo "Updated MARC A1 to $TARGET_REF from $REPO_BRANCH"
+  exit 0
+fi
+
+echo "Update failed, restoring previous app state." >&2
+systemctl stop marc-a1.service || true
+rsync -a --delete --exclude '.env' --exclude '.marc_a1' "$BACKUP_DIR/" "$APP_DIR/"
+chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
+systemctl start marc-a1.service || true
+exit 1

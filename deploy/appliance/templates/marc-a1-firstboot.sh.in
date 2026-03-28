@@ -1,0 +1,146 @@
+#!/bin/sh
+set -eu
+
+export DEBIAN_FRONTEND=noninteractive
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export HOME="/root"
+export OLLAMA_HOST="http://127.0.0.1:11434"
+
+CONFIG_FILE="/etc/marc-a1/appliance.env"
+STAMP_FILE="/var/lib/marc-a1/.provisioned"
+INSTALLER_DIR="/opt/marc-a1-installer"
+APP_DIR="/opt/marc-a1/app"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "Missing appliance config: $CONFIG_FILE" >&2
+  exit 1
+fi
+
+. "$CONFIG_FILE"
+
+if [ -f "$STAMP_FILE" ]; then
+  exit 0
+fi
+
+install -d -m 0755 /opt/marc-a1 "$APP_DIR" /var/lib/marc-a1 /var/log/marc-a1 "$WORKSPACE_ROOT"
+chown -R "$INSTALL_USERNAME:$INSTALL_USERNAME" /var/lib/marc-a1 /var/log/marc-a1 "$WORKSPACE_ROOT"
+
+apt-get update
+apt-get install -y --no-install-recommends curl ca-certificates git python3 python3-venv python3-pip rsync sudo zstd openssh-server
+
+curl -fsSL https://ollama.com/install.sh | sh
+
+install -d -m 0755 "$OLLAMA_MODELS"
+if [ -d "$INSTALLER_DIR/ollama-models" ]; then
+  rsync -a "$INSTALLER_DIR/ollama-models/" "$OLLAMA_MODELS/"
+fi
+if id ollama >/dev/null 2>&1; then
+  chown -R ollama:ollama "$OLLAMA_MODELS"
+fi
+
+install -d -m 0755 /etc/systemd/system/ollama.service.d
+install -D -m 0644 "$INSTALLER_DIR/ollama-override.conf" /etc/systemd/system/ollama.service.d/override.conf
+install -D -m 0644 "$INSTALLER_DIR/99-marc-a1.conf" /etc/sysctl.d/99-marc-a1.conf
+install -D -m 0755 "$INSTALLER_DIR/marc-a1-performance-tune" /usr/local/sbin/marc-a1-performance-tune
+install -D -m 0644 "$INSTALLER_DIR/marc-a1-performance-tune.service" /etc/systemd/system/marc-a1-performance-tune.service
+install -D -m 0755 "$INSTALLER_DIR/marc-a1-network-fallback" /usr/local/sbin/marc-a1-network-fallback
+install -D -m 0644 "$INSTALLER_DIR/marc-a1-network-fallback.service" /etc/systemd/system/marc-a1-network-fallback.service
+install -D -m 0755 "$INSTALLER_DIR/marc-a1-updater" /usr/local/sbin/marc-a1-updater
+install -D -m 0644 "$INSTALLER_DIR/marc-a1-updater.service" /etc/systemd/system/marc-a1-updater.service
+install -D -m 0644 "$INSTALLER_DIR/marc-a1-updater.timer" /etc/systemd/system/marc-a1-updater.timer
+install -D -m 0644 "$INSTALLER_DIR/updater.env" /etc/marc-a1/updater.env
+sysctl --system >/dev/null 2>&1 || true
+
+systemctl daemon-reload
+systemctl enable marc-a1-performance-tune.service
+systemctl start marc-a1-performance-tune.service || true
+systemctl enable ollama
+systemctl restart ollama
+
+OLLAMA_READY=0
+for _ in $(seq 1 180); do
+  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    OLLAMA_READY=1
+    break
+  fi
+  sleep 1
+done
+
+if [ "$OLLAMA_READY" -ne 1 ]; then
+  echo "Ollama API did not become ready in time." >&2
+  exit 1
+fi
+
+rm -rf "$APP_DIR"
+install -d -m 0755 "$APP_DIR"
+tar -xzf "$INSTALLER_DIR/marc-a1-bundle.tar.gz" -C "$APP_DIR" --strip-components=1
+
+install -D -m 0644 "$INSTALLER_DIR/marc-a1.service" /etc/systemd/system/marc-a1.service
+
+AUTH_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+cat >"$APP_DIR/.env" <<EOF
+# MARC A1 appliance runtime
+AUTH_ENABLED=1
+AUTH_SECRET_KEY=$AUTH_SECRET_KEY
+AUTH_COOKIE_SECURE=0
+OLLAMA_HOST=http://127.0.0.1:11434
+MODEL_NAME=$MODEL_NAME
+ROUTER_MODEL_NAME=$ROUTER_MODEL_NAME
+ACCESS_MODE=$ACCESS_MODE
+WORKSPACE_ROOT=$WORKSPACE_ROOT
+STATE_ROOT_OVERRIDE=$STATE_ROOT_OVERRIDE
+OLLAMA_NUM_CTX=$OLLAMA_NUM_CTX
+ROUTER_NUM_CTX=$ROUTER_NUM_CTX
+OLLAMA_TEMPERATURE=$OLLAMA_TEMPERATURE
+AUTO_INSTALL_RECOMMENDED_MODELS=0
+WARMUP_MODELS_ON_STARTUP=1
+WARMUP_TIMEOUT=90
+LLM_TIMEOUT=$LLM_TIMEOUT
+ROUTER_TIMEOUT=$ROUTER_TIMEOUT
+LLM_REQUEST_RETRIES=1
+ROUTER_RETRIES=1
+ALLOWED_HOSTS=*
+SECURITY_ALLOWED_HOSTS=*
+PUBLIC_BASE_URL=
+HSTS_ENABLED=0
+EOF
+
+chmod 0640 "$APP_DIR/.env"
+chown -R "$INSTALL_USERNAME:$INSTALL_USERNAME" /opt/marc-a1 /var/lib/marc-a1 /var/log/marc-a1 "$WORKSPACE_ROOT"
+
+if ! ollama list | awk 'NR > 1 {print $1}' | grep -Fx "$MODEL_NAME" >/dev/null 2>&1; then
+  ollama pull "$MODEL_NAME"
+fi
+if [ "$ROUTER_MODEL_NAME" != "$MODEL_NAME" ] && ! ollama list | awk 'NR > 1 {print $1}' | grep -Fx "$ROUTER_MODEL_NAME" >/dev/null 2>&1; then
+  ollama pull "$ROUTER_MODEL_NAME"
+fi
+
+systemctl enable ssh
+systemctl enable marc-a1-network-fallback.service
+systemctl enable marc-a1.service
+systemctl enable marc-a1-updater.timer
+systemctl restart marc-a1.service
+systemctl start marc-a1-network-fallback.service || true
+systemctl start marc-a1-updater.service || true
+systemctl start marc-a1-updater.timer
+
+cat >"/root/MARC_A1_READY.txt" <<EOF
+M.A.R.C A1 appliance provisioning completed.
+
+Web UI:
+  DHCP network now, later in DMZ fallback: http://$STATIC_IP:8000
+
+SSH:
+  DHCP network now, later in DMZ fallback: ssh $INSTALL_USERNAME@$STATIC_IP
+
+Notes:
+  - The web setup assistant is still active for the first admin user.
+  - The default local model is $MODEL_NAME.
+  - Ollama is bound to 127.0.0.1 and is only reachable locally.
+  - Ollama model path: $OLLAMA_MODELS
+  - Auto-update watches origin/@@REPO_BRANCH@@ on a timer.
+  - Without DHCP the host falls back to $STATIC_IP/@@STATIC_PREFIX_LENGTH@@ via $STATIC_GATEWAY.
+EOF
+
+touch "$STAMP_FILE"
+systemctl disable marc-a1-firstboot.service >/dev/null 2>&1 || true

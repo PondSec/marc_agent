@@ -1,0 +1,15 @@
+[Unit]
+Description=MARC A1 appliance first-boot provisioning
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/marc-a1/.provisioned
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/marc-a1-firstboot
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

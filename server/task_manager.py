@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +18,7 @@ from agent.models import FollowUpContext, SessionState, utc_now
 from agent.session import SessionStore
 from config.settings import AccessMode, AppConfig
 from runtime.logger import AgentLogger
+from runtime.workspace import WorkspaceError, WorkspaceManager
 from server.schemas import LogRecord, SessionSummary, WorkspaceInspectResponse
 from server.workspace_store import WorkspaceStore
 
@@ -37,11 +43,35 @@ class WorkspaceBusyError(RuntimeError):
     pass
 
 
+class SessionNotFoundError(RuntimeError):
+    pass
+
+
+class WorkspacePreviewUnavailableError(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class ResolvedWorkspace:
     id: str | None
     name: str
     path: str
+
+
+@dataclass(slots=True)
+class ExportArchive:
+    archive_path: Path
+    download_name: str
+    cleanup_dir: Path
+
+
+@dataclass(slots=True)
+class WorkspacePreviewTarget:
+    kind: str
+    workspace_id: str
+    workspace_name: str
+    workspace_root: str
+    entry_path: str
 
 
 class TaskManager:
@@ -204,6 +234,211 @@ class TaskManager:
             text=agent.memory.render_snapshot(snapshot),
             snapshot=snapshot.model_dump(),
         )
+
+    def build_session_handoff(self, session_id: str) -> ExportArchive:
+        session = self.get_session(session_id)
+        if session is None:
+            raise SessionNotFoundError("Session not found.")
+        workspace = self._resolve_workspace(session, session.workspace_id)
+        if workspace is None:
+            raise WorkspaceRequiredError("Select a workspace before downloading a handoff bundle.")
+
+        manager = WorkspaceManager(workspace.path)
+        file_entries: list[tuple[Path, str]] = []
+        change_manifest: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+
+        for change in session.changed_files:
+            display_path = self._exportable_relative_path(manager, change.path)
+            if display_path is None:
+                change_manifest.append(
+                    {
+                        "path": change.path,
+                        "operation": change.operation,
+                        "included": False,
+                        "reason": "outside_workspace",
+                    }
+                )
+                continue
+            if display_path in seen_paths:
+                continue
+            seen_paths.add(display_path)
+            target = manager.resolve_path(display_path)
+            if target.exists() and target.is_file():
+                file_entries.append((target, display_path))
+                change_manifest.append(
+                    {
+                        "path": display_path,
+                        "operation": change.operation,
+                        "included": True,
+                    }
+                )
+                continue
+            reason = "deleted" if change.operation.lower() == "delete" else "missing"
+            change_manifest.append(
+                {
+                    "path": display_path,
+                    "operation": change.operation,
+                    "included": False,
+                    "reason": reason,
+                }
+            )
+
+        report_payload = self._report_payload_for_session(session)
+        extras = {
+            "_marc_export/session.json": session.model_dump_json(indent=2),
+            "_marc_export/manifest.json": json.dumps(
+                {
+                    "version": 1,
+                    "bundle_type": "session_handoff",
+                    "generated_at": utc_now(),
+                    "session_id": session.id,
+                    "session_title": session.title,
+                    "task": session.task,
+                    "workspace_id": workspace.id,
+                    "workspace_name": workspace.name,
+                    "workspace_root": workspace.path,
+                    "included_files": [path for _, path in file_entries],
+                    "changes": change_manifest,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "_marc_export/README.txt": (
+                "Dieses Bundle enthaelt nur die vom Agent geaenderten Dateien.\n"
+                "Entpacke es direkt ueber deinem lokalen Projekt oder vergleiche die Dateien manuell.\n"
+                "Loeschungen und ausgelassene Dateien stehen in _marc_export/manifest.json.\n"
+            ),
+        }
+        if report_payload is not None:
+            extras["_marc_export/report.json"] = report_payload
+        logs_payload = self._logs_payload_for_session(session.id)
+        if logs_payload is not None:
+            extras["_marc_export/logs.jsonl"] = logs_payload
+
+        download_name = (
+            f"{self._slugify(workspace.name)}-{self._slugify(session.title or session.id)}-handoff.zip"
+        )
+        return self._write_export_archive(
+            download_name=download_name,
+            files=file_entries,
+            extra_text=extras,
+        )
+
+    def build_workspace_export(self, workspace_id: str) -> ExportArchive:
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError("Workspace not found.")
+
+        manager = WorkspaceManager(workspace.path)
+        files = [
+            (path, manager.display_path(path))
+            for path in manager.iter_files(max_results=50_000)
+        ]
+        extras = {
+            "_marc_export/manifest.json": json.dumps(
+                {
+                    "version": 1,
+                    "bundle_type": "workspace_export",
+                    "generated_at": utc_now(),
+                    "workspace_id": workspace.id,
+                    "workspace_name": workspace.name,
+                    "workspace_root": workspace.path,
+                    "included_files": [arcname for _, arcname in files],
+                    "file_count": len(files),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "_marc_export/README.txt": (
+                "Dieses Bundle enthaelt den kompletten Workspace ohne grosse Cache- und Build-Ordner.\n"
+                "Du kannst es lokal direkt entpacken oder als Cloud-Arbeitsstand archivieren.\n"
+            ),
+        }
+        download_name = f"{self._slugify(workspace.name)}-workspace.zip"
+        return self._write_export_archive(
+            download_name=download_name,
+            files=files,
+            extra_text=extras,
+        )
+
+    def detect_workspace_preview(self, workspace_id: str) -> WorkspacePreviewTarget:
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError("Workspace not found.")
+
+        manager = WorkspaceManager(workspace.path)
+        display_paths = [manager.display_path(path) for path in manager.iter_files(max_results=2_000)]
+        html_entry = self._pick_html_preview_entry(display_paths)
+        if html_entry is not None:
+            return WorkspacePreviewTarget(
+                kind="static",
+                workspace_id=workspace.id,
+                workspace_name=workspace.name,
+                workspace_root=workspace.path,
+                entry_path=html_entry,
+            )
+
+        python_entry = self._pick_python_preview_entry(display_paths)
+        if python_entry is not None:
+            return WorkspacePreviewTarget(
+                kind="python",
+                workspace_id=workspace.id,
+                workspace_name=workspace.name,
+                workspace_root=workspace.path,
+                entry_path=python_entry,
+            )
+
+        raise WorkspacePreviewUnavailableError(
+            "Kein Vorschauziel gefunden. Fuer die Cloud-Vorschau werden aktuell HTML-Dateien oder ein Python-Einstiegspunkt erwartet."
+        )
+
+    def run_python_preview(self, workspace_id: str) -> dict[str, Any]:
+        preview = self.detect_workspace_preview(workspace_id)
+        if preview.kind != "python":
+            raise WorkspacePreviewUnavailableError("Die Workspace-Vorschau ist kein Python-Lauf.")
+
+        working_dir = Path(preview.workspace_root).expanduser().resolve()
+        target = working_dir / preview.entry_path
+        timeout_seconds = min(max(int(self.base_config.shell_timeout), 5), 20)
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-I", str(target)],
+                cwd=working_dir,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            stdout = completed.stdout[-self.base_config.max_read_chars :]
+            stderr = completed.stderr[-self.base_config.max_read_chars :]
+            return {
+                "workspace_id": preview.workspace_id,
+                "workspace_name": preview.workspace_name,
+                "workspace_root": preview.workspace_root,
+                "entry_path": preview.entry_path,
+                "exit_code": completed.returncode,
+                "success": completed.returncode == 0,
+                "timeout": False,
+                "stdout": stdout,
+                "stderr": stderr,
+                "command": f"{sys.executable} -I {preview.entry_path}",
+            }
+        except subprocess.TimeoutExpired as exc:
+            stdout = str(exc.stdout or "")[-self.base_config.max_read_chars :]
+            stderr = str(exc.stderr or "")[-self.base_config.max_read_chars :]
+            return {
+                "workspace_id": preview.workspace_id,
+                "workspace_name": preview.workspace_name,
+                "workspace_root": preview.workspace_root,
+                "entry_path": preview.entry_path,
+                "exit_code": None,
+                "success": False,
+                "timeout": True,
+                "stdout": stdout,
+                "stderr": stderr,
+                "command": f"{sys.executable} -I {preview.entry_path}",
+            }
 
     def inspect_workspace_for(
         self,
@@ -723,3 +958,110 @@ class TaskManager:
                 continue
             unique.append(text)
         return unique
+
+    def _exportable_relative_path(
+        self,
+        manager: WorkspaceManager,
+        raw_path: str,
+    ) -> str | None:
+        text = str(raw_path or "").strip()
+        if not text:
+            return None
+        candidate = Path(text).expanduser()
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+            if not manager.is_within_root(resolved):
+                return None
+            return manager.display_path(resolved)
+        try:
+            resolved = manager.resolve_path(candidate)
+        except WorkspaceError:
+            return None
+        return manager.display_path(resolved)
+
+    def _report_payload_for_session(self, session: SessionState) -> str | None:
+        report_path = self.base_config.report_dir_path / f"{session.id}.json"
+        if report_path.exists():
+            return report_path.read_text(encoding="utf-8")
+        if session.report is None:
+            return None
+        return json.dumps(session.report.model_dump(), ensure_ascii=False, indent=2)
+
+    def _logs_payload_for_session(self, session_id: str) -> str | None:
+        log_path = self.base_config.log_dir_path / f"{session_id}.jsonl"
+        if not log_path.exists():
+            return None
+        return log_path.read_text(encoding="utf-8")
+
+    def _write_export_archive(
+        self,
+        *,
+        download_name: str,
+        files: list[tuple[Path, str]],
+        extra_text: dict[str, str],
+    ) -> ExportArchive:
+        cleanup_dir = Path(tempfile.mkdtemp(prefix="marc-export-"))
+        archive_path = cleanup_dir / download_name
+        with zipfile.ZipFile(
+            archive_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            for source, arcname in files:
+                if not source.exists() or not source.is_file():
+                    continue
+                archive.write(source, arcname=arcname)
+            for arcname, content in extra_text.items():
+                archive.writestr(arcname, content)
+        return ExportArchive(
+            archive_path=archive_path,
+            download_name=download_name,
+            cleanup_dir=cleanup_dir,
+        )
+
+    def cleanup_export_archive(self, bundle: ExportArchive) -> None:
+        shutil.rmtree(bundle.cleanup_dir, ignore_errors=True)
+
+    def _pick_html_preview_entry(self, display_paths: list[str]) -> str | None:
+        normalized = [path for path in display_paths if path.lower().endswith((".html", ".htm"))]
+        if not normalized:
+            return None
+        preferred = (
+            "index.html",
+            "public/index.html",
+            "src/index.html",
+        )
+        for candidate in preferred:
+            if candidate in normalized:
+                return candidate
+        for candidate in normalized:
+            if candidate.lower().endswith("/index.html"):
+                return candidate
+        return normalized[0]
+
+    def _pick_python_preview_entry(self, display_paths: list[str]) -> str | None:
+        candidates = [
+            path
+            for path in display_paths
+            if path.lower().endswith(".py") and not path.startswith("tests/")
+        ]
+        if not candidates:
+            return None
+        preferred = ("main.py", "app.py", "server.py", "run.py", "manage.py")
+        for candidate in preferred:
+            if candidate in candidates:
+                return candidate
+        root_level = [path for path in candidates if "/" not in path]
+        if root_level:
+            return root_level[0]
+        return candidates[0]
+
+    def _slugify(self, value: str) -> str:
+        compact = "".join(
+            ch.lower() if ch.isalnum() else "-"
+            for ch in str(value or "bundle").strip()
+        )
+        while "--" in compact:
+            compact = compact.replace("--", "-")
+        return compact.strip("-") or "bundle"

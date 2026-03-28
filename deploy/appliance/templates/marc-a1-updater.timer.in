@@ -1,0 +1,12 @@
+[Unit]
+Description=Run MARC A1 updater regularly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=@@AUTO_UPDATE_INTERVAL_MINUTES@@min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=marc-a1-updater.service
+
+[Install]
+WantedBy=timers.target

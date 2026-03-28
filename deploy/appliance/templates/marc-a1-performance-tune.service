@@ -1,0 +1,12 @@
+[Unit]
+Description=MARC A1 performance tuning
+After=local-fs.target
+Before=ollama.service marc-a1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/marc-a1-performance-tune
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

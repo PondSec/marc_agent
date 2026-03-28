@@ -1,0 +1,12 @@
+[Unit]
+Description=MARC A1 DHCP to DMZ fallback
+After=network.target
+Before=marc-a1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/marc-a1-network-fallback
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
