@@ -65,6 +65,45 @@ def test_validation_planner_marks_failure_when_current_generation_failed():
     assert planner.rollup_status(session) == "failed"
 
 
+def test_validation_planner_treats_unittest_importability_failure_as_discovery_gap(tmp_path):
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Create a word counting CLI with tests.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn="Create wordfreq.py, README.md, and tests/test_wordfreq.py.",
+            root_goal="Create the initial CLI implementation.",
+            active_goal="Create the CLI, docs, and tests.",
+            goal_relation="new_task",
+            output_expectation="A working CLI with docs and unittest coverage.",
+            verification_target="python -m unittest discover -s tests -v",
+            next_action="create",
+            target_artifacts=[
+                {"path": "wordfreq.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "README.md", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_wordfreq.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="wordfreq.py", operation="create"))
+    failed_run = ValidationRunRecord(
+        command="python -m unittest discover -s tests -v",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt="ImportError: Start directory is not importable: 'tests'",
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[:2] == ["tests/test_wordfreq.py", "tests/__init__.py"]
+    assert "tests/__init__.py" in evidence.file_hints
+    assert any("test discovery" in item.lower() for item in evidence.repair_requirements)
+
+
 def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypatch):
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(
@@ -188,6 +227,50 @@ def test_validation_planner_includes_explicit_user_requested_validation_command(
     assert plan[0].command == "python -m unittest"
     assert plan[0].verification_scope == "runtime"
     assert plan[0].required is True
+
+
+def test_validation_planner_extracts_multiline_explicit_validation_command_without_following_bullet_text():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=0,
+        language_counts={},
+        top_directories=[],
+        important_files=[],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=[],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Empty workspace.",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle ein kleines Projekt.\n"
+            "- Lege app.py an.\n"
+            "- Pruefe am Ende mit python -m unittest discover -s tests -v.\n"
+            "- Wenn du Beispieldateien brauchst, darfst du sie anlegen.\n"
+        ),
+        workspace_root="/tmp/demo",
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["app.py"],
+        session=session,
+    )
+
+    assert any(item.command == "python -m unittest discover -s tests -v" for item in plan)
+    assert not any("Wenn du Beispieldateien brauchst" in item.command for item in plan)
 
 
 def test_validation_planner_does_not_mark_unchecked_changes_as_passed():

@@ -47,3 +47,27 @@ def test_failure_analyzer_adds_discovery_hint_when_no_tests_ran(tmp_path):
     assert len(diagnostics) == 1
     assert diagnostics[0].category == "test_failure"
     assert any("test discovery" in hint for hint in diagnostics[0].action_hints)
+
+
+def test_failure_analyzer_ignores_pseudo_and_external_traceback_paths(tmp_path):
+    analyzer = FailureAnalyzer(WorkspaceManager(tmp_path))
+    result = ToolRunResult(
+        tool_name="run_tests",
+        success=False,
+        message="Validation command exited with 1.",
+        data={
+            "command": "python -m unittest discover -s tests -v",
+            "stderr": (
+                'Traceback (most recent call last):\n'
+                '  File "<frozen runpy>", line 198, in _run_module_as_main\n'
+                '  File "/usr/lib/python3.14/unittest/main.py", line 242, in _do_discovery\n'
+                "ImportError: Start directory is not importable: 'tests'\n"
+            ),
+            "exit_code": 1,
+        },
+    )
+
+    diagnostics = analyzer.analyze(result, iteration=5)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].file_hints == []

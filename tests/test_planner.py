@@ -3277,6 +3277,133 @@ def test_planner_uses_search_terms_for_general_default_filename(tmp_path):
     assert decision.tool_args["path"] == "kanban_board.py"
 
 
+def test_planner_finishes_explicit_create_targets_before_running_validation(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="create",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "create_artifact",
+                        "reason": "Create the requested project files.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "run_validation",
+                        "reason": "Validate the generated project.",
+                    },
+                ],
+                target_paths=["wordfreq.py", "README.md", "tests/test_wordfreq.py"],
+                target_name="wordfreq.py",
+                repo_context_needed=False,
+            )
+        ],
+        text_payloads=["# Wordfreq\n\nUsage: python wordfreq.py sample.txt\n"],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Create wordfreq.py, README.md, and tests/test_wordfreq.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest discover -s tests -v",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest discover -s tests -v"],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest discover -s tests -v",
+    )
+    session.changed_files.append(FileChangeRecord(path="wordfreq.py", operation="create"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "README.md"
+
+
+def test_planner_prefers_lightweight_model_for_remaining_create_targets_after_primary_start_failure(tmp_path):
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "create_artifact",
+                "reason": "Create the requested project files.",
+            },
+            {
+                "step": 2,
+                "action": "run_validation",
+                "reason": "Validate the generated project.",
+            },
+        ],
+        target_paths=["wordfreq.py", "README.md", "tests/test_wordfreq.py"],
+        target_name="wordfreq.py",
+        repo_context_needed=False,
+    )
+    llm = ScriptedLLM(
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 110.0 seconds",
+                reason="startup_timeout",
+                retryable=False,
+                model_name="qwen3-coder:30b",
+                startup_timeout_seconds=110,
+            ),
+            "print('hello')\n",
+            "# Wordfreq\n",
+        ],
+        config=AppConfig(
+            workspace_root=".",
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Create wordfreq.py, README.md, and tests/test_wordfreq.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest discover -s tests -v",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest discover -s tests -v"],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest discover -s tests -v",
+    )
+
+    first_decision = planner.decide_next_action(session.task, session)
+
+    assert first_decision.action_type == AgentActionType.CALL_TOOL
+    assert first_decision.tool_name == "create_file"
+    assert first_decision.tool_args["path"] == "wordfreq.py"
+    session.changed_files.append(FileChangeRecord(path="wordfreq.py", operation="create"))
+
+    second_decision = planner.decide_next_action(session.task, session)
+
+    assert second_decision.action_type == AgentActionType.CALL_TOOL
+    assert second_decision.tool_name == "create_file"
+    assert second_decision.tool_args["path"] == "README.md"
+    assert llm.generate_calls[2]["kwargs"]["model"] == "qwen2.5-coder:14b"
+
+
 def test_planner_reuses_active_artifact_instead_of_junk_follow_up_filename(tmp_path):
     target = tmp_path / "tic_tac_toe.py"
     target.write_text("print('old version')\n", encoding="utf-8")

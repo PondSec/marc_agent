@@ -192,6 +192,8 @@ def _infer_user_intent(
         supplied_evidence,
     )
     evidence_kinds = {item.kind for item in evidence}
+    if goal_relation == "new_task" and next_best_action == "create" and not evidence_kinds:
+        return "implement"
     if goal_relation in {"correct", "rollback_request", "scope_change"}:
         return "correct"
     if next_best_action == "debug" or open_problem or evidence_kinds & {"diagnostic", "test", "log"}:
@@ -261,6 +263,13 @@ def _infer_execution_strategy(
         supplied_evidence,
     )
     evidence_kinds = {item.kind for item in evidence}
+    if (
+        goal_relation == "new_task"
+        and next_best_action == "create"
+        and current_user_intent in {"implement", "repair"}
+        and not evidence_kinds
+    ):
+        return "feature_implementation"
     if goal_relation in {"correct", "rollback_request", "scope_change"} or current_user_intent == "correct":
         return "rollback_correction"
     if (
@@ -311,6 +320,8 @@ def _infer_user_intent_conservative(
     evidence: list[EvidenceItem],
 ) -> UserIntent:
     evidence_kinds = {item.kind for item in evidence}
+    if goal_relation == "new_task" and next_best_action == "create" and not evidence_kinds:
+        return "implement"
     if goal_relation in {"correct", "rollback_request", "scope_change"}:
         return "correct"
     if next_best_action == "debug" or open_problem or evidence_kinds & {"diagnostic", "test", "log"}:
@@ -340,6 +351,13 @@ def _infer_execution_strategy_conservative(
     evidence: list[EvidenceItem],
 ) -> ExecutionStrategy | None:
     evidence_kinds = {item.kind for item in evidence}
+    if (
+        goal_relation == "new_task"
+        and next_best_action == "create"
+        and current_user_intent in {None, "implement", "repair"}
+        and not evidence_kinds
+    ):
+        return "feature_implementation"
     if goal_relation in {"correct", "rollback_request", "scope_change"} or current_user_intent == "correct":
         return "rollback_correction"
     if (
@@ -472,6 +490,11 @@ class TaskState(StrictModel):
         self.execution_outline = _compact_strings(self.execution_outline, limit=6)
         self.clarification_questions = _compact_strings(self.clarification_questions, limit=3)
         self.next_best_action = self.next_best_action or self.next_action
+        if self._should_prefer_feature_bootstrap():
+            self.current_user_intent = "implement"
+            self.execution_strategy = "feature_implementation"
+            self.next_action = "create"
+            self.next_best_action = "create"
         if (
             self.execution_strategy is None
             and self.current_user_intent in {
@@ -514,6 +537,16 @@ class TaskState(StrictModel):
         if not self.output_expectation:
             raise ValueError("output_expectation is required")
         return self
+
+    def _should_prefer_feature_bootstrap(self) -> bool:
+        evidence_kinds = {item.kind for item in self.evidence}
+        return (
+            self.goal_relation == "new_task"
+            and self.next_best_action == "create"
+            and self.current_user_intent in {None, "implement", "repair"}
+            and not evidence_kinds
+            and not self.supplied_evidence
+        )
 
     def to_task_understanding(self) -> TaskUnderstanding:
         relation_map = {

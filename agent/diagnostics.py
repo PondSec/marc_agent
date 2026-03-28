@@ -102,6 +102,8 @@ class FailureAnalyzer:
                 if not raw_path:
                     continue
                 display = self._normalize_path(raw_path)
+                if not display:
+                    continue
                 if display not in seen_files:
                     seen_files.add(display)
                     file_hints.append(display)
@@ -109,11 +111,16 @@ class FailureAnalyzer:
                     line_hints.append(int(raw_line))
         return file_hints[:10], line_hints[:20]
 
-    def _normalize_path(self, raw_path: str) -> str:
-        path = Path(raw_path)
-        if not path.is_absolute():
-            return self.workspace.display_path(self.workspace.root / path)
-        return self.workspace.display_path(path)
+    def _normalize_path(self, raw_path: str) -> str | None:
+        text = str(raw_path or "").strip()
+        if not text or (text.startswith("<") and text.endswith(">")):
+            return None
+        path = Path(text)
+        candidate = path if path.is_absolute() else self.workspace.root / path
+        resolved = candidate.expanduser().resolve(strict=False)
+        if not self.workspace.is_within_root(resolved):
+            return None
+        return self.workspace.display_path(resolved)
 
     def _action_hints(self, category: str, command: str, *, text: str = "") -> list[str]:
         hints = {

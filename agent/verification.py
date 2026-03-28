@@ -132,6 +132,7 @@ class ValidationPlanner:
         re.compile(r"\bran\s+0\s+tests?\b", re.IGNORECASE),
         re.compile(r"\bno\s+tests\s+ran\b", re.IGNORECASE),
         re.compile(r"\bcollected\s+0\s+items\b", re.IGNORECASE),
+        re.compile(r"start directory is not importable", re.IGNORECASE),
     )
 
     def build_plan(
@@ -344,11 +345,11 @@ class ValidationPlanner:
 
         extracted: list[ValidationCommand] = []
         for source, text in texts:
-            normalized_text = " ".join(str(text or "").split())
-            if not normalized_text:
+            raw_text = str(text or "")
+            if not raw_text.strip():
                 continue
             for spec in self.EXPLICIT_VALIDATION_COMMAND_SPECS:
-                for match in spec["pattern"].finditer(normalized_text):
+                for match in spec["pattern"].finditer(raw_text):
                     command = self._normalize_explicit_validation_command(match.group("command"))
                     if not command:
                         continue

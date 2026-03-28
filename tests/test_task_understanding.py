@@ -1011,6 +1011,85 @@ def test_task_state_updater_routes_explicit_repair_contract_to_update_flow(tmp_p
     assert route.action_plan[1].action.value == "update_artifact"
 
 
+def test_task_state_updater_keeps_empty_workspace_create_requests_out_of_debug_flow(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle in diesem leeren Projekt ein kleines Python-CLI zum Wortzaehlen.",
+        "root_goal": "Create a small Python CLI for word counting in an empty project.",
+        "active_goal": "Set up the project structure and implement the basic functionality of the word counting CLI.",
+        "goal_relation": "new_task",
+        "output_expectation": "A working Python CLI that counts words in a text file, ignoring case and punctuation.",
+        "current_user_intent": "implement",
+        "execution_strategy": "debug_repair",
+        "open_problem": "No existing project structure to build upon; need to create the necessary files and implement the functionality.",
+        "verification_target": "Running `python wordfreq.py sample.txt` should output the most frequent words with their counts.",
+        "target_artifacts": [
+            {"path": "wordfreq.py", "name": "wordfreq.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "README.md", "name": "README.md", "kind": "doc", "role": "supporting_context", "confidence": 1.0},
+            {"path": "tests/test_wordfreq.py", "name": "test_wordfreq.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": ["Ignore case and punctuation.", "Use `unittest` for testing."],
+        "assumptions": ["The user wants a simple implementation without additional features."],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.98,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": [
+            "Choose the smallest conventional artifact or scaffold that fits the request.",
+            "Implement the requested behavior in minimal runnable scope.",
+            "Validate the created artifact with the most relevant command if available.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "create"
+    assert route.intent == RouteIntent.CREATE
+    assert route.action_plan[0].action.value == "create_artifact"
+
+
+def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_empty_workspace(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    task_state = updater.update_task_state(
+        (
+            "Erstelle in diesem leeren Projekt ein kleines Python-CLI zum Wortzaehlen. "
+            "Lege wordfreq.py, README.md und tests/test_wordfreq.py an."
+        ),
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "create"
+    assert [artifact.path for artifact in task_state.target_artifacts] == [
+        "wordfreq.py",
+        "README.md",
+        "tests/test_wordfreq.py",
+    ]
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_paths == [
+        "wordfreq.py",
+        "README.md",
+        "tests/test_wordfreq.py",
+    ]
+    assert route.action_plan[0].action.value == "create_artifact"
+
+
 def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
     invalid_payload = {
         "latest_user_turn": "Update README.md to document the CLI.",

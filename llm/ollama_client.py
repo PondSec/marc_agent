@@ -143,11 +143,27 @@ class OllamaClient:
     ) -> str:
         effective_model = str(model or self.config.model_name)
         inactivity_timeout = max(int(timeout or self.config.llm_timeout), 1)
-        overall_timeout = max(int(total_timeout or max(inactivity_timeout * 3, inactivity_timeout + 90)), inactivity_timeout)
+        inactivity_timeout = self._expanded_inactivity_timeout(
+            model_name=effective_model,
+            inactivity_timeout=inactivity_timeout,
+        )
+        overall_timeout = max(
+            int(total_timeout or max(inactivity_timeout * 3, inactivity_timeout + 90)),
+            inactivity_timeout,
+        )
+        overall_timeout = self._expanded_total_timeout(
+            model_name=effective_model,
+            inactivity_timeout=inactivity_timeout,
+            total_timeout=overall_timeout,
+        )
         startup_timeout = self._startup_stream_timeout(
             model_name=effective_model,
             inactivity_timeout=inactivity_timeout,
             total_timeout=overall_timeout,
+        )
+        effective_num_ctx = self._effective_num_ctx(
+            model_name=effective_model,
+            requested_num_ctx=num_ctx or self.config.ollama_num_ctx,
         )
         effective_retries = self.config.llm_request_retries if retries is None else max(int(retries), 0)
         payload: dict[str, Any] = {
@@ -157,7 +173,7 @@ class OllamaClient:
             "think": False,
             "options": {
                 "temperature": self.config.ollama_temperature,
-                "num_ctx": num_ctx or self.config.ollama_num_ctx,
+                "num_ctx": effective_num_ctx,
             },
         }
         if system:
@@ -270,6 +286,7 @@ class OllamaClient:
         total_characters = 0
         activity_count = 0
         startup_warning_sent = False
+        stream_timeout_promoted = False
 
         if progress_callback is not None:
             progress_callback(
@@ -286,7 +303,9 @@ class OllamaClient:
         while True:
             try:
                 raw_line = response.readline()
-            except socket.timeout as exc:
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_timeout_like(exc):
+                    raise
                 now = time.monotonic()
                 idle_for = now - last_activity_at
                 elapsed = now - started_at
@@ -403,6 +422,9 @@ class OllamaClient:
 
             last_activity_at = time.monotonic()
             activity_count += 1
+            if not stream_timeout_promoted:
+                self._set_socket_timeout(response, float(inactivity_timeout))
+                stream_timeout_promoted = True
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -445,6 +467,23 @@ class OllamaClient:
                         return json.dumps(completed_json, ensure_ascii=False)
             if payload.get("done") is True:
                 break
+            elapsed = round(last_activity_at - started_at, 1)
+            if elapsed >= total_timeout:
+                raise OllamaGenerationError(
+                    f"timed out waiting for model completion after {elapsed:.1f} seconds",
+                    reason="total_timeout",
+                    elapsed=elapsed,
+                    idle_for=0.0,
+                    characters=total_characters,
+                    activity_count=activity_count,
+                    partial_text="".join(streamed_parts),
+                    model_name=model_name,
+                    backend_identifier="ollama",
+                    startup_timeout_seconds=startup_timeout,
+                    inactivity_timeout_seconds=inactivity_timeout,
+                    total_timeout_seconds=total_timeout,
+                    first_output_received=bool(streamed_parts),
+                )
 
         if streamed_parts:
             return "".join(streamed_parts).strip()
@@ -590,6 +629,8 @@ class OllamaClient:
     def _is_timeout_like(exc: Exception) -> bool:
         if isinstance(exc, OllamaGenerationError):
             return exc.timed_out
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            return True
         return "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
 
     @staticmethod
@@ -622,8 +663,8 @@ class OllamaClient:
         extra_buffer = 20
         minimum_floor = 30
         if parameter_hint >= 24:
-            extra_buffer = 35
-            minimum_floor = 70
+            extra_buffer = 60
+            minimum_floor = 480
         elif parameter_hint >= 14:
             extra_buffer = 28
             minimum_floor = 55
@@ -631,6 +672,43 @@ class OllamaClient:
             extra_buffer = 20
             minimum_floor = 40
         return int(min(total_timeout, max(inactivity_timeout + extra_buffer, minimum_floor)))
+
+    @staticmethod
+    def _expanded_total_timeout(
+        *,
+        model_name: str,
+        inactivity_timeout: int,
+        total_timeout: int,
+    ) -> int:
+        parameter_hint = OllamaClient._parameter_size_hint(model_name)
+        adjusted_total = max(int(total_timeout), int(inactivity_timeout), 1)
+        if parameter_hint >= 24:
+            adjusted_total = max(adjusted_total, 1200)
+        return adjusted_total
+
+    @staticmethod
+    def _expanded_inactivity_timeout(
+        *,
+        model_name: str,
+        inactivity_timeout: int,
+    ) -> int:
+        parameter_hint = OllamaClient._parameter_size_hint(model_name)
+        adjusted_timeout = max(int(inactivity_timeout), 1)
+        if parameter_hint >= 24:
+            adjusted_timeout = max(adjusted_timeout, 240)
+        return adjusted_timeout
+
+    @staticmethod
+    def _effective_num_ctx(
+        *,
+        model_name: str,
+        requested_num_ctx: int,
+    ) -> int:
+        parameter_hint = OllamaClient._parameter_size_hint(model_name)
+        effective_num_ctx = max(int(requested_num_ctx), 256)
+        if parameter_hint >= 24:
+            effective_num_ctx = min(effective_num_ctx, 2048)
+        return effective_num_ctx
 
     @staticmethod
     def _parameter_size_hint(model_name: str) -> float:

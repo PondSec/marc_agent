@@ -155,7 +155,17 @@ class ExecutionDecisionPolicy:
             str(artifact.path or artifact.name or "").strip()
             for artifact in understanding.target_artifacts
         )
+        bootstrap_create = (
+            goal_relation == "new_task"
+            and mode == "create"
+            and current_user_intent in {"implement", "repair"}
+            and task_state is not None
+            and not task_state.evidence
+            and not task_state.supplied_evidence
+        )
 
+        if bootstrap_create:
+            return RouteIntent.CREATE
         if strategy == "debug_repair":
             return RouteIntent.DEBUG
         if strategy in {"refactor", "hardening", "rollback_correction"}:
@@ -477,7 +487,11 @@ class ExecutionDecisionPolicy:
         candidates: list[str] = [
             item.path
             for item in understanding.target_artifacts
-            if item.path and (intent != RouteIntent.CREATE or item.role in {"primary_target", "validation_target"})
+            if item.path
+            and (
+                intent != RouteIntent.CREATE
+                or item.role in {"primary_target", "validation_target", "supporting_context"}
+            )
         ]
         if candidates:
             return self._unique_paths(candidates)[:8]

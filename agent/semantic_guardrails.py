@@ -89,6 +89,20 @@ _DEICTIC_MARKERS = (
     "that",
     "this",
 )
+_EMPTY_WORKSPACE_CREATE_MARKERS = (
+    "erstell",
+    "erzeuge",
+    "baue",
+    "bau ",
+    "build",
+    "create",
+    "schreib",
+    "lege ",
+    "ich brauche",
+    "i need",
+    "need a",
+    "need an",
+)
 _PATH_RE = re.compile(
     r"([\w./-]+\.(py|js|ts|tsx|jsx|json|md|html|css|sh|toml|ya?ml|go|rs|java|kt|rb))",
     flags=re.IGNORECASE,
@@ -136,6 +150,23 @@ def build_minimal_task_state(
         signal=signal,
         anchor_artifacts=anchor_artifacts,
     )
+    if _prefer_create_in_empty_workspace(
+        request,
+        snapshot=snapshot,
+        context=context,
+        signal=signal,
+        target_artifacts=target_artifacts,
+    ):
+        signal = MinimalSemanticSignal(
+            intent="create",
+            goal_relation="new_task",
+            confidence=max(signal.confidence, 0.74),
+            use_context=False,
+            needs_clarification=False,
+            requested_extension=signal.requested_extension,
+            artifact_name_hint=signal.artifact_name_hint,
+            explicit_path=signal.explicit_path,
+        )
     constraints = extract_scope_constraints(request)
     if signal.goal_relation == "scope_change" and active_artifacts and constraints:
         filtered = _filter_artifacts_for_constraints(active_artifacts, constraints)
@@ -616,17 +647,20 @@ def _target_artifacts_for_signal(
     signal: MinimalSemanticSignal,
     anchor_artifacts: list[TaskArtifact],
 ) -> list[TaskArtifact]:
-    explicit_path = signal.explicit_path
-    if explicit_path:
-        return [
-            TaskArtifact(
-                path=explicit_path,
-                name=Path(explicit_path).name,
-                kind=Path(explicit_path).suffix.lower() or "file",
-                role="primary_target",
-                confidence=0.86,
+    explicit_paths = _extract_explicit_paths(request)
+    if explicit_paths:
+        artifacts: list[TaskArtifact] = []
+        for index, explicit_path in enumerate(explicit_paths[:6]):
+            artifacts.append(
+                TaskArtifact(
+                    path=explicit_path,
+                    name=Path(explicit_path).name,
+                    kind="test" if _looks_like_test_artifact(explicit_path) else Path(explicit_path).suffix.lower() or "file",
+                    role="validation_target" if _looks_like_test_artifact(explicit_path) else "primary_target",
+                    confidence=0.86 if index == 0 else 0.8,
+                )
             )
-        ]
+        return artifacts
     if signal.intent == "create":
         name = signal.artifact_name_hint or _default_artifact_name(signal.requested_extension)
         if not name:
@@ -836,15 +870,28 @@ def _looks_like_deictic_request(normalized: str) -> bool:
 
 
 def _extract_explicit_path(text: str) -> str | None:
-    match = _PATH_RE.search(text)
-    if not match:
-        return None
-    return match.group(1).lstrip("./")
+    paths = _extract_explicit_paths(text)
+    return paths[0] if paths else None
+
+
+def _extract_explicit_paths(text: str) -> list[str]:
+    paths: list[str] = []
+    for match in _PATH_RE.finditer(str(text or "")):
+        candidate = match.group(1).lstrip("./")
+        if candidate and candidate not in paths:
+            paths.append(candidate)
+    return paths[:8]
 
 
 def _extract_explicit_name(text: str) -> str | None:
     candidate = infer_artifact_name_hint(text)
     return candidate if candidate and len(candidate) >= 3 else None
+
+
+def _looks_like_test_artifact(path: str) -> bool:
+    lowered = str(path or "").lower()
+    name = Path(lowered).name
+    return "/tests/" in f"/{lowered}" or name.startswith("test_") or name.endswith("_test.py")
 
 
 def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
@@ -918,6 +965,32 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
             )
         )
     return artifacts
+
+
+def _prefer_create_in_empty_workspace(
+    request: str,
+    *,
+    snapshot,
+    context: dict[str, Any],
+    signal: MinimalSemanticSignal,
+    target_artifacts: list[TaskArtifact],
+) -> bool:
+    if snapshot is None or getattr(snapshot, "file_count", 0) != 0:
+        return False
+    if context.get("artifact_paths"):
+        return False
+    if signal.goal_relation != "new_task" or signal.needs_clarification:
+        return False
+    if signal.intent in {"debug", "validate", "search", "plan", "explain"}:
+        return False
+    normalized = normalize_text(request)
+    has_create_signal = any(marker in normalized for marker in _EMPTY_WORKSPACE_CREATE_MARKERS)
+    explicit_target = any(
+        Path(str(artifact.path or artifact.name or "")).suffix
+        for artifact in target_artifacts
+        if str(artifact.path or artifact.name or "").strip()
+    ) or infer_requested_extension(request) is not None
+    return has_create_signal and explicit_target
 
 
 def _default_artifact_name(extension: str | None) -> str | None:

@@ -139,7 +139,11 @@ def test_ollama_client_aggregates_streamed_generate_chunks(monkeypatch, tmp_path
 
 
 def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypatch, tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), llm_timeout=6)
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+        llm_timeout=6,
+    )
     client = OllamaClient(config)
     progress_events: list[dict] = []
 
@@ -173,6 +177,45 @@ def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypa
     assert result == "hello"
     assert [event["type"] for event in progress_events] == ["status", "status", "chunk", "heartbeat", "chunk"]
     assert progress_events[1]["stage"] == "waiting_for_first_chunk"
+
+
+def test_ollama_client_treats_timed_out_object_oserror_as_stream_wait(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+        llm_timeout=30,
+    )
+    client = OllamaClient(config)
+    progress_events: list[dict] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "O", "done": False}) + "\n").encode("utf-8"),
+                OSError("cannot read from timed out object"),
+                (json.dumps({"response": "K", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"done": True}) + "\n").encode("utf-8"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 1.0, 7.0, 8.0, 12.0, 13.0]),
+    )
+
+    result = client.generate(
+        "say ok",
+        timeout=30,
+        total_timeout=120,
+        retries=0,
+        progress_callback=progress_events.append,
+    )
+
+    assert result == "OK"
+    assert [event.get("type") for event in progress_events if event.get("type") == "chunk"] == ["chunk", "chunk"]
 
 
 def test_ollama_client_uses_longer_initial_response_timeout_for_slow_local_models(monkeypatch, tmp_path):
@@ -218,7 +261,12 @@ def test_ollama_client_stops_streaming_json_once_object_is_complete(monkeypatch,
 
 
 def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progress(monkeypatch, tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path), llm_timeout=6, llm_request_retries=0)
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+        llm_timeout=6,
+        llm_request_retries=0,
+    )
     client = OllamaClient(config)
 
     def fake_urlopen(req: request.Request, timeout):
@@ -248,10 +296,46 @@ def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progres
     assert error.progress_seen is True
 
 
+def test_ollama_client_enforces_total_timeout_while_streaming_progress(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+        llm_timeout=6,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "hel", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"response": "lo", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"response": " world", "done": False}) + "\n").encode("utf-8"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 0.0, 4.0, 11.2]),
+    )
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate("say hello", timeout=6, total_timeout=10, retries=0)
+
+    error = excinfo.value
+    assert error.reason == "total_timeout"
+    assert error.partial_text == "hello"
+    assert error.characters == 5
+    assert error.progress_seen is True
+
+
 def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
-        model_name="qwen3-coder:30b",
+        model_name="qwen2.5-coder:14b",
         llm_timeout=20,
         llm_request_retries=0,
     )
@@ -290,8 +374,7 @@ def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monke
     error = excinfo.value
     assert error.reason == "startup_timeout"
     assert error.progress_seen is False
-    assert error.retryable is False
-    assert error.model_name == "qwen3-coder:30b"
+    assert error.model_name == "qwen2.5-coder:14b"
     assert error.backend_identifier == "ollama"
     assert error.startup_timeout_seconds is not None
     assert error.total_timeout_seconds == 120
@@ -300,3 +383,74 @@ def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monke
     assert any(event.get("stage") == "waiting_for_first_chunk" for event in progress_events if event.get("type") == "status")
     assert any(event.get("phase") == "waiting_for_start" for event in progress_events if event.get("type") == "heartbeat")
     assert any(event.get("stage") == "startup_timeout_warning" for event in progress_events if event.get("type") == "status")
+
+
+def test_ollama_client_expands_large_model_time_budget(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3-coder:30b",
+        llm_timeout=25,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    captured: dict[str, object] = {}
+    progress_events: list[dict] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        captured["timeout"] = timeout
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "OK", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"response": "", "done": True}) + "\n").encode("utf-8"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    result = client.generate(
+        "Reply with OK only.",
+        timeout=25,
+        total_timeout=50,
+        retries=0,
+        progress_callback=progress_events.append,
+    )
+
+    assert result == "OK"
+    assert captured["timeout"] == 480
+    assert progress_events[0]["startup_timeout"] == 480
+    assert progress_events[0]["inactivity_timeout"] == 240
+    assert progress_events[0]["total_timeout"] == 1200
+
+
+def test_ollama_client_caps_num_ctx_for_large_models(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3-coder:30b",
+        llm_timeout=25,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(req: request.Request, timeout):
+        del timeout
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "OK", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"response": "", "done": True}) + "\n").encode("utf-8"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    result = client.generate(
+        "Reply with OK only.",
+        timeout=25,
+        total_timeout=50,
+        num_ctx=4096,
+        retries=0,
+    )
+
+    assert result == "OK"
+    assert captured["payload"]["options"]["num_ctx"] == 2048

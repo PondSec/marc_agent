@@ -328,7 +328,10 @@ class Planner:
                 route.direct_response,
             )
 
-        if session.changed_files and self._has_pending_explicit_update_targets(route, session):
+        if session.changed_files and (
+            self._has_pending_explicit_update_targets(route, session)
+            or self._has_pending_explicit_create_targets(route, session)
+        ):
             decision = self.execute_action_from_plan(route, session)
             self._log(
                 "execution_plan_selected",
@@ -1453,6 +1456,8 @@ class Planner:
         candidates.extend(item.path for item in reversed(session.changed_files))
         candidates.extend(session.candidate_files)
         for candidate in self._unique_paths(candidates):
+            if not self._is_safe_workspace_target_candidate(session, candidate):
+                continue
             absolute = Path(session.workspace_root, candidate)
             if absolute.exists() and absolute.is_file():
                 return candidate
@@ -1533,6 +1538,8 @@ class Planner:
         for candidate in self._unique_paths([*repair_context.file_hints, *repair_context.artifact_paths]):
             if exclude is not None and candidate == exclude:
                 continue
+            if not self._is_safe_workspace_target_candidate(session, candidate):
+                continue
             absolute = Path(session.workspace_root, candidate)
             if absolute.exists() and absolute.is_file():
                 existing.append(candidate)
@@ -1547,6 +1554,8 @@ class Planner:
         text = str(candidate or "").strip()
         if not text or repair_context is None:
             return False
+        if not self._is_safe_workspace_target_candidate(session, text):
+            return False
         if text not in repair_context.artifact_paths and text not in repair_context.file_hints:
             return False
         absolute = Path(session.workspace_root, text)
@@ -1559,6 +1568,18 @@ class Planner:
                 exclude=text,
             )
         )
+
+    def _is_safe_workspace_target_candidate(self, session: SessionState, candidate: str) -> bool:
+        text = str(candidate or "").strip()
+        if not text or (text.startswith("<") and text.endswith(">")):
+            return False
+        path = Path(text)
+        absolute = path if path.is_absolute() else Path(session.workspace_root, path)
+        try:
+            absolute.resolve(strict=False).relative_to(Path(session.workspace_root).resolve())
+        except ValueError:
+            return False
+        return True
 
     def _paths_from_internal_validation_command(self, command: str) -> list[str]:
         text = str(command or "").strip()
@@ -1887,6 +1908,15 @@ class Planner:
         changed_paths = {item.path for item in session.changed_files}
         return any(candidate not in changed_paths for candidate in explicit_targets)
 
+    def _has_pending_explicit_create_targets(self, route: RouterOutput, session: SessionState) -> bool:
+        if route.intent != RouteIntent.CREATE:
+            return False
+        explicit_targets = self._explicit_target_paths(route)
+        if len(explicit_targets) <= 1:
+            return False
+        changed_paths = {item.path for item in session.changed_files}
+        return any(candidate not in changed_paths for candidate in explicit_targets)
+
     def _next_unread_candidate(
         self,
         candidates: list[str],
@@ -1966,6 +1996,13 @@ class Planner:
         if follow_up_override:
             self._log("path_generation_skipped", path=follow_up_override, reason="active_artifact_follow_up")
             return follow_up_override
+        explicit_targets = self._explicit_target_paths(route)
+        if explicit_targets:
+            changed_paths = {item.path for item in session.changed_files}
+            for candidate in explicit_targets:
+                if candidate not in changed_paths:
+                    return candidate
+            return explicit_targets[0]
         for candidate in route.entities.target_paths:
             if candidate:
                 return candidate
@@ -3935,16 +3972,32 @@ class Planner:
         repair_context: ValidationFailureEvidence | None,
     ) -> bool:
         lightweight = self._lightweight_generation_model_name()
-        if lightweight is None or repair_context is None:
+        if lightweight is None:
             return False
         if route.needs_clarification or not route.safe_to_execute:
             return False
         if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.CREATE}:
             return False
 
-        implicated_paths = self._unique_paths([*repair_context.artifact_paths, *repair_context.file_hints])
-        if implicated_paths and path not in implicated_paths:
+        explicit_targets = self._explicit_target_paths(route)
+        if explicit_targets and path not in explicit_targets:
             return False
+        if len(explicit_targets) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+            return False
+
+        prefer_after_runtime_recovery = (
+            repair_context is None
+            and route.intent == RouteIntent.CREATE
+            and bool(session.changed_files)
+            and self._recent_primary_content_generation_recovered_on_lightweight(session)
+        )
+        if repair_context is None and not prefer_after_runtime_recovery:
+            return False
+
+        if repair_context is not None:
+            implicated_paths = self._unique_paths([*repair_context.artifact_paths, *repair_context.file_hints])
+            if implicated_paths and path not in implicated_paths:
+                return False
 
         absolute = Path(session.workspace_root, path)
         if absolute.exists() or absolute.is_dir():
@@ -3959,7 +4012,7 @@ class Planner:
         snapshot = session.workspace_snapshot
         if snapshot is not None and snapshot.file_count > MAX_LIGHTWEIGHT_UPDATE_WORKSPACE_FILES:
             return False
-        if not self._repair_related_existing_context_paths(session, repair_context, exclude=path):
+        if repair_context is not None and not self._repair_related_existing_context_paths(session, repair_context, exclude=path):
             return False
 
         task_state = session.task_state
@@ -3971,6 +4024,54 @@ class Planner:
             if float(task_state.confidence or 0.0) < MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE:
                 return False
 
+        return True
+
+    def _recent_primary_content_generation_recovered_on_lightweight(
+        self,
+        session: SessionState,
+    ) -> bool:
+        primary = self._primary_generation_model_name()
+        lightweight = self._lightweight_generation_model_name()
+        if primary is None or lightweight is None:
+            return False
+
+        for execution in reversed(session.runtime_executions[-6:]):
+            if str(execution.get("task_class") or "").strip() != "content_generation":
+                continue
+            attempts = execution.get("attempts") or []
+            if not isinstance(attempts, list):
+                continue
+
+            saw_primary_no_start = False
+            saw_lightweight_completion = False
+            for attempt in attempts:
+                if not isinstance(attempt, dict):
+                    continue
+                model_name = str(attempt.get("model_identifier") or "").strip()
+                if model_name == primary and self._attempt_record_dict_has_no_start_failure(attempt):
+                    saw_primary_no_start = True
+                if (
+                    model_name == lightweight
+                    and attempt.get("failure") is None
+                    and str(attempt.get("state") or "").strip() == "completed"
+                ):
+                    saw_lightweight_completion = True
+            if saw_primary_no_start and saw_lightweight_completion:
+                return True
+        return False
+
+    def _attempt_record_dict_has_no_start_failure(self, attempt: dict[str, object]) -> bool:
+        failure = attempt.get("failure")
+        if not isinstance(failure, dict):
+            return False
+        if str(failure.get("failure_class") or "").strip() != "startup_timeout":
+            return False
+        if bool(failure.get("first_output_received")) or bool(failure.get("had_progress")):
+            return False
+        if int(failure.get("characters") or 0) > 0:
+            return False
+        if str(failure.get("partial_text") or "").strip():
+            return False
         return True
 
     def _should_prefer_lightweight_update_generation(
