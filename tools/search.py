@@ -38,7 +38,7 @@ class SearchTools:
         return {
             "success": True,
             "message": f"Listed {len(files)} file(s).",
-            "files": [path.relative_to(self.workspace.root).as_posix() for path in files],
+            "files": [self.workspace.display_path(path) for path in files],
         }
 
     def search_in_files(self, args: SearchInFilesArgs) -> dict:
@@ -54,7 +54,7 @@ class SearchTools:
         for file_path in files:
             if len(matches) >= min(args.max_results, self.config.max_search_results):
                 break
-            rel = file_path.relative_to(self.workspace.root).as_posix()
+            rel = self.workspace.display_path(file_path)
             if args.glob and not fnmatch.fnmatch(rel, args.glob):
                 continue
             try:

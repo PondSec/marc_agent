@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from config.settings import AppConfig
 from llm.schemas import (
     AppendFileArgs,
@@ -165,7 +163,7 @@ class FileSystemTools:
     def show_diff(self, args: ShowDiffArgs) -> dict:
         target = self.safety.ensure_read_allowed(args.path)
         old = target.read_text(encoding="utf-8") if target.exists() else ""
-        rel = self.workspace.relative_path(target if target.exists() else Path(self.workspace.root / args.path))
+        rel = self.workspace.relative_path(target)
         diff = create_unified_diff(old, args.new_content, rel)
         return {
             "success": True,

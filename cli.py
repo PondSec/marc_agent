@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from bootstrap_runtime import ensure_runtime_dependencies
+from bootstrap_runtime import ensure_ollama_runtime, ensure_runtime_dependencies
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +116,7 @@ def print_session_result(session) -> None:
     print(f"Task: {session.task}")
     print(f"Status: {session.status}")
     print(f"Phase: {session.current_phase}")
+    print(f"Workflow stage: {session.workflow_stage}")
     print(f"Access mode: {session.access_mode}")
     print(f"Validation: {session.validation_status}")
     print(f"Iterations: {session.iterations}")
@@ -135,6 +136,10 @@ def print_session_result(session) -> None:
         print("\nVerification commands:")
         for command in session.verification_commands:
             print(f"- {command}")
+    if session.validation_runs:
+        print("\nValidation runs:")
+        for run in session.validation_runs[-8:]:
+            print(f"- [{run.status}] {run.kind or 'check'} :: {run.command}")
     if session.helper_artifacts:
         print("\nHelper artifacts:")
         for path in session.helper_artifacts:
@@ -151,6 +156,12 @@ def print_session_result(session) -> None:
         print("\nBlockers:")
         for blocker in session.blockers:
             print(f"- {blocker}")
+    if session.diagnostics:
+        print("\nDiagnostics:")
+        for diagnostic in session.diagnostics[-8:]:
+            print(f"- [{diagnostic.category}] {diagnostic.summary}")
+    if session.report and session.report.report_path:
+        print(f"\nReport path:\n{session.report.report_path}")
     if session.final_response:
         print("\nResult:")
         print(session.final_response)
@@ -230,10 +241,12 @@ def main() -> int:
 
     command = args.command
     if command == "task":
+        ensure_ollama_runtime(config.ollama_host)
         return run_task_command(config, args.prompt)
     if command == "inspect":
         return run_inspect_command(config, args.focus)
     if command == "chat":
+        ensure_ollama_runtime(config.ollama_host)
         return run_chat_command(config, args.session_id)
     if command == "diff":
         return run_diff_command(config, args.session_id)

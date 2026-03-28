@@ -39,6 +39,18 @@ def _parse_float(value: Any, default: float) -> float:
     return float(value)
 
 
+def _parse_csv_list(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return tuple(items) or default
+    text = str(value).strip()
+    if not text:
+        return default
+    return tuple(part.strip() for part in text.split(",") if part.strip()) or default
+
+
 def _load_dotenv(path: Path) -> dict[str, str]:
     data: dict[str, str] = {}
     if not path.exists():
@@ -82,12 +94,19 @@ def _normalize_access_mode(
 class AppConfig:
     ollama_host: str = "http://127.0.0.1:11434"
     model_name: str = "qwen3-coder:30b"
+    router_model_name: str | None = "qwen2.5-coder:14b"
     workspace_root: str = "."
+    state_root_override: str | None = None
     access_mode: str = AccessMode.APPROVAL.value
     max_iterations: int = 18
     max_tool_calls: int = 32
     max_repair_attempts: int = 3
     shell_timeout: int = 120
+    llm_timeout: int = 25
+    router_timeout: int = 35
+    llm_request_retries: int = 2
+    llm_retry_backoff_ms: int = 800
+    router_retries: int = 2
     approval_mode: bool = True
     read_only: bool = False
     verbose: bool = False
@@ -99,8 +118,31 @@ class AppConfig:
     max_search_results: int = 200
     max_files_in_context: int = 80
     state_dir_name: str = ".marc_a1"
-    ollama_num_ctx: int = 32_768
+    ollama_num_ctx: int = 8_192
+    router_num_ctx: int = 2_048
     ollama_temperature: float = 0.1
+    warmup_models_on_startup: bool = True
+    warmup_timeout: int = 45
+    auth_enabled: bool = True
+    auth_secret_key: str | None = None
+    auth_initial_admin_email: str | None = None
+    auth_initial_admin_password: str | None = None
+    auth_initial_admin_name: str = "Administrator"
+    auth_initial_admin_totp_secret: str | None = None
+    auth_cookie_secure: bool = True
+    auth_session_idle_seconds: int = 1800
+    auth_session_absolute_seconds: int = 43200
+    auth_session_touch_interval_seconds: int = 60
+    auth_min_password_length: int = 14
+    security_allowed_hosts: tuple[str, ...] = (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "testserver",
+    )
+    cors_allowed_origins: tuple[str, ...] = ()
+    hsts_enabled: bool = True
+    public_base_url: str | None = None
 
     @classmethod
     def from_sources(
@@ -137,7 +179,12 @@ class AppConfig:
         config = cls(
             ollama_host=str(pick("OLLAMA_HOST", defaults.ollama_host)),
             model_name=str(pick("MODEL_NAME", defaults.model_name)),
+            router_model_name=pick("ROUTER_MODEL_NAME", defaults.router_model_name),
             workspace_root=str(pick("WORKSPACE_ROOT", defaults.workspace_root)),
+            state_root_override=str(
+                pick("STATE_ROOT_OVERRIDE", defaults.state_root_override) or ""
+            ).strip()
+            or None,
             access_mode=access_mode.value,
             max_iterations=_parse_int(
                 pick("MAX_ITERATIONS", defaults.max_iterations),
@@ -154,6 +201,26 @@ class AppConfig:
             shell_timeout=_parse_int(
                 pick("SHELL_TIMEOUT", defaults.shell_timeout),
                 defaults.shell_timeout,
+            ),
+            llm_timeout=_parse_int(
+                pick("LLM_TIMEOUT", defaults.llm_timeout),
+                defaults.llm_timeout,
+            ),
+            router_timeout=_parse_int(
+                pick("ROUTER_TIMEOUT", defaults.router_timeout),
+                defaults.router_timeout,
+            ),
+            llm_request_retries=_parse_int(
+                pick("LLM_REQUEST_RETRIES", defaults.llm_request_retries),
+                defaults.llm_request_retries,
+            ),
+            llm_retry_backoff_ms=_parse_int(
+                pick("LLM_RETRY_BACKOFF_MS", defaults.llm_retry_backoff_ms),
+                defaults.llm_retry_backoff_ms,
+            ),
+            router_retries=_parse_int(
+                pick("ROUTER_RETRIES", defaults.router_retries),
+                defaults.router_retries,
             ),
             approval_mode=access_mode == AccessMode.APPROVAL,
             read_only=access_mode == AccessMode.SAFE,
@@ -185,10 +252,82 @@ class AppConfig:
                 pick("OLLAMA_NUM_CTX", defaults.ollama_num_ctx),
                 defaults.ollama_num_ctx,
             ),
+            router_num_ctx=_parse_int(
+                pick("ROUTER_NUM_CTX", defaults.router_num_ctx),
+                defaults.router_num_ctx,
+            ),
             ollama_temperature=_parse_float(
                 pick("OLLAMA_TEMPERATURE", defaults.ollama_temperature),
                 defaults.ollama_temperature,
             ),
+            warmup_models_on_startup=_parse_bool(
+                pick("WARMUP_MODELS_ON_STARTUP", defaults.warmup_models_on_startup),
+                defaults.warmup_models_on_startup,
+            ),
+            warmup_timeout=_parse_int(
+                pick("WARMUP_TIMEOUT", defaults.warmup_timeout),
+                defaults.warmup_timeout,
+            ),
+            auth_enabled=_parse_bool(
+                pick("AUTH_ENABLED", defaults.auth_enabled),
+                defaults.auth_enabled,
+            ),
+            auth_secret_key=str(pick("AUTH_SECRET_KEY", defaults.auth_secret_key) or "").strip()
+            or None,
+            auth_initial_admin_email=str(
+                pick("AUTH_INITIAL_ADMIN_EMAIL", defaults.auth_initial_admin_email) or ""
+            ).strip()
+            or None,
+            auth_initial_admin_password=str(
+                pick("AUTH_INITIAL_ADMIN_PASSWORD", defaults.auth_initial_admin_password) or ""
+            ).strip()
+            or None,
+            auth_initial_admin_name=str(
+                pick("AUTH_INITIAL_ADMIN_NAME", defaults.auth_initial_admin_name)
+            ).strip()
+            or defaults.auth_initial_admin_name,
+            auth_initial_admin_totp_secret=str(
+                pick("AUTH_INITIAL_ADMIN_TOTP_SECRET", defaults.auth_initial_admin_totp_secret)
+                or ""
+            ).strip()
+            or None,
+            auth_cookie_secure=_parse_bool(
+                pick("AUTH_COOKIE_SECURE", defaults.auth_cookie_secure),
+                defaults.auth_cookie_secure,
+            ),
+            auth_session_idle_seconds=_parse_int(
+                pick("AUTH_SESSION_IDLE_SECONDS", defaults.auth_session_idle_seconds),
+                defaults.auth_session_idle_seconds,
+            ),
+            auth_session_absolute_seconds=_parse_int(
+                pick("AUTH_SESSION_ABSOLUTE_SECONDS", defaults.auth_session_absolute_seconds),
+                defaults.auth_session_absolute_seconds,
+            ),
+            auth_session_touch_interval_seconds=_parse_int(
+                pick(
+                    "AUTH_SESSION_TOUCH_INTERVAL_SECONDS",
+                    defaults.auth_session_touch_interval_seconds,
+                ),
+                defaults.auth_session_touch_interval_seconds,
+            ),
+            auth_min_password_length=_parse_int(
+                pick("AUTH_MIN_PASSWORD_LENGTH", defaults.auth_min_password_length),
+                defaults.auth_min_password_length,
+            ),
+            security_allowed_hosts=_parse_csv_list(
+                pick("ALLOWED_HOSTS", defaults.security_allowed_hosts),
+                defaults.security_allowed_hosts,
+            ),
+            cors_allowed_origins=_parse_csv_list(
+                pick("CORS_ALLOWED_ORIGINS", defaults.cors_allowed_origins),
+                defaults.cors_allowed_origins,
+            ),
+            hsts_enabled=_parse_bool(
+                pick("HSTS_ENABLED", defaults.hsts_enabled),
+                defaults.hsts_enabled,
+            ),
+            public_base_url=str(pick("PUBLIC_BASE_URL", defaults.public_base_url) or "").strip()
+            or None,
         ).normalized()
 
         if workspace_override:
@@ -224,6 +363,8 @@ class AppConfig:
 
     @property
     def state_root(self) -> Path:
+        if self.state_root_override:
+            return Path(self.state_root_override).expanduser().resolve()
         return self.workspace_path / self.state_dir_name
 
     @property
@@ -243,6 +384,14 @@ class AppConfig:
         return self.state_root / "helpers"
 
     @property
+    def report_dir_path(self) -> Path:
+        return self.state_root / "reports"
+
+    @property
+    def auth_db_path(self) -> Path:
+        return self.state_root / "auth.db"
+
+    @property
     def full_access(self) -> bool:
         return self.access_mode == AccessMode.FULL.value
 
@@ -251,20 +400,69 @@ class AppConfig:
         self.log_dir_path.mkdir(parents=True, exist_ok=True)
         self.memory_dir_path.mkdir(parents=True, exist_ok=True)
         self.helper_dir_path.mkdir(parents=True, exist_ok=True)
+        self.report_dir_path.mkdir(parents=True, exist_ok=True)
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        for secret_key in (
+            "auth_secret_key",
+            "auth_initial_admin_password",
+            "auth_initial_admin_totp_secret",
+        ):
+            data.pop(secret_key, None)
         data["workspace_root"] = str(self.workspace_path)
         data["state_root"] = str(self.state_root)
         data["session_dir"] = str(self.session_dir_path)
         data["log_dir"] = str(self.log_dir_path)
         data["memory_dir"] = str(self.memory_dir_path)
         data["helper_dir"] = str(self.helper_dir_path)
+        data["report_dir"] = str(self.report_dir_path)
         data["full_access"] = self.full_access
+        data["path_scope"] = "system" if self.full_access else "workspace"
         data["branding"] = {
             "name": AGENT_NAME,
             "full_name": AGENT_FULL_NAME,
             "tagline": AGENT_TAGLINE,
         }
         data["access_modes"] = [item.value for item in AccessMode]
+        data["model_candidates"] = [self.model_name]
+        data["router_preferred_model_name"] = self.router_model_name
+        data["agent_profiles"] = [
+            {
+                "id": "core",
+                "label": "MARC A1 Core",
+                "description": "Allround-Run fuer neue Features, Refactors und Analysen.",
+            },
+            {
+                "id": "review",
+                "label": "Code Review",
+                "description": "Fokus auf Risiken, Regressionen und Validierung.",
+            },
+            {
+                "id": "repair",
+                "label": "Repair Loop",
+                "description": "Fehler beheben, Checks erneut ausfuehren und stabilisieren.",
+            },
+        ]
+        data["execution_profiles"] = [
+            {
+                "id": "fast",
+                "label": "Schnell",
+                "description": "Kuerzerer Lauf mit weniger Iterationen.",
+            },
+            {
+                "id": "balanced",
+                "label": "Ausgewogen",
+                "description": "Standardprofil fuer die meisten Aufgaben.",
+            },
+            {
+                "id": "deep",
+                "label": "Tief",
+                "description": "Mehr Iterationen und groessere Verifikationstiefe.",
+            },
+        ]
+        data["capabilities"] = {
+            "session_archiving": True,
+            "mfa_totp": True,
+        }
         return data
