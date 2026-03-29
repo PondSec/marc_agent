@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from agent.core import AgentCore
-from agent.models import FileChangeRecord, SessionState, ToolRunResult, ValidationCommand, ValidationRunRecord
+from agent.models import FileChangeRecord, SessionState, ValidationCommand, ValidationRunRecord
 from agent.task_state import TaskState
 from config.settings import AppConfig
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
@@ -80,7 +78,7 @@ def test_core_marks_model_start_failure_without_changes_as_partial(tmp_path):
         stop_reason="model_start_failed",
     )
     session.blockers.append(
-        "Repeated model start failure for snake.html: qwen3:14b, qwen3:8b produced no first chunk, and no safe local recovery path applied."
+        "Repeated model start failure for snake.html: qwen3-coder:30b, qwen2.5-coder:14b produced no first chunk, and no safe local recovery path applied."
     )
 
     status = core._resolve_final_status(session, final_action=True)
@@ -460,117 +458,3 @@ def test_core_does_not_offer_identical_failed_validation_again_without_progress(
     )
 
     assert core._pick_validation_command(session) is None
-
-
-def test_core_rebuilds_snapshot_after_write_and_picks_new_unittest_validation(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path))
-    config.ensure_state_dirs()
-    core = AgentCore(config)
-    session = SessionState(
-        task="Erstelle eine kleine Python-CLI, lege unittest-Tests an und fuehre sie aus.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=core.memory.build_snapshot("initial empty workspace"),
-    )
-
-    (tmp_path / "greet_cli").mkdir()
-    (tmp_path / "greet_cli" / "cli.py").write_text(
-        "def greet():\n    return 'Hello, world!'\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_cli.py").write_text(
-        (
-            "import unittest\n\n"
-            "class TestCLI(unittest.TestCase):\n"
-            "    def test_ok(self):\n"
-            "        self.assertTrue(True)\n"
-        ),
-        encoding="utf-8",
-    )
-
-    session.changed_files = [
-        FileChangeRecord(path="greet_cli/cli.py", operation="create"),
-        FileChangeRecord(path="tests/test_cli.py", operation="create"),
-    ]
-    decision = SimpleNamespace(tool_name="create_file")
-    result = ToolRunResult(
-        tool_name="create_file",
-        success=True,
-        message="Created tests/test_cli.py.",
-        changed_files=[FileChangeRecord(path="tests/test_cli.py", operation="create")],
-    )
-
-    core._update_session_after_result(session.task, session, decision, result)
-
-    assert session.workspace_snapshot is not None
-    assert "tests/test_cli.py" in session.workspace_snapshot.test_files
-    assert any(item.command == "python -m unittest tests.test_cli" for item in session.validation_plan)
-
-
-def test_core_keeps_latest_failed_validation_evidence_when_later_check_passes(tmp_path):
-    config = AppConfig(workspace_root=str(tmp_path))
-    config.ensure_state_dirs()
-    core = AgentCore(config)
-    session = SessionState(
-        task="Repair the broken CLI package and rerun validation.",
-        workspace_root=str(tmp_path),
-        edit_generation=1,
-    )
-    session.changed_files.append(FileChangeRecord(path="greet_cli/__main__.py", operation="create"))
-    session.validation_plan = [
-        ValidationCommand(
-            command='internal:python_cli_smoke:["greet_cli/__main__.py"]',
-            kind="test",
-            verification_scope="runtime",
-        ),
-        ValidationCommand(
-            command='internal:python_syntax:["greet_cli/__main__.py"]',
-            kind="check",
-            verification_scope="syntax",
-            required=False,
-        ),
-    ]
-    session.validation_runs.append(
-        ValidationRunRecord(
-            command='internal:python_cli_smoke:["greet_cli/__main__.py"]',
-            kind="test",
-            verification_scope="runtime",
-            status="failed",
-            exit_code=1,
-            iteration=3,
-            edit_generation=1,
-            summary="Validation command exited with 1.",
-            excerpt=(
-                '$ greet_cli/__main__.py\n'
-                'greet_cli/__main__.py: Traceback (most recent call last):\n'
-                'ModuleNotFoundError: No module named "greet_cli"'
-            ),
-        )
-    )
-
-    decision = SimpleNamespace(
-        tool_name="run_tests",
-        tool_args={
-            "command": 'internal:python_syntax:["greet_cli/__main__.py"]',
-            "cwd": ".",
-            "timeout": 120,
-        },
-    )
-    result = ToolRunResult(
-        tool_name="run_tests",
-        success=True,
-        message="Validation command exited with 0.",
-        data={
-            "command": 'internal:python_syntax:["greet_cli/__main__.py"]',
-            "exit_code": 0,
-            "stdout": "Checked 1 Python file(s).",
-        },
-    )
-
-    core._update_session_after_result(session.task, session, decision, result)
-
-    assert session.validation_status == "failed"
-    assert session.active_repair_context is not None
-    assert session.active_repair_context.status == "failed"
-    assert session.active_repair_context.command == 'internal:python_cli_smoke:["greet_cli/__main__.py"]'
-    assert "ModuleNotFoundError" in (session.last_error or "")

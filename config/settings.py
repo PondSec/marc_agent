@@ -118,7 +118,7 @@ class AppConfig:
     max_search_results: int = 200
     max_files_in_context: int = 80
     state_dir_name: str = ".marc_a1"
-    ollama_num_ctx: int = 4_096
+    ollama_num_ctx: int = 8_192
     router_num_ctx: int = 2_048
     ollama_temperature: float = 0.1
     auto_install_recommended_models: bool = True

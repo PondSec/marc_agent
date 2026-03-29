@@ -17,11 +17,11 @@ Zielbild:
 Die Voreinstellung ist bewusst auf den Dell OptiPlex 3070 Micro mit
 `i5-9500T` und `32 GB RAM` zugeschnitten:
 
-- Primärmodell: `qwen3:14b`
-- Routermodell: `qwen3:8b`
-- `OLLAMA_MAX_LOADED_MODELS=2`
+- Primärmodell: `qwen2.5-coder:14b`
+- Routermodell: `qwen2.5-coder:14b`
+- `OLLAMA_MAX_LOADED_MODELS=1`
 - `OLLAMA_NUM_PARALLEL=1`
-- `OLLAMA_CONTEXT_LENGTH=4096`
+- `OLLAMA_CONTEXT_LENGTH=8192`
 - CPU-Governor dauerhaft auf `performance`
 - reduzierte Swap-Neigung und staerkerer VFS-Cache fuer Repo-/Datei-Last
 
