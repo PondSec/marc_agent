@@ -71,3 +71,37 @@ def test_failure_analyzer_ignores_pseudo_and_external_traceback_paths(tmp_path):
 
     assert len(diagnostics) == 1
     assert diagnostics[0].file_hints == []
+
+
+def test_failure_analyzer_maps_tmp_traceback_paths_back_into_workspace(tmp_path):
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("def test_cli():\n    assert True\n", encoding="utf-8")
+    pkg_dir = tmp_path / "greet_cli"
+    pkg_dir.mkdir()
+    (pkg_dir / "__main__.py").write_text("def main():\n    pass\n", encoding="utf-8")
+
+    analyzer = FailureAnalyzer(WorkspaceManager(tmp_path))
+    result = ToolRunResult(
+        tool_name="run_tests",
+        success=False,
+        message="Validation command exited with 1.",
+        data={
+            "command": "python -m unittest tests.test_cli",
+            "stderr": (
+                "usage: python [-h] [name]\n"
+                "python: error: unrecognized arguments: -m\n"
+                '  File "/tmp/tests/test_cli.py", line 11, in test_greet_with_name\n'
+                "    __main__.main()\n"
+                '  File "/tmp/greet_cli/__main__.py", line 7, in main\n'
+                "    args = parser.parse_args()\n"
+            ),
+            "exit_code": 1,
+        },
+    )
+
+    diagnostics = analyzer.analyze(result, iteration=6)
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].file_hints == ["tests/test_cli.py", "greet_cli/__main__.py"]
+    assert diagnostics[0].line_hints == [11, 7]

@@ -141,7 +141,7 @@ def test_ollama_client_aggregates_streamed_generate_chunks(monkeypatch, tmp_path
 def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
-        model_name="qwen2.5-coder:14b",
+        model_name="qwen2.5-coder:7b",
         llm_timeout=6,
     )
     client = OllamaClient(config)
@@ -175,8 +175,21 @@ def test_ollama_client_treats_stream_heartbeats_as_progress_not_timeout(monkeypa
     )
 
     assert result == "hello"
-    assert [event["type"] for event in progress_events] == ["status", "status", "chunk", "heartbeat", "chunk"]
-    assert progress_events[1]["stage"] == "waiting_for_first_chunk"
+    assert [event["type"] for event in progress_events] == [
+        "status",
+        "status",
+        "status",
+        "status",
+        "chunk",
+        "heartbeat",
+        "chunk",
+        "status",
+    ]
+    assert progress_events[0]["stage"] == "request_started"
+    assert progress_events[1]["stage"] == "response_headers_received"
+    assert progress_events[2]["stage"] == "waiting_for_first_chunk"
+    assert progress_events[3]["stage"] == "first_chunk_received"
+    assert progress_events[-1]["stage"] == "response_completed"
 
 
 def test_ollama_client_treats_timed_out_object_oserror_as_stream_wait(monkeypatch, tmp_path):
@@ -263,7 +276,7 @@ def test_ollama_client_stops_streaming_json_once_object_is_complete(monkeypatch,
 def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progress(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
-        model_name="qwen2.5-coder:14b",
+        model_name="qwen2.5-coder:7b",
         llm_timeout=6,
         llm_request_retries=0,
     )
@@ -299,7 +312,7 @@ def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progres
 def test_ollama_client_enforces_total_timeout_while_streaming_progress(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
-        model_name="qwen2.5-coder:14b",
+        model_name="qwen2.5-coder:7b",
         llm_timeout=6,
         llm_request_retries=0,
     )
@@ -359,7 +372,7 @@ def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monke
     monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
     monkeypatch.setattr(
         "llm.ollama_client.time.monotonic",
-        FakeMonotonic([0.0, 12.0, 24.0, 36.0, 48.0, 60.0, 72.0]),
+        FakeMonotonic([0.0, 25.0, 50.0, 75.0, 100.0, 125.0, 132.0, 132.0]),
     )
 
     with pytest.raises(OllamaGenerationError) as excinfo:
@@ -376,13 +389,100 @@ def test_ollama_client_classifies_pre_chunk_stream_wait_as_startup_timeout(monke
     assert error.progress_seen is False
     assert error.model_name == "qwen2.5-coder:14b"
     assert error.backend_identifier == "ollama"
-    assert error.startup_timeout_seconds is not None
-    assert error.total_timeout_seconds == 120
+    assert error.startup_timeout_seconds == 130
+    assert error.inactivity_timeout_seconds == 45
+    assert error.total_timeout_seconds == 150
     assert error.first_output_received is False
     assert progress_events[0]["stage"] == "request_started"
+    assert progress_events[0]["startup_timeout"] == 130
+    assert progress_events[0]["inactivity_timeout"] == 45
+    assert progress_events[0]["total_timeout"] == 150
     assert any(event.get("stage") == "waiting_for_first_chunk" for event in progress_events if event.get("type") == "status")
     assert any(event.get("phase") == "waiting_for_start" for event in progress_events if event.get("type") == "heartbeat")
-    assert any(event.get("stage") == "startup_timeout_warning" for event in progress_events if event.get("type") == "status")
+
+
+def test_ollama_client_stops_model_after_pre_chunk_startup_timeout(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+        llm_timeout=20,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    stopped: list[str] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        del req, timeout
+        return FakeReadlineStreamingResponse(
+            [
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 25.0, 50.0, 75.0, 100.0, 125.0, 132.0, 132.0]),
+    )
+    monkeypatch.setattr(client, "_stop_running_model", stopped.append)
+
+    with pytest.raises(OllamaGenerationError):
+        client.generate(
+            "generate html",
+            timeout=20,
+            total_timeout=120,
+            retries=0,
+        )
+
+    assert stopped == ["qwen2.5-coder:14b"]
+
+
+def test_ollama_client_waits_for_model_to_leave_ollama_ps_after_stop(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+    )
+    client = OllamaClient(config)
+    calls: list[list[str]] = []
+    slept: list[float] = []
+    ps_outputs = iter(
+        [
+            "NAME ID SIZE PROCESSOR CONTEXT UNTIL\nqwen2.5-coder:14b abc 8.9 GB 100% CPU 2048 Stopping...\n",
+            "NAME ID SIZE PROCESSOR CONTEXT UNTIL\nqwen2.5-coder:14b abc 8.9 GB 100% CPU 2048 Stopping...\n",
+            "NAME ID SIZE PROCESSOR CONTEXT UNTIL\n",
+        ]
+    )
+
+    class _Completed:
+        def __init__(self, stdout: str = ""):
+            self.stdout = stdout
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["ollama", "stop"]:
+            return _Completed()
+        if cmd[:2] == ["ollama", "ps"]:
+            return _Completed(next(ps_outputs))
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr("llm.ollama_client.subprocess.run", fake_run)
+    monkeypatch.setattr("llm.ollama_client.time.monotonic", FakeMonotonic([0.0, 1.0, 2.0, 3.0, 4.0]))
+    monkeypatch.setattr("llm.ollama_client.time.sleep", slept.append)
+
+    client._stop_running_model("qwen2.5-coder:14b")
+
+    assert calls == [
+        ["ollama", "stop", "qwen2.5-coder:14b"],
+        ["ollama", "ps"],
+        ["ollama", "ps"],
+        ["ollama", "ps"],
+    ]
+    assert slept == [1.0, 1.0]
 
 
 def test_ollama_client_expands_large_model_time_budget(monkeypatch, tmp_path):
@@ -420,6 +520,100 @@ def test_ollama_client_expands_large_model_time_budget(monkeypatch, tmp_path):
     assert progress_events[0]["startup_timeout"] == 480
     assert progress_events[0]["inactivity_timeout"] == 240
     assert progress_events[0]["total_timeout"] == 1200
+
+
+def test_ollama_client_gives_7b_models_more_startup_headroom(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        llm_timeout=45,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    progress_events: list[dict] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 30.0, 60.0, 86.0, 86.0]),
+    )
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate(
+            "compact repair prompt",
+            timeout=45,
+            total_timeout=120,
+            retries=0,
+            strict_timeouts=True,
+            progress_callback=progress_events.append,
+        )
+
+    error = excinfo.value
+    assert error.reason == "startup_timeout"
+    assert error.startup_timeout_seconds == 85
+    assert error.inactivity_timeout_seconds == 45
+    assert error.total_timeout_seconds == 120
+    assert progress_events[0]["startup_timeout"] == 85
+    assert progress_events[0]["inactivity_timeout"] == 45
+    assert progress_events[0]["total_timeout"] == 120
+
+
+def test_ollama_client_strict_timeouts_preserve_compact_budget_for_14b_models(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        llm_timeout=45,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    progress_events: list[dict] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+                socket.timeout("still starting"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "llm.ollama_client.time.monotonic",
+        FakeMonotonic([0.0, 12.0, 24.0, 39.0, 39.0]),
+    )
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate(
+            "compact planning prompt",
+            timeout=18,
+            total_timeout=38,
+            retries=0,
+            strict_timeouts=True,
+            progress_callback=progress_events.append,
+        )
+
+    error = excinfo.value
+    assert error.reason == "startup_timeout"
+    assert error.startup_timeout_seconds == 38
+    assert error.inactivity_timeout_seconds == 18
+    assert error.total_timeout_seconds == 38
+    assert progress_events[0]["startup_timeout"] == 38
+    assert progress_events[0]["inactivity_timeout"] == 18
+    assert progress_events[0]["total_timeout"] == 38
 
 
 def test_ollama_client_caps_num_ctx_for_large_models(monkeypatch, tmp_path):

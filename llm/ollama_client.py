@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import subprocess
 import time
 from collections.abc import Callable
 from typing import Any, Iterator
@@ -138,24 +139,27 @@ class OllamaClient:
         retries: int | None = None,
         timeout: int | None = None,
         total_timeout: int | None = None,
+        strict_timeouts: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         num_ctx: int | None = None,
     ) -> str:
         effective_model = str(model or self.config.model_name)
         inactivity_timeout = max(int(timeout or self.config.llm_timeout), 1)
-        inactivity_timeout = self._expanded_inactivity_timeout(
-            model_name=effective_model,
-            inactivity_timeout=inactivity_timeout,
-        )
+        if not strict_timeouts:
+            inactivity_timeout = self._expanded_inactivity_timeout(
+                model_name=effective_model,
+                inactivity_timeout=inactivity_timeout,
+            )
         overall_timeout = max(
             int(total_timeout or max(inactivity_timeout * 3, inactivity_timeout + 90)),
             inactivity_timeout,
         )
-        overall_timeout = self._expanded_total_timeout(
-            model_name=effective_model,
-            inactivity_timeout=inactivity_timeout,
-            total_timeout=overall_timeout,
-        )
+        if not strict_timeouts:
+            overall_timeout = self._expanded_total_timeout(
+                model_name=effective_model,
+                inactivity_timeout=inactivity_timeout,
+                total_timeout=overall_timeout,
+            )
         startup_timeout = self._startup_stream_timeout(
             model_name=effective_model,
             inactivity_timeout=inactivity_timeout,
@@ -210,9 +214,26 @@ class OllamaClient:
                     req,
                     timeout=self._initial_response_timeout(startup_timeout=startup_timeout),
                 ) as response:
+                    headers_received_at = time.monotonic()
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "type": "status",
+                                "stage": "response_headers_received",
+                                "attempt": attempt + 1,
+                                "model": effective_model,
+                                "elapsed": round(headers_received_at - attempt_started_at, 3),
+                                "time_to_header": round(headers_received_at - attempt_started_at, 3),
+                                "startup_timeout": startup_timeout,
+                                "inactivity_timeout": inactivity_timeout,
+                                "total_timeout": overall_timeout,
+                            }
+                        )
                     return self._read_generate_response(
                         response,
                         model_name=effective_model,
+                        request_started_at=attempt_started_at,
+                        headers_received_at=headers_received_at,
                         startup_timeout=startup_timeout,
                         inactivity_timeout=inactivity_timeout,
                         total_timeout=overall_timeout,
@@ -244,6 +265,8 @@ class OllamaClient:
                     inactivity_timeout=inactivity_timeout,
                     total_timeout=overall_timeout,
                 )
+                if isinstance(normalized, OllamaGenerationError) and normalized.no_start_failure:
+                    self._stop_running_model(effective_model)
                 if isinstance(normalized, OllamaGenerationError) and not normalized.retryable:
                     raise normalized
                 if isinstance(normalized, OllamaClientError) and not self._is_timeout_like(normalized):
@@ -263,11 +286,69 @@ class OllamaClient:
             raise OllamaClientError(str(last_exception)) from last_exception
         raise OllamaClientError(f"Unknown Ollama generation failure for model {effective_model}")
 
+    def _stop_running_model(self, model_name: str | None) -> None:
+        text = str(model_name or "").strip()
+        if not text:
+            return
+        try:
+            subprocess.run(
+                ["ollama", "stop", text],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._wait_for_model_stop(text)
+
+    def _wait_for_model_stop(
+        self,
+        model_name: str,
+        *,
+        timeout_seconds: float = 20.0,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        normalized = str(model_name or "").strip()
+        if not normalized:
+            return
+        deadline = time.monotonic() + max(float(timeout_seconds), float(poll_interval_seconds))
+        while time.monotonic() < deadline:
+            running_models = self._running_model_names()
+            if normalized not in running_models:
+                return
+            time.sleep(max(float(poll_interval_seconds), 0.1))
+
+    @staticmethod
+    def _running_model_names() -> set[str]:
+        try:
+            result = subprocess.run(
+                ["ollama", "ps"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            return set()
+
+        names: set[str] = set()
+        for raw_line in str(result.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.lower().startswith("name "):
+                continue
+            parts = line.split()
+            if parts:
+                names.add(parts[0])
+        return names
+
     def _read_generate_response(
         self,
         response,
         *,
         model_name: str,
+        request_started_at: float,
+        headers_received_at: float,
         startup_timeout: int,
         inactivity_timeout: int,
         total_timeout: int,
@@ -279,14 +360,15 @@ class OllamaClient:
 
         poll_timeout = max(2.0, min(float(inactivity_timeout) / 3.0, 12.0))
         self._set_socket_timeout(response, poll_timeout)
-        started_at = time.monotonic()
+        started_at = request_started_at
         last_activity_at = started_at
-        last_heartbeat_at = started_at
+        last_heartbeat_at = headers_received_at
         streamed_parts: list[str] = []
         total_characters = 0
         activity_count = 0
         startup_warning_sent = False
         stream_timeout_promoted = False
+        first_chunk_announced = False
 
         if progress_callback is not None:
             progress_callback(
@@ -294,6 +376,8 @@ class OllamaClient:
                     "type": "status",
                     "stage": "waiting_for_first_chunk",
                     "model": model_name,
+                    "elapsed": round(headers_received_at - started_at, 3),
+                    "time_to_header": round(headers_received_at - started_at, 3),
                     "startup_timeout": startup_timeout,
                     "inactivity_timeout": inactivity_timeout,
                     "total_timeout": total_timeout,
@@ -331,7 +415,7 @@ class OllamaClient:
                             characters=total_characters,
                             activity_count=activity_count,
                             partial_text="".join(streamed_parts),
-                            retryable=False,
+                            retryable=True,
                             model_name=model_name,
                             backend_identifier="ollama",
                             startup_timeout_seconds=startup_timeout,
@@ -410,7 +494,7 @@ class OllamaClient:
                         characters=total_characters,
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
-                        retryable=False,
+                        retryable=True,
                         model_name=model_name,
                         backend_identifier="ollama",
                         startup_timeout_seconds=startup_timeout,
@@ -422,6 +506,21 @@ class OllamaClient:
 
             last_activity_at = time.monotonic()
             activity_count += 1
+            if progress_callback is not None and not first_chunk_announced:
+                progress_callback(
+                    {
+                        "type": "status",
+                        "stage": "first_chunk_received",
+                        "model": model_name,
+                        "elapsed": round(last_activity_at - started_at, 3),
+                        "time_to_header": round(headers_received_at - started_at, 3),
+                        "time_to_first_chunk": round(last_activity_at - started_at, 3),
+                        "startup_timeout": startup_timeout,
+                        "inactivity_timeout": inactivity_timeout,
+                        "total_timeout": total_timeout,
+                    }
+                )
+                first_chunk_announced = True
             if not stream_timeout_promoted:
                 self._set_socket_timeout(response, float(inactivity_timeout))
                 stream_timeout_promoted = True
@@ -486,6 +585,19 @@ class OllamaClient:
                 )
 
         if streamed_parts:
+            if progress_callback is not None:
+                finished_at = time.monotonic()
+                progress_callback(
+                    {
+                        "type": "status",
+                        "stage": "response_completed",
+                        "model": model_name,
+                        "elapsed": round(finished_at - started_at, 3),
+                        "time_to_header": round(headers_received_at - started_at, 3),
+                        "time_to_last_chunk": round(finished_at - started_at, 3),
+                        "characters": total_characters,
+                    }
+                )
             return "".join(streamed_parts).strip()
 
         if not hasattr(response, "read"):
@@ -498,7 +610,7 @@ class OllamaClient:
                 characters=total_characters,
                 activity_count=activity_count,
                 partial_text="".join(streamed_parts),
-                retryable=False,
+                retryable=True,
                 model_name=model_name,
                 backend_identifier="ollama",
                 startup_timeout_seconds=startup_timeout,
@@ -551,6 +663,7 @@ class OllamaClient:
         retries: int | None = None,
         timeout: int | None = None,
         total_timeout: int | None = None,
+        strict_timeouts: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         num_ctx: int | None = None,
     ) -> dict[str, Any]:
@@ -562,6 +675,7 @@ class OllamaClient:
             retries=retries,
             timeout=timeout,
             total_timeout=total_timeout,
+            strict_timeouts=strict_timeouts,
             progress_callback=progress_callback,
             num_ctx=num_ctx,
         )
@@ -666,11 +780,11 @@ class OllamaClient:
             extra_buffer = 60
             minimum_floor = 480
         elif parameter_hint >= 14:
-            extra_buffer = 28
-            minimum_floor = 55
+            extra_buffer = 40
+            minimum_floor = 130
         elif parameter_hint >= 7:
-            extra_buffer = 20
-            minimum_floor = 40
+            extra_buffer = 40
+            minimum_floor = 80
         return int(min(total_timeout, max(inactivity_timeout + extra_buffer, minimum_floor)))
 
     @staticmethod
@@ -684,6 +798,8 @@ class OllamaClient:
         adjusted_total = max(int(total_timeout), int(inactivity_timeout), 1)
         if parameter_hint >= 24:
             adjusted_total = max(adjusted_total, 1200)
+        elif parameter_hint >= 14:
+            adjusted_total = max(adjusted_total, 150)
         return adjusted_total
 
     @staticmethod
@@ -696,6 +812,8 @@ class OllamaClient:
         adjusted_timeout = max(int(inactivity_timeout), 1)
         if parameter_hint >= 24:
             adjusted_timeout = max(adjusted_timeout, 240)
+        elif parameter_hint >= 14:
+            adjusted_timeout = max(adjusted_timeout, 45)
         return adjusted_timeout
 
     @staticmethod

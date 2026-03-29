@@ -38,22 +38,21 @@ def semantic_model_candidates(preferred_model: str | None, config: object | None
             alternatives.append(text)
 
     primary_size = _estimated_model_size_billions(primary)
-    ranked: list[tuple[float, str]] = []
+    ranked_smaller_or_equal: list[tuple[float, str]] = []
+    ranked_larger: list[tuple[float, str]] = []
     unknown_size: list[str] = []
     for candidate in alternatives:
         candidate_size = _estimated_model_size_billions(candidate)
-        if (
-            primary_size is not None
-            and candidate_size is not None
-            and candidate_size > primary_size
-        ):
-            continue
         if candidate_size is None:
             unknown_size.append(candidate)
             continue
-        ranked.append((candidate_size, candidate))
+        if primary_size is not None and candidate_size > primary_size:
+            ranked_larger.append((candidate_size, candidate))
+            continue
+        ranked_smaller_or_equal.append((candidate_size, candidate))
 
-    candidates.extend(candidate for _, candidate in sorted(ranked, key=lambda item: item[0]))
+    candidates.extend(candidate for _, candidate in sorted(ranked_smaller_or_equal, key=lambda item: item[0]))
+    candidates.extend(candidate for _, candidate in sorted(ranked_larger, key=lambda item: item[0]))
     if primary_size is None:
         candidates.extend(unknown_size)
     return candidates

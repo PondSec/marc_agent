@@ -93,8 +93,8 @@ def _normalize_access_mode(
 @dataclass(slots=True)
 class AppConfig:
     ollama_host: str = "http://127.0.0.1:11434"
-    model_name: str = "qwen3-coder:30b"
-    router_model_name: str | None = "qwen2.5-coder:14b"
+    model_name: str = "qwen3:14b"
+    router_model_name: str | None = "qwen3:8b"
     workspace_root: str = "."
     state_root_override: str | None = None
     access_mode: str = AccessMode.APPROVAL.value
@@ -118,7 +118,7 @@ class AppConfig:
     max_search_results: int = 200
     max_files_in_context: int = 80
     state_dir_name: str = ".marc_a1"
-    ollama_num_ctx: int = 8_192
+    ollama_num_ctx: int = 4_096
     router_num_ctx: int = 2_048
     ollama_temperature: float = 0.1
     auto_install_recommended_models: bool = True

@@ -87,3 +87,23 @@ def test_repo_snapshot_detects_unittest_command_from_python_test_files_without_m
     snapshot = memory.build_snapshot("cli unittest")
 
     assert any(item.command == "python -m unittest" for item in snapshot.validation_commands)
+
+
+def test_repo_snapshot_marks_package_dunder_main_as_entrypoint(tmp_path):
+    (tmp_path / "greet_cli").mkdir()
+    (tmp_path / "greet_cli" / "__main__.py").write_text(
+        "from .cli import main\n\nif __name__ == '__main__':\n    main()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "greet_cli" / "cli.py").write_text(
+        "def main():\n    return 0\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    memory = RepoMemoryStore(config, WorkspaceManager(tmp_path))
+
+    snapshot = memory.build_snapshot("python -m greet_cli")
+
+    assert "greet_cli/__main__.py" in snapshot.entrypoints

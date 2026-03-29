@@ -11,19 +11,14 @@ from llm.ollama_client import OllamaClient
 
 RECOMMENDED_MODELS: tuple[dict[str, str], ...] = (
     {
-        "name": "qwen3-coder:30b",
-        "label": "Qwen3 Coder 30B",
-        "summary": "Staerkste Standardwahl fuer Repo-Arbeit, Refactors und agentisches Coding.",
+        "name": "qwen3:14b",
+        "label": "Qwen3 14B",
+        "summary": "Standard fuer Coding-Arbeit, Refactors, Debugging und agentische Umsetzungen.",
     },
     {
-        "name": "qwen3:30b",
-        "label": "Qwen3 30B",
-        "summary": "Stark fuer breitere Planung, Erklaerungen und allgemeine Aufgaben.",
-    },
-    {
-        "name": "qwen2.5-coder:14b",
-        "label": "Qwen2.5 Coder 14B",
-        "summary": "Leichteres Coding-Fallback-Modell, das auf diesem Geraet stabil laeuft.",
+        "name": "qwen3:8b",
+        "label": "Qwen3 8B",
+        "summary": "Schneller Pfad fuer Routing, kurze Shell-Aufgaben und kleine praezise Edits.",
     },
 )
 
@@ -164,12 +159,10 @@ class ModelManager:
             for item in self.client.list_models_safe()
             if item.get("name")
         }
-        for name in _unique_model_names(
-            [
-                self.config.router_model_name,
-                self.config.model_name,
-            ]
-        ):
+        # Warm the heavier content model first so the lightweight router model
+        # remains loaded for the first interactive planning step after startup.
+        warmup_targets: list[tuple[str, int]] = []
+        for name, num_ctx in self._warmup_targets():
             if name not in installed_names:
                 continue
             try:
@@ -177,11 +170,25 @@ class ModelManager:
                     "Reply with OK only.",
                     model=name,
                     timeout=self.config.warmup_timeout,
-                    num_ctx=256,
+                    num_ctx=num_ctx,
                     retries=0,
                 )
             except Exception:
                 continue
+
+    def _warmup_targets(self) -> list[tuple[str, int]]:
+        targets: list[tuple[str, int]] = []
+        for name, num_ctx in (
+            (self.config.model_name, max(int(self.config.ollama_num_ctx), 256)),
+            (self.config.router_model_name, max(int(self.config.router_num_ctx), 256)),
+        ):
+            normalized = str(name or "").strip()
+            if not normalized:
+                continue
+            if (normalized, num_ctx) in targets:
+                continue
+            targets.append((normalized, num_ctx))
+        return targets
 
     def _run_queue(self) -> None:
         while True:

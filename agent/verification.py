@@ -27,6 +27,12 @@ MUTATION_TOOL_NAMES = {
 
 
 class ValidationPlanner:
+    TRACEBACK_FRAME_PATTERN = re.compile(
+        r'File "(?P<path>[^"]+)", line (?P<line>\d+)(?:, in (?P<symbol>[^\n]+))?'
+    )
+    WORKSPACE_REFERENCE_PATTERN = re.compile(
+        r"(?P<quote>['\"])(?P<path>(?:[\w.-]+/)+[\w.-]+(?:\.[A-Za-z0-9_-]+)?)(?P=quote)"
+    )
     EXPLICIT_VALIDATION_COMMAND_SPECS = (
         {
             "kind": "test",
@@ -100,10 +106,12 @@ class ValidationPlanner:
     )
     EXPLICIT_COMMAND_TRAILING_STOPWORDS = re.compile(
         r"(?i)\s+(?:"
-        r"then|after|afterward|until|and|danach|danachmals|danachhin|"
-        r"und|bis|aus|ausfuehren|ausführen"
+        r"then|after|afterward|until|finish|complete|continue|summarize|report|"
+        r"and|danach|danachmals|danachhin|"
+        r"und|bis|aus|ausfuehren|ausführen|abschliessen|abschließen"
         r")\b.*$"
     )
+    EXPLICIT_COMMAND_SENTENCE_BOUNDARY = re.compile(r"(?<=[\w)\]'\"])[.!?]\s+(?=[A-ZÄÖÜ])")
     WEB_FEATURE_KEYWORDS = {
         "menu": ("menu", "menue", "menü", "navigation", "nav"),
         "highscore": ("highscore", "high score", "scoreboard", "leaderboard", "best score", "bestenliste"),
@@ -161,6 +169,11 @@ class ValidationPlanner:
             for item in snapshot.likely_commands
         ]
         commands = self._merge_explicit_validation_commands(commands, session=session)
+        commands = self._replace_generic_unittest_commands(
+            commands,
+            snapshot=snapshot,
+            changed_files=changed_paths,
+        )
         if changed_paths and not any(self.command_scope(command) == "runtime" for command in commands):
             commands.extend(self._default_commands(snapshot, changed_paths, task=task))
         synthesized = self._synthesized_runtime_commands(
@@ -217,6 +230,11 @@ class ValidationPlanner:
             command
             for command in required_commands
             if self.command_identity(command.command) not in passed
+            and not self._generic_unittest_satisfied_by_targeted_success(
+                session,
+                command.command,
+                current_generation_only=True,
+            )
         ]
 
     def next_command(self, session: SessionState) -> ValidationCommand | None:
@@ -379,7 +397,11 @@ class ValidationPlanner:
         if not command:
             return None
         command = command.strip("`'\"")
+        sentence_split = self.EXPLICIT_COMMAND_SENTENCE_BOUNDARY.split(command, maxsplit=1)
+        if sentence_split:
+            command = sentence_split[0].strip()
         command = self.EXPLICIT_COMMAND_TRAILING_STOPWORDS.sub("", command).strip()
+        command = self._trim_python_test_command_tokens(command)
         command = command.rstrip(".,;:!?")
         if not command:
             return None
@@ -423,6 +445,113 @@ class ValidationPlanner:
         ):
             return command
         return None
+
+    def _trim_python_test_command_tokens(self, command: str) -> str:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return command
+        if not tokens:
+            return command
+
+        lowered = [token.lower() for token in tokens]
+        if lowered[:3] in (["python", "-m", "unittest"], ["python3", "-m", "unittest"]):
+            trimmed = self._trim_unittest_command_tokens(tokens)
+            return " ".join(trimmed) if trimmed else command
+        if lowered[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):
+            trimmed = self._trim_pytest_command_tokens(tokens, prefix_len=3)
+            return " ".join(trimmed) if trimmed else command
+        if lowered[:1] == ["pytest"]:
+            trimmed = self._trim_pytest_command_tokens(tokens, prefix_len=1)
+            return " ".join(trimmed) if trimmed else command
+        return command
+
+    def _trim_unittest_command_tokens(self, tokens: list[str]) -> list[str]:
+        if len(tokens) <= 3:
+            return tokens
+
+        option_value_flags = {"-k", "-s", "-p", "-t", "--start-directory", "--pattern", "--top-level-directory"}
+        trimmed = tokens[:3]
+        saw_target = False
+        expect_option_value = False
+        for token in tokens[3:]:
+            lowered = token.lower()
+            if expect_option_value:
+                trimmed.append(token)
+                expect_option_value = False
+                continue
+            if token.startswith("-"):
+                trimmed.append(token)
+                if lowered in option_value_flags:
+                    expect_option_value = True
+                continue
+            if lowered == "discover" and not saw_target:
+                trimmed.append(token)
+                saw_target = True
+                continue
+            if self._looks_like_unittest_cli_target(token):
+                trimmed.append(token)
+                saw_target = True
+                continue
+            if saw_target:
+                break
+            break
+        return trimmed
+
+    def _trim_pytest_command_tokens(self, tokens: list[str], *, prefix_len: int) -> list[str]:
+        if len(tokens) <= prefix_len:
+            return tokens
+
+        option_value_flags = {"-k", "-m", "-c", "--maxfail", "--rootdir"}
+        trimmed = tokens[:prefix_len]
+        saw_target = False
+        expect_option_value = False
+        for token in tokens[prefix_len:]:
+            lowered = token.lower()
+            if expect_option_value:
+                trimmed.append(token)
+                expect_option_value = False
+                continue
+            if token.startswith("-"):
+                trimmed.append(token)
+                if lowered in option_value_flags:
+                    expect_option_value = True
+                continue
+            if self._looks_like_pytest_cli_target(token):
+                trimmed.append(token)
+                saw_target = True
+                continue
+            if saw_target:
+                break
+            break
+        return trimmed
+
+    def _looks_like_unittest_cli_target(self, token: str) -> bool:
+        cleaned = str(token or "").strip()
+        normalized = cleaned.rstrip(".,;:!?")
+        if not normalized or normalized.startswith("-"):
+            return False
+        lowered = normalized.lower()
+        if normalized.endswith(".py") or "/" in normalized or "\\" in normalized or "::" in normalized:
+            return True
+        if "." in normalized:
+            parts = [part for part in normalized.split(".") if part]
+            return bool(parts) and all(part.isidentifier() for part in parts)
+        return lowered in {"discover", "tests", "test"} or lowered.startswith("test_") or lowered.endswith("_test")
+
+    def _looks_like_pytest_cli_target(self, token: str) -> bool:
+        cleaned = str(token or "").strip()
+        normalized = cleaned.rstrip(".,;:!?")
+        if not normalized or normalized.startswith("-"):
+            return False
+        lowered = normalized.lower()
+        return (
+            normalized.endswith(".py")
+            or "/" in normalized
+            or "\\" in normalized
+            or "::" in normalized
+            or lowered in {".", "tests", "test"}
+        )
 
     def runtime_verification_required(self, session: SessionState) -> bool:
         task_state = session.task_state
@@ -547,7 +676,25 @@ class ValidationPlanner:
         session: SessionState,
         failed_run: ValidationRunRecord,
     ) -> ValidationFailureEvidence:
-        artifact_paths = self._artifact_paths_for_failed_run(session, failed_run)
+        traceback_file_hints, traceback_line_hints = self._traceback_workspace_hints(
+            session,
+            failed_run,
+        )
+        referenced_workspace_paths = self._referenced_workspace_paths(
+            session,
+            failed_run,
+        )
+        artifact_paths = self._unique_paths(
+            [
+                *traceback_file_hints,
+                *self._artifact_paths_for_failed_run(session, failed_run),
+                *referenced_workspace_paths,
+            ]
+        )
+        artifact_paths = self._prioritize_runtime_artifact_paths(
+            artifact_paths,
+            failed_run,
+        )
         diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
         missing_unittest_package_inits = self._missing_unittest_package_inits(
             session,
@@ -559,12 +706,17 @@ class ValidationPlanner:
         file_hints = self._unique_paths(
             [
                 *artifact_paths,
+                *traceback_file_hints,
+                *referenced_workspace_paths,
                 *missing_unittest_package_inits,
                 *(path for diagnostic in diagnostics for path in diagnostic.file_hints),
             ]
         )
         line_hints = self._unique_line_hints(
-            [line for diagnostic in diagnostics for line in diagnostic.line_hints]
+            [
+                *traceback_line_hints,
+                *(line for diagnostic in diagnostics for line in diagnostic.line_hints),
+            ]
         )
         action_hints = self._unique_strings(
             [hint for diagnostic in diagnostics for hint in diagnostic.action_hints]
@@ -619,6 +771,73 @@ class ValidationPlanner:
             evidence_signature=evidence_signature,
         )
 
+    def _referenced_workspace_paths(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+    ) -> list[str]:
+        workspace_root = Path(session.workspace_root).resolve()
+        referenced_paths: list[str] = []
+        texts = [
+            str(failed_run.excerpt or "").strip(),
+            str(failed_run.summary or "").strip(),
+        ]
+        for text in texts:
+            if not text:
+                continue
+            for match in self.WORKSPACE_REFERENCE_PATTERN.finditer(text):
+                raw_path = str(match.group("path") or "").strip().replace("\\", "/")
+                if not raw_path:
+                    continue
+                normalized = raw_path.removeprefix("./")
+                if normalized.startswith("/") or normalized.startswith("../") or "/../" in f"/{normalized}":
+                    continue
+                candidate = (workspace_root / normalized).resolve()
+                try:
+                    relative = candidate.relative_to(workspace_root).as_posix()
+                except ValueError:
+                    continue
+                if relative and relative not in referenced_paths:
+                    referenced_paths.append(relative)
+        return referenced_paths
+
+    def _traceback_workspace_hints(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+    ) -> tuple[list[str], list[int]]:
+        workspace_root = Path(session.workspace_root).resolve()
+        paths: list[str] = []
+        lines: list[int] = []
+        texts = [
+            str(failed_run.excerpt or "").strip(),
+            str(failed_run.summary or "").strip(),
+        ]
+        for text in texts:
+            if not text:
+                continue
+            for match in self.TRACEBACK_FRAME_PATTERN.finditer(text):
+                raw_path = str(match.group("path") or "").strip()
+                if not raw_path:
+                    continue
+                candidate = Path(raw_path).resolve()
+                try:
+                    relative = candidate.relative_to(workspace_root).as_posix()
+                except ValueError:
+                    continue
+                if relative and relative not in paths:
+                    paths.append(relative)
+                try:
+                    line = int(match.group("line") or 0)
+                except ValueError:
+                    line = 0
+                if line > 0 and line not in lines:
+                    lines.append(line)
+
+        implementation_paths = [path for path in paths if not self._is_test_path(path)]
+        test_paths = [path for path in paths if self._is_test_path(path)]
+        return [*implementation_paths, *test_paths], lines
+
     def can_repeat_command(
         self,
         session: SessionState,
@@ -628,6 +847,12 @@ class ValidationPlanner:
     ) -> bool:
         normalized = self.command_identity(command)
         if not normalized:
+            return False
+        if self._generic_unittest_satisfied_by_targeted_success(
+            session,
+            normalized,
+            current_generation_only=current_generation_only,
+        ):
             return False
         failed_run = self.latest_failed_run(
             session,
@@ -646,6 +871,36 @@ class ValidationPlanner:
                 continue
             if item.tool_name in MUTATION_TOOL_NAMES:
                 return True
+        return False
+
+    def _generic_unittest_satisfied_by_targeted_success(
+        self,
+        session: SessionState,
+        command: str,
+        *,
+        current_generation_only: bool,
+    ) -> bool:
+        normalized = self.command_identity(command).lower()
+        if normalized not in {"python -m unittest", "python3 -m unittest"}:
+            return False
+
+        for run in session.validation_runs:
+            if current_generation_only and run.edit_generation != session.edit_generation:
+                continue
+            if str(run.status or "").strip() != "passed":
+                continue
+            run_command = self.command_identity(run.command).lower()
+            if not (
+                run_command.startswith("python -m unittest ")
+                or run_command.startswith("python3 -m unittest ")
+            ):
+                continue
+            target_tokens = run_command.split()[3:]
+            if not target_tokens:
+                continue
+            if target_tokens[0] == "discover":
+                continue
+            return True
         return False
 
     def command_identity(self, command: ValidationCommand | str) -> str:
@@ -806,6 +1061,81 @@ class ValidationPlanner:
             for command in commands
         ]
 
+    def _replace_generic_unittest_commands(
+        self,
+        commands: list[ValidationCommand],
+        *,
+        snapshot: WorkspaceSnapshot,
+        changed_files: list[str],
+    ) -> list[ValidationCommand]:
+        generic_indexes: list[int] = []
+        command_prefix = "python"
+        for index, command in enumerate(commands):
+            normalized = self.command_identity(command.command).lower()
+            if normalized not in {"python -m unittest", "python3 -m unittest"}:
+                continue
+            if command.source in {"task_state", "user_request"}:
+                continue
+            generic_indexes.append(index)
+            if normalized.startswith("python3"):
+                command_prefix = "python3"
+
+        if not generic_indexes:
+            return commands
+
+        modules = self._targeted_unittest_modules(
+            changed_files=changed_files,
+            snapshot=snapshot,
+        )
+        if not modules:
+            return commands
+
+        template = commands[generic_indexes[0]]
+        replacement = template.model_copy(
+            update={
+                "command": f"{command_prefix} -m unittest {' '.join(modules)}",
+                "source": "unittest-targeted",
+                "priority": min(int(template.priority or 10), 9),
+                "reason": "Run the changed unittest modules directly to avoid zero-test discovery runs.",
+            }
+        )
+        return [replacement, *(item for index, item in enumerate(commands) if index not in generic_indexes)]
+
+    def _targeted_unittest_modules(
+        self,
+        *,
+        changed_files: list[str],
+        snapshot: WorkspaceSnapshot,
+    ) -> list[str]:
+        candidate_paths = [
+            path
+            for path in changed_files
+            if self._is_test_path(path) and Path(path).suffix.lower() == ".py"
+        ]
+        if not candidate_paths:
+            candidate_paths = [
+                path
+                for path in snapshot.test_files
+                if Path(path).suffix.lower() == ".py"
+            ]
+
+        modules: list[str] = []
+        for path in self._unique_paths(candidate_paths):
+            module = self._python_module_from_path(path)
+            if module:
+                modules.append(module)
+        return modules[:6]
+
+    def _python_module_from_path(self, path: str) -> str | None:
+        candidate = str(path or "").strip()
+        if not candidate.endswith(".py"):
+            return None
+        stem = candidate[:-3]
+        parts = [part for part in stem.split("/") if part]
+        if not parts or not all(part.isidentifier() for part in parts):
+            return None
+        return ".".join(parts)
+
     def _diagnostic_candidate_paths(self, session: SessionState) -> list[str]:
         task_state = session.task_state
         snapshot = session.workspace_snapshot
@@ -949,8 +1279,15 @@ class ValidationPlanner:
         failed_run: ValidationRunRecord,
     ) -> list[str]:
         paths: list[str] = []
-        if self._no_tests_executed(failed_run):
-            task_state = session.task_state
+        task_state = session.task_state
+        no_tests_executed = self._no_tests_executed(failed_run)
+        if failed_run.verification_scope == "runtime" and task_state is not None and not no_tests_executed:
+            paths.extend(
+                artifact.path
+                for artifact in task_state.target_artifacts
+                if artifact.path and artifact.role != "supporting_context"
+            )
+        if no_tests_executed:
             if task_state is not None:
                 paths.extend(
                     artifact.path
@@ -973,8 +1310,30 @@ class ValidationPlanner:
         paths.extend(item.path for item in session.changed_files)
         return self._unique_paths(paths)
 
+    def _prioritize_runtime_artifact_paths(
+        self,
+        artifact_paths: list[str],
+        failed_run: ValidationRunRecord,
+    ) -> list[str]:
+        if failed_run.verification_scope != "runtime" or self._no_tests_executed(failed_run):
+            return artifact_paths
+        implementation_paths = [
+            path
+            for path in artifact_paths
+            if path and not self._is_test_path(path)
+        ]
+        validation_paths = [
+            path
+            for path in artifact_paths
+            if path and self._is_test_path(path)
+        ]
+        ordered = [*implementation_paths, *validation_paths]
+        return ordered or artifact_paths
+
     def _paths_from_validation_command(self, command: str) -> list[str]:
-        _, payload = self._decoded_internal_validation_payload(command)
+        kind, payload = self._decoded_internal_validation_payload(command)
+        if kind is None:
+            return self._paths_from_explicit_test_command(command)
         values = payload if isinstance(payload, list) else [payload]
         paths: list[str] = []
         for item in values:
@@ -987,6 +1346,74 @@ class ValidationPlanner:
                 if cleaned:
                     paths.append(cleaned)
         return self._unique_paths(paths)
+
+    def _paths_from_explicit_test_command(self, command: str) -> list[str]:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return []
+        if not tokens:
+            return []
+        lowered = [token.lower() for token in tokens]
+        if len(tokens) >= 3 and lowered[:3] in (["python", "-m", "unittest"], ["python3", "-m", "unittest"]):
+            return self._unittest_targets_to_paths(tokens[3:])
+        if len(tokens) >= 3 and lowered[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):
+            return self._pytest_targets_to_paths(tokens[3:])
+        if lowered[0] == "pytest":
+            return self._pytest_targets_to_paths(tokens[1:])
+        return []
+
+    def _unittest_targets_to_paths(self, targets: list[str]) -> list[str]:
+        paths: list[str] = []
+        for target in targets:
+            cleaned = str(target or "").strip()
+            if not cleaned or cleaned.startswith("-"):
+                continue
+            path = self._path_from_unittest_target(cleaned)
+            if path:
+                paths.append(path)
+        return self._unique_paths(paths)
+
+    def _pytest_targets_to_paths(self, targets: list[str]) -> list[str]:
+        paths: list[str] = []
+        for target in targets:
+            cleaned = str(target or "").strip()
+            if not cleaned or cleaned.startswith("-"):
+                continue
+            path = cleaned.split("::", 1)[0].strip()
+            if not path or path.endswith(".py") is False:
+                continue
+            paths.append(path)
+        return self._unique_paths(paths)
+
+    def _path_from_unittest_target(self, target: str) -> str | None:
+        cleaned = str(target or "").strip()
+        if not cleaned:
+            return None
+        cleaned = cleaned.split("::", 1)[0].strip()
+        if cleaned.endswith(".py"):
+            return cleaned
+        if "/" in cleaned:
+            return f"{cleaned}.py" if "." not in Path(cleaned).suffix else cleaned
+
+        parts = [part for part in cleaned.split(".") if part]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            lowered = cleaned.lower()
+            if lowered not in {"tests", "test"} and not lowered.startswith("test_") and not lowered.endswith("_test"):
+                return None
+
+        module_parts: list[str] = []
+        for part in parts:
+            if part[:1].isupper():
+                break
+            module_parts.append(part)
+            if len(module_parts) >= 2 and module_parts[-1].startswith("test_"):
+                break
+        if not module_parts:
+            return None
+        return "/".join(module_parts) + ".py"
 
     def _expected_features_from_command(self, command: str) -> list[str]:
         kind, payload = self._decoded_internal_validation_payload(command)

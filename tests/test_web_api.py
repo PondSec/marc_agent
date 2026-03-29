@@ -99,8 +99,8 @@ def complete_setup_flow(
             "initial_workspace_name": "Demo Project",
             "initial_workspace_path": str(workspace_root),
             "ollama_host": "http://127.0.0.1:11434",
-            "model_name": "qwen3-coder:30b",
-            "router_model_name": "qwen2.5-coder:14b",
+            "model_name": "qwen3:14b",
+            "router_model_name": "qwen3:8b",
             "access_mode": "approval",
             "auth_cookie_secure": True,
             "public_base_url": "https://testserver",
@@ -184,8 +184,8 @@ def test_setup_completion_creates_env_admin_and_workspace(tmp_path):
             "initial_workspace_name": "Demo Project",
             "initial_workspace_path": str(workspace_root),
             "ollama_host": "http://127.0.0.1:11434",
-            "model_name": "qwen3-coder:30b",
-            "router_model_name": "qwen2.5-coder:14b",
+            "model_name": "qwen3:14b",
+            "router_model_name": "qwen3:8b",
             "access_mode": "approval",
             "auth_cookie_secure": True,
             "public_base_url": "https://testserver",
@@ -202,8 +202,8 @@ def test_setup_completion_creates_env_admin_and_workspace(tmp_path):
     env_path = tmp_path / ".env"
     env_text = env_path.read_text(encoding="utf-8")
     assert "AUTH_SECRET_KEY=" in env_text
-    assert "MODEL_NAME=qwen3-coder:30b" in env_text
-    assert "ROUTER_MODEL_NAME=qwen2.5-coder:14b" in env_text
+    assert "MODEL_NAME=qwen3:14b" in env_text
+    assert "ROUTER_MODEL_NAME=qwen3:8b" in env_text
     assert TEST_ADMIN_PASSWORD not in env_text
 
     session_response = client.get("/api/auth/session")
@@ -416,17 +416,17 @@ def test_config_exposes_preferred_and_installed_ollama_models(tmp_path):
     catalog = {
         "installed_models": [
             {
-                "name": "qwen2.5-coder:14b",
+                "name": "qwen3:14b",
                 "size": 8988124298,
                 "modified_at": "2026-03-20T18:09:35+01:00",
-                "family": "qwen2",
+                "family": "qwen3",
                 "parameter_size": "14.8B",
             }
         ],
         "recommended_models": [
             {
-                "name": "qwen3-coder:30b",
-                "label": "Qwen3 Coder 30B",
+                "name": "qwen3:14b",
+                "label": "Qwen3 14B",
                 "summary": "Coding default.",
                 "installed": False,
                 "status": "missing",
@@ -444,10 +444,10 @@ def test_config_exposes_preferred_and_installed_ollama_models(tmp_path):
         "server.app._fetch_installed_ollama_models",
         return_value=[
             {
-                "name": "qwen2.5-coder:14b",
+                "name": "qwen3:14b",
                 "size": 8988124298,
                 "modified_at": "2026-03-20T18:09:35+01:00",
-                "family": "qwen2",
+                "family": "qwen3",
                 "parameter_size": "14.8B",
             }
         ],
@@ -459,31 +459,71 @@ def test_config_exposes_preferred_and_installed_ollama_models(tmp_path):
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["preferred_model_name"] == "qwen2.5-coder:14b"
-    assert payload["router_preferred_model_name"] == "qwen2.5-coder:14b"
-    assert payload["model_candidates"] == ["qwen2.5-coder:14b"]
-    assert payload["installed_ollama_models"][0]["name"] == "qwen2.5-coder:14b"
-    assert payload["recommended_models"][0]["name"] == "qwen3-coder:30b"
+    assert payload["preferred_model_name"] == "qwen3:14b"
+    assert payload["router_preferred_model_name"] == "qwen3:14b"
+    assert payload["model_candidates"] == ["qwen3:14b"]
+    assert payload["installed_ollama_models"][0]["name"] == "qwen3:14b"
+    assert payload["recommended_models"][0]["name"] == "qwen3:14b"
 
 
 def test_available_models_pick_fast_router_model_when_possible(tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
-        model_name="qwen3-coder:30b",
-        router_model_name="qwen2.5-coder:14b",
+        model_name="qwen3:14b",
+        router_model_name="qwen3:8b",
+    )
+
+    with patch(
+        "server.app._fetch_installed_ollama_models",
+        return_value=[
+            {"name": "qwen3:14b"},
+            {"name": "qwen3:8b"},
+        ],
+    ):
+        updated = _with_available_models(config)
+
+    assert updated.model_name == "qwen3:14b"
+    assert updated.router_model_name == "qwen3:8b"
+
+
+def test_available_models_prefer_same_size_coder_fallback_when_requested_model_is_missing(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen3:8b",
     )
 
     with patch(
         "server.app._fetch_installed_ollama_models",
         return_value=[
             {"name": "qwen3-coder:30b"},
+            {"name": "qwen3:30b"},
             {"name": "qwen2.5-coder:14b"},
         ],
     ):
         updated = _with_available_models(config)
 
-    assert updated.model_name == "qwen3-coder:30b"
+    assert updated.model_name == "qwen2.5-coder:14b"
     assert updated.router_model_name == "qwen2.5-coder:14b"
+
+
+def test_available_models_do_not_auto_upgrade_to_30b_when_only_larger_model_is_installed(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen3:8b",
+    )
+
+    with patch(
+        "server.app._fetch_installed_ollama_models",
+        return_value=[
+            {"name": "qwen3:30b"},
+        ],
+    ):
+        updated = _with_available_models(config)
+
+    assert updated.model_name == "qwen3:14b"
+    assert updated.router_model_name == "qwen3:8b"
 
 
 def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_path):
@@ -492,17 +532,17 @@ def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_p
     catalog = {
         "installed_models": [
             {
-                "name": "qwen2.5-coder:14b",
+                "name": "qwen3:14b",
                 "size": 8988124298,
                 "modified_at": "2026-03-20T18:09:35+01:00",
-                "family": "qwen2",
+                "family": "qwen3",
                 "parameter_size": "14.8B",
             }
         ],
         "recommended_models": [
             {
-                "name": "qwen3-coder:30b",
-                "label": "Qwen3 Coder 30B",
+                "name": "qwen3:14b",
+                "label": "Qwen3 14B",
                 "summary": "Coding default.",
                 "installed": False,
                 "status": "pulling",

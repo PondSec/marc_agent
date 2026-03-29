@@ -544,18 +544,33 @@ class AgentCore:
             session.last_error = None
             session.blockers = []
             self._track_helper_artifacts(session, result.changed_files)
+            # Rebuild the snapshot after successful mutations so newly created tests,
+            # entrypoints, and validation commands become visible immediately.
+            session.workspace_snapshot = self.memory.build_snapshot(task)
             self._refresh_session_context(task, session)
 
         if decision.tool_name in VERIFY_TOOLS:
             self._record_validation_run(session, decision, result)
             session.validation_status = self.validation_planner.rollup_status(session)
             if session.validation_status == "failed":
-                failed_run = session.validation_runs[-1]
-                session.active_repair_context = self.validation_planner.build_failure_evidence(
+                failed_run = self.validation_planner.latest_failed_run(
                     session,
-                    failed_run,
+                    current_generation_only=False,
                 )
-                session.last_error = self._build_output_excerpt(result.data) or result.message
+                if failed_run is not None:
+                    session.active_repair_context = self.validation_planner.build_failure_evidence(
+                        session,
+                        failed_run,
+                    )
+                    session.last_error = (
+                        failed_run.excerpt
+                        or failed_run.summary
+                        or self._build_output_excerpt(result.data)
+                        or result.message
+                    )
+                else:
+                    session.active_repair_context = None
+                    session.last_error = self._build_output_excerpt(result.data) or result.message
             elif session.validation_status == "passed":
                 session.repair_attempts = 0
                 session.active_repair_context = None

@@ -241,7 +241,7 @@ def test_reporter_describes_model_start_failure_more_precisely(tmp_path):
         ),
     )
     session.blockers.append(
-        "Repeated model start failure for snake.html: qwen3-coder:30b, qwen2.5-coder:14b produced no first chunk, and no safe local recovery path applied."
+        "Repeated model start failure for snake.html: qwen3:14b, qwen3:8b produced no first chunk, and no safe local recovery path applied."
     )
     session.report = reporter.build_report(session)
 

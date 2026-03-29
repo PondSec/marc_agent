@@ -107,6 +107,9 @@ _PATH_RE = re.compile(
     r"([\w./-]+\.(py|js|ts|tsx|jsx|json|md|html|css|sh|toml|ya?ml|go|rs|java|kt|rb))",
     flags=re.IGNORECASE,
 )
+_CONVENTIONAL_ARTIFACT_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\breadme(?:\.md)?\b", flags=re.IGNORECASE), "README.md"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +135,11 @@ def build_minimal_task_state(
     context = _context_anchor(session)
     signal = _minimal_semantic_signal(request, context=context)
     inferred_snapshot_targets = _snapshot_target_artifacts(request, snapshot)
+    signal_targets = _target_artifacts_for_signal(
+        request,
+        signal=signal,
+        anchor_artifacts=context["artifacts"],
+    )
     if signal.intent == "update" and signal.needs_clarification and inferred_snapshot_targets:
         signal = MinimalSemanticSignal(
             intent=signal.intent,
@@ -145,11 +153,10 @@ def build_minimal_task_state(
         )
     anchor_artifacts = context["artifacts"]
     active_artifacts = anchor_artifacts[:6] if signal.use_context else []
-    target_artifacts = inferred_snapshot_targets or _target_artifacts_for_signal(
-        request,
-        signal=signal,
-        anchor_artifacts=anchor_artifacts,
-    )
+    if signal.intent == "create" and any(str(item.path or "").strip() for item in signal_targets):
+        target_artifacts = signal_targets
+    else:
+        target_artifacts = inferred_snapshot_targets or signal_targets
     if _prefer_create_in_empty_workspace(
         request,
         snapshot=snapshot,
@@ -489,10 +496,10 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
         intent = "explain"
     elif _looks_like_plan_request(normalized):
         intent = "plan"
-    elif _looks_like_search_request(normalized):
-        intent = "search"
     elif looks_like_debug_request(request):
         intent = "debug"
+    elif _looks_like_search_request(normalized):
+        intent = "search"
     elif create_like:
         intent = "create"
     elif update_like:
@@ -649,14 +656,25 @@ def _target_artifacts_for_signal(
 ) -> list[TaskArtifact]:
     explicit_paths = _extract_explicit_paths(request)
     if explicit_paths:
+        has_non_doc_primary = any(
+            not _looks_like_test_artifact(explicit_path)
+            and Path(explicit_path).suffix.lower() not in {".md", ".markdown", ".rst", ".txt"}
+            for explicit_path in explicit_paths
+        )
         artifacts: list[TaskArtifact] = []
         for index, explicit_path in enumerate(explicit_paths[:6]):
+            if _looks_like_test_artifact(explicit_path):
+                role = "validation_target"
+            elif has_non_doc_primary and Path(explicit_path).suffix.lower() in {".md", ".markdown", ".rst", ".txt"}:
+                role = "supporting_context"
+            else:
+                role = "primary_target"
             artifacts.append(
                 TaskArtifact(
                     path=explicit_path,
                     name=Path(explicit_path).name,
                     kind="test" if _looks_like_test_artifact(explicit_path) else Path(explicit_path).suffix.lower() or "file",
-                    role="validation_target" if _looks_like_test_artifact(explicit_path) else "primary_target",
+                    role=role,
                     confidence=0.86 if index == 0 else 0.8,
                 )
             )
@@ -850,11 +868,24 @@ def _open_problem_summary(request: str, evidence: list[EvidenceItem]) -> str:
     return request
 
 def _looks_like_plan_request(normalized: str) -> bool:
-    return any(marker in normalized for marker in _PLAN_REQUEST_MARKERS)
+    return _contains_marker_phrase(normalized, _PLAN_REQUEST_MARKERS)
 
 
 def _looks_like_search_request(normalized: str) -> bool:
-    return any(marker in normalized for marker in _SEARCH_REQUEST_MARKERS)
+    return _contains_marker_phrase(normalized, _SEARCH_REQUEST_MARKERS)
+
+
+def _contains_marker_phrase(normalized: str, markers: tuple[str, ...]) -> bool:
+    if not normalized:
+        return False
+    token_space = f" {re.sub(r'[^a-z0-9_äöüß]+', ' ', normalized).strip()} "
+    if token_space == "  ":
+        return False
+    for marker in markers:
+        marker_tokens = re.sub(r"[^a-z0-9_äöüß]+", " ", str(marker or "").strip().lower()).strip()
+        if marker_tokens and f" {marker_tokens} " in token_space:
+            return True
+    return False
 
 
 def _has_explicit_change_marker(normalized: str) -> bool:
@@ -880,6 +911,17 @@ def _extract_explicit_paths(text: str) -> list[str]:
         candidate = match.group(1).lstrip("./")
         if candidate and candidate not in paths:
             paths.append(candidate)
+    source_text = str(text or "")
+    for pattern, conventional_path in _CONVENTIONAL_ARTIFACT_PATHS:
+        if not pattern.search(source_text):
+            continue
+        if conventional_path in paths:
+            continue
+        insert_at = next(
+            (index for index, candidate in enumerate(paths) if _looks_like_test_artifact(candidate)),
+            len(paths),
+        )
+        paths.insert(insert_at, conventional_path)
     return paths[:8]
 
 
@@ -894,6 +936,14 @@ def _looks_like_test_artifact(path: str) -> bool:
     return "/tests/" in f"/{lowered}" or name.startswith("test_") or name.endswith("_test.py")
 
 
+def _is_non_actionable_test_support_path(path: str) -> bool:
+    text = str(path or "").strip()
+    if not text:
+        return False
+    normalized = text.replace("\\", "/")
+    return Path(normalized).name.lower() == "__init__.py" and "/tests/" in f"/{normalized.lower()}"
+
+
 def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
     if snapshot is None:
         return []
@@ -901,6 +951,12 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
     request_tokens = [token for token in infer_scope_tokens(request) if len(token) >= 3]
     if not request_tokens:
         return []
+    request_lower = str(request or "").lower()
+    request_space = f" {re.sub(r'[^0-9a-zäöüß]+', ' ', request_lower).strip()} "
+    explicit_request_paths = _explicit_snapshot_request_paths(request_lower, request_space, snapshot)
+    request_targets_cli_entrypoint = _request_targets_package_cli_entrypoint(request_lower)
+    request_targets_tests = _request_targets_existing_tests(request_lower)
+    request_targets_runtime_repair = request_targets_tests and looks_like_debug_request(request)
 
     candidate_paths: list[str] = []
     for group in (
@@ -912,6 +968,8 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
     ):
         for item in group[:12]:
             path = str(item or "").strip()
+            if _is_non_actionable_test_support_path(path):
+                continue
             if path and path not in candidate_paths:
                 candidate_paths.append(path)
 
@@ -926,19 +984,31 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
                     score += 2.0
                 elif len(request_token) >= 4 and (request_token in path_token or path_token in request_token):
                     score += 1.0
+        basename = Path(path).name.lower()
+        if request_targets_cli_entrypoint and basename == "__main__.py":
+            score += 2.5
+        if path in explicit_request_paths:
+            score += 1.5
         if score >= 1.0:
             scored.append((score, path))
 
     if not scored:
-        return []
+        fallback_paths = explicit_request_paths[:4]
+        return _task_artifacts_for_paths(snapshot, fallback_paths)
 
     best_score = max(score for score, _ in scored)
     entrypoints = set(getattr(snapshot, "entrypoints", []) or [])
     manifests = set(getattr(snapshot, "manifests", []) or [])
-    test_files = set(getattr(snapshot, "test_files", []) or [])
+    test_files = {
+        str(path or "").strip()
+        for path in (getattr(snapshot, "test_files", []) or [])
+        if str(path or "").strip() and not _is_non_actionable_test_support_path(str(path or "").strip())
+    }
 
     def path_priority(path: str) -> tuple[int, str]:
         suffix = Path(path).suffix.lower()
+        if request_targets_cli_entrypoint and Path(path).name.lower() == "__main__.py":
+            return (-1, path)
         if path in entrypoints:
             return (0, path)
         if path in manifests or suffix in {".md", ".rst", ".txt"}:
@@ -951,20 +1021,225 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
         path
         for score, path in sorted(scored, key=lambda item: (*path_priority(item[1]), -item[0]))
         if score >= max(1.0, best_score - 1.0)
-    ][:4]
+    ]
+    if request_targets_cli_entrypoint:
+        implementation_like = [
+            path
+            for _, path in sorted(scored, key=lambda item: (*path_priority(item[1]), -item[0]))
+            if path not in manifests and path not in test_files and "/tests/" not in f"/{path}"
+        ]
+        selected = [*implementation_like[:2], *selected]
+    elif request_targets_runtime_repair:
+        implementation_like = _runtime_repair_implementation_paths(snapshot, selected)
+        implementation_like = [
+            *implementation_like,
+            *[
+                path
+            for _, path in sorted(scored, key=lambda item: (*path_priority(item[1]), -item[0]))
+            if path not in manifests and path not in test_files and "/tests/" not in f"/{path}"
+            ],
+        ]
+        selected = [*implementation_like[:2], *selected]
+    if request_targets_tests:
+        relevant_tests = _relevant_snapshot_test_paths(
+            scored=scored,
+            snapshot=snapshot,
+            request_tokens=request_tokens,
+            selected=selected,
+        )
+        selected = [*selected, *relevant_tests[:2]]
+    explicit_support_paths = [
+        path
+        for path in explicit_request_paths
+        if path in manifests or Path(path).suffix.lower() in {".md", ".rst", ".txt"}
+    ]
+    selected_non_tests = [
+        path
+        for path in selected
+        if path not in test_files and "/tests/" not in f"/{path}"
+    ]
+    selected_tests = [
+        path
+        for path in selected
+        if path in test_files or "/tests/" in f"/{path}"
+    ]
+    ordered_paths: list[str] = []
+    for candidate in [
+        *selected_non_tests,
+        *explicit_support_paths,
+        *selected_tests,
+        *explicit_request_paths,
+    ]:
+        if candidate and candidate not in ordered_paths:
+            ordered_paths.append(candidate)
+    selected = ordered_paths[:4]
+    return _task_artifacts_for_paths(snapshot, selected)
+
+
+def _task_artifacts_for_paths(snapshot, selected: list[str]) -> list[TaskArtifact]:
     artifacts: list[TaskArtifact] = []
+    manifests = set(getattr(snapshot, "manifests", []) or [])
+    test_files = set(getattr(snapshot, "test_files", []) or [])
     for path in selected:
         confidence = 0.58
+        role = "primary_target"
+        suffix = Path(path).suffix.lower()
+        if path in test_files or "/tests/" in f"/{path}":
+            role = "validation_target"
+        elif path in manifests or suffix in {".md", ".rst", ".txt"}:
+            role = "supporting_context"
         artifacts.append(
             TaskArtifact(
                 path=path,
                 name=Path(path).name,
                 kind=Path(path).suffix.lower() or "file",
-                role="primary_target",
+                role=role,
                 confidence=confidence,
             )
         )
     return artifacts
+
+
+def _explicit_snapshot_request_paths(
+    request_lower: str,
+    request_space: str,
+    snapshot,
+) -> list[str]:
+    candidate_paths: list[str] = []
+    for group in (
+        getattr(snapshot, "focus_files", []),
+        getattr(snapshot, "important_files", []),
+        getattr(snapshot, "manifests", []),
+        getattr(snapshot, "test_files", []),
+        getattr(snapshot, "entrypoints", []),
+    ):
+        for item in group[:12]:
+            path = str(item or "").strip()
+            if path and path not in candidate_paths:
+                candidate_paths.append(path)
+
+    generic_stems = {"app", "cli", "doc", "docs", "guide", "index", "main", "test", "tests"}
+    explicit: list[str] = []
+    for path in candidate_paths:
+        path_lower = path.lower()
+        basename = Path(path).name.lower()
+        stem = Path(path).stem.lower()
+        normalized_path = re.sub(r"[^0-9a-zäöüß]+", " ", path_lower).strip()
+        normalized_basename = re.sub(r"[^0-9a-zäöüß]+", " ", basename).strip()
+        normalized_stem = re.sub(r"[^0-9a-zäöüß]+", " ", stem).strip()
+
+        matches_request = False
+        if basename and basename in request_lower:
+            matches_request = True
+        elif normalized_path and f" {normalized_path} " in request_space:
+            matches_request = True
+        elif normalized_basename and f" {normalized_basename} " in request_space:
+            matches_request = True
+        elif (
+            normalized_stem
+            and normalized_stem not in generic_stems
+            and f" {normalized_stem} " in request_space
+        ):
+            matches_request = True
+
+        if matches_request and path not in explicit:
+            explicit.append(path)
+    return explicit
+
+
+def _request_targets_package_cli_entrypoint(request_lower: str) -> bool:
+    lowered = str(request_lower or "").lower()
+    if "python -m" in lowered or "python3 -m" in lowered:
+        return True
+    if "command line" in lowered or "kommandozeile" in lowered:
+        return True
+    if "argparse" in lowered:
+        return True
+    if " cli " in f" {re.sub(r'[^0-9a-zäöüß]+', ' ', lowered).strip()} ":
+        return True
+    return bool(re.search(r"(^|[^0-9a-z])--[a-z0-9][\\w-]*", lowered))
+
+
+def _request_targets_existing_tests(request_lower: str) -> bool:
+    lowered = str(request_lower or "").lower()
+    if any(marker in lowered for marker in ["unittest", "pytest", "unit test", "unit tests", "testcase", "test case"]):
+        return True
+    normalized = f" {re.sub(r'[^0-9a-zäöüß]+', ' ', lowered).strip()} "
+    return " tests " in normalized or " test " in normalized
+
+
+def _relevant_snapshot_test_paths(
+    *,
+    scored: list[tuple[float, str]],
+    snapshot,
+    request_tokens: list[str],
+    selected: list[str],
+) -> list[str]:
+    test_files = [
+        str(path or "").strip()
+        for path in getattr(snapshot, "test_files", []) or []
+        if str(path or "").strip() and not _is_non_actionable_test_support_path(str(path or "").strip())
+    ]
+    if not test_files:
+        return []
+
+    scored_tests = [
+        path
+        for _, path in sorted(scored, key=lambda item: -item[0])
+        if path in test_files or "/tests/" in f"/{path}"
+    ]
+    if scored_tests:
+        return scored_tests
+
+    selected_tokens: set[str] = set()
+    for candidate in selected:
+        normalized = normalize_text(candidate).replace("_", " ")
+        selected_tokens.update(token for token in re.split(r"[^a-z0-9äöüß]+", normalized) if len(token) >= 3)
+    selected_tokens.update(token for token in request_tokens if len(token) >= 3)
+
+    ranked: list[tuple[int, str]] = []
+    for path in test_files:
+        normalized = normalize_text(path).replace("_", " ")
+        tokens = {token for token in re.split(r"[^a-z0-9äöüß]+", normalized) if len(token) >= 3}
+        overlap = len(tokens & selected_tokens)
+        ranked.append((overlap, path))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _, path in ranked]
+
+
+def _runtime_repair_implementation_paths(snapshot, selected: list[str]) -> list[str]:
+    candidate_paths: list[str] = []
+    for group in (
+        getattr(snapshot, "focus_files", []),
+        getattr(snapshot, "important_files", []),
+        getattr(snapshot, "entrypoints", []),
+    ):
+        for item in group[:12]:
+            path = str(item or "").strip()
+            if path and path not in candidate_paths:
+                candidate_paths.append(path)
+
+    if not candidate_paths:
+        return []
+
+    requested_stems: list[str] = []
+    for path in selected:
+        name = Path(path).name
+        stem = Path(name).stem
+        if stem.startswith("test_") and len(stem) > 5:
+            requested_stems.append(stem.removeprefix("test_"))
+        elif stem.endswith("_test") and len(stem) > 5:
+            requested_stems.append(stem.removesuffix("_test"))
+
+    ordered: list[str] = []
+    for candidate in candidate_paths:
+        if candidate in ordered or _looks_like_test_artifact(candidate):
+            continue
+        candidate_stem = Path(candidate).stem.lower()
+        if any(stem and candidate_stem == stem.lower() for stem in requested_stems):
+            ordered.append(candidate)
+    return ordered
 
 
 def _prefer_create_in_empty_workspace(

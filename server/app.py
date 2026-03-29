@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import mimetypes
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -883,10 +884,10 @@ def _with_available_models(config: AppConfig) -> AppConfig:
         router_model_name = config.router_model_name or config.model_name
         return replace(config, router_model_name=router_model_name)
 
-    primary_model = config.model_name
-    if primary_model not in installed_names:
-        ranked = sorted(installed_names, key=_model_preference_rank)
-        primary_model = ranked[0]
+    primary_model = _select_primary_model(
+        preferred_model=config.model_name,
+        installed_names=installed_names,
+    )
 
     router_model = _select_router_model(
         preferred_router=config.router_model_name,
@@ -909,6 +910,90 @@ def _merge_model_candidates(preferred_model: str, installed_models: list[dict]) 
     return candidates
 
 
+def _select_primary_model(
+    *,
+    preferred_model: str,
+    installed_names: list[str],
+) -> str:
+    preferred = str(preferred_model or "").strip()
+    if not installed_names:
+        return preferred
+    if preferred and preferred in installed_names:
+        return preferred
+
+    candidates = list(installed_names)
+    if "coder" in preferred.lower():
+        coder_candidates = [name for name in candidates if "coder" in name.lower()]
+        if coder_candidates:
+            candidates = coder_candidates
+
+    preferred_size = _model_size_hint(preferred)
+    if preferred_size is not None:
+        not_larger: list[str] = []
+        larger_candidates_seen = False
+        for name in candidates:
+            candidate_size = _model_size_hint(name)
+            if candidate_size is None:
+                continue
+            if candidate_size <= preferred_size:
+                not_larger.append(name)
+                continue
+            larger_candidates_seen = True
+        if not_larger:
+            candidates = not_larger
+        elif larger_candidates_seen and preferred:
+            return preferred
+
+    ranked = sorted(
+        candidates,
+        key=lambda name: _primary_model_fallback_rank(
+            preferred_model=preferred,
+            candidate=name,
+        ),
+    )
+    return ranked[0]
+
+
+def _primary_model_fallback_rank(
+    *,
+    preferred_model: str,
+    candidate: str,
+) -> tuple[int, float, int, tuple[int, str]]:
+    preferred = str(preferred_model or "").strip().lower()
+    name = str(candidate or "").strip().lower()
+    preferred_base = preferred.partition(":")[0]
+    candidate_base = name.partition(":")[0]
+    preferred_size = _model_size_hint(preferred_model)
+    candidate_size = _model_size_hint(candidate)
+
+    base_penalty = 0 if preferred_base and candidate_base == preferred_base else 1
+
+    if preferred_size is None or candidate_size is None:
+        size_distance = 999.0
+        larger_penalty = 0
+    else:
+        size_distance = abs(candidate_size - preferred_size)
+        larger_penalty = 1 if candidate_size > preferred_size else 0
+
+    return (
+        base_penalty,
+        size_distance,
+        larger_penalty,
+        _model_preference_rank(candidate),
+    )
+
+
+def _model_size_hint(name: str) -> float | None:
+    lowered = str(name or "").strip().lower()
+    match = re.search(r"(\d+(?:\.\d+)?)b\b", lowered)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 def _model_preference_rank(name: str) -> tuple[int, str]:
     lowered = name.lower()
     if "coder" in lowered and "qwen3" in lowered:
@@ -928,19 +1013,41 @@ def _select_router_model(
 ) -> str:
     if preferred_router and preferred_router in installed_names:
         return preferred_router
-    if "qwen2.5-coder:14b" in installed_names:
-        return "qwen2.5-coder:14b"
+    candidates = list(installed_names)
+    if not candidates:
+        return preferred_router or primary_model
+
+    primary_size = _model_size_hint(primary_model)
+    if primary_size is not None:
+        not_larger = [
+            name
+            for name in candidates
+            if (candidate_size := _model_size_hint(name)) is not None and candidate_size <= primary_size
+        ]
+        if not_larger:
+            candidates = not_larger
+        else:
+            return preferred_router or primary_model
+
+    coder_candidates = [name for name in candidates if "coder" in name.lower()]
+    if coder_candidates:
+        candidates = coder_candidates
+
     coder_ranked = sorted(
-        installed_names,
+        candidates,
         key=_router_model_preference_rank,
     )
     if coder_ranked:
         return coder_ranked[0]
-    return primary_model
+    return preferred_router or primary_model
 
 
-def _router_model_preference_rank(name: str) -> tuple[int, int, str]:
+def _router_model_preference_rank(name: str) -> tuple[int, float, str]:
     lowered = name.lower()
-    is_coder = 0 if "coder" in lowered else 1
-    is_smallish = 0 if "14b" in lowered or "7b" in lowered or "8b" in lowered else 1
-    return (is_coder, is_smallish, lowered)
+    family_penalty = _model_preference_rank(name)[0]
+    size = _model_size_hint(name)
+    return (
+        family_penalty,
+        size if size is not None else 999.0,
+        lowered,
+    )

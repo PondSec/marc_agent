@@ -99,6 +99,8 @@ class FailureAnalyzer:
             for match in pattern.finditer(text):
                 raw_path = match.group("path")
                 raw_line = match.groupdict().get("line")
+                if raw_line and raw_line.isdigit():
+                    line_hints.append(int(raw_line))
                 if not raw_path:
                     continue
                 display = self._normalize_path(raw_path)
@@ -107,8 +109,6 @@ class FailureAnalyzer:
                 if display not in seen_files:
                     seen_files.add(display)
                     file_hints.append(display)
-                if raw_line and raw_line.isdigit():
-                    line_hints.append(int(raw_line))
         return file_hints[:10], line_hints[:20]
 
     def _normalize_path(self, raw_path: str) -> str | None:
@@ -119,8 +119,25 @@ class FailureAnalyzer:
         candidate = path if path.is_absolute() else self.workspace.root / path
         resolved = candidate.expanduser().resolve(strict=False)
         if not self.workspace.is_within_root(resolved):
-            return None
+            return self._workspace_suffix_match(path)
         return self.workspace.display_path(resolved)
+
+    def _workspace_suffix_match(self, path: Path) -> str | None:
+        if not path.is_absolute():
+            return None
+        parts = [part for part in path.parts if part and part != path.anchor]
+        for start in range(len(parts)):
+            suffix_parts = parts[start:]
+            if len(suffix_parts) < 2:
+                continue
+            candidate = (self.workspace.root / Path(*suffix_parts)).resolve(strict=False)
+            if candidate.exists() and candidate.is_file() and self.workspace.is_within_root(candidate):
+                return self.workspace.display_path(candidate)
+        if parts:
+            candidate = (self.workspace.root / parts[-1]).resolve(strict=False)
+            if candidate.exists() and candidate.is_file() and self.workspace.is_within_root(candidate):
+                return self.workspace.display_path(candidate)
+        return None
 
     def _action_hints(self, category: str, command: str, *, text: str = "") -> list[str]:
         hints = {
