@@ -368,7 +368,7 @@ class TaskManager:
             raise WorkspaceNotFoundError("Workspace not found.")
 
         manager = WorkspaceManager(workspace.path)
-        display_paths = [manager.display_path(path) for path in manager.iter_files(max_results=2_000)]
+        display_paths = [manager.display_path(path) for path in manager.iter_files(max_results=10_000)]
         html_entry = self._pick_html_preview_entry(display_paths)
         if html_entry is not None:
             return WorkspacePreviewTarget(
@@ -889,7 +889,11 @@ class TaskManager:
         updates: dict[str, Any] = {}
 
         if session.status == "failed" and session.final_response and not session.blockers:
-            if session.validation_status not in {"failed", "blocked"} and not session.stop_requested:
+            if (
+                session.validation_status not in {"failed", "blocked"}
+                and not session.stop_requested
+                and not session.stop_reason
+            ):
                 updates["status"] = "completed"
 
         if session.status in {"queued", "running"}:

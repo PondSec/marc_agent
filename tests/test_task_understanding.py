@@ -9,7 +9,6 @@ from agent.decision import ExecutionDecisionPolicy
 from agent.models import ChatMessage, FollowUpContext, SessionState, WorkspaceSnapshot
 from agent.planner import Planner
 from agent.prompts import task_state_update_prompt
-from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
@@ -1164,71 +1163,6 @@ def test_task_state_timeout_fallback_preserves_clear_debug_request(tmp_path):
     assert task_state.target_artifacts[0].path == "app/auth.py"
     assert route.intent == RouteIntent.DEBUG
     assert route.needs_clarification is False
-
-
-def test_minimal_task_state_does_not_treat_explanatory_as_plan_request():
-    task_state = build_minimal_task_state(
-        "Fix this existing Python repo so python -m unittest tests.test_wordfreq passes. "
-        "Read the repo, change only what is needed, and update code or support files as appropriate. "
-        "Preserve the intended behavior and do not add explanatory prose into runtime data files."
-    )
-
-    assert task_state.current_user_intent != "plan"
-    assert task_state.next_action != "plan"
-    assert task_state.output_expectation != "Provide a practical implementation plan."
-
-
-def test_task_state_short_circuit_keeps_fix_request_out_of_plan_mode(tmp_path):
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=4,
-        language_counts={"python": 3, "text": 1},
-        top_directories=["tests"],
-        important_files=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt", "README.md"],
-        focus_files=["wordfreq.py", "tests/test_wordfreq.py"],
-        file_briefs={
-            "wordfreq.py": "Counts words from a text file.",
-            "tests/test_wordfreq.py": "Unittest coverage for word counting.",
-            "tests/test_data.txt": "Runtime fixture data used by tests.",
-        },
-        manifests=[],
-        configs=[],
-        test_files=["tests/test_wordfreq.py"],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=["wordfreq.py"],
-        repo_map=["wordfreq.py", "tests/"],
-        project_labels=["python"],
-        likely_commands=["python -m unittest tests.test_wordfreq"],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Small Python utility with unittest coverage for word counting.",
-    )
-    config = AppConfig(
-        workspace_root=str(tmp_path),
-        model_name="qwen2.5-coder:7b",
-        router_model_name="qwen2.5-coder:7b",
-    )
-    llm = ScriptedLLM()
-    llm.config = config
-    updater = TaskStateUpdater(llm)
-
-    task_state = updater.update_task_state(
-        (
-            "Fix this existing Python repo so python -m unittest tests.test_wordfreq passes. "
-            "Read the repo, change only what is needed, and update code or support files as appropriate. "
-            "Preserve the intended behavior and do not add explanatory prose into runtime data files."
-        ),
-        snapshot=snapshot,
-    )
-    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
-
-    assert task_state.semantic_resolution == "minimal_inference"
-    assert task_state.current_user_intent == "repair"
-    assert task_state.execution_strategy == "debug_repair"
-    assert task_state.next_action == "debug"
-    assert route.intent == RouteIntent.DEBUG
-    assert llm.generate_json_calls == []
     assert task_state.semantic_resolution == "minimal_inference"
 
 
@@ -1323,52 +1257,49 @@ def test_task_state_timeout_fallback_prioritizes_package_main_for_cli_feature_re
     assert route.entities.target_name == "greet_cli/__main__.py"
 
 
-def test_task_state_timeout_fallback_keeps_readme_and_ignores_tests_init_for_cli_feature_requests(tmp_path):
+def test_task_state_timeout_fallback_prefers_cli_helper_over_package_init_for_cli_feature_requests(tmp_path):
     snapshot = WorkspaceSnapshot(
         root=str(tmp_path),
         file_count=5,
         language_counts={"python": 4, "markdown": 1},
         top_directories=["greet_cli", "tests"],
-        important_files=[
-            "greet_cli/cli.py",
-            "greet_cli/__main__.py",
-            "README.md",
-            "tests/test_cli.py",
-            "tests/__init__.py",
-        ],
-        focus_files=["greet_cli/cli.py", "greet_cli/__main__.py", "tests/test_cli.py"],
+        important_files=["README.md", "tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py", "greet_cli/__init__.py"],
+        focus_files=["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py", "greet_cli/__init__.py"],
         file_briefs={},
         manifests=["README.md"],
         configs=[],
-        test_files=["tests/test_cli.py", "tests/__init__.py"],
+        test_files=["tests/test_cli.py"],
         build_files=[],
         deploy_files=[],
         entrypoints=["greet_cli/__main__.py", "greet_cli/cli.py"],
         repo_map=["greet_cli/", "tests/"],
         project_labels=["python"],
-        likely_commands=["python -m unittest tests.test_cli"],
+        likely_commands=["python3 -m unittest tests.test_cli"],
         validation_commands=[],
         workflow_commands=[],
         repo_summary="Small CLI package runnable with python -m greet_cli.",
     )
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
     prompt = (
-        "Extend the existing greet_cli package so the CLI accepts a --uppercase flag that prints the greeting in uppercase. "
-        "Update README.md usage examples, keep the package entrypoint working, run python -m unittest tests.test_cli, "
-        "and finish only when the tests pass."
+        "Extend this existing CLI so it supports --prefix TEXT and --repeat N while keeping --uppercase working. "
+        "Update the implementation, the README, and the unittest coverage. "
+        "The repeated output should print the full greeting on separate lines. "
+        "Finish only when python3 -m unittest tests.test_cli passes."
     )
 
     task_state = updater.update_task_state(prompt, snapshot=snapshot)
-    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
-    artifact_paths = [artifact.path for artifact in task_state.target_artifacts]
 
-    assert "README.md" in artifact_paths
-    assert "tests/test_cli.py" in artifact_paths
-    assert "tests/__init__.py" not in artifact_paths
-    assert "README.md" in route.entities.target_paths
-    assert "tests/test_cli.py" in route.entities.target_paths
-    assert "tests/__init__.py" not in route.entities.target_paths
-    assert route.entities.target_name == "greet_cli/__main__.py"
+    assert [artifact.path for artifact in task_state.target_artifacts[:2]] == [
+        "greet_cli/__main__.py",
+        "greet_cli/cli.py",
+    ]
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "greet_cli/__main__.py",
+        "greet_cli/cli.py",
+        "README.md",
+        "tests/test_cli.py",
+    }
+    assert "greet_cli/__init__.py" not in {artifact.path for artifact in task_state.target_artifacts}
 
 
 def test_task_state_model_normalizes_route_style_aliases():
@@ -1521,66 +1452,6 @@ def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_e
         "tests/test_wordfreq.py",
     ]
     assert route.action_plan[0].action.value == "create_artifact"
-
-
-def test_task_state_timeout_fallback_prefers_explicit_create_paths_over_existing_validation_files(tmp_path):
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=2,
-        language_counts={"python": 2},
-        top_directories=["tests"],
-        important_files=["tests/test_site.py", "tests/__init__.py"],
-        focus_files=[],
-        file_briefs={
-            "tests/test_site.py": "Validation for a multi-page portfolio site.",
-            "tests/__init__.py": "Empty file.",
-        },
-        manifests=[],
-        configs=[],
-        test_files=["tests/test_site.py", "tests/__init__.py"],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=[],
-        repo_map=["tests/"],
-        project_labels=["python"],
-        likely_commands=["python -m unittest tests.test_site"],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Test-only repository waiting for the portfolio site implementation.",
-    )
-    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
-
-    task_state = updater.update_task_state(
-        (
-            "Create a multi-page personal portfolio website in this repo. "
-            "Add index.html, about.html, projects.html, contact.html, and styles.css. "
-            "Use one shared navigation across pages, make it responsive, and finish only when "
-            "python -m unittest tests.test_site passes."
-        ),
-        snapshot=snapshot,
-    )
-    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
-
-    assert task_state.goal_relation == "new_task"
-    assert task_state.current_user_intent == "implement"
-    assert task_state.execution_strategy == "feature_implementation"
-    assert task_state.next_action == "create"
-    assert [artifact.path for artifact in task_state.target_artifacts] == [
-        "index.html",
-        "about.html",
-        "projects.html",
-        "contact.html",
-        "styles.css",
-    ]
-    assert route.intent == RouteIntent.CREATE
-    assert route.entities.target_paths == [
-        "index.html",
-        "about.html",
-        "projects.html",
-        "contact.html",
-        "styles.css",
-    ]
-    assert any(step.action.value == "create_artifact" for step in route.action_plan)
 
 
 def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):

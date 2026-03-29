@@ -944,6 +944,14 @@ def _is_non_actionable_test_support_path(path: str) -> bool:
     return Path(normalized).name.lower() == "__init__.py" and "/tests/" in f"/{normalized.lower()}"
 
 
+def _is_package_init_path(path: str) -> bool:
+    text = str(path or "").strip()
+    if not text:
+        return False
+    normalized = text.replace("\\", "/")
+    return Path(normalized).name.lower() == "__init__.py" and "/tests/" not in f"/{normalized.lower()}"
+
+
 def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
     if snapshot is None:
         return []
@@ -1011,6 +1019,8 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
             return (-1, path)
         if path in entrypoints:
             return (0, path)
+        if _is_package_init_path(path) and path not in explicit_request_paths:
+            return (1, path)
         if path in manifests or suffix in {".md", ".rst", ".txt"}:
             return (1, path)
         if path in test_files or "/tests/" in f"/{path}":

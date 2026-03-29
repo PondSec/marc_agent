@@ -1848,13 +1848,17 @@ class Planner:
             ]
             if part
         ).lower()
-        return any(
+        failure_indicates_support_or_fixture_issue = any(
             marker in failure_text
             for marker in (
                 "filenotfounderror",
                 "no such file or directory",
-                "assertionerror",
-                "self.assertequal",
+                "fixture",
+                "sample data",
+                "sample text",
+                "raw fixture",
+                "test data",
+                "test_data",
             )
         )
         if not failure_indicates_support_or_fixture_issue:
@@ -2430,15 +2434,16 @@ class Planner:
                 deferred.add(path)
         return deferred
 
+    def _active_deferred_update_targets(self, session: SessionState) -> set[str]:
+        if session.active_repair_context is not None:
+            return set()
+        return self._deferred_update_targets(session)
+
     def _next_update_target(self, route: RouterOutput, session: SessionState) -> str | None:
         explicit_targets = self._explicit_target_paths(route, session)
         if explicit_targets:
             changed_paths = {item.path for item in session.changed_files}
-            deferred_targets = (
-                self._deferred_update_targets(session)
-                if session.changed_files and session.active_repair_context is None
-                else set()
-            )
+            deferred_targets = self._active_deferred_update_targets(session)
             for candidate in explicit_targets:
                 if candidate in deferred_targets:
                     continue
@@ -2454,11 +2459,7 @@ class Planner:
         if len(explicit_targets) <= 1:
             return False
         changed_paths = {item.path for item in session.changed_files}
-        deferred_targets = (
-            self._deferred_update_targets(session)
-            if session.changed_files and session.active_repair_context is None
-            else set()
-        )
+        deferred_targets = self._active_deferred_update_targets(session)
         return any(
             candidate not in changed_paths and candidate not in deferred_targets
             for candidate in explicit_targets
@@ -3102,12 +3103,47 @@ class Planner:
             prompt=prompt,
             current_content=current_content,
         )
-        attempts = self._content_generation_recovery_attempts(issue)
-        if not attempts:
-            return GenerationRetryResult()
-
+        retained_progress_issue = issue if issue.failed_after_progress and issue.partial_text else None
+        attempted_recovery_keys: set[tuple[str, str, str | None]] = set()
+        forced_follow_up: GenerationRecoveryAttempt | None = None
+        used_resume_retry_after_no_start = False
         retry_attempts: list[ExecutionAttemptRecord] = []
-        for attempt in attempts:
+        while True:
+            attempt: GenerationRecoveryAttempt | None = None
+            if forced_follow_up is not None:
+                forced_key = (
+                    forced_follow_up.strategy,
+                    forced_follow_up.prompt_kind,
+                    forced_follow_up.model_name,
+                )
+                if forced_key not in attempted_recovery_keys:
+                    attempt = forced_follow_up
+                forced_follow_up = None
+            if attempt is None:
+                attempts = [
+                    candidate
+                    for candidate in self._content_generation_recovery_attempts(issue)
+                    if (
+                        candidate.strategy,
+                        candidate.prompt_kind,
+                        candidate.model_name,
+                    )
+                    not in attempted_recovery_keys
+                ]
+                if not attempts:
+                    break
+                attempt = attempts[0]
+
+            attempted_recovery_keys.add(
+                (
+                    attempt.strategy,
+                    attempt.prompt_kind,
+                    attempt.model_name,
+                )
+            )
+            effective_partial_text = issue.partial_text
+            if not effective_partial_text and attempt.prompt_kind == "resume" and retained_progress_issue is not None:
+                effective_partial_text = retained_progress_issue.partial_text
             retry_prompt = self._content_generation_prompt_for_attempt(
                 attempt,
                 route,
@@ -3115,7 +3151,7 @@ class Planner:
                 path=path,
                 current_content=current_content,
                 prompt=prompt,
-                partial_text=issue.partial_text,
+                partial_text=effective_partial_text,
                 repair_context=repair_context,
                 repair_strategy=repair_strategy,
             )
@@ -3204,6 +3240,24 @@ class Planner:
                 failure_class=retry_issue.classification if retry_issue is not None else "generation_failed",
                 capability_tier=attempt.capability_tier,
             )
+            if retry_issue is not None and retry_issue.failed_after_progress and retry_issue.partial_text:
+                retained_progress_issue = retry_issue
+            if (
+                retry_issue is not None
+                and retry_issue.no_start_failure
+                and attempt.prompt_kind == "resume"
+                and retained_progress_issue is not None
+                and retained_progress_issue.partial_text
+                and not used_resume_retry_after_no_start
+            ):
+                forced_follow_up = GenerationRecoveryAttempt(
+                    strategy=f"{attempt.strategy}_retry",
+                    prompt_kind="resume",
+                    model_name=attempt.model_name,
+                    capability_tier=attempt.capability_tier,
+                )
+                used_resume_retry_after_no_start = True
+            issue = retry_issue or issue
         return GenerationRetryResult(attempts=retry_attempts)
 
     def _assess_generation_issue(
@@ -5346,6 +5400,18 @@ class Planner:
                 proposed_content=proposed_content,
             )
         if review is None:
+            review = self._entrypoint_helper_contract_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+        if review is None:
+            review = self._cli_wrapper_responsibility_review(
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
+        if review is None:
             review = self._validation_repair_relevance_review(
                 path=path,
                 current_content=current_content,
@@ -6502,6 +6568,125 @@ class Planner:
             ],
         )
 
+    def _entrypoint_helper_contract_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        if Path(path).name != "__main__.py":
+            return None
+
+        try:
+            current_module = ast.parse(str(current_content or ""))
+            proposed_module = ast.parse(str(proposed_content or ""))
+        except SyntaxError:
+            return None
+
+        current_markers = set(self._entrypoint_helper_contract_markers(current_module))
+        proposed_markers = set(self._entrypoint_helper_contract_markers(proposed_module))
+        new_markers = sorted(marker for marker in proposed_markers if marker not in current_markers)
+        if not new_markers:
+            return None
+
+        blocking_issues: list[str] = []
+        for marker_type, attrs in new_markers:
+            attr_text = ", ".join(sorted(attrs)) or "CLI values"
+            if marker_type == "compound_input":
+                blocking_issues.append(
+                    f"The proposal composes helper inputs from CLI values ({attr_text}) inside {path} instead of passing a stable helper contract."
+                )
+            elif marker_type == "wrapped_output":
+                blocking_issues.append(
+                    f"The proposal wraps the helper result with extra CLI-derived formatting ({attr_text}) inside {path}, which moves greeting semantics into the CLI wrapper."
+                )
+
+        if not blocking_issues:
+            return None
+
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed entrypoint update blurs the contract between CLI parsing and helper behavior.",
+            confidence=0.94,
+            blocking_issues=blocking_issues,
+            preservation_risks=[],
+            repair_hints=[
+                "Keep the entrypoint focused on parsing argv, invoking the helper, and printing or repeating the final result.",
+                "Pass parsed values into the helper as direct arguments instead of composing new greeting text around the helper call in __main__.py.",
+            ],
+        )
+
+    def _entrypoint_helper_contract_markers(
+        self,
+        module: ast.AST,
+    ) -> list[tuple[str, tuple[str, ...]]]:
+        parse_arg_bindings = self._entrypoint_parse_arg_bindings(module)
+        if not parse_arg_bindings:
+            return []
+
+        helper_function_names, helper_aliases = self._entrypoint_relative_import_bindings(module)
+        if not helper_function_names and not helper_aliases:
+            return []
+
+        parent_map = self._ast_parent_map(module)
+        markers: list[tuple[str, tuple[str, ...]]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        statement_nodes = (
+            ast.Assign,
+            ast.AnnAssign,
+            ast.AugAssign,
+            ast.Expr,
+            ast.Return,
+            ast.For,
+            ast.AsyncFor,
+            ast.If,
+            ast.While,
+            ast.With,
+            ast.AsyncWith,
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.Module,
+        )
+
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Call):
+                continue
+            if not self._call_matches_helper_binding(
+                node,
+                helper_function_names=helper_function_names,
+                helper_aliases=helper_aliases,
+            ):
+                continue
+
+            helper_attrs: set[str] = set()
+            for arg_node in [*node.args, *(keyword.value for keyword in node.keywords if keyword.value is not None)]:
+                attrs = self._parse_arg_attrs_in_node(arg_node, parse_arg_bindings)
+                helper_attrs.update(attrs)
+                if attrs and not self._is_direct_parse_arg_reference(arg_node, parse_arg_bindings):
+                    marker = ("compound_input", tuple(sorted(attrs)))
+                    if marker not in seen:
+                        seen.add(marker)
+                        markers.append(marker)
+
+            current = node
+            while current in parent_map:
+                parent = parent_map[current]
+                if isinstance(parent, (ast.JoinedStr, ast.BinOp)):
+                    outside_attrs = self._parse_arg_attrs_in_node(parent, parse_arg_bindings) - helper_attrs
+                    if outside_attrs:
+                        marker = ("wrapped_output", tuple(sorted(outside_attrs)))
+                        if marker not in seen:
+                            seen.add(marker)
+                            markers.append(marker)
+                        break
+                if isinstance(parent, statement_nodes):
+                    break
+                current = parent
+        return markers
+
     def _file_contains_cli_launcher_logic(self, lowered_content: str) -> bool:
         text = str(lowered_content or "")
         if not text:
@@ -6538,6 +6723,305 @@ class Planner:
         if helper_stem and f"from .{helper_stem} import" in sibling_excerpt:
             return True
         return sibling_entrypoint in (session.workspace_snapshot.entrypoints if session.workspace_snapshot is not None else [])
+
+    def _cli_wrapper_responsibility_review(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        if Path(path).name == "__main__.py":
+            return None
+
+        sibling_entrypoint = Path(path).with_name("__main__.py").as_posix()
+        sibling_content = (
+            self._current_file_content(session, sibling_entrypoint)
+            or self._current_or_last_read_excerpt(session, path=sibling_entrypoint)
+        )
+        if not sibling_content:
+            return None
+        if not self._file_contains_cli_launcher_logic(str(sibling_content).lower()):
+            return None
+        if not self._request_or_context_targets_package_entrypoint(
+            session,
+            helper_path=path,
+            sibling_entrypoint=sibling_entrypoint,
+        ):
+            return None
+
+        helper_optional_params = self._helper_optional_cli_params(
+            helper_path=path,
+            sibling_content=sibling_content,
+            proposed_content=proposed_content,
+        )
+        if not helper_optional_params:
+            return None
+
+        wrapper_attrs = self._entrypoint_wrapper_cli_attrs(
+            helper_path=path,
+            entrypoint_content=sibling_content,
+        )
+        overlap = sorted(
+            {
+                attr
+                for attr in helper_optional_params.intersection(wrapper_attrs)
+                if attr not in {"name", "names", "argv", "args"}
+            }
+        )
+        if not overlap:
+            return None
+
+        overlap_text = ", ".join(overlap[:4])
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed helper update duplicates CLI wrapper responsibilities that are still handled in the package entrypoint.",
+            confidence=0.93,
+            blocking_issues=[
+                (
+                    f"The proposal adds helper parameters for {overlap_text} in {path} while "
+                    f"{sibling_entrypoint} still applies the same CLI options around the helper result."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                (
+                    "Keep one clear contract boundary: either let the helper own those options and "
+                    "remove the outer wrapper transformations, or keep the helper focused on the base value."
+                ),
+                (
+                    f"Use the current {sibling_entrypoint} logic as the cross-file contract and avoid "
+                    "making the helper and entrypoint apply the same flag twice."
+                ),
+            ],
+        )
+
+    def _helper_optional_cli_params(
+        self,
+        *,
+        helper_path: str,
+        sibling_content: str,
+        proposed_content: str,
+    ) -> set[str]:
+        try:
+            sibling_module = ast.parse(str(sibling_content or ""))
+            proposed_module = ast.parse(str(proposed_content or ""))
+        except SyntaxError:
+            return set()
+
+        helper_function_names, _ = self._helper_import_bindings(
+            sibling_module,
+            helper_path=helper_path,
+        )
+        optional_params: set[str] = set()
+        for node in proposed_module.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if helper_function_names and node.name not in helper_function_names:
+                continue
+            positional = [
+                arg.arg
+                for arg in [*node.args.posonlyargs, *node.args.args]
+                if str(arg.arg or "").strip() not in {"self", "cls"}
+            ]
+            optional_params.update(item for item in positional[1:] if str(item or "").strip())
+            optional_params.update(
+                arg.arg
+                for arg in node.args.kwonlyargs
+                if str(arg.arg or "").strip() not in {"self", "cls"}
+            )
+
+        if optional_params or helper_function_names:
+            return optional_params
+
+        for node in proposed_module.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name.startswith("_"):
+                continue
+            positional = [
+                arg.arg
+                for arg in [*node.args.posonlyargs, *node.args.args]
+                if str(arg.arg or "").strip() not in {"self", "cls"}
+            ]
+            optional_params.update(item for item in positional[1:] if str(item or "").strip())
+            optional_params.update(
+                arg.arg
+                for arg in node.args.kwonlyargs
+                if str(arg.arg or "").strip() not in {"self", "cls"}
+            )
+        return optional_params
+
+    def _helper_import_bindings(
+        self,
+        sibling_module: ast.AST,
+        *,
+        helper_path: str,
+    ) -> tuple[set[str], set[str]]:
+        helper_stem = Path(helper_path).stem
+        imported_function_names: set[str] = set()
+        helper_aliases: set[str] = set()
+        for node in ast.walk(sibling_module):
+            if isinstance(node, ast.ImportFrom):
+                module_name = str(node.module or "").split(".")[-1]
+                if module_name != helper_stem:
+                    continue
+                for alias in node.names:
+                    imported_function_names.add(alias.name)
+                    helper_aliases.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = str(alias.name or "").split(".")[-1]
+                    if module_name != helper_stem:
+                        continue
+                    helper_aliases.add(alias.asname or module_name)
+        return imported_function_names, helper_aliases
+
+    def _entrypoint_relative_import_bindings(
+        self,
+        module: ast.AST,
+    ) -> tuple[set[str], set[str]]:
+        helper_function_names: set[str] = set()
+        helper_aliases: set[str] = set()
+        for node in ast.walk(module):
+            if isinstance(node, ast.ImportFrom):
+                if int(node.level or 0) < 1:
+                    continue
+                for alias in node.names:
+                    helper_function_names.add(alias.name)
+                    helper_aliases.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = str(alias.name or "").strip()
+                    if "." not in module_name:
+                        continue
+                    helper_aliases.add(alias.asname or module_name.split(".")[-1])
+        return helper_function_names, helper_aliases
+
+    def _entrypoint_parse_arg_bindings(
+        self,
+        module: ast.AST,
+    ) -> set[str]:
+        bindings: set[str] = set()
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not isinstance(node.value, ast.Call):
+                continue
+            func = node.value.func
+            if not isinstance(func, ast.Attribute) or func.attr not in {"parse_args", "parse_known_args"}:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bindings.add(target.id)
+                elif isinstance(target, ast.Tuple) and target.elts and isinstance(target.elts[0], ast.Name):
+                    bindings.add(target.elts[0].id)
+        return bindings
+
+    def _ast_parent_map(self, module: ast.AST) -> dict[ast.AST, ast.AST]:
+        parent_map: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(module):
+            for child in ast.iter_child_nodes(node):
+                parent_map[child] = node
+        return parent_map
+
+    def _call_matches_helper_binding(
+        self,
+        node: ast.Call,
+        *,
+        helper_function_names: set[str],
+        helper_aliases: set[str],
+    ) -> bool:
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id in helper_function_names or func.id in helper_aliases
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            return func.value.id in helper_aliases
+        return False
+
+    def _parse_arg_attrs_in_node(
+        self,
+        node: ast.AST,
+        parse_arg_bindings: set[str],
+    ) -> set[str]:
+        attrs: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Attribute):
+                continue
+            if not isinstance(child.value, ast.Name):
+                continue
+            if child.value.id not in parse_arg_bindings:
+                continue
+            attrs.add(str(child.attr or "").strip())
+        return {item for item in attrs if item}
+
+    def _is_direct_parse_arg_reference(
+        self,
+        node: ast.AST,
+        parse_arg_bindings: set[str],
+    ) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in parse_arg_bindings
+            and bool(str(node.attr or "").strip())
+        )
+
+    def _entrypoint_wrapper_cli_attrs(
+        self,
+        *,
+        helper_path: str,
+        entrypoint_content: str,
+    ) -> set[str]:
+        try:
+            module = ast.parse(str(entrypoint_content or ""))
+        except SyntaxError:
+            return set()
+
+        helper_function_names, helper_aliases = self._helper_import_bindings(
+            module,
+            helper_path=helper_path,
+        )
+        parent_map = self._ast_parent_map(module)
+        parse_arg_bindings = self._entrypoint_parse_arg_bindings(module)
+
+        def in_parse_args_call(node: ast.AST) -> bool:
+            current = node
+            while current in parent_map:
+                current = parent_map[current]
+                if not isinstance(current, ast.Call):
+                    continue
+                func = current.func
+                return isinstance(func, ast.Attribute) and func.attr in {"parse_args", "parse_known_args"}
+            return False
+
+        def in_helper_call_arg(node: ast.AST) -> bool:
+            current = node
+            while current in parent_map:
+                current = parent_map[current]
+                if not isinstance(current, ast.Call):
+                    continue
+                return self._call_matches_helper_binding(
+                    current,
+                    helper_function_names=helper_function_names,
+                    helper_aliases=helper_aliases,
+                )
+            return False
+
+        attrs: set[str] = set()
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if not isinstance(node.value, ast.Name):
+                continue
+            if node.value.id not in parse_arg_bindings:
+                continue
+            if in_parse_args_call(node) or in_helper_call_arg(node):
+                continue
+            attrs.add(str(node.attr or "").strip())
+        return {item for item in attrs if item}
 
     def _argv_launcher_runtime_review(
         self,

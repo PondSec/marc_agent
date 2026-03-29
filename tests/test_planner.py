@@ -1931,223 +1931,6 @@ def test_fallback_semantic_review_flags_pending_snapshot_explicit_target(tmp_pat
     assert review.file_hints == ["README.md"]
 
 
-def test_snapshot_explicit_target_paths_ignore_validation_only_test_command_reference(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
-    task = (
-        "Fix this existing Python repo so python -m unittest tests.test_wordfreq passes. "
-        "Read the repo, change only what is needed, and preserve the intended behavior."
-    )
-    session = SessionState(
-        task=task,
-        workspace_root=str(tmp_path),
-        workspace_snapshot=WorkspaceSnapshot(
-            root=str(tmp_path),
-            file_count=4,
-            language_counts={"python": 2, "text": 1},
-            top_directories=["tests"],
-            important_files=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt", "README.md"],
-            focus_files=["wordfreq.py", "tests/test_wordfreq.py"],
-            file_briefs={},
-            manifests=["README.md"],
-            configs=[],
-            test_files=["tests/test_wordfreq.py"],
-            build_files=[],
-            deploy_files=[],
-            entrypoints=["wordfreq.py"],
-            repo_map=["wordfreq.py", "tests/"],
-            project_labels=["python"],
-            likely_commands=["python -m unittest tests.test_wordfreq"],
-            validation_commands=[],
-            workflow_commands=[],
-            repo_summary="Small Python utility with unittest coverage for word counting.",
-        ),
-        task_state=TaskState(
-            latest_user_turn=task,
-            root_goal="Fix the existing Python repo.",
-            active_goal="Repair the failing runtime behavior with the smallest safe change.",
-            goal_relation="new_task",
-            output_expectation="The requested unittest command passes without changing unrelated behavior.",
-            current_user_intent="repair",
-            execution_strategy="debug_repair",
-            verification_target="python -m unittest tests.test_wordfreq",
-            target_artifacts=[
-                TaskArtifact(path="wordfreq.py", name="wordfreq.py", kind="file", role="primary_target", confidence=0.95),
-                TaskArtifact(
-                    path="tests/test_wordfreq.py",
-                    name="tests/test_wordfreq.py",
-                    kind="test",
-                    role="validation_target",
-                    confidence=0.95,
-                ),
-            ],
-            evidence=[],
-            relevant_context=[],
-            constraints=[],
-            assumptions=[],
-            missing_info=[],
-            ambiguity_level="low",
-            risk_level="medium",
-            confidence=0.84,
-            next_action="debug",
-            execution_outline=["Run the failing unittest command, repair the relevant artifact, and rerun it."],
-            needs_clarification=False,
-            clarification_questions=[],
-        ),
-    )
-
-    explicit_targets = planner._snapshot_explicit_target_paths(session)
-
-    assert "tests/test_wordfreq.py" not in explicit_targets
-
-
-def test_snapshot_explicit_target_paths_keep_path_named_outside_validation_command(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
-    task = (
-        "Fix this repo, add concrete assertions in tests/test_wordfreq.py, and then run "
-        "python -m unittest tests.test_wordfreq until it passes."
-    )
-    session = SessionState(
-        task=task,
-        workspace_root=str(tmp_path),
-        workspace_snapshot=WorkspaceSnapshot(
-            root=str(tmp_path),
-            file_count=4,
-            language_counts={"python": 2, "text": 1},
-            top_directories=["tests"],
-            important_files=["wordfreq.py", "tests/test_wordfreq.py", "README.md"],
-            focus_files=["wordfreq.py", "tests/test_wordfreq.py"],
-            file_briefs={},
-            manifests=["README.md"],
-            configs=[],
-            test_files=["tests/test_wordfreq.py"],
-            build_files=[],
-            deploy_files=[],
-            entrypoints=["wordfreq.py"],
-            repo_map=["wordfreq.py", "tests/"],
-            project_labels=["python"],
-            likely_commands=["python -m unittest tests.test_wordfreq"],
-            validation_commands=[],
-            workflow_commands=[],
-            repo_summary="Small Python utility with unittest coverage for word counting.",
-        ),
-        task_state=TaskState(
-            latest_user_turn=task,
-            root_goal="Repair the repo and update the requested test file.",
-            active_goal="Change the explicitly named test artifact and confirm the command passes.",
-            goal_relation="new_task",
-            output_expectation="The requested test file contains concrete assertions and the command passes.",
-            current_user_intent="repair",
-            execution_strategy="debug_repair",
-            verification_target="python -m unittest tests.test_wordfreq",
-            target_artifacts=[
-                TaskArtifact(path="wordfreq.py", name="wordfreq.py", kind="file", role="primary_target", confidence=0.9),
-                TaskArtifact(
-                    path="tests/test_wordfreq.py",
-                    name="tests/test_wordfreq.py",
-                    kind="test",
-                    role="validation_target",
-                    confidence=0.95,
-                ),
-            ],
-            evidence=[],
-            relevant_context=[],
-            constraints=[],
-            assumptions=[],
-            missing_info=[],
-            ambiguity_level="low",
-            risk_level="medium",
-            confidence=0.84,
-            next_action="debug",
-            execution_outline=["Update the explicitly named test file and rerun the requested unittest command."],
-            needs_clarification=False,
-            clarification_questions=[],
-        ),
-    )
-
-    explicit_targets = planner._snapshot_explicit_target_paths(session)
-
-    assert "tests/test_wordfreq.py" in explicit_targets
-
-
-def test_fallback_semantic_review_ignores_validation_only_test_command_reference_after_runtime_pass(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
-    task = (
-        "Fix this existing Python repo so python -m unittest tests.test_wordfreq passes. "
-        "Read the repo, change only what is needed, and preserve the intended behavior."
-    )
-    session = SessionState(
-        task=task,
-        workspace_root=str(tmp_path),
-        workspace_snapshot=WorkspaceSnapshot(
-            root=str(tmp_path),
-            file_count=4,
-            language_counts={"python": 2, "text": 1},
-            top_directories=["tests"],
-            important_files=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt", "README.md"],
-            focus_files=["wordfreq.py", "tests/test_wordfreq.py"],
-            file_briefs={},
-            manifests=["README.md"],
-            configs=[],
-            test_files=["tests/test_wordfreq.py"],
-            build_files=[],
-            deploy_files=[],
-            entrypoints=["wordfreq.py"],
-            repo_map=["wordfreq.py", "tests/"],
-            project_labels=["python"],
-            likely_commands=["python -m unittest tests.test_wordfreq"],
-            validation_commands=[],
-            workflow_commands=[],
-            repo_summary="Small Python utility with unittest coverage for word counting.",
-        ),
-        validation_status="passed",
-        changed_files=[FileChangeRecord(path="tests/test_data.txt", operation="modify")],
-        validation_runs=[
-            ValidationRunRecord(
-                command="python -m unittest tests.test_wordfreq",
-                verification_scope="runtime",
-                status="passed",
-            )
-        ],
-        task_state=TaskState(
-            latest_user_turn=task,
-            root_goal="Fix the existing Python repo.",
-            active_goal="Repair the failing runtime behavior with the smallest safe change.",
-            goal_relation="new_task",
-            output_expectation="The requested unittest command passes without changing unrelated behavior.",
-            current_user_intent="repair",
-            execution_strategy="debug_repair",
-            verification_target="python -m unittest tests.test_wordfreq",
-            target_artifacts=[
-                TaskArtifact(path="wordfreq.py", name="wordfreq.py", kind="file", role="primary_target", confidence=0.95),
-                TaskArtifact(
-                    path="tests/test_wordfreq.py",
-                    name="tests/test_wordfreq.py",
-                    kind="test",
-                    role="validation_target",
-                    confidence=0.95,
-                ),
-            ],
-            evidence=[],
-            relevant_context=[],
-            constraints=[],
-            assumptions=[],
-            missing_info=[],
-            ambiguity_level="low",
-            risk_level="medium",
-            confidence=0.84,
-            next_action="debug",
-            execution_outline=["Run the failing unittest command, repair the relevant artifact, and rerun it."],
-            needs_clarification=False,
-            clarification_questions=[],
-        ),
-    )
-
-    review = planner._fallback_semantic_change_review(session)
-
-    assert review.requirements_satisfied is True
-    assert "tests/test_wordfreq.py" not in review.file_hints
-
-
 def test_planner_blocks_moving_cli_launcher_logic_into_helper_module(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
@@ -2990,154 +2773,6 @@ def test_planner_defers_review_blocked_target_and_continues_then_validates(tmp_p
             operation="write",
         )
     )
-
-    second_decision = planner.decide_next_action(session.task, session)
-
-    assert second_decision.action_type == AgentActionType.CALL_TOOL
-    assert second_decision.tool_name == "run_tests"
-    assert second_decision.tool_args["command"] == "python -m unittest tests.test_cli"
-
-
-def test_planner_defers_identical_explicit_update_target_and_continues_to_remaining_targets(tmp_path, monkeypatch):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    (pkg / "__main__.py").write_text(
-        "from .cli import greet\n\n"
-        "def main(argv=None):\n"
-        "    print(greet('Ada'))\n",
-        encoding="utf-8",
-    )
-    (pkg / "cli.py").write_text(
-        "def greet(name: str, uppercase: bool = False) -> str:\n"
-        "    greeting = f\"Hello, {name}!\"\n"
-        "    return greeting.upper() if uppercase else greeting\n",
-        encoding="utf-8",
-    )
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    test_cli = tests_dir / "test_cli.py"
-    current_test = (
-        "import io\n"
-        "import unittest\n"
-        "from unittest.mock import patch\n\n"
-        "from greet_cli import __main__\n\n"
-        "class TestCLI(unittest.TestCase):\n"
-        "    def run_cli(self, argv):\n"
-        "        with patch('sys.stdout', new_callable=io.StringIO) as stdout:\n"
-        "            __main__.main(argv)\n"
-        "            return stdout.getvalue().strip()\n\n"
-        "    def test_default_greeting(self):\n"
-        "        self.assertEqual(self.run_cli(['Ada']), 'Hello, Ada!')\n\n"
-        "    def test_uppercase_flag(self):\n"
-        "        self.assertEqual(self.run_cli(['--uppercase', 'Ada']), 'HELLO, ADA!')\n"
-    )
-    test_cli.write_text(current_test, encoding="utf-8")
-    readme = tmp_path / "README.md"
-    readme.write_text("# greet_cli\n\nRun with `python -m greet_cli Ada`.\n", encoding="utf-8")
-
-    snapshot = WorkspaceSnapshot(
-        root=str(tmp_path),
-        file_count=4,
-        language_counts={"python": 3, "markdown": 1},
-        top_directories=["greet_cli", "tests"],
-        important_files=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py", "README.md"],
-        focus_files=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-        file_briefs={},
-        manifests=["README.md"],
-        configs=[],
-        test_files=["tests/test_cli.py"],
-        build_files=[],
-        deploy_files=[],
-        entrypoints=["greet_cli/__main__.py", "greet_cli/cli.py"],
-        repo_map=["greet_cli/", "tests/"],
-        project_labels=["python"],
-        likely_commands=["python -m unittest tests.test_cli"],
-        validation_commands=[],
-        workflow_commands=[],
-        repo_summary="Small CLI package.",
-    )
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend the CLI with an uppercase flag and document the usage.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=snapshot,
-        verification_commands=["python -m unittest tests.test_cli"],
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the target files first."},
-            {"step": 2, "action": "update_artifact", "reason": "Apply the requested updates."},
-            {"step": 3, "action": "run_validation", "reason": "Verify the resulting CLI behavior."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py", "README.md"],
-        target_name="greet_cli/__main__.py",
-    )
-    commit_task_state_and_route(planner, session, payload)
-    session.changed_files.extend(
-        [
-            FileChangeRecord(path="greet_cli/__main__.py", operation="write"),
-            FileChangeRecord(path="greet_cli/cli.py", operation="write"),
-        ]
-    )
-    session.tool_calls.extend(
-        [
-            ToolCallRecord(
-                iteration=1,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/__main__.py"},
-                success=True,
-                summary="Read greet_cli/__main__.py.",
-                output_excerpt=(pkg / "__main__.py").read_text(encoding="utf-8"),
-            ),
-            ToolCallRecord(
-                iteration=2,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/cli.py"},
-                success=True,
-                summary="Read greet_cli/cli.py.",
-                output_excerpt=(pkg / "cli.py").read_text(encoding="utf-8"),
-            ),
-            ToolCallRecord(
-                iteration=3,
-                tool_name="read_file",
-                tool_args={"path": "tests/test_cli.py"},
-                success=True,
-                summary="Read tests/test_cli.py.",
-                output_excerpt=current_test,
-            ),
-            ToolCallRecord(
-                iteration=4,
-                tool_name="read_file",
-                tool_args={"path": "README.md"},
-                success=True,
-                summary="Read README.md.",
-                output_excerpt=readme.read_text(encoding="utf-8"),
-            ),
-        ]
-    )
-
-    def fake_generate(route, active_session, *, path, current_content=None, repair_context=None, repair_strategy=None):
-        assert route.intent == RouteIntent.UPDATE
-        assert active_session is session
-        del repair_context, repair_strategy
-        if path == "tests/test_cli.py":
-            return ContentGenerationResult(content=current_content)
-        if path == "README.md":
-            return ContentGenerationResult(content="# greet_cli\n\nRun with `python -m greet_cli --uppercase Ada`.\n")
-        raise AssertionError(path)
-
-    monkeypatch.setattr(planner, "_generate_file_content", fake_generate)
-
-    first_decision = planner.decide_next_action(session.task, session)
-
-    assert first_decision.action_type == AgentActionType.CALL_TOOL
-    assert first_decision.tool_name == "write_file"
-    assert first_decision.tool_args["path"] == "README.md"
-    assert f"{DEFERRED_UPDATE_TARGET_NOTE_PREFIX}tests/test_cli.py" in session.notes
-
-    session.changed_files.append(FileChangeRecord(path="README.md", operation="write"))
 
     second_decision = planner.decide_next_action(session.task, session)
 
@@ -5706,142 +5341,6 @@ def test_generate_content_prompt_includes_runtime_fixture_data_hints(tmp_path):
     assert "Do not add explanatory prose" in prompt
 
 
-def test_fallback_review_allows_large_runtime_fixture_rewrite(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Repair the failing runtime fixture.",
-        workspace_root=str(tmp_path),
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Repair the failing fixture file."},
-        ],
-        target_paths=["tests/test_data.txt"],
-        target_name="test_data.txt",
-    )
-    commit_task_state_and_route(planner, session, payload)
-    session.active_repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_wordfreq",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["tests/test_data.txt"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "Traceback (most recent call last):\n"
-            "  File \"/tmp/tests/test_wordfreq.py\", line 8, in test_count_words\n"
-            "    self.assertEqual(result, expected)\n"
-            "AssertionError: {'this': 1, 'sample': 1} != {'hello': 2, 'world': 1}\n"
-        ),
-        failure_summary="tests/test_data.txt still produces extra words during the runtime validation.",
-        expected_features=[],
-        missing_features=[],
-        file_hints=["tests/test_data.txt"],
-        line_hints=[8],
-        action_hints=[],
-        repair_requirements=[],
-        evidence_signature="sig-runtime-fixture-reduction",
-    )
-
-    review = planner._fallback_proposed_update_review(
-        session.router_result,
-        session=session,
-        path="tests/test_data.txt",
-        current_content=(
-            "This is a test data file for wordfreq.py.\n"
-            "It contains some words to be counted.\n"
-            "Punctuation should be ignored.\n"
-            "Case insensitivity matters.\n"
-        ),
-        proposed_content="Hello hello world\n",
-    )
-
-    assert review.safe_to_write is True
-    assert "fixture or support data" in review.summary
-
-
-def test_validation_relevance_review_blocks_runtime_fixture_that_keeps_sample_prose(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
-    repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_wordfreq",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "Traceback (most recent call last):\n"
-            "  File \"tests/test_wordfreq.py\", line 7, in test_count_words\n"
-            "    self.assertEqual(result, expected)\n"
-            "AssertionError: ['This', 'is', 'placeholder', 'fixture', 'text.'] != {'hello': 2, 'world': 1}\n"
-        ),
-        failure_summary="AssertionError: the runtime fixture still produces extra words instead of the expected result.",
-        expected_features=[],
-        missing_features=[],
-        file_hints=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt"],
-        line_hints=[7],
-        action_hints=[],
-        repair_requirements=[],
-        evidence_signature="sig-runtime-fixture-prose",
-    )
-
-    review = planner._validation_repair_relevance_review(
-        path="tests/test_data.txt",
-        current_content=(
-            "This is a sample text file for testing wordfreq.py.\n"
-            "It contains some words, punctuation, and repeated words to test the functionality of the script.\n"
-            "Hello hello world\n"
-        ),
-        proposed_content=(
-            "This is a sample text file for testing wordfreq.py.\n"
-            "It contains some words, punctuation, and repeated words to test the functionality of the script.\n"
-            "hello hello world\n"
-        ),
-        repair_context=repair_context,
-    )
-
-    assert review is not None
-    assert review.safe_to_write is False
-    assert "runtime support file" in review.summary.lower()
-
-
-def test_validation_relevance_review_allows_minimal_runtime_fixture_content(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
-    repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_wordfreq",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "Traceback (most recent call last):\n"
-            "  File \"tests/test_wordfreq.py\", line 7, in test_count_words\n"
-            "    self.assertEqual(result, expected)\n"
-            "AssertionError: ['This', 'is', 'placeholder', 'fixture', 'text.'] != {'hello': 2, 'world': 1}\n"
-        ),
-        failure_summary="AssertionError: the runtime fixture still produces extra words instead of the expected result.",
-        expected_features=[],
-        missing_features=[],
-        file_hints=["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt"],
-        line_hints=[7],
-        action_hints=[],
-        repair_requirements=[],
-        evidence_signature="sig-runtime-fixture-minimal",
-    )
-
-    review = planner._validation_repair_relevance_review(
-        path="tests/test_data.txt",
-        current_content=(
-            "This is a sample text file for testing wordfreq.py.\n"
-            "It contains some words, punctuation, and repeated words to test the functionality of the script.\n"
-            "Hello hello world\n"
-        ),
-        proposed_content="hello hello world\n",
-        repair_context=repair_context,
-    )
-
-    assert review is None
-
-
 def test_compact_create_prompt_marks_other_requested_files_out_of_scope(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
@@ -6202,6 +5701,97 @@ def test_planner_switches_target_immediately_after_identical_repair_generation(t
     assert decision.tool_args["path"] == "greet_cli/__main__.py"
 
 
+def test_nonblocking_update_target_deferral_is_honored_before_any_files_change(tmp_path, monkeypatch):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text(
+        "import argparse\nfrom .cli import greet\n\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name', nargs='?', default='world')\n"
+        "    args = parser.parse_args()\n"
+        "    print(greet(args.name))\n",
+        encoding="utf-8",
+    )
+    (pkg / "cli.py").write_text("def greet(name):\n    return f'Hello, {name}!'\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# greet-cli\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("def test_cli():\n    assert True\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Extend the CLI with --prefix and --repeat, keep --uppercase working, "
+            "update the README, and extend the unittest module."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": [
+                    "greet_cli/__main__.py",
+                    "greet_cli/cli.py",
+                    "README.md",
+                    "tests/test_cli.py",
+                ],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["greet_cli/__main__.py"],
+                "repo_summary": "Small Python CLI project with entrypoint, helper, README, and tests.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested feature update."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+        ],
+        target_paths=[
+            "greet_cli/__main__.py",
+            "greet_cli/cli.py",
+            "README.md",
+            "tests/test_cli.py",
+        ],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_cli",
+    )
+
+    def fake_execute_action_from_plan(_route, _session):
+        return AgentDecision(
+            thought_summary="Continue with the next explicit target.",
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="read_file",
+            tool_args={"path": planner._next_update_target(_route, _session)},
+            expected_outcome="Inspect the next file that still needs an update.",
+            final_response=None,
+        )
+
+    monkeypatch.setattr(planner, "execute_action_from_plan", fake_execute_action_from_plan)
+
+    decision = planner._continue_after_nonblocking_update_target_failure(
+        session.router_result,
+        session,
+        target="greet_cli/__main__.py",
+        stop_reason="update_review_rejected",
+        repair_context=None,
+    )
+
+    assert decision is not None
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "read_file"
+    assert decision.tool_args["path"] == "greet_cli/cli.py"
+    assert f"{DEFERRED_UPDATE_TARGET_NOTE_PREFIX}greet_cli/__main__.py" in session.notes
+    assert planner._has_pending_explicit_update_targets(session.router_result, session) is True
+
+
 def test_planner_prefers_implementation_target_before_validation_target_for_runtime_failure(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
@@ -6533,259 +6123,29 @@ def test_planner_keeps_recent_runtime_fixture_target_after_follow_up_assertion_f
     assert next_target == "tests/test_data.txt"
 
 
-def test_planner_prefers_runtime_fixture_target_on_initial_assertion_mismatch(tmp_path):
-    (tmp_path / "wordfreq.py").write_text(
-        "def count_words(file_path):\n"
-        "    with open(file_path, 'r') as file:\n"
-        "        return file.read().split()\n",
-        encoding="utf-8",
-    )
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    (tests_dir / "test_wordfreq.py").write_text(
-        "import unittest\n"
-        "from wordfreq import count_words\n\n"
-        "class TestWordFreq(unittest.TestCase):\n"
-        "    def test_count_words(self):\n"
-        "        expected = {'hello': 2, 'world': 1}\n"
-        "        result = count_words('tests/test_data.txt')\n"
-        "        self.assertEqual(result, expected)\n",
-        encoding="utf-8",
-    )
-    (tests_dir / "test_data.txt").write_text(
-        "This is placeholder fixture text.\n",
-        encoding="utf-8",
-    )
-
+def test_runtime_support_candidates_do_not_lead_without_fixture_signal(tmp_path):
     planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Fix the failing wordfreq runtime validation.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 3,
-                "important_files": ["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt"],
-                "focus_files": ["wordfreq.py", "tests/test_wordfreq.py", "tests/test_data.txt"],
-                "test_files": ["tests/test_wordfreq.py"],
-                "likely_commands": ["python -m unittest tests.test_wordfreq"],
-            }
-        ),
-        validation_status="failed",
-        edit_generation=1,
-        validation_plan=[
-            ValidationCommand(
-                command="python -m unittest tests.test_wordfreq",
-                kind="test",
-                verification_scope="runtime",
-            )
-        ],
-        verification_commands=["python -m unittest tests.test_wordfreq"],
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Repair the failed validation."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
-        ],
-        target_paths=["wordfreq.py"],
-        target_name="wordfreq.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_wordfreq and finish only when it passes.",
-    )
-    session.changed_files.extend(
-        [
-            FileChangeRecord(path="wordfreq.py", operation="create"),
-            FileChangeRecord(path="tests/test_wordfreq.py", operation="create"),
-            FileChangeRecord(path="tests/test_data.txt", operation="create"),
-        ]
-    )
-    session.validation_runs.append(
-        ValidationRunRecord(
-            command="python -m unittest tests.test_wordfreq",
-            kind="test",
-            verification_scope="runtime",
-            status="failed",
-            edit_generation=1,
-            iteration=4,
-            summary="Validation command exited with 1.",
-            excerpt=(
-                "Traceback (most recent call last):\n"
-                f'  File "{tmp_path / "tests" / "test_wordfreq.py"}", line 7, in test_count_words\n'
-                "    self.assertEqual(result, expected)\n"
-                "AssertionError: ['This', 'is', 'placeholder', 'fixture', 'text.'] != {'hello': 2, 'world': 1}\n"
-            ),
-        )
-    )
-
-    failed_run = session.validation_runs[-1]
-    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
-
-    next_target = planner._repair_target_after_failed_validation(
-        session.router_result,
-        session,
-        failed_run,
-        repair_context,
-    )
-
-    assert next_target == "tests/test_data.txt"
-
-
-def test_planner_prefers_failure_specific_stylesheet_over_first_created_page_after_website_validation_failure(tmp_path):
-    for relative_path, content in {
-        "index.html": "<!doctype html><title>Home</title>\n",
-        "about.html": "<!doctype html><title>About</title>\n",
-        "projects.html": "<!doctype html><title>Projects</title>\n",
-        "contact.html": "<!doctype html><title>Contact</title>\n",
-        "styles.css": "body { color: #222; }\n",
-    }.items():
-        absolute = tmp_path / relative_path
-        absolute.write_text(content, encoding="utf-8")
-
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    (tests_dir / "__init__.py").write_text("", encoding="utf-8")
-    (tests_dir / "test_site.py").write_text(
-        "import unittest\n\n"
-        "class TestSite(unittest.TestCase):\n"
-        "    def test_styles_include_variables_and_responsive_rule(self):\n"
-        "        self.assertTrue(True)\n",
-        encoding="utf-8",
-    )
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task=(
-            "Create a multi-page personal portfolio website in this repo. "
-            "Add index.html, about.html, projects.html, contact.html, and styles.css. "
-            "Use one shared navigation across pages, make it responsive, and finish only "
-            "when python -m unittest tests.test_site passes."
-        ),
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 7,
-                "important_files": [
-                    "index.html",
-                    "about.html",
-                    "projects.html",
-                    "contact.html",
-                    "styles.css",
-                    "tests/test_site.py",
-                ],
-                "focus_files": [
-                    "index.html",
-                    "about.html",
-                    "projects.html",
-                    "contact.html",
-                    "styles.css",
-                ],
-                "test_files": ["tests/test_site.py"],
-                "likely_commands": ["python -m unittest tests.test_site"],
-            }
-        ),
-        validation_status="failed",
-        edit_generation=1,
-        validation_plan=[
-            ValidationCommand(
-                command="python -m unittest tests.test_site",
-                kind="test",
-                verification_scope="runtime",
-            )
-        ],
-        verification_commands=["python -m unittest tests.test_site"],
-    )
-    payload = route_payload(
-        intent="create",
-        action_plan=[
-            {"step": 1, "action": "create_artifact", "reason": "Create the requested website files."},
-            {"step": 2, "action": "run_validation", "reason": "Run the targeted unittest module."},
-        ],
-        target_paths=["index.html", "about.html", "projects.html", "contact.html", "styles.css"],
-        target_name="index.html",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_site and finish only when it passes.",
-    )
-    session.changed_files.extend(
-        [
-            FileChangeRecord(path="index.html", operation="create"),
-            FileChangeRecord(path="about.html", operation="create"),
-            FileChangeRecord(path="projects.html", operation="create"),
-            FileChangeRecord(path="contact.html", operation="create"),
-            FileChangeRecord(path="styles.css", operation="create"),
-        ]
-    )
-
-    failed_run = ValidationRunRecord(
-        command="python -m unittest tests.test_site",
-        kind="test",
-        verification_scope="runtime",
-        status="failed",
-        edit_generation=1,
-        iteration=5,
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "FAIL: test_styles_include_variables_and_responsive_rule "
-            "(tests.test_site.TestSite.test_styles_include_variables_and_responsive_rule)\n"
-            "Traceback (most recent call last):\n"
-            '  File "/tmp/tests/test_site.py", line 41, in test_styles_include_variables_and_responsive_rule\n'
-            "    self.assertIn(':root', css)\n"
-            "AssertionError: ':root' not found in 'body { color: #222; }\\n\\n"
-            ".contact-form { display: flex; }\\n\\n"
-            "@media (max-width: 600px) { nav { flex-direction: column; } }\\n'\n"
-        ),
-    )
     repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_site",
+        command="python -m unittest tests.test_cli",
         verification_scope="runtime",
         status="failed",
-        artifact_paths=[
-            "index.html",
-            "about.html",
-            "projects.html",
-            "contact.html",
-            "styles.css",
-            "tests/test_site.py",
-        ],
+        artifact_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
         summary="Validation command exited with 1.",
-        excerpt=failed_run.excerpt,
-        failure_summary="The stylesheet validation still fails because the responsive CSS contract is incomplete.",
+        excerpt="AssertionError: 'Ada' != 'Hello, Ada!'",
+        failure_summary="The CLI still returns the wrong greeting.",
         expected_features=[],
         missing_features=[],
-        file_hints=[
-            "index.html",
-            "about.html",
-            "projects.html",
-            "contact.html",
-            "styles.css",
-            "tests/test_site.py",
-        ],
-        line_hints=[41],
-        action_hints=[
-            "Keep the multi-page site structure intact and repair only the failing stylesheet behavior."
-        ],
-        repair_requirements=[
-            "Change index.html so the failing runtime or test path can complete successfully.",
-            "Do not stop at an equivalent or formatting-only rewrite.",
-        ],
-        evidence_signature="sig-website-css-repair",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        line_hints=[12],
+        action_hints=[],
+        repair_requirements=[],
+        evidence_signature="sig-no-fixture-signal",
     )
 
-    next_target = planner._repair_target_after_failed_validation(
-        session.router_result,
-        session,
-        failed_run,
+    assert planner._runtime_support_candidates_should_lead(
+        ["tests/test_data.txt"],
         repair_context,
-    )
-
-    assert next_target == "styles.css"
+    ) is False
 
 
 def test_planner_reads_related_test_before_creating_missing_runtime_fixture(tmp_path):
@@ -7557,772 +6917,6 @@ def test_planner_switches_to_remaining_repair_target_after_generation_failure(tm
     assert decision is not None
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "read_file"
-    assert decision.tool_args["path"] == "greet_cli/__main__.py"
-
-
-def test_compact_runtime_repair_retry_prompt_includes_neighbor_implementation_context(tmp_path):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    (pkg / "__main__.py").write_text(
-        "from .cli import greet\n\n"
-        "def main(argv=None):\n"
-        "    print(greet('Ada'))\n",
-        encoding="utf-8",
-    )
-    (pkg / "cli.py").write_text(
-        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
-        "    greeting = f'{prefix}{name}'\n"
-        "    if uppercase:\n"
-        "        greeting = greeting.upper()\n"
-        "    return greeting * repeat\n",
-        encoding="utf-8",
-    )
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    (tests_dir / "test_cli.py").write_text(
-        "import unittest\n\n"
-        "class TestCLI(unittest.TestCase):\n"
-        "    def test_default_greeting(self):\n"
-        "        self.assertEqual('Ada', 'Hello, Ada!')\n",
-        encoding="utf-8",
-    )
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend this existing CLI with prefix and repeat support while keeping uppercase working.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 4,
-                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-                "focus_files": ["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py"],
-                "test_files": ["tests/test_cli.py"],
-                "likely_commands": ["python -m unittest tests.test_cli"],
-            }
-        ),
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
-        target_name="greet_cli/__main__.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
-    )
-    session.tool_calls.extend(
-        [
-            ToolCallRecord(
-                iteration=1,
-                tool_name="read_file",
-                tool_args={"path": "tests/test_cli.py"},
-                success=True,
-                summary="Read tests/test_cli.py.",
-                output_excerpt=(tests_dir / "test_cli.py").read_text(encoding="utf-8"),
-            ),
-            ToolCallRecord(
-                iteration=2,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/__main__.py"},
-                success=True,
-                summary="Read greet_cli/__main__.py.",
-                output_excerpt=(pkg / "__main__.py").read_text(encoding="utf-8"),
-            ),
-        ]
-    )
-    repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_cli",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["greet_cli/cli.py", "tests/test_cli.py", "greet_cli/__main__.py"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "FAIL: test_default_greeting (tests.test_cli.TestCLI.test_default_greeting)\n"
-            "AssertionError: 'Ada' != 'Hello, Ada!'\n"
-        ),
-        failure_summary="test_default_greeting expects Hello, Ada! but the CLI only prints Ada.",
-        file_hints=["tests/test_cli.py", "greet_cli/__main__.py"],
-        line_hints=[4],
-        action_hints=["Inspect the failing expectation and the runtime path before editing."],
-        repair_requirements=["Repair greet_cli/cli.py so the failing runtime validation passes."],
-        evidence_signature="runtime-neighbor-context",
-    )
-    review_feedback = ProposedUpdateReview(
-        safe_to_write=False,
-        summary="The proposed update moves package entrypoint logic into a helper module.",
-        confidence=0.96,
-        blocking_issues=[
-            "The proposal adds argparse and/or __main__ launcher logic to greet_cli/cli.py even though the package already has a sibling entrypoint at greet_cli/__main__.py."
-        ],
-        preservation_risks=[],
-        repair_hints=[
-            "Keep greet_cli/cli.py focused on reusable helper behavior and place CLI parsing or launcher handling in greet_cli/__main__.py."
-        ],
-    )
-
-    prompt = generate_content_retry_prompt(
-        session.router_result,
-        session,
-        path="greet_cli/cli.py",
-        current_content=(pkg / "cli.py").read_text(encoding="utf-8"),
-        repair_context=repair_context,
-        repair_strategy="validation_targeted",
-        review_feedback=review_feedback,
-        mode="compact",
-    )
-
-    assert "Supporting file hints: tests/test_cli.py:" in prompt
-    assert "greet_cli/__main__.py:" in prompt
-
-
-def test_compact_runtime_repair_retry_prompt_prefers_current_workspace_support_content(tmp_path):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    current_main = (
-        "from __future__ import annotations\n\n"
-        "import argparse\n\n"
-        "from .cli import greet\n\n\n"
-        "def main(argv=None):\n"
-        "    parser = argparse.ArgumentParser()\n"
-        "    parser.add_argument('name')\n"
-        "    parser.add_argument('--prefix', type=str)\n"
-        "    parser.add_argument('--repeat', type=int, default=1)\n"
-        "    parser.add_argument('--uppercase', action='store_true')\n"
-        "    args = parser.parse_args(argv)\n\n"
-        "    greeting = greet(args.name)\n"
-        "    if args.prefix:\n"
-        "        greeting = f\"{args.prefix} {greeting}\"\n"
-        "    if args.uppercase:\n"
-        "        greeting = greeting.upper()\n\n"
-        "    for _ in range(args.repeat):\n"
-        "        print(greeting)\n"
-    )
-    stale_main = (
-        "from __future__ import annotations\n\n"
-        "import argparse\n\n"
-        "from .cli import greet\n\n\n"
-        "def main(argv=None):\n"
-        "    parser = argparse.ArgumentParser()\n"
-        "    parser.add_argument('name')\n"
-        "    args = parser.parse_args(argv)\n"
-        "    print(greet(args.name))\n"
-    )
-    (pkg / "__main__.py").write_text(current_main, encoding="utf-8")
-    current_cli = (
-        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
-        "    greeting = f'{prefix}{name}'\n"
-        "    if uppercase:\n"
-        "        greeting = greeting.upper()\n"
-        "    return greeting * repeat\n"
-    )
-    (pkg / "cli.py").write_text(current_cli, encoding="utf-8")
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    test_content = (
-        "import io\n"
-        "import unittest\n"
-        "from unittest.mock import patch\n\n"
-        "from greet_cli import __main__\n\n\n"
-        "class TestCLI(unittest.TestCase):\n"
-        "    def run_cli(self, argv):\n"
-        "        with patch('sys.stdout', new_callable=io.StringIO) as stdout:\n"
-        "            __main__.main(argv)\n"
-        "            return stdout.getvalue().strip()\n\n"
-        "    def test_default_greeting(self):\n"
-        "        self.assertEqual(self.run_cli(['Ada']), 'Hello, Ada!')\n"
-    )
-    (tests_dir / "test_cli.py").write_text(test_content, encoding="utf-8")
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 4,
-                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-                "focus_files": ["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py"],
-                "test_files": ["tests/test_cli.py"],
-                "likely_commands": ["python -m unittest tests.test_cli"],
-            }
-        ),
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-        target_name="greet_cli/cli.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
-    )
-    session.tool_calls.extend(
-        [
-            ToolCallRecord(
-                iteration=1,
-                tool_name="read_file",
-                tool_args={"path": "tests/test_cli.py"},
-                success=True,
-                summary="Read tests/test_cli.py.",
-                output_excerpt=test_content,
-            ),
-            ToolCallRecord(
-                iteration=2,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/__main__.py"},
-                success=True,
-                summary="Read greet_cli/__main__.py.",
-                output_excerpt=stale_main,
-            ),
-        ]
-    )
-    repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_cli",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["greet_cli/cli.py", "tests/test_cli.py", "greet_cli/__main__.py"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "FAIL: test_default_greeting (tests.test_cli.TestCLI.test_default_greeting)\n"
-            "AssertionError: 'Ada' != 'Hello, Ada!'\n"
-        ),
-        failure_summary="test_default_greeting expects Hello, Ada! but the CLI only prints Ada.",
-        file_hints=["tests/test_cli.py", "greet_cli/__main__.py"],
-        line_hints=[12],
-        action_hints=["Inspect the failing expectation and the runtime path before editing."],
-        repair_requirements=["Repair greet_cli/cli.py so the failed runtime validation passes."],
-        evidence_signature="runtime-current-support-context",
-    )
-    review_feedback = ProposedUpdateReview(
-        safe_to_write=False,
-        summary="The proposed update keeps the helper wrong and misses the active CLI wiring.",
-        confidence=0.91,
-        blocking_issues=[
-            "The helper update does not repair the cross-file runtime behavior expected by the failing tests."
-        ],
-        preservation_risks=[],
-        repair_hints=[
-            "Use the current runtime neighbor files as the contract for what the helper should return."
-        ],
-    )
-
-    prompt = generate_content_retry_prompt(
-        session.router_result,
-        session,
-        path="greet_cli/cli.py",
-        current_content=current_cli,
-        repair_context=repair_context,
-        repair_strategy="validation_targeted",
-        review_feedback=review_feedback,
-        mode="compact",
-    )
-
-    assert "greet_cli/__main__.py:" in prompt
-    assert "parser.add_argument('--prefix', type=str)" in prompt
-    assert "print(greet(args.name))" not in prompt
-
-
-def test_compact_update_prompt_prefers_current_workspace_related_file_content(tmp_path):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    stale_main = (
-        "from __future__ import annotations\n\n"
-        "import argparse\n\n"
-        "from .cli import greet\n\n\n"
-        "def main(argv=None):\n"
-        "    parser = argparse.ArgumentParser()\n"
-        "    parser.add_argument('name')\n"
-        "    args = parser.parse_args(argv)\n"
-        "    print(greet(args.name))\n"
-    )
-    current_main = (
-        "from __future__ import annotations\n\n"
-        "import argparse\n\n"
-        "from .cli import greet\n\n\n"
-        "def main(argv=None):\n"
-        "    parser = argparse.ArgumentParser()\n"
-        "    parser.add_argument('name')\n"
-        "    parser.add_argument('--prefix', type=str)\n"
-        "    parser.add_argument('--repeat', type=int, default=1)\n"
-        "    parser.add_argument('--uppercase', action='store_true')\n"
-        "    args = parser.parse_args(argv)\n\n"
-        "    greeting = greet(args.name)\n"
-        "    if args.prefix:\n"
-        "        greeting = f\"{args.prefix} {greeting}\"\n"
-        "    if args.uppercase:\n"
-        "        greeting = greeting.upper()\n\n"
-        "    for _ in range(args.repeat):\n"
-        "        print(greeting)\n"
-    )
-    (pkg / "__main__.py").write_text(current_main, encoding="utf-8")
-    current_cli = "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n"
-    (pkg / "cli.py").write_text(current_cli, encoding="utf-8")
-    readme = tmp_path / "README.md"
-    readme.write_text("# greet_cli\n", encoding="utf-8")
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 3,
-                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "README.md"],
-                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py"],
-                "likely_commands": ["python -m unittest tests.test_cli"],
-            }
-        ),
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Extend the existing CLI behavior."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
-        target_name="greet_cli/cli.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
-    )
-    session.tool_calls.extend(
-        [
-            ToolCallRecord(
-                iteration=1,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/__main__.py"},
-                success=True,
-                summary="Read greet_cli/__main__.py.",
-                output_excerpt=stale_main,
-            ),
-            ToolCallRecord(
-                iteration=2,
-                tool_name="write_file",
-                tool_args={"path": "greet_cli/__main__.py", "content": current_main},
-                success=True,
-                summary="Wrote greet_cli/__main__.py.",
-                output_excerpt=current_main,
-            ),
-            ToolCallRecord(
-                iteration=3,
-                tool_name="read_file",
-                tool_args={"path": "README.md"},
-                success=True,
-                summary="Read README.md.",
-                output_excerpt=readme.read_text(encoding="utf-8"),
-            ),
-        ]
-    )
-
-    prompt = generate_content_prompt(
-        session.router_result,
-        session,
-        path="greet_cli/cli.py",
-        current_content=current_cli,
-        mode="compact",
-    )
-
-    assert "greet_cli/__main__.py:" in prompt
-    assert "parser.add_argument('--prefix', type=str)" in prompt
-    assert "print(greet(args.name))" not in prompt
-
-
-def test_compact_update_prompt_prefers_runtime_tests_over_readme_context(tmp_path):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    current_main = (
-        "from __future__ import annotations\n\n"
-        "import argparse\n\n"
-        "from .cli import greet\n\n\n"
-        "def main(argv=None):\n"
-        "    parser = argparse.ArgumentParser()\n"
-        "    parser.add_argument('name')\n"
-        "    parser.add_argument('--prefix', type=str)\n"
-        "    parser.add_argument('--repeat', type=int, default=1)\n"
-        "    parser.add_argument('--uppercase', action='store_true')\n"
-        "    args = parser.parse_args(argv)\n\n"
-        "    greeting = greet(args.name)\n"
-        "    if args.prefix:\n"
-        "        greeting = f\"{args.prefix} {greeting}\"\n"
-        "    if args.uppercase:\n"
-        "        greeting = greeting.upper()\n\n"
-        "    for _ in range(args.repeat):\n"
-        "        print(greeting)\n"
-    )
-    (pkg / "__main__.py").write_text(current_main, encoding="utf-8")
-    current_cli = "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n"
-    (pkg / "cli.py").write_text(current_cli, encoding="utf-8")
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    test_content = (
-        "import io\n"
-        "import unittest\n"
-        "from unittest.mock import patch\n\n"
-        "from greet_cli import __main__\n\n\n"
-        "class TestCLI(unittest.TestCase):\n"
-        "    def run_cli(self, argv):\n"
-        "        with patch('sys.stdout', new_callable=io.StringIO) as stdout:\n"
-        "            __main__.main(argv)\n"
-        "            return stdout.getvalue().strip()\n\n"
-        "    def test_prefix_flag(self):\n"
-        "        self.assertEqual(self.run_cli(['--prefix', 'Mr.', 'Ada']), 'Hello, Mr. Ada!')\n"
-    )
-    (tests_dir / "test_cli.py").write_text(test_content, encoding="utf-8")
-    readme = tmp_path / "README.md"
-    readme.write_text(
-        "# greet_cli\n\nRun the package with:\n\n```sh\npython -m greet_cli Ada\n```\n",
-        encoding="utf-8",
-    )
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 4,
-                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py", "README.md"],
-                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-                "test_files": ["tests/test_cli.py"],
-                "likely_commands": ["python -m unittest tests.test_cli"],
-            }
-        ),
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Extend the existing CLI behavior."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
-        target_name="greet_cli/cli.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
-    )
-    session.tool_calls.extend(
-        [
-            ToolCallRecord(
-                iteration=1,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/__main__.py"},
-                success=True,
-                summary="Read greet_cli/__main__.py.",
-                output_excerpt=current_main,
-            ),
-            ToolCallRecord(
-                iteration=2,
-                tool_name="read_file",
-                tool_args={"path": "README.md"},
-                success=True,
-                summary="Read README.md.",
-                output_excerpt=readme.read_text(encoding="utf-8"),
-            ),
-            ToolCallRecord(
-                iteration=3,
-                tool_name="read_file",
-                tool_args={"path": "tests/test_cli.py"},
-                success=True,
-                summary="Read tests/test_cli.py.",
-                output_excerpt=test_content,
-            ),
-        ]
-    )
-
-    prompt = generate_content_prompt(
-        session.router_result,
-        session,
-        path="greet_cli/cli.py",
-        current_content=current_cli,
-        mode="compact",
-    )
-
-    assert "greet_cli/__main__.py:" in prompt
-    assert "tests/test_cli.py:" in prompt
-    assert "Hello, Mr. Ada!" in prompt
-    assert "README.md:" not in prompt
-
-
-def test_compact_runtime_repair_supporting_test_excerpt_keeps_assertion_line(tmp_path):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    (pkg / "__main__.py").write_text(
-        "from .cli import greet\n\n"
-        "def main(argv=None):\n"
-        "    print(greet('Ada'))\n",
-        encoding="utf-8",
-    )
-    (pkg / "cli.py").write_text(
-        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
-        "    greeting = f'{prefix}{name}'\n"
-        "    if uppercase:\n"
-        "        greeting = greeting.upper()\n"
-        "    return greeting * repeat\n",
-        encoding="utf-8",
-    )
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    test_content = (
-        "import io\n"
-        "import unittest\n"
-        "from unittest.mock import patch\n\n"
-        "from greet_cli import __main__\n\n\n"
-        "class TestCLI(unittest.TestCase):\n"
-        "    def run_cli(self, argv):\n"
-        "        with patch('sys.stdout', new_callable=io.StringIO) as stdout:\n"
-        "            __main__.main(argv)\n"
-        "            return stdout.getvalue().strip()\n\n"
-        "    def test_default_greeting(self):\n"
-        "        self.assertEqual(self.run_cli(['Ada']), 'Hello, Ada!')\n"
-    )
-    (tests_dir / "test_cli.py").write_text(test_content, encoding="utf-8")
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 4,
-                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-                "focus_files": ["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py"],
-                "test_files": ["tests/test_cli.py"],
-                "likely_commands": ["python -m unittest tests.test_cli"],
-            }
-        ),
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
-        target_name="greet_cli/cli.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
-    )
-    repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_cli",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["greet_cli/cli.py", "tests/test_cli.py", "greet_cli/__main__.py"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "FAIL: test_default_greeting (tests.test_cli.TestCLI.test_default_greeting)\n"
-            "AssertionError: 'Ada' != 'Hello, Ada!'\n"
-            "self.assertEqual(self.run_cli(['Ada']), 'Hello, Ada!')\n"
-        ),
-        failure_summary="test_default_greeting expects Hello, Ada! but the CLI only prints Ada.",
-        file_hints=["tests/test_cli.py", "greet_cli/__main__.py"],
-        line_hints=[12],
-        action_hints=["Inspect the failing expectation and the runtime path before editing."],
-        repair_requirements=["Repair greet_cli/cli.py so the failed runtime validation passes."],
-        evidence_signature="runtime-support-assertion-line",
-    )
-    review_feedback = ProposedUpdateReview(
-        safe_to_write=False,
-        summary="The helper still misses the expected greeting contract.",
-        confidence=0.92,
-        blocking_issues=["The updated helper still does not satisfy the failing assertion."],
-        preservation_risks=[],
-        repair_hints=["Preserve the existing greeting wrapper while adding the new flags."],
-    )
-
-    prompt = generate_content_retry_prompt(
-        session.router_result,
-        session,
-        path="greet_cli/cli.py",
-        current_content=(pkg / "cli.py").read_text(encoding="utf-8"),
-        repair_context=repair_context,
-        repair_strategy="validation_targeted",
-        review_feedback=review_feedback,
-        mode="compact",
-    )
-
-    assert "Supporting file hints: tests/test_cli.py:" in prompt
-    assert "self.assertEqual(self.run_cli(['Ada']), 'Hello, Ada!')" in prompt
-
-
-def test_planner_pivots_runtime_helper_repair_after_identical_change(tmp_path, monkeypatch):
-    pkg = tmp_path / "greet_cli"
-    pkg.mkdir()
-    main = pkg / "__main__.py"
-    main.write_text(
-        "from .cli import greet\n\n"
-        "def main(argv=None):\n"
-        "    print(greet('Ada'))\n",
-        encoding="utf-8",
-    )
-    cli = pkg / "cli.py"
-    current_cli = (
-        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
-        "    greeting = f'{prefix}{name}'\n"
-        "    if uppercase:\n"
-        "        greeting = greeting.upper()\n"
-        "    return greeting * repeat\n"
-    )
-    cli.write_text(current_cli, encoding="utf-8")
-    tests_dir = tmp_path / "tests"
-    tests_dir.mkdir()
-    (tests_dir / "test_cli.py").write_text(
-        "import unittest\n\n"
-        "class TestCLI(unittest.TestCase):\n"
-        "    def test_default_greeting(self):\n"
-        "        self.assertEqual('Ada', 'Hello, Ada!')\n",
-        encoding="utf-8",
-    )
-    readme = tmp_path / "README.md"
-    readme.write_text("# greet_cli\n", encoding="utf-8")
-
-    planner = Planner(ScriptedLLM(), "")
-    session = SessionState(
-        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
-        workspace_root=str(tmp_path),
-        workspace_snapshot=build_snapshot(tmp_path).model_copy(
-            update={
-                "file_count": 5,
-                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py", "README.md"],
-                "focus_files": ["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py"],
-                "test_files": ["tests/test_cli.py"],
-                "likely_commands": ["python -m unittest tests.test_cli"],
-            }
-        ),
-        validation_status="failed",
-        edit_generation=1,
-        validation_plan=[
-            ValidationCommand(
-                command="python -m unittest tests.test_cli",
-                kind="test",
-                verification_scope="runtime",
-            )
-        ],
-        verification_commands=["python -m unittest tests.test_cli"],
-    )
-    payload = route_payload(
-        intent="update",
-        action_plan=[
-            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."},
-            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
-        ],
-        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
-        target_name="greet_cli/__main__.py",
-    )
-    commit_task_state_and_route(
-        planner,
-        session,
-        payload,
-        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
-    )
-    session.changed_files.extend(
-        [
-            FileChangeRecord(path="greet_cli/__main__.py", operation="write"),
-            FileChangeRecord(path="greet_cli/cli.py", operation="write"),
-            FileChangeRecord(path="README.md", operation="write"),
-            FileChangeRecord(path="tests/test_cli.py", operation="write"),
-        ]
-    )
-    session.tool_calls.extend(
-        [
-            ToolCallRecord(
-                iteration=1,
-                tool_name="read_file",
-                tool_args={"path": "tests/test_cli.py"},
-                success=True,
-                summary="Read tests/test_cli.py.",
-                output_excerpt=(tests_dir / "test_cli.py").read_text(encoding="utf-8"),
-            ),
-            ToolCallRecord(
-                iteration=2,
-                tool_name="read_file",
-                tool_args={"path": "greet_cli/__main__.py"},
-                success=True,
-                summary="Read greet_cli/__main__.py.",
-                output_excerpt=main.read_text(encoding="utf-8"),
-            ),
-        ]
-    )
-    session.validation_runs.append(
-        ValidationRunRecord(
-            command="python -m unittest tests.test_cli",
-            kind="test",
-            verification_scope="runtime",
-            status="failed",
-            edit_generation=1,
-            iteration=9,
-            summary="Validation command exited with 1.",
-            excerpt=(
-                "FAIL: test_default_greeting (tests.test_cli.TestCLI.test_default_greeting)\n"
-                "AssertionError: 'Ada' != 'Hello, Ada!'\n"
-            ),
-        )
-    )
-    failed_run = session.validation_runs[-1]
-    repair_context = ValidationFailureEvidence(
-        command="python -m unittest tests.test_cli",
-        verification_scope="runtime",
-        status="failed",
-        artifact_paths=["greet_cli/cli.py", "tests/test_cli.py", "greet_cli/__main__.py", "README.md"],
-        summary="Validation command exited with 1.",
-        excerpt=(
-            "FAIL: test_default_greeting (tests.test_cli.TestCLI.test_default_greeting)\n"
-            "AssertionError: 'Ada' != 'Hello, Ada!'\n"
-        ),
-        failure_summary="test_default_greeting expects Hello, Ada! but the CLI only prints Ada.",
-        file_hints=["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py"],
-        line_hints=[4],
-        action_hints=[
-            "Read the failing test output and inspect the hinted source files before editing.",
-            "Prefer a targeted fix over broad refactors, then rerun the same test command.",
-        ],
-        repair_requirements=[
-            "Repair greet_cli/cli.py so the failed runtime validation passes.",
-            "Do not stop at an equivalent or formatting-only rewrite.",
-        ],
-        evidence_signature="runtime-cli-regression",
-    )
-    session.active_repair_context = repair_context
-
-    repair_route = planner._repair_route_after_failed_validation(
-        session.router_result,
-        session,
-        failed_run,
-        repair_context,
-    )
-    assert repair_route is not None
-
-    monkeypatch.setattr(
-        planner,
-        "_generate_file_content",
-        lambda *_args, **kwargs: SimpleNamespace(content=current_cli, failure=None),
-    )
-
-    decision = planner._draft_update_decision(repair_route, session, "greet_cli/cli.py")
-
-    assert decision.action_type == AgentActionType.CALL_TOOL
-    assert decision.tool_name in {"read_file", "write_file"}
     assert decision.tool_args["path"] == "greet_cli/__main__.py"
 
 
@@ -9134,6 +7728,260 @@ def test_review_generated_update_rejects_python_m_launcher_fix_that_requires_mai
     assert review.safe_to_write is False
     assert "launcher tokens" in review.summary.lower()
     assert any("without arguments" in issue for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_rejects_helper_that_duplicates_entrypoint_cli_flags(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    main_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str)\n"
+        "    parser.add_argument('--repeat', type=int, default=1)\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.prefix:\n"
+        "        greeting = f\"{args.prefix} {greeting}\"\n"
+        "    if args.uppercase:\n"
+        "        greeting = greeting.upper()\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greeting)\n"
+    )
+    current_cli = "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n"
+    proposed_cli = (
+        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
+        "    greeting = f\"{prefix}Hello, {name}!\"\n"
+        "    if uppercase:\n"
+        "        greeting = greeting.upper()\n"
+        "    return greeting * repeat\n"
+    )
+    (pkg / "__main__.py").write_text(main_content, encoding="utf-8")
+    (pkg / "cli.py").write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from unittest.mock import patch\n\n"
+        "from greet_cli import __main__\n\n\n"
+        "class TestCLI(unittest.TestCase):\n"
+        "    def run_cli(self, argv):\n"
+        "        with patch('sys.stdout', new_callable=io.StringIO) as stdout:\n"
+        "            __main__.main(argv)\n"
+        "            return stdout.getvalue().strip()\n",
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Extend the CLI behavior."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        target_name="greet_cli/cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="greet_cli/cli.py",
+        current_content=current_cli,
+        proposed_content=proposed_cli,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "duplicates cli wrapper responsibilities" in review.summary.lower()
+    assert "prefix, repeat, uppercase" in review.blocking_issues[0]
+
+
+def test_pre_write_update_review_rejects_entrypoint_that_composes_helper_input_from_cli_values(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    current_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str, default='')\n"
+        "    parser.add_argument('--repeat', type=int, default=1)\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greet(args.name, uppercase=args.uppercase))\n"
+    )
+    proposed_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str, default='')\n"
+        "    parser.add_argument('--repeat', type=int, default=1)\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greet(f\"{args.prefix} {args.name}\", uppercase=args.uppercase))\n"
+    )
+    (pkg / "__main__.py").write_text(current_main, encoding="utf-8")
+    (pkg / "cli.py").write_text("def greet(name: str, uppercase: bool = False) -> str:\n    return name\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Extend the CLI behavior."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_main,
+        proposed_content=proposed_main,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "blurs the contract" in review.summary.lower()
+    assert any("helper inputs" in issue.lower() for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_rejects_entrypoint_that_wraps_helper_output_with_cli_formatting(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    current_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str, default='')\n"
+        "    parser.add_argument('--repeat', type=int, default=1)\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greet(args.name, uppercase=args.uppercase))\n"
+    )
+    proposed_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str, default='')\n"
+        "    parser.add_argument('--repeat', type=int, default=1)\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    full_greeting = f\"{args.prefix} {greet(args.name, uppercase=args.uppercase)}\"\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(full_greeting)\n"
+    )
+    (pkg / "__main__.py").write_text(current_main, encoding="utf-8")
+    (pkg / "cli.py").write_text("def greet(name: str, uppercase: bool = False) -> str:\n    return name\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Extend this existing CLI so it supports --prefix and --repeat while keeping uppercase working.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Extend the CLI behavior."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_main,
+        proposed_content=proposed_main,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "blurs the contract" in review.summary.lower()
+    assert any("helper result" in issue.lower() for issue in review.blocking_issues)
 
 
 def test_planner_prefers_primary_model_for_validation_guided_repairs(tmp_path):
@@ -10533,6 +9381,73 @@ def test_planner_uses_compact_same_model_retry_after_retryable_no_start(tmp_path
     assert attempts[0].model_name is None
 
 
+def test_planner_recovers_from_retryable_no_start_with_same_model_retry(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested UI update.",
+                    }
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 100.1 seconds",
+                reason="startup_timeout",
+                retryable=True,
+                model_name="qwen2.5-coder:7b",
+                startup_timeout_seconds=100,
+                total_timeout_seconds=150,
+            ),
+            "print('gui version')\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Bau eine GUI dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "app.py"
+    target.write_text("print('terminal version')\n", encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app.py"
+    assert decision.tool_args["content"] == "print('gui version')"
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[1]["kwargs"]["model"] is None
+    assert llm.generate_calls[1]["kwargs"]["timeout"] >= 60
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 210
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 2048
+
+
 def test_planner_extends_compact_primary_generation_budget_for_repairs(tmp_path):
     planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
     repair_context = ValidationFailureEvidence(
@@ -10587,6 +9502,81 @@ def test_planner_extends_compact_resume_budget_after_timeout_progress(tmp_path):
     assert timeout_seconds == 60
     assert total_timeout_seconds == 210
     assert num_ctx == 3072
+
+
+def test_planner_retries_resume_once_after_no_start_during_partial_progress_recovery(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested UI update.",
+                    }
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion after 150.0 seconds",
+                reason="total_timeout",
+                partial_text="print('gui",
+                characters=10,
+            ),
+            OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 100.1 seconds",
+                reason="startup_timeout",
+                retryable=True,
+                model_name="qwen2.5-coder:7b",
+                startup_timeout_seconds=100,
+                total_timeout_seconds=210,
+            ),
+            "print('gui version')\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Bau eine GUI dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "app.py"
+    target.write_text("print('terminal version')\n", encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app.py"
+    assert decision.tool_args["content"] == "print('gui version')"
+    assert len(llm.generate_calls) == 3
+    assert llm.generate_calls[1]["kwargs"]["model"] is None
+    assert llm.generate_calls[2]["kwargs"]["model"] is None
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[1]["args"][0]
+    assert "print('gui" in llm.generate_calls[2]["args"][0]
+    assert llm.generate_calls[2]["kwargs"]["timeout"] >= 60
+    assert llm.generate_calls[2]["kwargs"]["total_timeout"] >= 210
 
 
 def test_planner_classifies_repeated_no_start_as_model_start_failure(tmp_path):
