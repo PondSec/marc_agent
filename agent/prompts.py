@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import re
@@ -1160,7 +1161,7 @@ def _compact_task_state(state: TaskState | None) -> dict[str, object]:
 
 def _compact_repair_context(context: ValidationFailureEvidence) -> dict[str, object]:
     prefer_balanced_failure = context.verification_scope == "runtime"
-    return {
+    payload = {
         "command": _trim_text(context.command, 140),
         "verification_scope": context.verification_scope,
         "artifact_paths": context.artifact_paths[:4],
@@ -1190,6 +1191,72 @@ def _compact_repair_context(context: ValidationFailureEvidence) -> dict[str, obj
         "action_hints": [_trim_text(item, 120) for item in context.action_hints[:3]],
         "repair_requirements": [_trim_text(item, 140) for item in context.repair_requirements[:4]],
     }
+    brief = _compact_repair_brief(context, target_path=None)
+    if brief:
+        payload["repair_brief"] = brief
+    return payload
+
+
+def _compact_repair_brief(
+    context: ValidationFailureEvidence,
+    *,
+    target_path: str | None,
+) -> dict[str, object]:
+    brief = context.repair_brief
+    if brief is None:
+        return {}
+    target = str(target_path or "").strip()
+
+    def _choose_paths(items: list[str], *, limit: int) -> list[str]:
+        selected: list[str] = []
+        normalized_target = target.lower()
+        for candidate in items:
+            path = str(candidate or "").strip()
+            if not path:
+                continue
+            if normalized_target and _artifact_matches_path(target, path, path):
+                if path not in selected:
+                    selected.append(path)
+        for candidate in items:
+            path = str(candidate or "").strip()
+            if path and path not in selected:
+                selected.append(path)
+        return selected[:limit]
+
+    payload: dict[str, object] = {}
+    if str(brief.failure_type or "").strip():
+        payload["failure_type"] = str(brief.failure_type or "").strip()
+    if str(brief.primary_target or "").strip():
+        payload["primary_target"] = str(brief.primary_target or "").strip()
+    if str(brief.locked_target or "").strip():
+        payload["locked_target"] = str(brief.locked_target or "").strip()
+    if brief.expected_semantics:
+        payload["expected_semantics"] = [_trim_text(item, 140) for item in brief.expected_semantics[:3]]
+    if brief.observed_semantics:
+        payload["observed_semantics"] = [_trim_text(item, 140) for item in brief.observed_semantics[:3]]
+    if brief.implicated_symbols:
+        payload["implicated_symbols"] = [_trim_text(item, 60) for item in brief.implicated_symbols[:5]]
+    if str(brief.implicated_region_hint or "").strip():
+        payload["implicated_region_hint"] = _trim_text(str(brief.implicated_region_hint or "").strip(), 120)
+    if brief.repair_constraints:
+        payload["repair_constraints"] = [_trim_text(item, 120) for item in brief.repair_constraints[:3]]
+    if brief.recent_failed_attempts:
+        payload["recent_failed_attempts"] = [
+            {
+                "target": _trim_text(str(item.target or "").strip(), 80) if str(item.target or "").strip() else None,
+                "strategy": _trim_text(str(item.strategy or "").strip(), 48),
+                "result": _trim_text(str(item.result or "").strip(), 48),
+                "reason": _trim_text(str(item.reason or "").strip(), 100) if str(item.reason or "").strip() else None,
+            }
+            for item in brief.recent_failed_attempts[:3]
+        ]
+    allowed_files = _choose_paths(brief.allowed_files, limit=4)
+    if allowed_files:
+        payload["allowed_files"] = allowed_files
+    forbidden_files = _choose_paths(brief.forbidden_files, limit=4)
+    if forbidden_files:
+        payload["forbidden_files"] = forbidden_files
+    return payload
 
 
 def _targeted_compact_repair_context(
@@ -1305,8 +1372,12 @@ def _targeted_compact_repair_context(
                 if part
             ),
             target_path=normalized_target,
+            other_paths=[path for path in [*context.artifact_paths, *context.file_hints] if path and not _artifact_matches_path(normalized_target, path, path)],
             limit=6,
         )
+    brief = _compact_repair_brief(context, target_path=normalized_target)
+    if brief:
+        compact["repair_brief"] = brief
     return compact
 
 
@@ -1421,6 +1492,7 @@ def _compact_repair_update_prompt(
         + " ".join(part for part in validation_context_parts if part),
     ]
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
+    repair_brief = targeted_context.get("repair_brief") or {}
     if compact_focus.get("current_write_requirements"):
         sections.append(
             "Repair-scoped requirements: "
@@ -1430,9 +1502,38 @@ def _compact_repair_update_prompt(
                 if str(item or "").strip()
             )
         )
+    if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
+        target_summary = repair_brief.get("locked_target") or repair_brief.get("primary_target")
+        sections.append(f"Primary repair target: {target_summary}")
+    if repair_brief.get("expected_semantics"):
+        sections.append(
+            "Expected semantics: "
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
+        )
+    if repair_brief.get("observed_semantics"):
+        sections.append(
+            "Observed semantics: "
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
+        )
+    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    if semantic_deltas:
+        sections.append(
+            "Minimal semantic delta: "
+            + " | ".join(_trim_text(item, 180) for item in semantic_deltas[:2])
+        )
     if failure_focus:
         sections.append("Failure focus: " + " | ".join(failure_focus[:3]))
-    support_excerpt_limit = 300 if repair_context.verification_scope == "runtime" else 180
+    if repair_brief.get("implicated_region_hint") or repair_brief.get("implicated_symbols"):
+        region_parts: list[str] = []
+        if repair_brief.get("implicated_region_hint"):
+            region_parts.append(f"region={repair_brief['implicated_region_hint']}")
+        if repair_brief.get("implicated_symbols"):
+            region_parts.append(
+                "symbols=" + ", ".join(_trim_text(str(item or "").strip(), 40) for item in repair_brief.get("implicated_symbols", [])[:4])
+            )
+        if region_parts:
+            sections.append("Repair focus: " + " ".join(region_parts))
+    support_excerpt_limit = 500 if repair_context.verification_scope == "runtime" else 180
     support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
     related_context = _repair_related_file_context(
         session,
@@ -1461,6 +1562,41 @@ def _compact_repair_update_prompt(
             "Keep the update narrow and preserve unrelated existing behavior, imports, and interfaces.",
         ]
     )
+    if repair_brief.get("repair_constraints"):
+        sections.append(
+            "Repair constraints: "
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("repair_constraints", [])[:3])
+        )
+    if repair_brief.get("allowed_files"):
+        sections.append(
+            "Allowed repair files: "
+            + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("allowed_files", [])[:4])
+        )
+    if repair_brief.get("forbidden_files"):
+        sections.append(
+            "Avoid drifting into other files without strong new evidence: "
+            + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("forbidden_files", [])[:4])
+        )
+    if repair_brief.get("recent_failed_attempts"):
+        sections.append(
+            "Recent failed repair attempts: "
+            + " | ".join(
+                _trim_text(
+                    " ".join(
+                        part
+                        for part in [
+                            str(item.get("target") or "").strip(),
+                            str(item.get("strategy") or "").strip(),
+                            str(item.get("result") or "").strip(),
+                            str(item.get("reason") or "").strip(),
+                        ]
+                        if part
+                    ),
+                    160,
+                )
+                for item in repair_brief.get("recent_failed_attempts", [])[:3]
+            )
+        )
     if runtime_hints:
         sections.append(
             "Targeted runtime hints: "
@@ -1542,8 +1678,40 @@ def _compact_repair_retry_prompt(
         _repair_rules(repair_strategy),
         "Keep the update narrow and preserve unrelated existing behavior.",
     ]
+    repair_brief = targeted_context.get("repair_brief") or {}
+    if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
+        sections.append(
+            "Primary repair target: "
+            + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
+        )
+    if repair_brief.get("expected_semantics"):
+        sections.append(
+            "Expected semantics: "
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("expected_semantics", [])[:3])
+        )
+    if repair_brief.get("observed_semantics"):
+        sections.append(
+            "Observed semantics: "
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("observed_semantics", [])[:3])
+        )
+    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    if semantic_deltas:
+        sections.append(
+            "Minimal semantic delta: "
+            + " | ".join(_trim_text(item, 160) for item in semantic_deltas[:2])
+        )
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    if repair_brief.get("allowed_files"):
+        sections.append(
+            "Allowed repair files: "
+            + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("allowed_files", [])[:4])
+        )
+    if repair_brief.get("forbidden_files"):
+        sections.append(
+            "Avoid drifting into other files without strong new evidence: "
+            + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("forbidden_files", [])[:4])
+        )
     if runtime_hints:
         sections.append(
             "Targeted runtime hints: "
@@ -1607,6 +1775,285 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
     return "\n".join(lines)
 
 
+def _repair_semantic_delta_lines(
+    repair_context: ValidationFailureEvidence,
+    *,
+    limit: int = 2,
+) -> list[str]:
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is None:
+        return []
+
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in getattr(brief, "expected_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in getattr(brief, "observed_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    if not expected_items or not observed_items:
+        return []
+
+    deltas: list[str] = []
+    for observed_value, expected_value in zip(observed_items, expected_items):
+        compared_observed, compared_expected = _first_mismatching_semantic_line_pair(
+            observed_value,
+            expected_value,
+        )
+        delta = _render_semantic_delta(compared_observed, compared_expected)
+        if not delta or delta in deltas:
+            continue
+        deltas.append(delta)
+        if len(deltas) >= limit:
+            break
+    return deltas
+
+
+def _repair_semantic_value_text(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    prefixes = (
+        "Validation should produce:",
+        "Validation currently produces:",
+        "Required validation features must be present:",
+    )
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            return text[len(prefix) :].strip()
+    return text
+
+
+def _first_mismatching_semantic_line_pair(observed_value: str, expected_value: str) -> tuple[str, str]:
+    observed = str(observed_value or "")
+    expected = str(expected_value or "")
+    observed_lines = [line for line in observed.splitlines() if line.strip()]
+    expected_lines = [line for line in expected.splitlines() if line.strip()]
+    paired = zip(observed_lines, expected_lines)
+    for observed_line, expected_line in paired:
+        if observed_line != expected_line:
+            return observed_line, expected_line
+    if observed_lines and expected_lines:
+        return observed_lines[0], expected_lines[0]
+    return observed, expected
+
+
+def _render_semantic_delta(observed_value: str, expected_value: str) -> str | None:
+    observed = str(observed_value or "")
+    expected = str(expected_value or "")
+    if not observed or not expected or observed == expected:
+        return None
+
+    prefix_length = 0
+    max_prefix = min(len(observed), len(expected))
+    while prefix_length < max_prefix and observed[prefix_length] == expected[prefix_length]:
+        prefix_length += 1
+    observed_remainder = observed[prefix_length:]
+    expected_remainder = expected[prefix_length:]
+
+    suffix_length = 0
+    max_suffix = min(len(observed_remainder), len(expected_remainder))
+    while suffix_length < max_suffix and observed_remainder[-(suffix_length + 1)] == expected_remainder[-(suffix_length + 1)]:
+        suffix_length += 1
+
+    if suffix_length:
+        observed_middle = observed_remainder[:-suffix_length]
+        expected_middle = expected_remainder[:-suffix_length]
+        shared_suffix = observed_remainder[-suffix_length:]
+    else:
+        observed_middle = observed_remainder
+        expected_middle = expected_remainder
+        shared_suffix = ""
+    shared_prefix = observed[:prefix_length]
+
+    context_parts: list[str] = []
+    if shared_prefix.strip():
+        context_parts.append(f"shared prefix '{_trim_repair_delta_context(shared_prefix, keep_tail=True)}'")
+    if shared_suffix.strip():
+        context_parts.append(f"shared suffix '{_trim_repair_delta_context(shared_suffix, keep_tail=False)}'")
+
+    action = ""
+    if observed_middle and expected_middle:
+        action = (
+            f"Replace observed-only text '{_trim_repair_delta_value(observed_middle)}' "
+            f"with expected text '{_trim_repair_delta_value(expected_middle)}'"
+        )
+    elif observed_middle:
+        action = f"Remove observed-only text '{_trim_repair_delta_value(observed_middle)}'"
+    elif expected_middle:
+        action = f"Insert expected-only text '{_trim_repair_delta_value(expected_middle)}'"
+    else:
+        return None
+
+    if context_parts:
+        return action + " between " + " and ".join(context_parts) + "."
+    return action + "."
+
+
+def _trim_repair_delta_context(text: str, *, keep_tail: bool, limit: int = 40) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    if keep_tail:
+        return "…" + normalized[-(limit - 1) :]
+    return normalized[: limit - 1] + "…"
+
+
+def _trim_repair_delta_value(text: str, limit: int = 48) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "…"
+
+
+def _repair_required_literal_anchors(
+    *,
+    path: str,
+    current_content: str,
+    repair_context: ValidationFailureEvidence,
+    limit: int = 3,
+) -> list[str]:
+    focus_text = "\n".join(
+        part
+        for part in [
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ]
+        if part
+    )
+    scoped_lines = _targeted_runtime_failure_focus_lines(
+        focus_text,
+        target_path=path,
+        other_paths=_repair_other_paths(repair_context, target_path=path),
+        limit=8,
+    )
+    requirement_lines = list(scoped_lines)
+    normalized_path = str(path or "").strip().lower()
+    path_obj = Path(normalized_path)
+    target_markers = {
+        marker
+        for marker in _artifact_scope_markers(path)
+        if marker
+        and (
+            marker == normalized_path
+            or marker == path_obj.name
+            or marker == path_obj.stem
+            or marker not in _GENERIC_ARTIFACT_MARKERS
+        )
+    }
+    target_tokens = {
+        token
+        for token in [normalized_path, path_obj.name.lower(), path_obj.stem.lower()]
+        if token and token not in _GENERIC_ARTIFACT_MARKERS
+    }
+    for raw in focus_text.splitlines():
+        line = str(raw or "").strip()
+        lowered = line.lower()
+        references_target = any(marker and marker in lowered for marker in target_markers) or any(
+            token and token in lowered for token in target_tokens
+        )
+        if line and references_target and line not in requirement_lines:
+            requirement_lines.append(line)
+    requirements = _literal_validation_requirements(requirement_lines)
+    if not requirements:
+        return []
+
+    anchors: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for literal, minimum_count in requirements:
+        key = (literal, minimum_count)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not literal:
+            continue
+        exact_count = current_content.count(literal)
+        if exact_count >= minimum_count:
+            continue
+        near_match = _literal_near_match_in_content(literal, current_content)
+        if near_match and near_match != literal:
+            if minimum_count > 1:
+                anchors.append(
+                    f"Replace near-match literal {near_match!r} with the exact required literal {literal!r} and ensure it appears at least {minimum_count} times in {path}."
+                )
+            else:
+                anchors.append(
+                    f"Replace near-match literal {near_match!r} with the exact required literal {literal!r} in {path}."
+                )
+        elif minimum_count > 1:
+            anchors.append(
+                f"Ensure the exact required literal {literal!r} appears at least {minimum_count} times in {path}."
+            )
+        else:
+            anchors.append(
+                f"Ensure the exact required literal {literal!r} appears verbatim in {path}."
+            )
+        if len(anchors) >= limit:
+            break
+    return anchors
+
+
+def _literal_validation_requirements(lines: list[str]) -> list[tuple[str, int]]:
+    requirements: list[tuple[str, int]] = []
+    count_pattern = re.compile(
+        r"assert(?:GreaterEqual|Equal)\([^\\n]*?count\(\s*(?P<literal>'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*\)\s*,\s*(?P<count>\d+)",
+    )
+    contains_pattern = re.compile(
+        r"assertIn\(\s*(?P<literal>'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*,",
+    )
+    for raw in lines:
+        stripped = str(raw or "").strip()
+        if not stripped:
+            continue
+        count_match = count_pattern.search(stripped)
+        if count_match is not None:
+            literal = _literal_validation_token(count_match.group("literal"))
+            if literal:
+                try:
+                    minimum_count = max(int(count_match.group("count") or 0), 1)
+                except ValueError:
+                    minimum_count = 1
+                requirements.append((literal, minimum_count))
+            continue
+        contains_match = contains_pattern.search(stripped)
+        if contains_match is not None:
+            literal = _literal_validation_token(contains_match.group("literal"))
+            if literal:
+                requirements.append((literal, 1))
+    return requirements
+
+
+def _literal_validation_token(raw: str | None) -> str | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        value = ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        value = text
+    normalized = str(value or "")
+    return normalized[:160] if normalized else None
+
+
+def _literal_near_match_in_content(literal: str, current_content: str) -> str | None:
+    text = str(literal or "")
+    content = str(current_content or "")
+    if not text or not content:
+        return None
+    pattern = re.escape(text)
+    pattern = pattern.replace("\\'", "['\"]").replace('\\"', "['\"]")
+    pattern = pattern.replace("'", "['\"]").replace('"', "['\"]")
+    match = re.search(pattern, content)
+    if match is None:
+        return None
+    candidate = str(match.group(0) or "")
+    return candidate or None
+
+
 def _mandatory_mutation_anchors(
     *,
     path: str,
@@ -1617,10 +2064,15 @@ def _mandatory_mutation_anchors(
     anchors: list[str] = []
 
     line_excerpt = ""
-    if repair_context.line_hints:
+    focused_line_hints = _repair_target_line_hints(
+        path=path,
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+    if focused_line_hints:
         line_excerpt = _line_focused_excerpt(
             current_content,
-            line_hints=repair_context.line_hints,
+            line_hints=focused_line_hints,
             limit=220,
             before_radius=0,
             after_radius=0,
@@ -1641,6 +2093,7 @@ def _mandatory_mutation_anchors(
                     if part
                 ),
                 target_path=path,
+                other_paths=_repair_other_paths(repair_context, target_path=path),
                 limit=4,
             )
             if line and not line.startswith("File ") and not line.startswith("Traceback")
@@ -1650,6 +2103,19 @@ def _mandatory_mutation_anchors(
                 "Resolve the failure focus tied to this file: "
                 + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
             )
+
+    for literal_anchor in _repair_required_literal_anchors(
+        path=path,
+        current_content=current_content,
+        repair_context=repair_context,
+    ):
+        anchors.append(literal_anchor)
+
+    for delta in _repair_semantic_delta_lines(repair_context, limit=2):
+        anchors.append(
+            "Apply this exact semantic delta in the behavior produced by this file: "
+            + _trim_text(delta, 220)
+        )
 
     if review_feedback is not None:
         if review_feedback.blocking_issues:
@@ -1664,6 +2130,103 @@ def _mandatory_mutation_anchors(
             )
 
     return anchors[:3]
+
+
+def _repair_target_line_hints(
+    *,
+    path: str,
+    current_content: str,
+    repair_context: ValidationFailureEvidence,
+) -> list[int]:
+    hints: list[int] = []
+    brief = getattr(repair_context, "repair_brief", None)
+    region_hint = str(getattr(brief, "implicated_region_hint", "") or "").strip()
+    prefix = f"{path}:line "
+    if region_hint.startswith(prefix):
+        suffix = region_hint[len(prefix) :].strip()
+        try:
+            line = int(suffix)
+        except ValueError:
+            line = 0
+        if line > 0:
+            hints.append(line)
+    if hints:
+        return hints
+    supporting_hints = _supporting_file_line_hints(
+        current_content,
+        repair_context=repair_context,
+        target_path=path,
+        limit=4,
+        allow_target_token_fallback=False,
+    )
+    if supporting_hints:
+        return supporting_hints
+    return _semantic_output_anchor_line_hints(
+        current_content,
+        repair_context=repair_context,
+        limit=4,
+    )
+
+
+def _semantic_output_anchor_line_hints(
+    text: str,
+    *,
+    repair_context: ValidationFailureEvidence,
+    limit: int = 4,
+) -> list[int]:
+    semantic_deltas = _repair_semantic_delta_lines(repair_context, limit=1)
+    if not semantic_deltas:
+        return []
+
+    lines = [str(line or "").rstrip() for line in str(text or "").splitlines()]
+    if not lines:
+        return []
+
+    brief = getattr(repair_context, "repair_brief", None)
+    symbol_tokens: set[str] = set()
+    if brief is not None:
+        for symbol in getattr(brief, "implicated_symbols", []) or []:
+            normalized = str(symbol or "").strip().lower()
+            if not normalized or normalized.startswith("test_"):
+                continue
+            for token in re.split(r"[^a-z0-9_]+", normalized):
+                token = token.strip()
+                if len(token) >= 4:
+                    symbol_tokens.add(token)
+
+    scored: list[tuple[int, int]] = []
+    for index, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        if not lowered.strip():
+            continue
+        score = 0
+        if re.search(r"""(^|\W)f["']""", line):
+            score += 5
+        if ".format(" in lowered:
+            score += 4
+        if re.search(r"\b(print|return)\b", lowered) or any(
+            marker in lowered for marker in (".write(", ".append(", "textcontent", "innerhtml", "innertext")
+        ):
+            score += 3
+        if "=" in line:
+            score += 1
+        if any(token and token in lowered for token in symbol_tokens):
+            score += 2
+        if score > 0:
+            scored.append((score, index))
+
+    if not scored:
+        return []
+
+    best_line = max(scored, key=lambda item: (item[0], -item[1]))[1]
+    hints: list[int] = []
+    previous_index = best_line - 1
+    if previous_index >= 1:
+        previous_line = lines[previous_index - 1].strip().lower()
+        if previous_line.startswith(("if ", "elif ", "else", "for ", "while ", "with ", "case ")):
+            hints.append(previous_index)
+    hints.append(best_line)
+    return hints[:limit]
 
 
 def _targeted_runtime_prompt_hints(
@@ -1894,6 +2457,8 @@ def _artifact_scoped_focus(
         session,
         path=path,
         current_content=current_content,
+        current_markers=current_markers,
+        other_markers=other_markers,
     )
     for candidate in literal_constraints:
         if candidate not in current_requirements:
@@ -1981,6 +2546,8 @@ def _target_literal_constraints(
     *,
     path: str,
     current_content: str | None = None,
+    current_markers: set[str] | None = None,
+    other_markers: set[str] | None = None,
 ) -> list[str]:
     reference = str(current_content or "").strip()
     if not reference and session is not None:
@@ -1994,10 +2561,147 @@ def _target_literal_constraints(
 
     literals: list[str] = []
     request_text = _request_text_for_literals(route, session)
+    other_paths = _literal_scope_other_artifacts(route, session, path)
     for candidate in _request_literal_candidates(request_text):
-        if _literal_matches_reference(candidate, current_tokens):
-            literals.append(candidate)
+        if not _literal_matches_reference(candidate, current_tokens):
+            continue
+        if _python_call_literal_needs_path_scope(candidate, path) and not _call_literal_scopes_to_current_artifact(
+            candidate,
+            request_text=request_text,
+            current_path=path,
+            other_paths=other_paths,
+            reference=reference,
+        ):
+            continue
+        scoped_candidate = _scoped_literal_constraint(candidate, path)
+        if scoped_candidate and scoped_candidate not in literals:
+            literals.append(scoped_candidate)
     return literals[:4]
+
+
+def _scoped_literal_constraint(candidate: str, path: str) -> str | None:
+    normalized = str(candidate or "").strip()
+    if not normalized:
+        return None
+    normalized_path = str(path or "").strip().replace("\\", "/")
+    suffix = Path(normalized_path).suffix.lower()
+    if "(" in normalized and ")" in normalized:
+        if suffix in {".md", ".markdown", ".rst", ".txt"} or _related_context_is_test_like(normalized_path):
+            callee = str(normalized.split("(", 1)[0] or "").strip()
+            if callee:
+                return callee
+    return normalized
+
+
+def _python_call_literal_needs_path_scope(candidate: str, path: str) -> bool:
+    normalized = str(candidate or "").strip()
+    if "(" not in normalized or ")" not in normalized:
+        return False
+    normalized_path = str(path or "").strip().replace("\\", "/")
+    suffix = Path(normalized_path).suffix.lower()
+    if suffix not in {".py", ".pyi"}:
+        return False
+    return not _related_context_is_test_like(normalized_path)
+
+
+def _call_literal_scopes_to_current_artifact(
+    candidate: str,
+    *,
+    request_text: str,
+    current_path: str,
+    other_paths: list[str],
+    reference: str,
+) -> bool:
+    if _python_reference_defines_literal_callee(reference, candidate):
+        return True
+
+    segments = _request_segments_for_literal_candidate(request_text, candidate)
+    if not segments:
+        return False
+
+    for segment in segments:
+        current_score = _artifact_specific_relevance_score(segment, current_path)
+        other_score = max((_artifact_specific_relevance_score(segment, other) for other in other_paths), default=0)
+        if current_score > 0 and current_score >= other_score:
+            return True
+    return False
+
+
+def _literal_scope_other_artifacts(
+    route: RouterOutput,
+    session: SessionState | None,
+    current_path: str,
+) -> list[str]:
+    seen: set[str] = set()
+    others: list[str] = []
+
+    def add(candidate: str) -> None:
+        normalized = str(candidate or "").strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        others.append(normalized)
+
+    explicit_targets = [str(item or "").strip() for item in route.entities.target_paths if str(item or "").strip()]
+    for candidate in explicit_targets:
+        if not _artifact_matches_path(current_path, candidate, candidate):
+            add(candidate)
+
+    task_state = session.task_state if session is not None else None
+    if task_state is None:
+        return others
+
+    for artifact in task_state.target_artifacts:
+        artifact_path = str(artifact.path or "").strip()
+        artifact_name = str(artifact.name or "").strip()
+        if _artifact_matches_path(current_path, artifact_path, artifact_name):
+            continue
+        if artifact_path:
+            add(artifact_path)
+        elif artifact_name:
+            add(artifact_name)
+    return others
+
+
+def _request_segments_for_literal_candidate(text: str, candidate: str) -> list[str]:
+    normalized = str(text or "").strip()
+    literal = str(candidate or "").strip()
+    if not normalized or not literal:
+        return []
+    callee = str(literal.split("(", 1)[0] or "").strip()
+    callee_pattern = (
+        re.compile(rf"(?<![A-Za-z0-9_]){re.escape(callee)}(?![A-Za-z0-9_])")
+        if callee
+        else None
+    )
+    segments: list[str] = []
+    for sentence in _requirement_sentences(normalized):
+        clauses = _split_requirement_clauses(sentence)
+        for segment in clauses or [sentence]:
+            segment_text = str(segment or "").strip()
+            if not segment_text:
+                continue
+            if literal in segment_text or (callee_pattern is not None and callee_pattern.search(segment_text)):
+                if segment_text not in segments:
+                    segments.append(segment_text)
+    return segments
+
+
+def _python_reference_defines_literal_callee(reference: str, candidate: str) -> bool:
+    normalized = str(candidate or "").strip()
+    if "(" not in normalized or ")" not in normalized:
+        return False
+    callee = str(normalized.split("(", 1)[0] or "").strip().split(".")[-1]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", callee):
+        return False
+    try:
+        tree = ast.parse(str(reference or ""))
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == callee:
+            return True
+    return False
 
 
 def _literal_matches_reference(candidate: str, reference_tokens: set[str]) -> bool:
@@ -2213,6 +2917,121 @@ def _artifact_scope_markers(path_or_name: str) -> set[str]:
             if len(token) >= 3:
                 expanded.add(token)
     return expanded
+
+
+_GENERIC_ARTIFACT_MARKERS = {
+    "app",
+    "apps",
+    "asset",
+    "assets",
+    "component",
+    "components",
+    "config",
+    "configs",
+    "css",
+    "dist",
+    "docs",
+    "file",
+    "files",
+    "fixture",
+    "fixtures",
+    "html",
+    "include",
+    "includes",
+    "js",
+    "json",
+    "layout",
+    "layouts",
+    "markdown",
+    "md",
+    "module",
+    "modules",
+    "page",
+    "pages",
+    "partial",
+    "partials",
+    "public",
+    "py",
+    "pyi",
+    "readme",
+    "rst",
+    "sample",
+    "samples",
+    "script",
+    "scripts",
+    "section",
+    "sections",
+    "site",
+    "src",
+    "static",
+    "style",
+    "styles",
+    "test",
+    "tests",
+    "text",
+    "toml",
+    "tsx",
+    "ts",
+    "txt",
+    "view",
+    "views",
+    "yaml",
+    "yml",
+}
+
+
+def _artifact_specific_markers(path_or_name: str) -> set[str]:
+    normalized = str(path_or_name or "").strip().lower()
+    if not normalized:
+        return set()
+
+    path_obj = Path(normalized)
+    specific: set[str] = set()
+    exact_candidates = [normalized, path_obj.name, path_obj.stem]
+    for candidate in exact_candidates:
+        cleaned = str(candidate or "").strip().lower()
+        if cleaned and cleaned not in _GENERIC_ARTIFACT_MARKERS:
+            specific.add(cleaned)
+
+    token_sources = [*path_obj.parts, path_obj.name, path_obj.stem]
+    for source in token_sources:
+        for token in re.split(r"[^a-z0-9]+", str(source or "").strip().lower()):
+            token = token.strip()
+            if len(token) < 3 or token in _GENERIC_ARTIFACT_MARKERS:
+                continue
+            specific.add(token)
+    return specific
+
+
+def _artifact_specific_relevance_score(text: str, path_or_name: str) -> int:
+    normalized_text = str(text or "").strip().lower()
+    normalized_path = str(path_or_name or "").strip().lower()
+    if not normalized_text or not normalized_path:
+        return 0
+
+    path_obj = Path(normalized_path)
+    score = 0
+    if normalized_path in normalized_text:
+        score += 10
+
+    name = path_obj.name.lower()
+    stem = path_obj.stem.lower()
+    if name and name in normalized_text:
+        score += 7
+    elif stem and stem in normalized_text:
+        score += 4
+
+    if name and re.search(rf"['\"]{re.escape(name)}['\"]", normalized_text):
+        score += 4
+    elif normalized_path and re.search(rf"['\"]{re.escape(normalized_path)}['\"]", normalized_text):
+        score += 4
+
+    for marker in _artifact_specific_markers(normalized_path):
+        if marker in {normalized_path, name, stem}:
+            continue
+        if marker in normalized_text:
+            score += 3 if len(marker) >= 5 else 2
+    return score
 
 
 def _scope_relevance_score(text: str, markers: set[str]) -> int:
@@ -2482,6 +3301,32 @@ def _repair_related_file_context(
             max_files=max_files,
         )
 
+    target_focus_lines: list[str] = []
+    allowed_related_paths: set[str] = set()
+    if repair_context.verification_scope == "runtime":
+        target_focus_lines = _targeted_runtime_failure_focus_lines(
+            "\n".join(
+                part
+                for part in [
+                    str(repair_context.excerpt or "").strip(),
+                    str(repair_context.failure_summary or "").strip(),
+                    str(repair_context.summary or "").strip(),
+                ]
+                if part
+            ),
+            target_path=target_path,
+            other_paths=_repair_other_paths(repair_context, target_path=target_path),
+            limit=8,
+        )
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is not None:
+            allowed_related_paths = {
+                str(item or "").strip()
+                for item in getattr(brief, "allowed_files", []) or []
+                if str(item or "").strip() and str(item or "").strip() != target_path
+            }
+    target_focus_text = "\n".join(target_focus_lines)
+
     latest_excerpts: dict[str, str] = {}
     for path in candidate_paths:
         excerpt = _workspace_file_excerpt(session, path)
@@ -2506,17 +3351,50 @@ def _repair_related_file_context(
         excerpt = latest_excerpts.get(path)
         if not excerpt:
             continue
+        if (
+            repair_context.verification_scope == "runtime"
+            and target_focus_lines
+            and not _related_context_is_test_like(path)
+            and path not in allowed_related_paths
+            and _artifact_specific_relevance_score(target_focus_text, path) <= 0
+        ):
+            continue
         normalized_excerpt = str(excerpt or "").strip()
-        if len(normalized_excerpt) <= excerpt_limit or (
+        focused_line_hints = _supporting_file_line_hints(
+            excerpt,
+            repair_context=repair_context,
+            target_path=target_path,
+        )
+        if focused_line_hints:
+            focused_excerpt = _line_focused_excerpt(
+                excerpt,
+                line_hints=focused_line_hints,
+                limit=excerpt_limit,
+                before_radius=1,
+                after_radius=0,
+            )
+            if (
+                _related_context_is_test_like(path)
+                and _path_was_created(session, path)
+                and len(str(excerpt or "").splitlines()) <= 10
+            ):
+                header_excerpt = _line_focused_excerpt(
+                    excerpt,
+                    line_hints=[1, 2, 3],
+                    limit=min(180, excerpt_limit),
+                    before_radius=0,
+                    after_radius=0,
+                )
+                if header_excerpt and header_excerpt not in focused_excerpt:
+                    focused_excerpt = _trim_balanced_text(
+                        header_excerpt + "\n...\n" + focused_excerpt,
+                        excerpt_limit,
+                    )
+        elif len(normalized_excerpt) <= excerpt_limit or (
             len(normalized_excerpt.splitlines()) <= 12 and len(normalized_excerpt) <= excerpt_limit + 120
         ):
             focused_excerpt = normalized_excerpt
         else:
-            focused_line_hints = _supporting_file_line_hints(
-                excerpt,
-                repair_context=repair_context,
-                target_path=target_path,
-            )
             if focused_line_hints:
                 focused_excerpt = _line_focused_excerpt(
                     excerpt,
@@ -2664,6 +3542,7 @@ def _supporting_file_line_hints(
     repair_context: ValidationFailureEvidence,
     target_path: str,
     limit: int = 4,
+    allow_target_token_fallback: bool = True,
 ) -> list[int]:
     focus_lines = _targeted_runtime_failure_focus_lines(
         "\n".join(
@@ -2676,6 +3555,7 @@ def _supporting_file_line_hints(
             if part
         ),
         target_path=target_path,
+        other_paths=_repair_other_paths(repair_context, target_path=target_path),
         limit=8,
     )
     file_lines = [str(line or "").strip() for line in str(text or "").splitlines()]
@@ -2702,7 +3582,119 @@ def _supporting_file_line_hints(
                     matches.append(index)
                 if len(matches) >= limit:
                     return matches
+        query_tokens = _focus_line_query_tokens(anchor)
+        if not query_tokens:
+            continue
+        scored_indexes: list[tuple[int, int]] = []
+        for index, line in enumerate(normalized_file_lines, start=1):
+            if not line:
+                continue
+            score = sum(1 for token in query_tokens if token in line)
+            if score > 0:
+                scored_indexes.append((score, index))
+        for _, index in sorted(scored_indexes, key=lambda item: (-item[0], item[1]))[:2]:
+            previous_index = index - 1
+            if previous_index >= 1 and file_lines[previous_index - 1].strip():
+                if previous_index not in matches:
+                    matches.append(previous_index)
+                if len(matches) >= limit:
+                    return matches
+            if index not in matches:
+                matches.append(index)
+            if len(matches) >= limit:
+                return matches
+    if matches:
+        return matches
+
+    if not allow_target_token_fallback:
+        return matches
+
+    fallback_tokens = _supporting_target_query_tokens(target_path, repair_context=repair_context)
+    if not fallback_tokens:
+        return matches
+
+    scored_indexes: list[tuple[int, int]] = []
+    for index, line in enumerate(file_lines, start=1):
+        lowered = normalized_file_lines[index - 1]
+        if not lowered:
+            continue
+        score = sum(3 for token in fallback_tokens if token in lowered)
+        if "patch(" in lowered or ".read(" in lowered or "assert" in lowered:
+            score += 2
+        if re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", line):
+            score += 1
+        if score > 0:
+            scored_indexes.append((score, index))
+    for _, index in sorted(scored_indexes, key=lambda item: (-item[0], item[1]))[:2]:
+        previous_index = index - 1
+        if previous_index >= 1 and file_lines[previous_index - 1].strip():
+            if previous_index not in matches:
+                matches.append(previous_index)
+            if len(matches) >= limit:
+                return matches
+        if index not in matches:
+            matches.append(index)
+        if len(matches) >= limit:
+            return matches
     return matches
+
+
+def _focus_line_query_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+
+    def add(candidate: str, *, min_length: int = 4) -> None:
+        normalized = _normalized_focus_text(candidate)
+        if len(normalized) < min_length:
+            return
+        if normalized in {
+            "assertin",
+            "assertequal",
+            "traceback",
+            "file",
+            "read",
+            "html",
+            "css",
+            "line",
+            "error",
+            "assertionerror",
+        }:
+            return
+        if normalized not in tokens:
+            tokens.append(normalized)
+
+    raw = str(text or "").strip()
+    for candidate in re.findall(r"['\"]([^'\"]{3,})['\"]", raw):
+        add(candidate, min_length=3)
+    for candidate in re.findall(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+", raw):
+        add(candidate, min_length=3)
+    for candidate in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{4,}\b", raw):
+        add(candidate, min_length=5)
+    return tokens[:6]
+
+
+def _supporting_target_query_tokens(
+    target_path: str,
+    *,
+    repair_context: ValidationFailureEvidence,
+) -> list[str]:
+    tokens: list[str] = []
+
+    def add(candidate: str, *, min_length: int = 3) -> None:
+        normalized = _normalized_focus_text(candidate)
+        if len(normalized) < min_length:
+            return
+        if normalized not in tokens:
+            tokens.append(normalized)
+
+    for marker in _artifact_specific_markers(target_path):
+        add(marker, min_length=3)
+
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        for symbol in getattr(brief, "implicated_symbols", []) or []:
+            add(str(symbol or ""), min_length=4)
+
+    return tokens[:6]
 
 
 def _workspace_file_excerpt(session: SessionState, path: str) -> str:
@@ -2731,6 +3723,18 @@ def _workspace_file_excerpt(session: SessionState, path: str) -> str:
     if "\x00" in content:
         return ""
     return content
+
+
+def _path_was_created(session: SessionState, path: str) -> bool:
+    target = str(path or "").strip()
+    if not target:
+        return False
+    for item in reversed(session.tool_calls):
+        if item.tool_name != "create_file" or not item.success:
+            continue
+        if str(item.tool_args.get("path") or "").strip() == target:
+            return True
+    return False
 
 
 def _normalized_focus_text(text: str) -> str:
@@ -2796,6 +3800,8 @@ def _runtime_failure_focus_lines(text: str, *, limit: int = 6) -> list[str]:
             stripped,
         ):
             add(stripped)
+            for diff_line in _adjacent_assertion_diff_lines(lines, start_index=index):
+                add(diff_line)
             continue
         if re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", stripped) and (
             "assert" in stripped.lower()
@@ -2812,13 +3818,82 @@ def _runtime_failure_focus_lines(text: str, *, limit: int = 6) -> list[str]:
     return [_trim_text(line.strip(), 180) for line in lines if line.strip()][:limit]
 
 
+def _runtime_failure_blocks(lines: list[str]) -> list[list[str]]:
+    blocks: list[list[str]] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            blocks.append(current)
+            current = []
+
+    for raw in lines:
+        stripped = str(raw or "").rstrip()
+        compact = stripped.strip()
+        if not compact:
+            flush()
+            continue
+        if re.fullmatch(r"[=\-_/]{5,}", compact):
+            flush()
+            continue
+        if current and re.match(r"\b(?:FAIL|FAILED|ERROR):", compact):
+            flush()
+        current.append(stripped)
+
+    flush()
+    return blocks
+
+
+def _targeted_runtime_failure_blocks(
+    text: str,
+    *,
+    target_path: str,
+    other_paths: list[str] | None = None,
+) -> list[list[str]]:
+    lines = [str(line or "").rstrip() for line in str(text or "").splitlines()]
+    blocks = _runtime_failure_blocks(lines)
+    if len(blocks) <= 1:
+        return blocks
+
+    target_specific: list[list[str]] = []
+    neutral: list[list[str]] = []
+    other_candidates = [str(item or "").strip() for item in (other_paths or []) if str(item or "").strip()]
+    for block in blocks:
+        block_text = "\n".join(block)
+        target_score = _artifact_specific_relevance_score(block_text, target_path)
+        other_score = max(
+            (_artifact_specific_relevance_score(block_text, candidate) for candidate in other_candidates),
+            default=0,
+        )
+        if target_score > 0 and target_score >= other_score:
+            target_specific.append(block)
+            continue
+        if target_score == 0 and other_score == 0:
+            neutral.append(block)
+
+    if target_specific:
+        return target_specific + neutral[:1]
+    return blocks
+
+
 def _targeted_runtime_failure_focus_lines(
     text: str,
     *,
     target_path: str,
+    other_paths: list[str] | None = None,
     limit: int = 6,
 ) -> list[str]:
-    lines = [str(line or "").rstrip() for line in str(text or "").splitlines()]
+    original_lines = [str(line or "").rstrip() for line in str(text or "").splitlines()]
+    original_blocks = _runtime_failure_blocks(original_lines)
+    scoped_blocks = _targeted_runtime_failure_blocks(
+        text,
+        target_path=target_path,
+        other_paths=other_paths,
+    )
+    block_scoped = bool(original_blocks) and scoped_blocks != original_blocks
+    scoped_text = "\n".join(line for block in scoped_blocks for line in block)
+    lines = [str(line or "").rstrip() for line in str(scoped_text or "").splitlines()]
     if not lines:
         return []
 
@@ -2828,10 +3903,33 @@ def _targeted_runtime_failure_focus_lines(
         Path(str(target_path or "").strip()).name.lower(),
         Path(str(target_path or "").strip()).stem.lower(),
     }
-    scored: list[tuple[int, int, str]] = []
+    other_markers: set[str] = set()
+    other_tokens: set[str] = set()
+    for candidate in other_paths or []:
+        path = str(candidate or "").strip()
+        if not path:
+            continue
+        other_markers.update(_artifact_scope_markers(path))
+        other_tokens.update(
+            {
+                path.lower(),
+                Path(path).name.lower(),
+                Path(path).stem.lower(),
+            }
+        )
+    has_target_frame = any(
+        (
+            re.match(r'File ".+", line \d+, in .+', stripped)
+            or re.match(r"[\w./\\-]+\.py:\d+(?::\d+)?", stripped)
+        )
+        and any(marker and marker in stripped.lower() for marker in target_markers)
+        for stripped in (line.strip() for line in lines)
+        if stripped
+    )
+    scored: list[tuple[int, int, int, int, str]] = []
     seen: set[str] = set()
 
-    def add(candidate: str, *, index: int, score: int) -> None:
+    def add(candidate: str, *, index: int, score: int, target_score: int, other_score: int) -> None:
         normalized = str(candidate or "").strip()
         if not normalized:
             return
@@ -2839,7 +3937,7 @@ def _targeted_runtime_failure_focus_lines(
         if clipped in seen:
             return
         seen.add(clipped)
-        scored.append((score, index, clipped))
+        scored.append((score, target_score, other_score, index, clipped))
 
     for index, raw in enumerate(lines):
         stripped = raw.strip()
@@ -2847,6 +3945,12 @@ def _targeted_runtime_failure_focus_lines(
             continue
         lowered = stripped.lower()
         score = 0
+        target_score = _scope_relevance_score(stripped, target_markers)
+        other_score = _scope_relevance_score(stripped, other_markers)
+        if any(token and token in lowered for token in target_tokens):
+            target_score += 4
+        if any(token and token in lowered for token in other_tokens):
+            other_score += 4
         if stripped.startswith("Traceback"):
             score += 2
         if re.search(
@@ -2860,35 +3964,171 @@ def _targeted_runtime_failure_focus_lines(
         ):
             score += 3
             target_frame = any(marker and marker in lowered for marker in target_markers)
+            other_frame = any(marker and marker in lowered for marker in other_markers)
             if target_frame:
                 score += 5
-            add(stripped, index=index, score=score)
+                target_score += 5
+            if other_frame:
+                other_score += 5
+            add(stripped, index=index, score=score, target_score=target_score, other_score=other_score)
             if index + 1 < len(lines):
                 next_line = lines[index + 1].strip()
                 if next_line and not next_line.startswith("Traceback") and not next_line.startswith("File "):
                     next_score = 4
+                    next_target_score = target_score
+                    next_other_score = other_score
                     if re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", next_line):
                         next_score += 2
                     if target_frame:
                         next_score += 5
+                        next_target_score += 3
+                    elif has_target_frame and re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", next_line):
+                        next_score += 3
+                        next_target_score = max(next_target_score, next_other_score + 1, 2)
                     elif re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", next_line):
                         next_score += 2
-                    add(next_line, index=index + 1, score=next_score)
+                    add(
+                        next_line,
+                        index=index + 1,
+                        score=next_score,
+                        target_score=next_target_score,
+                        other_score=next_other_score,
+                    )
             continue
-        if any(token and token in lowered for token in target_tokens):
-            score += 4
+        if target_score > 0:
+            score += min(target_score, 6)
         if re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", stripped):
             score += 3
         if "test_" in lowered or "mock" in lowered:
             score += 1
         if score > 0:
-            add(stripped, index=index, score=score)
+            add(stripped, index=index, score=score, target_score=target_score, other_score=other_score)
+            if "assertionerror" in lowered:
+                for offset, diff_line in enumerate(
+                    _adjacent_assertion_diff_lines(lines, start_index=index),
+                    start=1,
+                ):
+                    add(
+                        diff_line,
+                        index=index + offset,
+                        score=max(score - 1, 1),
+                        target_score=target_score,
+                        other_score=other_score,
+                    )
 
     if not scored:
         return _runtime_failure_focus_lines(text, limit=limit)
 
-    ranked = sorted(scored, key=lambda item: (-item[0], item[1]))
-    return [line for _, _, line in ranked[:limit]]
+    if not block_scoped and any(item[1] > 0 for item in scored):
+        targeted = [item for item in scored if item[1] > 0 and item[1] >= item[2]]
+        if targeted:
+            scored = targeted
+        else:
+            filtered = [item for item in scored if item[2] <= item[1]]
+            if filtered:
+                scored = filtered
+
+    def kind_priority(line: str) -> int:
+        lowered = str(line or "").lower()
+        if "assertionerror" in lowered:
+            return 0
+        if str(line or "").startswith(("-", "+", "?")):
+            return 1
+        if re.search(
+            r"\b(?:typeerror|valueerror|runtimeerror|nameerror|attributeerror|importerror|modulenotfounderror|syntaxerror|indexerror|keyerror|systemexit)\b",
+            lowered,
+        ):
+            return 2
+        if any(marker and marker in lowered for marker in target_markers):
+            return 3
+        if "assert" in lowered:
+            return 5
+        if lowered.startswith("file ") or lowered.startswith("traceback"):
+            return 6
+        return 4
+
+    ranked = sorted(scored, key=lambda item: (kind_priority(item[4]), -item[0], -item[1], item[3]))
+    selected = [line for _, _, _, _, line in ranked[:limit]]
+    assertion_lines = [
+        _trim_text(str(line or "").strip(), 180)
+        for line in lines
+        if str(line or "").strip()
+        and (
+            "assertionerror" in str(line or "").lower()
+            or str(line or "").strip().startswith(("-", "+", "?"))
+        )
+    ]
+    if assertion_lines and not any(
+        "assertionerror" in str(line or "").lower() or str(line or "").startswith(("-", "+", "?"))
+        for line in selected
+    ):
+        selected = assertion_lines[: min(len(assertion_lines), limit)] + [
+            line for line in selected if line not in assertion_lines
+        ]
+    if not any(
+        ("assert" in str(line or "").lower()) or re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", str(line or ""))
+        for line in selected
+        if not str(line or "").startswith(("File ", "Traceback"))
+    ):
+        for _, target_score, other_score, _, line in ranked:
+            lowered = str(line or "").lower()
+            if str(line or "").startswith(("File ", "Traceback")):
+                continue
+            if not (
+                "assert" in lowered
+                or re.search(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)", str(line or ""))
+            ):
+                continue
+            if not block_scoped and target_score <= 0 and other_score > target_score:
+                continue
+            if line not in selected:
+                if len(selected) >= limit:
+                    selected[-1] = line
+                else:
+                    selected.append(line)
+                break
+    return selected[:limit]
+
+
+def _repair_other_paths(
+    repair_context: ValidationFailureEvidence,
+    *,
+    target_path: str,
+) -> list[str]:
+    target = str(target_path or "").strip()
+    return [
+        path
+        for path in [str(item or "").strip() for item in [*repair_context.artifact_paths, *repair_context.file_hints]]
+        if path and not _artifact_matches_path(target, path, path)
+    ]
+
+
+def _adjacent_assertion_diff_lines(
+    lines: list[str],
+    *,
+    start_index: int,
+    limit: int = 4,
+) -> list[str]:
+    collected: list[str] = []
+    for raw in lines[start_index + 1 :]:
+        stripped = str(raw or "").strip()
+        if not stripped:
+            break
+        if stripped.startswith(("Traceback", "File ")):
+            break
+        if re.match(r"[=-]{5,}", stripped):
+            break
+        if re.search(r"\b(?:FAIL|FAILED|ERROR)\b", stripped):
+            break
+        if stripped.startswith(("-", "+", "?")):
+            collected.append(stripped)
+            if len(collected) >= limit:
+                break
+            continue
+        if collected:
+            break
+        break
+    return collected
 
 
 def _repair_support_paths(

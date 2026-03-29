@@ -1058,15 +1058,36 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
             selected=selected,
         )
         selected = [*selected, *relevant_tests[:2]]
+    explicit_primary_paths = [
+        path
+        for path in explicit_request_paths
+        if path not in test_files
+        and "/tests/" not in f"/{path}"
+        and path not in manifests
+        and Path(path).suffix.lower() not in {".md", ".rst", ".txt"}
+    ]
     explicit_support_paths = [
         path
         for path in explicit_request_paths
         if path in manifests or Path(path).suffix.lower() in {".md", ".rst", ".txt"}
     ]
-    selected_non_tests = [
+    explicit_test_paths = [
+        path
+        for path in explicit_request_paths
+        if path in test_files or "/tests/" in f"/{path}"
+    ]
+    selected_primary_paths = [
         path
         for path in selected
-        if path not in test_files and "/tests/" not in f"/{path}"
+        if path not in test_files
+        and "/tests/" not in f"/{path}"
+        and path not in manifests
+        and Path(path).suffix.lower() not in {".md", ".rst", ".txt"}
+    ]
+    selected_support_paths = [
+        path
+        for path in selected
+        if path in manifests or Path(path).suffix.lower() in {".md", ".rst", ".txt"}
     ]
     selected_tests = [
         path
@@ -1075,14 +1096,23 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
     ]
     ordered_paths: list[str] = []
     for candidate in [
-        *selected_non_tests,
+        *explicit_primary_paths,
+        *selected_primary_paths,
         *explicit_support_paths,
+        *selected_support_paths,
         *selected_tests,
+        *explicit_test_paths,
         *explicit_request_paths,
     ]:
         if candidate and candidate not in ordered_paths:
             ordered_paths.append(candidate)
-    selected = ordered_paths[:4]
+    selection_limit = 4
+    if explicit_request_paths:
+        selection_limit = max(
+            selection_limit,
+            min(6, len(explicit_primary_paths) + len(explicit_support_paths) + len(explicit_test_paths)),
+        )
+    selected = ordered_paths[:selection_limit]
     return _task_artifacts_for_paths(snapshot, selected)
 
 

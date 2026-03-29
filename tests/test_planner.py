@@ -10,6 +10,8 @@ from agent.models import (
     FileChangeRecord,
     FollowUpContext,
     ProposedUpdateReview,
+    RepairAttemptSummary,
+    RepairBrief,
     RepairAttemptRecord,
     SessionState,
     ToolCallRecord,
@@ -27,6 +29,7 @@ from agent.planner import (
 )
 from agent.prompts import (
     _artifact_scoped_focus,
+    _repair_required_literal_anchors,
     _targeted_runtime_failure_focus_lines,
     _targeted_runtime_prompt_hints,
     generate_content_prompt,
@@ -518,11 +521,452 @@ def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path
     prompt = llm.generate_json_calls[0]["args"][0]
 
     assert review.safe_to_write is True
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
     assert '"task_understanding"' not in prompt
     assert '"follow_up_context"' not in prompt
+
+
+def test_planner_uses_local_review_fallback_for_small_updates_without_fallback_model(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+                "confidence": 0.84,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the target."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the requested change."},
+            {"step": 3, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 4, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["cli.py", "README.md", "tests/test_cli.py"],
+        target_name="cli.py",
+    )
+    session = SessionState(
+        task="Fuege eine kleine CLI-Option hinzu und halte die bestehenden Optionen stabil.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest")
+    session.changed_files.append(FileChangeRecord(path="README.md", operation="modify", diff="+ usage\n"))
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "tests/test_cli.py"},
+            success=True,
+            summary="Read tests/test_cli.py.",
+            output_excerpt="from cli import build_parser\n",
+        )
+    )
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="cli.py",
+        current_content="def build_parser():\n    return None\n",
+        proposed_content="def build_parser():\n    parser = None\n    return parser\n",
+    )
+
+    assert review.safe_to_write is True
+    assert llm.generate_json_calls == []
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
+    assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
+
+
+def test_planner_uses_local_review_fallback_for_compact_single_model_repairs(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+                "confidence": 0.84,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Fix the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:compactrepair",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_region_hint="greet_cli/__main__.py:line 5",
+            repair_constraints=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title}: {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title} {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    assert llm.generate_json_calls == []
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
+    assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
+
+
+def test_planner_repair_target_scope_review_blocks_drift_before_ai_review(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+                "confidence": 0.84,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Fix the failing target."}],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting without changing tests.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:lockscope",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="tests/test_cli.py",
+        current_content="def test_cli():\n    assert run_cli(['Ada']) == 'Hello, Ada!'\n",
+        proposed_content="def test_cli():\n    assert run_cli(['Ada']) == 'Dr. Hello, Ada!'\n",
+        repair_context=repair_context,
+    )
+
+    assert review.safe_to_write is False
+    assert "locked" in review.summary.lower() or "scope" in review.summary.lower()
+    assert llm.generate_json_calls == []
+
+
+def test_planner_broad_single_model_repair_can_still_escalate_to_ai_review(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The broader rewrite still preserves the required behavior.",
+                "confidence": 0.75,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Fix the failing target."}],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting even if the implementation needs a larger rewrite.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:broadrepair",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            allowed_files=["greet_cli/__main__.py"],
+        ),
+    )
+
+    current_content = "\n".join(f"line_{index} = {index}" for index in range(1, 15)) + "\n"
+    proposed_content = "\n".join(f"rewritten_line_{index} = {index}" for index in range(1, 15)) + "\n"
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+    )
+
+    assert review.safe_to_write is True
+    assert len(llm.generate_json_calls) == 1
+
+
+def test_planner_uses_local_review_fallback_for_locked_single_model_repair_without_explicit_targets(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "This JSON review should be skipped for a focused locked repair.",
+                "confidence": 0.8,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Fix the failing target."}],
+        target_paths=None,
+        target_name=None,
+    )
+    session = SessionState(
+        task="Repair the CLI entrypoint without drifting into docs or tests.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.changed_files = [
+        FileChangeRecord(path="greet_cli/__main__.py", operation="write", diff=""),
+        FileChangeRecord(path="README.md", operation="write", diff=""),
+        FileChangeRecord(path="tests/test_cli.py", operation="write", diff=""),
+    ]
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:livecompactrepair",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_region_hint="greet_cli/__main__.py",
+            repair_constraints=[
+                "Change greet_cli/__main__.py so the failing runtime path can complete successfully.",
+                "Keep one clear contract boundary between the entrypoint and helper.",
+            ],
+            allowed_files=["greet_cli/__main__.py", "greet_cli/cli.py"],
+            forbidden_files=["README.md", "tests/test_cli.py"],
+        ),
+    )
+
+    current_content = (
+        "def main(argv=None):\n"
+        "    greeting = 'Hello, Ada!'\n"
+        "    title = 'Dr.'\n"
+        "    if title:\n"
+        "        greeting = f\"{title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    greeting = 'Hello, Ada!'\n"
+        "    title = 'Dr.'\n"
+        "    if title:\n"
+        "        greeting = f\"{title} {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+    )
+
+    assert review.safe_to_write is True
+    assert llm.generate_json_calls == []
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
+
+
+def test_planner_repair_no_effective_change_blocks_model_review(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "This JSON review should not run when the repair makes no change.",
+                "confidence": 0.7,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Fix the failing target."}],
+        target_paths=None,
+        target_name=None,
+    )
+    session = SessionState(
+        task="Repair the CLI entrypoint with a real behavior change.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:noeffectivechange",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    current_content = (
+        "def main(argv=None):\n"
+        "    greeting = 'Hello, Ada!'\n"
+        "    title = 'Dr.'\n"
+        "    if title:\n"
+        "        greeting = f\"{title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is False
+    assert "unchanged" in review.summary.lower() or "effective change" in review.summary.lower()
+    assert llm.generate_json_calls == []
 
 
 def test_planner_falls_back_locally_after_compact_review_start_failure(tmp_path):
@@ -566,8 +1010,11 @@ def test_planner_falls_back_locally_after_compact_review_start_failure(tmp_path)
     )
 
     assert review.safe_to_write is True
-    assert len(llm.generate_json_calls) == 1
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
+    assert len(llm.generate_json_calls) == 2
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen3:8b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is True
 
 
 def test_planner_uses_compact_primary_review_for_validation_guided_repairs(tmp_path):
@@ -2190,6 +2637,191 @@ def test_planner_blocks_unrequested_markdown_heading_before_write(tmp_path):
     assert review is not None
     assert review.safe_to_write is False
     assert "markdown headings" in review.blocking_issues[0].lower()
+
+
+def test_planner_accepts_typed_python_signature_for_explicit_literal_constraint(tmp_path):
+    current = (
+        "from __future__ import annotations\n\n"
+        "import re\n"
+        "from collections import Counter\n\n\n"
+        "def count_words(file_path: str) -> dict[str, int]:\n"
+        "    with open(file_path, 'r', encoding='utf-8') as handle:\n"
+        "        words = re.findall(r'\\\\b\\\\w+\\\\b', handle.read().lower())\n"
+        "    return dict(Counter(words))\n"
+    )
+    proposed = (
+        current
+        + "\n\n"
+        + "def top_words(file_path: str, limit: int) -> list[tuple[str, int]]:\n"
+        + "    counts = count_words(file_path)\n"
+        + "    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]\n"
+    )
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Keep count_words in wordfreq.py intact and add a new helper top_words(file_path, limit) in wordfreq.py "
+            "that returns the most frequent words sorted by count descending and alphabetically for ties."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Add the requested helper to wordfreq.py."},
+        ],
+        target_paths=["wordfreq.py", "README.md", "tests/test_wordfreq.py"],
+        target_name="wordfreq.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._explicit_constraint_integrity_review(
+        session.router_result,
+        session,
+        path="wordfreq.py",
+        current_content=current,
+        proposed_content=proposed,
+    )
+
+    assert review is None
+
+
+def test_artifact_scoped_focus_scopes_helper_signature_literal_to_owning_python_file(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    main_current = (
+        "from .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    print(greet('Ada'))\n"
+    )
+    cli_current = "def greet(name):\n    return f'Hello, {name}!'\n"
+    (pkg / "__main__.py").write_text(main_current, encoding="utf-8")
+    (pkg / "cli.py").write_text(cli_current, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "You are working in an existing Python CLI repo. Keep the default greeting behavior intact. "
+            "Extend greet_cli/cli.py so greet(name, shout=False) returns an uppercased greeting when shout=True. "
+            "Update greet_cli/__main__.py to add a --shout flag that routes through the helper, and update README.md with the new flag."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested CLI update."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    main_focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "greet_cli/__main__.py",
+        current_content=main_current,
+    )
+    cli_focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "greet_cli/cli.py",
+        current_content=cli_current,
+    )
+
+    assert "greet(name, shout=False)" not in main_focus["literal_constraints"]
+    assert "greet(name, shout=False)" in cli_focus["literal_constraints"]
+
+
+def test_planner_does_not_reject_entrypoint_update_for_helper_signature_literal_scoped_elsewhere(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    main_current = (
+        "from .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    print(greet('Ada'))\n"
+    )
+    proposed_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(description='Simple greeter')\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--shout', action='store_true')\n"
+        "    return parser\n\n\n"
+        "def main(argv=None) -> int:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    print(greet(args.name, shout=args.shout))\n"
+        "    return 0\n"
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "You are working in an existing Python CLI repo. Keep the default greeting behavior intact. "
+            "Extend greet_cli/cli.py so greet(name, shout=False) returns an uppercased greeting when shout=True. "
+            "Update greet_cli/__main__.py to add a --shout flag that routes through the helper, and update README.md with the new flag."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested CLI update."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "README.md", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._explicit_constraint_integrity_review(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=main_current,
+        proposed_content=proposed_main,
+    )
+
+    assert review is None
+
+
+def test_planner_allows_example_heading_for_requested_readme_example(tmp_path):
+    current = "# Word Frequency\n\nCount words from a text file.\n"
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Update README.md to document top_words with a short example.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Document the new helper in README.md."},
+        ],
+        target_paths=["README.md", "wordfreq.py"],
+        target_name="README.md",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._explicit_constraint_integrity_review(
+        session.router_result,
+        session,
+        path="README.md",
+        current_content=current,
+        proposed_content=(
+            "# Word Frequency\n\n"
+            "Count words from a text file.\n\n"
+            "## Example\n\n"
+            "`top_words('tests/test_data.txt', limit=2)` returns the most frequent entries.\n"
+        ),
+    )
+
+    assert review is None
 
 
 def test_planner_blocks_markdown_instruction_echo_before_write(tmp_path):
@@ -4887,6 +5519,99 @@ def test_compact_repair_update_prompt_adds_mandatory_mutation_anchors_after_unch
     assert "Required repair direction: Change the implicated callable instead of editing unrelated helper code." in prompt
 
 
+def test_compact_repair_update_prompt_avoids_cross_file_line_hint_drift(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    main = pkg / "__main__.py"
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--title')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.title:\n"
+        "        greeting = f\"{args.title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+    main.write_text(current_content, encoding="utf-8")
+    cli = pkg / "cli.py"
+    cli.write_text("def greet(name):\n    return f'Hello, {name}!'\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix the title formatting bug in the existing CLI.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."}],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/tests/test_cli.py", line 25, in test_title_and_repeat_flags\n'
+            '    self.assertEqual(self.run_cli(["Ada", "--title", "Dr.", "--repeat", "2"]), "Dr. Hello, Ada!\\nDr. Hello, Ada!")\n'
+            "AssertionError: 'Dr.: Hello, Ada!\\nDr.: Hello, Ada!' != 'Dr. Hello, Ada!\\nDr. Hello, Ada!'\n"
+            "- Dr.: Hello, Ada!\n"
+            "+ Dr. Hello, Ada!\n"
+        ),
+        failure_summary="The CLI adds extra punctuation when formatting titled greetings.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        line_hints=[25],
+        repair_requirements=[],
+        evidence_signature="sig-title-drift",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:deadbeef",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_symbols=[],
+            implicated_region_hint="greet_cli/__main__.py",
+            repair_constraints=[],
+            recent_failed_attempts=[],
+            allowed_files=["greet_cli/__main__.py", "greet_cli/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Change the implicated current lines in greet_cli/__main__.py:" in prompt
+    assert "13:     if args.title:" in prompt
+    assert '14:         greeting = f"{args.title}: {greeting}"' in prompt
+    assert "Change the implicated current lines in greet_cli/__main__.py:\n25:" not in prompt
+
+
 def test_compact_repair_update_prompt_prefers_created_test_context_and_traceback_focus(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
@@ -5047,6 +5772,330 @@ def test_compact_repair_update_prompt_prefers_created_test_context_and_traceback
     assert "TypeError: main() takes 0 positional arguments but 1 was given" in prompt
 
 
+def test_compact_repair_prompt_includes_assertion_diff_lines_for_runtime_mismatch(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    main = pkg / "__main__.py"
+    main.write_text(
+        "import argparse\nfrom .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name', nargs='?', default='world')\n"
+        "    parser.add_argument('--title', default='')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.title:\n"
+        "        greeting = f'{args.title} {greeting}'\n"
+        "    print(greeting)\n",
+        encoding="utf-8",
+    )
+    cli = pkg / "cli.py"
+    cli.write_text("def greet(name):\n    return f'Hello, {name}!'\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_content = (
+        "import unittest\n"
+        "from unittest.mock import patch\n"
+        "from io import StringIO\n\n"
+        "class TestCLI(unittest.TestCase):\n"
+        "    @patch('sys.stdout', new_callable=StringIO)\n"
+        "    def test_greet_with_title(self, mock_stdout):\n"
+        "        from greet_cli import __main__\n"
+        "        __main__.main(['Ada', '--title', 'Mr.'])\n"
+        "        self.assertEqual(mock_stdout.getvalue().strip(), 'Hello, Mr. Ada!')\n"
+    )
+    (tests_dir / "test_cli.py").write_text(test_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py", "README.md"],
+                "focus_files": ["greet_cli/__main__.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_cli",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_cli"],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="greet_cli/__main__.py", operation="write"),
+            FileChangeRecord(path="greet_cli/cli.py", operation="write"),
+            FileChangeRecord(path="tests/test_cli.py", operation="write"),
+        ]
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "greet_cli/__main__.py"},
+                success=True,
+                summary="Read greet_cli/__main__.py.",
+                output_excerpt=main.read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "greet_cli/cli.py"},
+                success=True,
+                summary="Read greet_cli/cli.py.",
+                output_excerpt=cli.read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="create_file",
+                tool_args={"path": "tests/test_cli.py", "content": test_content, "overwrite": False},
+                success=True,
+                summary="Created tests/test_cli.py.",
+                output_excerpt=test_content,
+            ),
+        ]
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.test_cli",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            iteration=8,
+            summary="Validation command exited with 1.",
+            excerpt=(
+                "Traceback (most recent call last):\n"
+                '  File "/tmp/tests/test_cli.py", line 9, in test_greet_with_title\n'
+                "    self.assertEqual(mock_stdout.getvalue().strip(), 'Hello, Mr. Ada!')\n"
+                "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'\n"
+                "- Mr. Hello, Ada!\n"
+                "+ Hello, Mr. Ada!\n"
+            ),
+        )
+    )
+
+    failed_run = session.validation_runs[-1]
+    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
+    repair_route = planner._repair_route_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    prompt = generate_content_prompt(
+        repair_route,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=main.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        mode="compact",
+    )
+
+    assert "Failure focus:" in prompt
+    assert "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'" in prompt
+    assert "- Mr. Hello, Ada!" in prompt
+    assert "+ Hello, Mr. Ada!" in prompt
+
+
+def test_compact_repair_prompt_includes_repair_brief_semantics_and_file_constraints(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    main = pkg / "__main__.py"
+    main.write_text(
+        "def main(argv=None):\n"
+        "    greeting = 'Mr. Hello, Ada!'\n"
+        "    print(greeting)\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root=str(tmp_path),
+    )
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'",
+        failure_summary="The CLI output ordering is wrong for the title-aware greeting.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py", "README.md"],
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        evidence_signature="sig-repair-brief",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:abcd1234",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Hello, Mr. Ada!"],
+            observed_semantics=["Validation currently produces: Mr. Hello, Ada!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="greet_cli/__main__.py:line 2",
+            repair_constraints=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+            recent_failed_attempts=[
+                RepairAttemptSummary(
+                    target="greet_cli/__main__.py",
+                    strategy="validation_targeted",
+                    result="no_effective_change",
+                    reason="The generated edit left the implicated behavior unchanged.",
+                )
+            ],
+            allowed_files=["greet_cli/__main__.py", "greet_cli/cli.py"],
+            forbidden_files=["README.md", "tests/test_cli.py"],
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."}],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=main.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        mode="compact",
+    )
+
+    assert "Primary repair target: greet_cli/__main__.py" in prompt
+    assert "Expected semantics: Validation should produce: Hello, Mr. Ada!" in prompt
+    assert "Observed semantics: Validation currently produces: Mr. Hello, Ada!" in prompt
+    assert "Minimal semantic delta:" in prompt
+    assert "Allowed repair files: greet_cli/__main__.py, greet_cli/cli.py" in prompt
+    assert "Avoid drifting into other files without strong new evidence: README.md, tests/test_cli.py" in prompt
+    assert "Recent failed repair attempts:" in prompt
+
+
+def test_compact_repair_prompt_surfaces_minimal_semantic_delta_for_behavior_mismatch(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--title')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.title:\n"
+        "        greeting = f\"{args.title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+    (pkg / "__main__.py").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix the title formatting bug in the existing CLI.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."}],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli and fix the failing CLI behavior.",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "AssertionError: 'Dr.: Hello, Ada!\\nDr.: Hello, Ada!' != 'Dr. Hello, Ada!\\nDr. Hello, Ada!'\n"
+            "- Dr.: Hello, Ada!\n"
+            "+ Dr. Hello, Ada!\n"
+        ),
+        failure_summary="The CLI adds extra punctuation when formatting titled greetings.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        line_hints=[25],
+        repair_requirements=[],
+        evidence_signature="sig-title-delta",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:delta1234",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!\nDr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!\nDr.: Hello, Ada!"],
+            implicated_symbols=[],
+            implicated_region_hint="greet_cli/__main__.py",
+            repair_constraints=[],
+            recent_failed_attempts=[],
+            allowed_files=["greet_cli/__main__.py", "greet_cli/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert (
+        "Minimal semantic delta: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+    assert "Change the implicated current lines in greet_cli/__main__.py:" in prompt
+    assert "13:     if args.title:" in prompt
+    assert '14:         greeting = f"{args.title}: {greeting}"' in prompt
+    assert (
+        "Apply this exact semantic delta in the behavior produced by this file: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+
+
 def test_compact_repair_prompt_focuses_supporting_test_lines_around_runtime_hints(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
@@ -5183,6 +6232,234 @@ def test_compact_repair_prompt_focuses_supporting_test_lines_around_runtime_hint
     assert "10:         with patch('__main__.sys.argv', ['python', '-m', 'greet_cli', 'Ada']):" in prompt
     assert "17:         with patch('__main__.sys.argv', ['python', '-m', 'greet_cli']):" in prompt
     assert "1: import unittest" not in prompt
+
+
+def test_compact_repair_prompt_scopes_multi_file_website_failures_per_target(tmp_path):
+    projects = tmp_path / "projects.html"
+    projects.write_text(
+        "<!doctype html>\n<html><body><main><h1>Projects</h1></main></body></html>\n",
+        encoding="utf-8",
+    )
+    contact = tmp_path / "contact.html"
+    contact.write_text(
+        "<!doctype html>\n<html><body><main><form></form></main></body></html>\n",
+        encoding="utf-8",
+    )
+    styles = tmp_path / "styles.css"
+    styles.write_text("body { margin: 0; }\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_content = (
+        "import unittest\n\n"
+        "class TestSite(unittest.TestCase):\n"
+        "    def read(self, name):\n"
+        "        with open(name, 'r', encoding='utf-8') as handle:\n"
+        "            return handle.read()\n\n"
+        "    def test_projects_page(self):\n"
+        "        html = self.read('projects.html')\n"
+        "        self.assertIn('Case Studies', html)\n\n"
+        "    def test_contact_page(self):\n"
+        "        html = self.read('contact.html')\n"
+        "        self.assertIn('class=\"contact-form\"', html)\n\n"
+        "    def test_stylesheet_layout(self):\n"
+        "        css = self.read('styles.css')\n"
+        "        self.assertIn('.site-grid', css)\n"
+    )
+    (tests_dir / "test_site.py").write_text(test_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the portfolio website so the targeted page-level validation passes.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the targeted website file."}],
+        target_paths=["projects.html"],
+        target_name="projects.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_site and repair the failing website behavior.",
+    )
+
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_site",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["projects.html", "contact.html", "styles.css", "tests/test_site.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_contact_page (tests.test_site.TestSite.test_contact_page)\n"
+            '  File "/tmp/tests/test_site.py", line 12, in test_contact_page\n'
+            "    self.assertIn('class=\"contact-form\"', self.read('contact.html'))\n"
+            "AssertionError: 'class=\"contact-form\"' not found in '<form></form>'\n"
+            "\n"
+            "FAIL: test_projects_page (tests.test_site.TestSite.test_projects_page)\n"
+            '  File "/tmp/tests/test_site.py", line 8, in test_projects_page\n'
+            "    self.assertIn('Case Studies', self.read('projects.html'))\n"
+            "AssertionError: 'Case Studies' not found in '<h1>Projects</h1>'\n"
+            "\n"
+            "FAIL: test_stylesheet_layout (tests.test_site.TestSite.test_stylesheet_layout)\n"
+            '  File "/tmp/tests/test_site.py", line 16, in test_stylesheet_layout\n'
+            "    self.assertIn('.site-grid', self.read('styles.css'))\n"
+            "AssertionError: '.site-grid' not found in 'body { margin: 0; }'\n"
+        ),
+        failure_summary="The generated portfolio site still misses required page-specific and stylesheet content.",
+        file_hints=["projects.html", "contact.html", "styles.css", "tests/test_site.py"],
+        repair_requirements=[],
+        evidence_signature="sig-website-scoped-repair",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:website1234",
+            primary_target="projects.html",
+            locked_target="projects.html",
+            expected_semantics=["projects.html should include Case Studies."],
+            observed_semantics=["projects.html currently omits Case Studies."],
+            implicated_symbols=[],
+            implicated_region_hint="projects.html",
+            repair_constraints=["Only repair the requested target file for this write step."],
+            recent_failed_attempts=[],
+            allowed_files=["projects.html"],
+            forbidden_files=["contact.html", "styles.css"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="projects.html",
+        current_content=projects.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Case Studies" in prompt
+    assert "self.assertIn('Case Studies', self.read('projects.html'))" in prompt
+    assert 'class="contact-form"' not in prompt
+    assert ".site-grid" not in prompt
+    assert "self.read('contact.html')" not in prompt
+    assert "self.read('styles.css')" not in prompt
+
+
+def test_compact_repair_prompt_adds_exact_literal_anchor_for_quote_variant(tmp_path):
+    about = tmp_path / "about.html"
+    about.write_text(
+        "<!doctype html>\n<html><body><header class='about-hero'></header></body></html>\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_site.py").write_text("pass\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the portfolio about page so the targeted page-level validation passes.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the targeted website file."}],
+        target_paths=["about.html"],
+        target_name="about.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_site and repair the failing website behavior.",
+    )
+
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_site",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["about.html", "tests/test_site.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_about_page (tests.test_site.TestSite.test_about_page)\n"
+            '  File "/tmp/tests/test_site.py", line 8, in test_about_page\n'
+            "    self.assertIn('class=\"about-hero\"', self.read('about.html'))\n"
+            "AssertionError: 'class=\"about-hero\"' not found in \"<header class='about-hero'></header>\"\n"
+        ),
+        failure_summary="The about page still misses the required hero marker.",
+        file_hints=["about.html", "tests/test_site.py"],
+        repair_requirements=[],
+        evidence_signature="sig-website-literal-anchor",
+    )
+
+    anchors = _repair_required_literal_anchors(
+        path="about.html",
+        current_content=about.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+    )
+
+    assert anchors
+    assert "exact required literal" in anchors[0]
+    assert "near-match literal" in anchors[0]
+    assert 'class="about-hero"' in anchors[0]
+    assert "class='about-hero'" in anchors[0]
+
+
+def test_compact_repair_prompt_adds_count_based_literal_anchor(tmp_path):
+    projects = tmp_path / "projects.html"
+    projects.write_text(
+        "<!doctype html>\n<html><body><div class='project-card'></div></body></html>\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_site.py").write_text("pass\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the projects page so the project cards satisfy validation.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the targeted website file."}],
+        target_paths=["projects.html"],
+        target_name="projects.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_site and repair the failing website behavior.",
+    )
+
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_site",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["projects.html", "tests/test_site.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_projects_page (tests.test_site.TestSite.test_projects_page)\n"
+            '  File "/tmp/tests/test_site.py", line 12, in test_projects_page\n'
+            "    self.assertGreaterEqual(self.read('projects.html').count('class=\"project-card\"'), 3)\n"
+            "AssertionError: 1 not greater than or equal to 3\n"
+        ),
+        failure_summary="The projects page still exposes too few project cards.",
+        file_hints=["projects.html", "tests/test_site.py"],
+        repair_requirements=[],
+        evidence_signature="sig-website-count-anchor",
+    )
+
+    anchors = _repair_required_literal_anchors(
+        path="projects.html",
+        current_content=projects.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+    )
+
+    assert anchors
+    assert "appears at least 3 times" in anchors[0]
+    assert 'class="project-card"' in anchors[0]
+    assert "class='project-card'" in anchors[0]
 
 
 def test_compact_repair_retry_prompt_includes_optional_argv_and_launcher_strip_hints(tmp_path):
@@ -5497,6 +6774,54 @@ def test_targeted_runtime_failure_focus_keeps_adjacent_code_lines_for_runtime_re
     assert "__main__.main()" in focus
 
 
+def test_targeted_runtime_failure_focus_includes_assertion_diff_lines():
+    focus = _targeted_runtime_failure_focus_lines(
+        (
+            "FAIL: test_greet_with_title (tests.test_cli.TestCLI.test_greet_with_title)\n"
+            '  File "/home/marc/workspace/e2e-python-cli/tests/test_cli.py", line 12, in test_greet_with_title\n'
+            "    self.assertEqual(mock_stdout.getvalue().strip(), 'Hello, Mr. Ada!')\n"
+            "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'\n"
+            "- Mr. Hello, Ada!\n"
+            "+ Hello, Mr. Ada!\n"
+            "?     -------\n"
+        ),
+        target_path="greet_cli/__main__.py",
+        limit=6,
+    )
+
+    assert "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'" in focus
+    assert "- Mr. Hello, Ada!" in focus
+    assert "+ Hello, Mr. Ada!" in focus
+
+
+def test_targeted_runtime_failure_focus_scopes_multi_file_website_failures_to_target():
+    focus = _targeted_runtime_failure_focus_lines(
+        (
+            "FAIL: test_contact_page (tests.test_site.TestSite.test_contact_page)\n"
+            '  File "/tmp/tests/test_site.py", line 12, in test_contact_page\n'
+            "    self.assertIn('class=\"contact-form\"', self.read('contact.html'))\n"
+            "AssertionError: 'class=\"contact-form\"' not found in '<form></form>'\n"
+            "\n"
+            "FAIL: test_projects_page (tests.test_site.TestSite.test_projects_page)\n"
+            '  File "/tmp/tests/test_site.py", line 8, in test_projects_page\n'
+            "    self.assertIn('Case Studies', self.read('projects.html'))\n"
+            "AssertionError: 'Case Studies' not found in '<h1>Projects</h1>'\n"
+            "\n"
+            "FAIL: test_stylesheet_layout (tests.test_site.TestSite.test_stylesheet_layout)\n"
+            '  File "/tmp/tests/test_site.py", line 16, in test_stylesheet_layout\n'
+            "    self.assertIn('.site-grid', self.read('styles.css'))\n"
+            "AssertionError: '.site-grid' not found in 'body { margin: 0; }'\n"
+        ),
+        target_path="projects.html",
+        other_paths=["contact.html", "styles.css", "tests/test_site.py"],
+        limit=6,
+    )
+
+    assert any("Case Studies" in line for line in focus)
+    assert all('class="contact-form"' not in line for line in focus)
+    assert all(".site-grid" not in line for line in focus)
+
+
 def test_planner_repair_switches_to_another_candidate_after_no_effective_change(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
@@ -5605,6 +6930,66 @@ def test_planner_repair_switches_to_another_candidate_after_no_effective_change(
     )
 
     assert next_target == "greet_cli/__main__.py"
+
+
+def test_planner_no_effective_change_keeps_locked_primary_target_before_pivot():
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root="/tmp/demo",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'",
+        failure_summary="The CLI output ordering is wrong for the title-aware greeting.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        evidence_signature="sig-runtime-locked",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:locked1234",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Hello, Mr. Ada!"],
+            observed_semantics=["Validation currently produces: Mr. Hello, Ada!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="greet_cli/__main__.py:line 7",
+            allowed_files=["greet_cli/__main__.py", "greet_cli/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="greet_cli/__main__.py",
+            validation_command=repair_context.command,
+            verification_scope="runtime",
+            strategy="validation_targeted",
+            result="no_effective_change",
+            reason="identical content",
+            failure_signature="runtime:assertion_mismatch:locked1234",
+        )
+    )
+
+    assert planner._should_pivot_after_no_effective_change(session, "greet_cli/__main__.py", repair_context) is False
+
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="greet_cli/__main__.py",
+            validation_command=repair_context.command,
+            verification_scope="runtime",
+            strategy="validation_escalated",
+            result="no_effective_change",
+            reason="same failure signature after edit",
+            failure_signature="runtime:assertion_mismatch:locked1234",
+        )
+    )
+
+    assert planner._should_pivot_after_no_effective_change(session, "greet_cli/__main__.py", repair_context) is True
 
 
 def test_planner_switches_target_immediately_after_identical_repair_generation(tmp_path, monkeypatch):
@@ -5818,6 +7203,259 @@ def test_nonblocking_update_target_deferral_is_honored_before_any_files_change(t
     assert decision.tool_args["path"] == "greet_cli/cli.py"
     assert f"{DEFERRED_UPDATE_TARGET_NOTE_PREFIX}greet_cli/__main__.py" in session.notes
     assert planner._has_pending_explicit_update_targets(session.router_result, session) is True
+
+
+def test_planner_keeps_review_blocked_pending_target_deferred_during_runtime_repair(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text(
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.uppercase:\n"
+        "        greeting = greeting.upper()\n"
+        "    print(greeting)\n",
+        encoding="utf-8",
+    )
+    (pkg / "cli.py").write_text(
+        "def greet(name: str) -> str:\n"
+        "    return f\"Hello, {name}!\"\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# greet_cli\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Extend this existing CLI so it supports an optional --prefix TEXT flag and an optional "
+            "--repeat N flag while keeping the existing --uppercase behavior working."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": [
+                    "greet_cli/__main__.py",
+                    "greet_cli/cli.py",
+                    "README.md",
+                    "tests/test_cli.py",
+                ],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["greet_cli/__main__.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_cli",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_cli"],
+        notes=[f"{DEFERRED_UPDATE_TARGET_NOTE_PREFIX}greet_cli/cli.py"],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested feature update."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=[
+            "greet_cli/__main__.py",
+            "greet_cli/cli.py",
+            "README.md",
+            "tests/test_cli.py",
+        ],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="greet_cli/__main__.py", operation="write"),
+            FileChangeRecord(path="README.md", operation="write"),
+            FileChangeRecord(path="tests/test_cli.py", operation="write"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        iteration=8,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            ".FFFFF.\n"
+            "======================================================================\n"
+            "FAIL: test_prefix_flag (tests.test_cli.TestCLI.test_prefix_flag)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_cli.py"}", line 21, in test_prefix_flag\n'
+            "    self.assertEqual(self.run_cli(['--prefix', 'Mr.', 'Ada']), 'Hello, Mr. Ada!')\n"
+            "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'\n"
+            f'  File "{tmp_path / "greet_cli" / "__main__.py"}", line 14, in main\n'
+            "    print(greeting * args.repeat)\n"
+        ),
+    )
+    session.validation_runs.append(failed_run)
+    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
+
+    assert repair_context.artifact_paths[0] == "greet_cli/__main__.py"
+    assert session.active_repair_context is None
+    assert planner._active_deferred_update_targets(session) == {"greet_cli/cli.py"}
+    assert planner._has_pending_explicit_update_targets(session.router_result, session) is False
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "read_file"
+    assert decision.tool_args["path"] == "greet_cli/__main__.py"
+
+
+def test_planner_runtime_repair_ignores_test_cli_substring_when_repairing_entrypoint(tmp_path):
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text(
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.uppercase:\n"
+        "        greeting = greeting.upper()\n"
+        "    print(greeting)\n",
+        encoding="utf-8",
+    )
+    (pkg / "cli.py").write_text(
+        "def greet(name: str) -> str:\n"
+        "    return f\"Hello, {name}!\"\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# greet_cli\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Extend this existing CLI so it supports an optional --prefix TEXT flag and an optional "
+            "--repeat N flag while keeping the existing --uppercase behavior working."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": [
+                    "greet_cli/__main__.py",
+                    "greet_cli/cli.py",
+                    "README.md",
+                    "tests/test_cli.py",
+                ],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["greet_cli/__main__.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=3,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_cli",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_cli"],
+        notes=[f"{DEFERRED_UPDATE_TARGET_NOTE_PREFIX}greet_cli/cli.py"],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested feature update."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=[
+            "greet_cli/__main__.py",
+            "greet_cli/cli.py",
+            "README.md",
+            "tests/test_cli.py",
+        ],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="greet_cli/__main__.py", operation="write"),
+            FileChangeRecord(path="README.md", operation="write"),
+            FileChangeRecord(path="tests/test_cli.py", operation="write"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=3,
+        iteration=8,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            ".FFFFF.\n"
+            "======================================================================\n"
+            "FAIL: test_prefix_flag (tests.test_cli.TestCLI.test_prefix_flag)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_cli.py"}", line 21, in test_prefix_flag\n'
+            "    self.assertEqual(self.run_cli(['--prefix', 'Mr.', 'Ada']), 'Hello, Mr. Ada!')\n"
+            "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'\n"
+            f'  File "{tmp_path / "greet_cli" / "__main__.py"}", line 14, in main\n'
+            "    print(greeting * args.repeat)\n"
+        ),
+    )
+    session.validation_runs.append(failed_run)
+    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
+    session.active_repair_context = repair_context
+
+    assert planner._repair_candidate_matches_failure_text("greet_cli/__main__.py", repair_context) is True
+    assert planner._repair_candidate_matches_failure_text("greet_cli/cli.py", repair_context) is False
+    assert planner._repair_candidate_is_explicitly_referenced("greet_cli/cli.py", repair_context) is False
+
+    next_target = planner._repair_target_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    assert next_target == "greet_cli/__main__.py"
 
 
 def test_planner_prefers_implementation_target_before_validation_target_for_runtime_failure(tmp_path):
@@ -6271,6 +7909,148 @@ def test_planner_reads_related_test_before_creating_missing_runtime_fixture(tmp_
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "read_file"
     assert decision.tool_args["path"] == "tests/test_wordfreq.py"
+
+
+def test_actionable_explicit_update_targets_drop_inferred_validation_targets(tmp_path):
+    (tmp_path / "wordfreq.py").write_text(
+        "def count_words(file_path):\n    return {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# Word Frequency\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_wordfreq.py").write_text(
+        "import unittest\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_data.txt").write_text("hello hello world hello world pond\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Keep count_words in wordfreq.py intact. Add a new helper top_words(file_path, limit) "
+            "in wordfreq.py. Update README.md to document top_words with a short example. "
+            "Do not rewrite the tests unless it is truly necessary for the requested feature. "
+            "Run python -m unittest tests.test_wordfreq and finish only when it passes."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": [
+                    "wordfreq.py",
+                    "README.md",
+                    "tests/test_wordfreq.py",
+                    "tests/test_data.txt",
+                ],
+                "focus_files": [
+                    "wordfreq.py",
+                    "README.md",
+                    "tests/test_wordfreq.py",
+                    "tests/test_data.txt",
+                ],
+                "test_files": ["tests/test_wordfreq.py"],
+                "likely_commands": ["python -m unittest tests.test_wordfreq"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Implement the requested helper."},
+            {"step": 2, "action": "update_artifact", "reason": "Document the new helper in README."},
+            {"step": 3, "action": "run_validation", "reason": "Run the targeted unittest module."},
+        ],
+        target_paths=["wordfreq.py", "README.md", "tests/test_data.txt", "tests/test_wordfreq.py"],
+        target_name="wordfreq.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_wordfreq and finish only when it passes.",
+    )
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="wordfreq.py", name="wordfreq.py", kind=".py", role="primary_target", confidence=1.0),
+        TaskArtifact(path="README.md", name="README.md", kind=".md", role="supporting_context", confidence=0.92),
+        TaskArtifact(
+            path="tests/test_data.txt",
+            name="tests/test_data.txt",
+            kind=".txt",
+            role="validation_target",
+            confidence=0.82,
+        ),
+        TaskArtifact(
+            path="tests/test_wordfreq.py",
+            name="tests/test_wordfreq.py",
+            kind="test",
+            role="validation_target",
+            confidence=0.84,
+        ),
+    ]
+
+    assert planner._actionable_explicit_target_paths(session.router_result, session) == [
+        "wordfreq.py",
+        "README.md",
+    ]
+
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="wordfreq.py", operation="write"),
+            FileChangeRecord(path="README.md", operation="write"),
+        ]
+    )
+
+    assert planner._has_pending_explicit_update_targets(session.router_result, session) is False
+
+
+def test_actionable_explicit_update_targets_keep_requested_validation_target(tmp_path):
+    (tmp_path / "README.md").write_text("# Word Frequency\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_wordfreq.py").write_text(
+        "import unittest\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Update tests/test_wordfreq.py and README.md to document the new top_words behavior.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 2,
+                "important_files": ["README.md", "tests/test_wordfreq.py"],
+                "focus_files": ["tests/test_wordfreq.py", "README.md"],
+                "test_files": ["tests/test_wordfreq.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Update the requested test file."},
+            {"step": 2, "action": "update_artifact", "reason": "Update the requested README file."},
+        ],
+        target_paths=["README.md", "tests/test_wordfreq.py"],
+        target_name="tests/test_wordfreq.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="README.md", name="README.md", kind=".md", role="supporting_context", confidence=0.9),
+        TaskArtifact(
+            path="tests/test_wordfreq.py",
+            name="tests/test_wordfreq.py",
+            kind="test",
+            role="validation_target",
+            confidence=0.95,
+        ),
+    ]
+
+    assert planner._actionable_explicit_target_paths(session.router_result, session) == [
+        "README.md",
+        "tests/test_wordfreq.py",
+    ]
 
 
 def test_planner_keeps_runtime_repair_on_last_implicated_implementation_target(tmp_path):
@@ -8012,6 +9792,205 @@ def test_pre_write_update_review_rejects_entrypoint_that_wraps_helper_output_wit
     assert any("helper result" in issue.lower() for issue in review.blocking_issues)
 
 
+def test_pre_write_update_review_uses_latest_session_write_for_sibling_entrypoint_contract(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    original_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    print(greet(args.name))\n"
+    )
+    updated_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str)\n"
+        "    parser.add_argument('--repeat', type=int, default=1)\n"
+        "    parser.add_argument('--uppercase', action='store_true')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.prefix:\n"
+        "        greeting = f\"{args.prefix} {greeting}\"\n"
+        "    if args.uppercase:\n"
+        "        greeting = greeting.upper()\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greeting)\n"
+    )
+    current_cli = "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n"
+    proposed_cli = (
+        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
+        "    greeting = f\"{prefix}Hello, {name}!\"\n"
+        "    if uppercase:\n"
+        "        greeting = greeting.upper()\n"
+        "    return greeting * repeat\n"
+    )
+    (pkg / "__main__.py").write_text(original_main, encoding="utf-8")
+    (pkg / "cli.py").write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task=(
+            "Extend this existing CLI so it supports an optional --prefix TEXT flag and an optional "
+            "--repeat N flag while keeping the existing --uppercase behavior working."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+        tool_calls=[
+            ToolCallRecord(
+                iteration=5,
+                tool_name="write_file",
+                tool_args={"path": "greet_cli/__main__.py", "content": updated_main},
+                success=True,
+                summary="Wrote greet_cli/__main__.py.",
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Extend the CLI behavior."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        target_name="greet_cli/cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="greet_cli/cli.py",
+        current_content=current_cli,
+        proposed_content=proposed_cli,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "duplicates cli wrapper responsibilities" in review.summary.lower()
+    assert "repeat" in review.blocking_issues[0].lower()
+
+
+def test_pre_write_update_review_rejects_entrypoint_that_passes_duplicate_cli_values_to_helper(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    current_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str, help='Optional prefix to prepend to the greeting')\n"
+        "    parser.add_argument('--repeat', type=int, default=1, help='Number of times to repeat the greeting')\n"
+        "    parser.add_argument('--uppercase', action='store_true', help='Convert the greeting to uppercase')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.prefix:\n"
+        "        greeting = f\"{args.prefix} {greeting}\"\n"
+        "    if args.uppercase:\n"
+        "        greeting = greeting.upper()\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greeting)\n"
+    )
+    proposed_main = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--prefix', type=str, default='', help='Optional prefix to prepend to the greeting')\n"
+        "    parser.add_argument('--repeat', type=int, default=1, help='Number of times to repeat the greeting')\n"
+        "    parser.add_argument('--uppercase', action='store_true', help='Convert the greeting to uppercase')\n"
+        "    args = parser.parse_args(argv)\n\n"
+        "    greeting = greet(args.name, prefix=args.prefix, repeat=args.repeat, uppercase=args.uppercase)\n\n"
+        "    for _ in range(args.repeat):\n"
+        "        print(greeting)\n"
+    )
+    (pkg / "__main__.py").write_text(current_main, encoding="utf-8")
+    (pkg / "cli.py").write_text(
+        "def greet(name: str, prefix: str = '', repeat: int = 1, uppercase: bool = False) -> str:\n"
+        "    greeting = f\"{prefix}Hello, {name}!\"\n"
+        "    if uppercase:\n"
+        "        greeting = greeting.upper()\n"
+        "    return greeting * repeat\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task=(
+            "Extend this existing CLI so it supports an optional --prefix TEXT flag and an optional "
+            "--repeat N flag while keeping the existing --uppercase behavior working."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "likely_commands": ["python -m unittest tests.test_cli"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the CLI behavior."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the relevant tests."},
+        ],
+        target_paths=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_cli after updating the CLI.",
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_main,
+        proposed_content=proposed_main,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "blurs the contract" in review.summary.lower()
+    assert any("same cli values outside the helper call" in issue.lower() for issue in review.blocking_issues)
+
+
 def test_planner_prefers_primary_model_for_validation_guided_repairs(tmp_path):
     planner = Planner(
         ScriptedLLM(
@@ -8236,6 +10215,315 @@ def test_planner_review_retry_keeps_same_model_for_compact_and_full_follow_up_at
     assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is True
     assert "references sys.argv without importing sys." in llm.generate_calls[1]["args"][0]
     assert "add import sys before using it" in llm.generate_calls[1]["args"][0]
+
+
+def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "def main():\n    return 'draft'\n",
+            "def main(argv=None):\n    return argv or []\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Update app.py so main accepts optional argv while keeping the edit focused.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refine the focused update."}],
+        target_paths=["app.py"],
+        target_name="app.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    reviews = iter(
+        [
+            ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The retry still leaves argv handling incomplete.",
+                confidence=0.9,
+                blocking_issues=["The proposal still ignores the optional argv path."],
+                preservation_risks=[],
+                repair_hints=["Handle argv=None inside main() instead of hard-coding a fixed return value."],
+            ),
+            ProposedUpdateReview(
+                safe_to_write=True,
+                summary="ok",
+                confidence=0.9,
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=[],
+            ),
+        ]
+    )
+    monkeypatch.setattr(planner, "_pre_write_update_review", lambda *_args, **_kwargs: next(reviews))
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.py",
+        current_content="def main():\n    return []\n",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal replaces the focused update with a stub.",
+            confidence=0.82,
+            blocking_issues=["Keep the change focused on argv handling."],
+            preservation_risks=[],
+            repair_hints=["Revise only the main() logic that needs argv support."],
+        ),
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content == "def main(argv=None):\n    return argv or []"
+    assert len(llm.generate_calls) == 2
+    assert all(call["kwargs"]["strict_timeouts"] is True for call in llm.generate_calls)
+    assert all(call["kwargs"]["num_ctx"] == 2048 for call in llm.generate_calls)
+    assert "The retry still leaves argv handling incomplete." in llm.generate_calls[1]["args"][0]
+    assert "Handle argv=None inside main() instead of hard-coding a fixed return value." in llm.generate_calls[1]["args"][0]
+
+
+def test_review_guided_retry_prompt_surfaces_minimal_semantic_delta(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "from __future__ import annotations\n\n"
+            "import argparse\n\n"
+            "from .cli import greet\n\n"
+            "def main(argv=None):\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('name')\n"
+            "    parser.add_argument('--title')\n"
+            "    args = parser.parse_args(argv)\n"
+            "    greeting = greet(args.name)\n"
+            "    if args.title:\n"
+            "        greeting = f\"{args.title} {greeting}\"\n"
+            "    print(greeting)\n"
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the title formatting bug in the existing CLI.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."}],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="__main__.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    monkeypatch.setattr(
+        planner,
+        "_pre_write_update_review",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "from .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('name')\n"
+        "    parser.add_argument('--title')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    greeting = greet(args.name)\n"
+        "    if args.title:\n"
+        "        greeting = f\"{args.title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "AssertionError: 'Dr.: Hello, Ada!\\nDr.: Hello, Ada!' != 'Dr. Hello, Ada!\\nDr. Hello, Ada!'\n"
+            "- Dr.: Hello, Ada!\n"
+            "+ Dr. Hello, Ada!\n"
+        ),
+        failure_summary="The CLI adds extra punctuation when formatting titled greetings.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        repair_requirements=[],
+        evidence_signature="sig-review-delta",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:delta5678",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!\nDr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!\nDr.: Hello, Ada!"],
+            implicated_symbols=[],
+            implicated_region_hint="greet_cli/__main__.py",
+            repair_constraints=[],
+            recent_failed_attempts=[],
+            allowed_files=["greet_cli/__main__.py", "greet_cli/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal still leaves the title punctuation mismatch in place.",
+            confidence=0.89,
+            blocking_issues=["The proposal still preserves the observed punctuation mismatch in the titled greeting output."],
+            preservation_risks=[],
+            repair_hints=["Change the output construction in the locked target so the observed-only punctuation disappears."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert "greeting = f\"{args.title} {greeting}\"" in result.content
+    assert len(llm.generate_calls) == 1
+    prompt = llm.generate_calls[0]["args"][0]
+    assert (
+        "Minimal semantic delta: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+    assert "Change the implicated current lines in greet_cli/__main__.py:" in prompt
+    assert '14:         greeting = f"{args.title}: {greeting}"' in prompt
+    assert (
+        "Apply this exact semantic delta in the behavior produced by this file: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+
+
+def test_review_guided_retry_can_escalate_to_full_for_broad_updates(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "def main(argv=None):\n    return argv or []\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Update app.py for a broader refactor.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Revise a broad update."}],
+        target_paths=["app.py"],
+        target_name="app.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    monkeypatch.setattr(
+        planner,
+        "_pre_write_update_review",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    broad_current_content = "\n".join(f"line_{index} = {index}" for index in range(320))
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.py",
+        current_content=broad_current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal needs a broader revision.",
+            confidence=0.75,
+            blocking_issues=["The broad refactor still misses requested coverage."],
+            preservation_risks=[],
+            repair_hints=["Pull more surrounding context into the next draft."],
+        ),
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content == "def main(argv=None):\n    return argv or []"
+    assert len(llm.generate_calls) == 1
+    assert llm.generate_calls[0]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 4096
+
+
+def test_review_guided_retry_skips_duplicate_same_model_prompt_followup(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "def main():\n    return 'draft'\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Update app.py so main accepts optional argv while keeping the edit focused.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refine the focused update."}],
+        target_paths=["app.py"],
+        target_name="app.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    repeated_review = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposal still ignores the optional argv path.",
+        confidence=0.9,
+        blocking_issues=["The proposal still ignores the optional argv path."],
+        preservation_risks=[],
+        repair_hints=["Handle argv=None inside main() instead of hard-coding a fixed return value."],
+    )
+    monkeypatch.setattr(planner, "_pre_write_update_review", lambda *_args, **_kwargs: repeated_review)
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.py",
+        current_content="def main():\n    return []\n",
+        review_feedback=repeated_review,
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content is None
+    assert result.review == repeated_review
+    assert len(llm.generate_calls) == 1
 
 
 def test_planner_prefers_lightweight_model_for_missing_validation_support_artifact(tmp_path):

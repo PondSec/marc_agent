@@ -1060,6 +1060,71 @@ def test_task_state_local_short_circuit_infers_readme_for_empty_workspace_create
     assert llm.generate_json_calls == []
 
 
+def test_task_state_local_short_circuit_preserves_explicit_multi_file_website_targets(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=6,
+        language_counts={"html": 4, "css": 1, "python": 1},
+        top_directories=["tests"],
+        important_files=["tests/test_site.py", "about.html", "contact.html", "index.html", "projects.html", "styles.css"],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_site.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=["tests/"],
+        project_labels=["website"],
+        likely_commands=["python -m unittest tests.test_site"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Starter portfolio website.",
+    )
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        (
+            "You are working in an existing starter portfolio website. "
+            "Turn it into a polished multi-page portfolio without breaking the current pages. "
+            "Keep index.html and about.html coherent, update projects.html so it contains a visible Case Studies section, "
+            "update contact.html so the form uses class=\"contact-form\", update styles.css so it defines a .site-grid layout "
+            "and keeps the look consistent across pages, then run python -m unittest tests.test_site and finish only when it passes."
+        ),
+        snapshot=snapshot,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts}
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "about.html",
+        "projects.html",
+        "contact.html",
+        "styles.css",
+        "tests/test_site.py",
+    }
+    assert artifact_roles["tests/test_site.py"] == "validation_target"
+    assert {path for path in route.entities.target_paths} >= {
+        "index.html",
+        "about.html",
+        "projects.html",
+        "contact.html",
+        "styles.css",
+        "tests/test_site.py",
+    }
+    assert llm.generate_json_calls == []
+
+
 def test_task_state_local_short_circuit_prioritizes_debug_for_bugfix_prompts_with_search_words(tmp_path):
     snapshot = WorkspaceSnapshot(
         root=str(tmp_path),

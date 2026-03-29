@@ -81,6 +81,28 @@ class ValidationRunRecord(StrictModel):
     timestamp: str = Field(default_factory=utc_now)
 
 
+class RepairAttemptSummary(StrictModel):
+    target: str | None = None
+    strategy: str
+    result: str
+    reason: str | None = None
+
+
+class RepairBrief(StrictModel):
+    failure_type: str | None = None
+    failure_signature: str | None = None
+    primary_target: str | None = None
+    locked_target: str | None = None
+    expected_semantics: list[str] = Field(default_factory=list)
+    observed_semantics: list[str] = Field(default_factory=list)
+    implicated_symbols: list[str] = Field(default_factory=list)
+    implicated_region_hint: str | None = None
+    repair_constraints: list[str] = Field(default_factory=list)
+    recent_failed_attempts: list[RepairAttemptSummary] = Field(default_factory=list)
+    allowed_files: list[str] = Field(default_factory=list)
+    forbidden_files: list[str] = Field(default_factory=list)
+
+
 class ValidationFailureEvidence(StrictModel):
     command: str
     verification_scope: Literal["syntax", "static", "structural", "semantic", "runtime"] = "static"
@@ -96,6 +118,7 @@ class ValidationFailureEvidence(StrictModel):
     action_hints: list[str] = Field(default_factory=list)
     repair_requirements: list[str] = Field(default_factory=list)
     evidence_signature: str | None = None
+    repair_brief: RepairBrief | None = None
 
 
 class SemanticChangeReview(StrictModel):
@@ -141,6 +164,8 @@ class RepairAttemptRecord(StrictModel):
     result: Literal["mutation_planned", "no_effective_change", "generation_failed", "blocked"]
     reason: str
     evidence_signature: str | None = None
+    failure_signature: str | None = None
+    region_hint: str | None = None
     iteration: int | None = None
     timestamp: str = Field(default_factory=utc_now)
 

@@ -954,7 +954,7 @@ class Planner:
                     result="no_effective_change",
                     reason=mutation.reason,
                 )
-                if self._should_pivot_after_no_effective_change(target, repair_context):
+                if self._should_pivot_after_no_effective_change(session, target, repair_context):
                     alternative_decision = self._alternative_repair_target_decision(
                         route,
                         session,
@@ -1169,11 +1169,16 @@ class Planner:
 
     def _should_pivot_after_no_effective_change(
         self,
+        session: SessionState,
         target: str,
         repair_context: ValidationFailureEvidence | None,
     ) -> bool:
         text = str(target or "").strip()
         if not text or repair_context is None:
+            return False
+        locked_target = self._repair_brief_locked_target(repair_context)
+        primary_target = self._repair_brief_primary_target(repair_context)
+        if text in {locked_target, primary_target} and self._repair_attempt_failure_count(session, repair_context, text) < 2:
             return False
         if self.validation_planner._is_test_path(text):
             return True
@@ -1299,10 +1304,76 @@ class Planner:
                 result=result,
                 reason=reason,
                 evidence_signature=repair_context.evidence_signature,
+                failure_signature=self._repair_failure_signature(repair_context),
+                region_hint=self._repair_region_hint(repair_context),
                 iteration=session.iterations,
             )
         )
         session.repair_history = session.repair_history[-20:]
+
+    def _repair_failure_signature(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+        signature = str(getattr(brief, "failure_signature", "") or "").strip()
+        return signature or None
+
+    def _repair_region_hint(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+        region = str(getattr(brief, "implicated_region_hint", "") or "").strip()
+        return region or None
+
+    def _repair_brief_primary_target(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str | None:
+        if repair_context is None or getattr(repair_context, "repair_brief", None) is None:
+            return None
+        target = str(getattr(repair_context.repair_brief, "primary_target", "") or "").strip()
+        return target or None
+
+    def _repair_brief_locked_target(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str | None:
+        if repair_context is None or getattr(repair_context, "repair_brief", None) is None:
+            return None
+        target = str(getattr(repair_context.repair_brief, "locked_target", "") or "").strip()
+        if target:
+            return target
+        return self._repair_brief_primary_target(repair_context)
+
+    def _repair_attempt_failure_count(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        target: str,
+    ) -> int:
+        normalized_target = str(target or "").strip()
+        if not normalized_target:
+            return 0
+        failure_signature = self._repair_failure_signature(repair_context)
+        evidence_signature = str(repair_context.evidence_signature or "").strip()
+        count = 0
+        for item in reversed(session.repair_history):
+            if str(item.artifact_path or "").strip() != normalized_target:
+                continue
+            if item.result not in {"no_effective_change", "blocked", "generation_failed"}:
+                continue
+            if failure_signature and str(item.failure_signature or "").strip() == failure_signature:
+                count += 1
+                continue
+            if not failure_signature and evidence_signature and str(item.evidence_signature or "").strip() == evidence_signature:
+                count += 1
+        return count
 
     def _assess_effective_mutation(
         self,
@@ -1629,6 +1700,11 @@ class Planner:
             attempted = [candidate for candidate in group if candidate in attempted_results]
             return [*unattempted, *attempted]
 
+        locked_target = self._repair_brief_locked_target(repair_context)
+        if locked_target and locked_target in candidates:
+            remaining = [candidate for candidate in candidates if candidate != locked_target]
+            return [locked_target, *_order_by_attempt_status(remaining)]
+
         if repair_context.verification_scope == "runtime":
             recent_support_target = self._recent_runtime_support_repair_target(
                 session,
@@ -1788,6 +1864,8 @@ class Planner:
         existing = self._repair_related_existing_context_paths(session, repair_context)
         return self._unique_paths(
             [
+                self._repair_brief_locked_target(repair_context),
+                self._repair_brief_primary_target(repair_context),
                 sticky_target,
                 *failure_specific_support,
                 *(leading_support_candidates if support_should_lead else []),
@@ -1935,6 +2013,40 @@ class Planner:
         ]
         return self._repair_texts_reference_candidate(reference_tokens, failure_texts)
 
+    def _repair_candidate_is_strongly_referenced(
+        self,
+        candidate: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        text = str(candidate or "").strip()
+        if not text:
+            return False
+        path = Path(text)
+        dotted = text.replace("/", ".").removesuffix(".py")
+        reference_tokens = self._unique_paths(
+            [
+                text.lower(),
+                path.name.lower(),
+                dotted.lower(),
+            ]
+        )
+        evidence_texts = [
+            str(repair_context.failure_summary or "").strip().lower(),
+            str(repair_context.summary or "").strip().lower(),
+            str(repair_context.excerpt or "").strip().lower(),
+            *(str(item or "").strip().lower() for item in repair_context.repair_requirements),
+            *(str(item or "").strip().lower() for item in repair_context.action_hints),
+        ]
+        return any(
+            token
+            and re.search(
+                rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])",
+                evidence_text,
+            )
+            for evidence_text in evidence_texts
+            for token in reference_tokens
+        )
+
     def _repair_candidate_reference_tokens(self, candidate: str) -> list[str]:
         text = str(candidate or "").strip()
         if not text:
@@ -1943,7 +2055,10 @@ class Planner:
         basename = path.name
         stem = path.stem
         dotted = text.replace("/", ".").removesuffix(".py")
-        allow_stem_token = path.suffix.lower() not in {".html", ".htm"}
+        allow_stem_token = (
+            path.suffix.lower() not in {".html", ".htm"}
+            and self._repair_reference_stem_is_specific(path)
+        )
         return [
             token.lower()
             for token in (
@@ -1955,6 +2070,32 @@ class Planner:
             if str(token or "").strip()
         ]
 
+    def _repair_reference_stem_is_specific(self, path: Path) -> bool:
+        stem = re.sub(r"[^0-9a-z]+", "", path.stem.lower())
+        if len(stem) < 4:
+            return False
+        return stem not in {
+            "app",
+            "apps",
+            "cli",
+            "doc",
+            "docs",
+            "file",
+            "files",
+            "helper",
+            "helpers",
+            "index",
+            "main",
+            "module",
+            "readme",
+            "test",
+            "tests",
+            "tool",
+            "tools",
+            "util",
+            "utils",
+        }
+
     def _repair_texts_reference_candidate(
         self,
         reference_tokens: list[str],
@@ -1962,7 +2103,14 @@ class Planner:
     ) -> bool:
         lowered_texts = [str(item or "").strip().lower() for item in evidence_texts if str(item or "").strip()]
         return any(
-            any(token in text for token in reference_tokens if token)
+            any(
+                re.search(
+                    rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])",
+                    text,
+                )
+                for token in reference_tokens
+                if token
+            )
             for text in lowered_texts
         )
 
@@ -2341,14 +2489,50 @@ class Planner:
             candidates.extend(self._snapshot_explicit_target_paths(session))
         return self._unique_paths(candidates)
 
+    def _actionable_explicit_target_paths(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> list[str]:
+        explicit = self._explicit_target_paths(route, session)
+        if not explicit:
+            return explicit
+
+        task_state = session.task_state
+        if task_state is None:
+            return explicit
+
+        artifact_roles = {
+            path: str(artifact.role or "").strip().lower()
+            for artifact in task_state.target_artifacts
+            for path in [str(artifact.path or "").strip()]
+            if path
+        }
+        if not artifact_roles:
+            return explicit
+
+        has_non_validation_target = any(
+            artifact_roles.get(path) != "validation_target"
+            for path in explicit
+        )
+        if not has_non_validation_target:
+            return explicit
+
+        filtered = [
+            path
+            for path in explicit
+            if artifact_roles.get(path) != "validation_target"
+            or self._path_matches_explicit_request(session, path)
+        ]
+        return filtered or explicit
+
     def _snapshot_explicit_target_paths(self, session: SessionState) -> list[str]:
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return []
 
         request_lower = self._request_text_for_explicit_target_matching(session)
-        request_space = f" {re.sub(r'[^0-9a-zäöüß]+', ' ', request_lower).strip()} "
-        if not request_space.strip():
+        if not request_lower.strip():
             return []
 
         candidate_paths: list[str] = []
@@ -2367,31 +2551,56 @@ class Planner:
         generic_stems = {"app", "cli", "doc", "docs", "guide", "index", "main", "test", "tests"}
         explicit: list[str] = []
         for path in candidate_paths:
-            path_lower = path.lower()
-            basename = Path(path).name.lower()
-            stem = Path(path).stem.lower()
-            normalized_path = re.sub(r"[^0-9a-zäöüß]+", " ", path_lower).strip()
-            normalized_basename = re.sub(r"[^0-9a-zäöüß]+", " ", basename).strip()
-            normalized_stem = re.sub(r"[^0-9a-zäöüß]+", " ", stem).strip()
-
-            matches_request = False
-            if basename and basename in request_lower:
-                matches_request = True
-            elif normalized_path and f" {normalized_path} " in request_space:
-                matches_request = True
-            elif normalized_basename and f" {normalized_basename} " in request_space:
-                matches_request = True
-            elif (
-                normalized_stem
-                and normalized_stem not in generic_stems
-                and f" {normalized_stem} " in request_space
-            ):
-                matches_request = True
-
-            if matches_request:
+            if self._path_matches_explicit_request(session, path, generic_stems=generic_stems):
                 explicit.append(path)
 
         return self._unique_paths(explicit)
+
+    def _path_matches_explicit_request(
+        self,
+        session: SessionState,
+        path: str,
+        *,
+        generic_stems: set[str] | None = None,
+    ) -> bool:
+        text = str(path or "").strip()
+        if not text:
+            return False
+
+        request_lower = self._request_text_for_explicit_target_matching(session)
+        request_space = f" {re.sub(r'[^0-9a-zäöüß]+', ' ', request_lower).strip()} "
+        if not request_space.strip():
+            return False
+
+        generic_stems = generic_stems or {
+            "app",
+            "cli",
+            "doc",
+            "docs",
+            "guide",
+            "index",
+            "main",
+            "test",
+            "tests",
+        }
+        path_lower = text.lower()
+        basename = Path(text).name.lower()
+        stem = Path(text).stem.lower()
+        normalized_path = re.sub(r"[^0-9a-zäöüß]+", " ", path_lower).strip()
+        normalized_basename = re.sub(r"[^0-9a-zäöüß]+", " ", basename).strip()
+        normalized_stem = re.sub(r"[^0-9a-zäöüß]+", " ", stem).strip()
+
+        if basename and basename in request_lower:
+            return True
+        if normalized_path and f" {normalized_path} " in request_space:
+            return True
+        if normalized_basename and f" {normalized_basename} " in request_space:
+            return True
+        return bool(
+            normalized_stem
+            and normalized_stem not in generic_stems
+            and f" {normalized_stem} " in request_space
+        )
 
     def _request_text_for_explicit_target_matching(self, session: SessionState) -> str:
         request_text = ""
@@ -2434,13 +2643,49 @@ class Planner:
                 deferred.add(path)
         return deferred
 
-    def _active_deferred_update_targets(self, session: SessionState) -> set[str]:
+    def _current_repair_context_hint(
+        self,
+        session: SessionState,
+    ) -> ValidationFailureEvidence | None:
         if session.active_repair_context is not None:
-            return set()
-        return self._deferred_update_targets(session)
+            return session.active_repair_context
+        if session.validation_status != "failed" or not session.validation_runs:
+            return None
+        failed_run = self.validation_planner.latest_failed_run(session)
+        if failed_run is None:
+            return None
+        return self.validation_planner.build_failure_evidence(session, failed_run)
+
+    def _active_deferred_update_targets(self, session: SessionState) -> set[str]:
+        deferred = self._deferred_update_targets(session)
+        repair_context = self._current_repair_context_hint(session)
+        if repair_context is None or not deferred:
+            return deferred
+
+        reactivated: set[str] = set()
+        primary_target = next(
+            (
+                path
+                for path in [*repair_context.artifact_paths, *repair_context.file_hints]
+                if path
+            ),
+            None,
+        )
+        if primary_target:
+            reactivated.add(primary_target)
+        reactivated.update(
+            candidate
+            for candidate in deferred
+            if self._repair_candidate_is_strongly_referenced(candidate, repair_context)
+        )
+        return {
+            candidate
+            for candidate in deferred
+            if candidate not in reactivated
+        }
 
     def _next_update_target(self, route: RouterOutput, session: SessionState) -> str | None:
-        explicit_targets = self._explicit_target_paths(route, session)
+        explicit_targets = self._actionable_explicit_target_paths(route, session)
         if explicit_targets:
             changed_paths = {item.path for item in session.changed_files}
             deferred_targets = self._active_deferred_update_targets(session)
@@ -2455,7 +2700,7 @@ class Planner:
     def _has_pending_explicit_update_targets(self, route: RouterOutput, session: SessionState) -> bool:
         if route.intent != RouteIntent.UPDATE:
             return False
-        explicit_targets = self._explicit_target_paths(route, session)
+        explicit_targets = self._actionable_explicit_target_paths(route, session)
         if len(explicit_targets) <= 1:
             return False
         changed_paths = {item.path for item in session.changed_files}
@@ -3924,6 +4169,30 @@ class Planner:
             return None
         return target.read_text(encoding="utf-8")
 
+    def _latest_session_write_content(self, session: SessionState, path: str) -> str | None:
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return None
+
+        for item in reversed(session.tool_calls):
+            if not item.success:
+                continue
+            if item.tool_name not in {"write_file", "create_file", "replace_file"}:
+                continue
+            candidate_path = str(item.tool_args.get("path") or "").strip()
+            if candidate_path != normalized_path:
+                continue
+            content = item.tool_args.get("content")
+            if isinstance(content, str):
+                return content
+        return None
+
+    def _session_or_current_file_content(self, session: SessionState, path: str) -> str | None:
+        pending_content = self._latest_session_write_content(session, path)
+        if pending_content is not None:
+            return pending_content
+        return self._current_file_content(session, path)
+
     def _clarification_response(self, route: RouterOutput, *, session: SessionState | None = None) -> str:
         language = self._session_language(session) if session is not None else self._language_for_text(route.user_goal)
         questions = route.clarification_questions[:3]
@@ -4113,7 +4382,7 @@ class Planner:
             return None
 
         changed_paths = {item.path for item in session.changed_files}
-        explicit_targets = self._explicit_target_paths(route, session)
+        explicit_targets = self._actionable_explicit_target_paths(route, session)
         alternative_targets = [
             candidate
             for candidate in explicit_targets
@@ -4766,7 +5035,7 @@ class Planner:
         if route.needs_clarification or not route.safe_to_execute:
             return False
 
-        target_paths = self._explicit_target_paths(route, session)
+        target_paths = self._actionable_explicit_target_paths(route, session)
         if target_paths and path not in target_paths:
             return False
         if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
@@ -5081,7 +5350,7 @@ class Planner:
         if route.intent != RouteIntent.UPDATE or route.needs_clarification or not route.safe_to_execute:
             return False
 
-        target_paths = self._explicit_target_paths(route, session)
+        target_paths = self._actionable_explicit_target_paths(route, session)
         if target_paths and path not in target_paths:
             return False
         if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
@@ -5112,6 +5381,50 @@ class Planner:
 
         return True
 
+    def _should_keep_update_review_compact(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+    ) -> bool:
+        if current_content is None:
+            return False
+        if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG}:
+            return False
+        if route.needs_clarification or not route.safe_to_execute:
+            return False
+
+        target_paths = self._actionable_explicit_target_paths(route, session)
+        if target_paths and path not in target_paths:
+            return False
+        if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+            return False
+
+        suffix = Path(path).suffix.lower()
+        if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
+            return False
+        if len(current_content) > MAX_LIGHTWEIGHT_UPDATE_CHARS:
+            return False
+        if current_content.count("\n") + 1 > MAX_LIGHTWEIGHT_UPDATE_LINES:
+            return False
+        if len(session.changed_files) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
+            return False
+
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count > MAX_LIGHTWEIGHT_UPDATE_WORKSPACE_FILES:
+            return False
+
+        task_state = session.task_state
+        if task_state is not None:
+            if task_state.needs_clarification:
+                return False
+            if task_state.ambiguity_level == "high" or task_state.risk_level == "high":
+                return False
+
+        return True
+
     def _content_generation_num_ctx(self, prompt_variant: str) -> int:
         if prompt_variant == "compact":
             return min(self._llm_num_ctx(2048), 2048)
@@ -5138,7 +5451,7 @@ class Planner:
         if session.validation_status != "passed" and not self.validation_planner.has_runtime_success(session):
             return False
 
-        target_paths = self._explicit_target_paths(route, session)
+        target_paths = self._actionable_explicit_target_paths(route, session)
         if target_paths and len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
             return False
 
@@ -5172,6 +5485,132 @@ class Planner:
 
         return True
 
+    def _compact_repair_change_line_count(
+        self,
+        *,
+        current_content: str,
+        proposed_content: str,
+    ) -> int:
+        count = 0
+        for raw in difflib.unified_diff(
+            str(current_content or "").splitlines(),
+            str(proposed_content or "").splitlines(),
+            lineterm="",
+        ):
+            if raw.startswith(("---", "+++", "@@")):
+                continue
+            if raw.startswith(("+", "-")):
+                count += 1
+        return count
+
+    def _should_skip_model_backed_repair_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+    ) -> bool:
+        repair_context = session.active_repair_context
+        if repair_context is None or current_content is None:
+            return False
+        if reserve_model is not None:
+            return False
+        if route.needs_clarification or not route.safe_to_execute:
+            return False
+
+        brief = getattr(repair_context, "repair_brief", None)
+        locked_target = str(getattr(brief, "locked_target", "") or "").strip()
+        primary_target = str(getattr(brief, "primary_target", "") or "").strip()
+        allowed_files = {
+            str(item or "").strip()
+            for item in getattr(brief, "allowed_files", [])
+            if str(item or "").strip()
+        }
+        forbidden_files = {
+            str(item or "").strip()
+            for item in getattr(brief, "forbidden_files", [])
+            if str(item or "").strip()
+        }
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return False
+        suffix = Path(normalized_path).suffix.lower()
+        if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
+            return False
+        if len(current_content) > MAX_LIGHTWEIGHT_UPDATE_CHARS:
+            return False
+        if current_content.count("\n") + 1 > MAX_LIGHTWEIGHT_UPDATE_LINES:
+            return False
+        if locked_target and locked_target != normalized_path:
+            return False
+        if primary_target and primary_target != normalized_path:
+            return False
+        if allowed_files and normalized_path not in allowed_files:
+            return False
+        if normalized_path in forbidden_files:
+            return False
+        if len(allowed_files) > 2:
+            return False
+        if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 2:
+            return False
+
+        changed_line_count = self._compact_repair_change_line_count(
+            current_content=current_content,
+            proposed_content=proposed_content,
+        )
+        if changed_line_count <= 0:
+            return False
+        if changed_line_count > 24:
+            return False
+
+        return True
+
+    def _repair_no_effective_change_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is None:
+            return None
+
+        changed_line_count = self._compact_repair_change_line_count(
+            current_content=current_content,
+            proposed_content=proposed_content,
+        )
+        if changed_line_count > 0:
+            return None
+
+        normalized_path = str(path or "").strip()
+        failure_signature = str(getattr(repair_context, "evidence_signature", "") or "").strip()
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is not None:
+            candidate_signature = str(getattr(brief, "failure_signature", "") or "").strip()
+            if candidate_signature:
+                failure_signature = candidate_signature
+
+        signature_suffix = f" for {failure_signature}" if failure_signature else ""
+        blocking_issue = f"The proposed repair does not make an effective change to {normalized_path}{signature_suffix}."
+        locked_target = self._repair_brief_locked_target(repair_context)
+        if locked_target:
+            blocking_issue += f" The locked repair target is still {locked_target}."
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is effectively unchanged, so writing it would only repeat the same failing state.",
+            confidence=0.93,
+            blocking_issues=[blocking_issue],
+            preservation_risks=[],
+            repair_hints=[
+                "Change the locked repair target in a way that alters the failing behavior instead of resubmitting the same implementation.",
+                "Use the expected-versus-observed repair brief to make a minimal but real semantic change.",
+            ],
+        )
+
     def _review_generated_update(
         self,
         route: RouterOutput,
@@ -5190,7 +5629,13 @@ class Planner:
         )
         if argv_launcher_review is not None:
             return argv_launcher_review
-        compact_review = repair_review or self._should_prefer_lightweight_update_generation(
+        focused_compact_review = self._should_keep_update_review_compact(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
+        compact_review = repair_review or focused_compact_review or self._should_prefer_lightweight_update_generation(
             route,
             session,
             path=path,
@@ -5237,9 +5682,56 @@ class Planner:
             )
         reserve_model = self._lightweight_generation_model_name()
         primary_model = self._primary_generation_model_name()
+        local_review_reason: str | None = None
+        if focused_compact_review and not repair_review and reserve_model is None:
+            local_review_reason = "single_model_compact_update"
+        elif self._should_skip_model_backed_repair_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+        ):
+            local_review_reason = "single_model_compact_repair"
+        if local_review_reason is not None:
+            review = self._fallback_proposed_update_review(
+                route,
+                session=session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+            self._log(
+                "proposed_update_review_skipped",
+                path=path,
+                reason=local_review_reason,
+                model=primary_model,
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="proposed_update_review",
+                    task_class="proposed_update_review",
+                    final_state="degraded_success",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_fallback",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
+                    attempts=[],
+                ),
+            )
+            return review
         review_attempts: list[tuple[str | None, str, str]] = []
         if repair_review:
             review_attempts.append((primary_model, "tier_a", "primary_model_review"))
+        elif focused_compact_review:
+            review_attempts.append((primary_model, "tier_a", "primary_model_review"))
+            if reserve_model is not None:
+                review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
         elif compact_review and reserve_model is not None:
             # On constrained hardware a second full-model review often costs far more
             # latency than the lightweight safety value it adds for small focused edits.
@@ -5269,6 +5761,7 @@ class Planner:
                 compact_prompt is not None
                 and (
                     (repair_review and capability_tier == "tier_a")
+                    or (focused_compact_review and capability_tier == "tier_a")
                     or (
                         reserve_model is not None
                         and model_name == reserve_model
@@ -5417,6 +5910,11 @@ class Planner:
                 proposed_content=proposed_content,
             )
         if review is None:
+            review = self._repair_target_scope_review(
+                path=path,
+                repair_context=repair_context,
+            )
+        if review is None:
             review = self._cli_wrapper_responsibility_review(
                 session,
                 path=path,
@@ -5430,14 +5928,97 @@ class Planner:
                 repair_context=repair_context,
             )
         if review is None:
+            review = self._repair_no_effective_change_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
             review = self._review_generated_update(
                 route,
                 session,
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
-            )
+        )
         return review
+
+    def _repair_target_scope_review(
+        self,
+        *,
+        path: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is None:
+            return None
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return None
+
+        allowed_files = {
+            str(item or "").strip()
+            for item in getattr(brief, "allowed_files", [])
+            if str(item or "").strip()
+        }
+        forbidden_files = {
+            str(item or "").strip()
+            for item in getattr(brief, "forbidden_files", [])
+            if str(item or "").strip()
+        }
+        locked_target = str(getattr(brief, "locked_target", "") or "").strip()
+        primary_target = str(getattr(brief, "primary_target", "") or "").strip()
+
+        if normalized_path in forbidden_files:
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposed repair drifts into a file that the repair brief explicitly marked as out of scope.",
+                confidence=0.92,
+                blocking_issues=[
+                    f"The repair brief forbids editing {normalized_path} for this failure.",
+                ],
+                preservation_risks=[],
+                repair_hints=[
+                    "Stay on the primary implementation target from the repair brief.",
+                ],
+            )
+        if allowed_files and normalized_path not in allowed_files:
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposed repair targets a file outside the repair brief's allowed scope.",
+                confidence=0.9,
+                blocking_issues=[
+                    f"The repair brief only allows edits in: {', '.join(sorted(allowed_files)[:4])}.",
+                ],
+                preservation_risks=[],
+                repair_hints=[
+                    "Return to the locked or primary repair target instead of drifting into a different file.",
+                ],
+            )
+
+        locked_scope = locked_target or primary_target
+        if (
+            locked_scope
+            and locked_scope != normalized_path
+            and not self._is_runtime_support_repair_target(normalized_path, repair_context)
+        ):
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposed repair moved away from the locked repair target without strong new evidence.",
+                confidence=0.89,
+                blocking_issues=[
+                    f"The repair brief is locked to {locked_scope}, not {normalized_path}.",
+                ],
+                preservation_risks=[],
+                repair_hints=[
+                    "Keep the repair on the locked target unless new validation evidence clearly points somewhere else.",
+                ],
+            )
+        return None
 
     def _pre_write_create_review(
         self,
@@ -5492,6 +6073,16 @@ class Planner:
             current_content=current_content,
         )
         prefer_primary_repair_retry = repair_context is not None
+        keep_compact_update_retry = (
+            repair_context is None
+            and current_content is not None
+            and self._should_keep_update_review_compact(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+            )
+        )
 
         retry_models: list[tuple[str | None, str, str, int, int, int, str]] = []
         if prefer_compact_create_retry:
@@ -5506,17 +6097,18 @@ class Planner:
                     "compact",
                 )
             )
-            retry_models.append(
-                (
-                    primary_model,
-                    "tier_a",
-                    "review_guided_primary_fallback",
-                    max(self._llm_timeout(60), 60),
-                    max(self._llm_timeout(180), 180),
-                    min(self._llm_num_ctx(3072), 3072),
-                    "full",
+            if not keep_compact_update_retry:
+                retry_models.append(
+                    (
+                        primary_model,
+                        "tier_a",
+                        "review_guided_primary_fallback",
+                        max(self._llm_timeout(60), 60),
+                        max(self._llm_timeout(180), 180),
+                        min(self._llm_num_ctx(3072), 3072),
+                        "full",
+                    )
                 )
-            )
             if reserve_model is not None:
                 retry_models.append(
                     (
@@ -5564,20 +6156,56 @@ class Planner:
                     "compact",
                 )
             )
-        retry_models.append(
-            (
-                primary_model,
-                "tier_a",
-                "review_guided_retry"
-                if not prefer_lightweight_retry and not prefer_primary_repair_retry
-                else "review_guided_primary_fallback",
-                max(self._llm_timeout(60), 60),
-                max(self._llm_timeout(180), 180),
-                min(self._llm_num_ctx(4096), 4096),
-                "full",
+        elif keep_compact_update_retry:
+            retry_models.append(
+                (
+                    primary_model,
+                    "tier_a",
+                    "review_guided_retry",
+                    max(self._llm_timeout(45), 45),
+                    max(self._llm_timeout(150), 150),
+                    min(self._llm_num_ctx(2048), 2048),
+                    "compact",
+                )
             )
-        )
-        if reserve_model is not None and not prefer_lightweight_retry:
+            retry_models.append(
+                (
+                    primary_model,
+                    "tier_a",
+                    "review_guided_retry_followup",
+                    max(self._llm_timeout(45), 45),
+                    max(self._llm_timeout(150), 150),
+                    min(self._llm_num_ctx(2048), 2048),
+                    "compact",
+                )
+            )
+        if prefer_lightweight_retry and reserve_model is not None and keep_compact_update_retry:
+            retry_models.append(
+                (
+                    primary_model,
+                    "tier_a",
+                    "review_guided_primary_followup",
+                    max(self._llm_timeout(45), 45),
+                    max(self._llm_timeout(150), 150),
+                    min(self._llm_num_ctx(2048), 2048),
+                    "compact",
+                )
+            )
+        if not keep_compact_update_retry and not prefer_primary_repair_retry:
+            retry_models.append(
+                (
+                    primary_model,
+                    "tier_a",
+                    "review_guided_retry"
+                    if not prefer_lightweight_retry
+                    else "review_guided_primary_fallback",
+                    max(self._llm_timeout(60), 60),
+                    max(self._llm_timeout(180), 180),
+                    min(self._llm_num_ctx(4096), 4096),
+                    "full",
+                )
+            )
+        if reserve_model is not None and not prefer_lightweight_retry and not keep_compact_update_retry:
             retry_models.append(
                 (
                     reserve_model,
@@ -5591,6 +6219,7 @@ class Planner:
             )
 
         seen_retry_variants: set[tuple[str, str, str]] = set()
+        seen_retry_prompts: set[tuple[str, str]] = set()
         for (
             model_name,
             capability_tier,
@@ -5616,6 +6245,21 @@ class Planner:
                 review_feedback=last_review,
                 mode=prompt_variant,
             )
+            prompt_sha = self._prompt_sha256(prompt)
+            prompt_key = (normalized_model or primary_model or "__default__", prompt_sha)
+            if prompt_key in seen_retry_prompts:
+                self._log(
+                    "content_generation_retry_skipped",
+                    path=path,
+                    strategy=strategy,
+                    reason="duplicate_prompt",
+                    model=model_name or primary_model,
+                    capability_tier=capability_tier,
+                    prompt_variant=prompt_variant,
+                    prompt_sha256=prompt_sha,
+                )
+                continue
+            seen_retry_prompts.add(prompt_key)
             prompt_trace_path = self._write_prompt_trace(
                 session,
                 operation_name=f"content_generation_{strategy}",
@@ -5637,7 +6281,7 @@ class Planner:
                 prompt_variant=prompt_variant,
                 prompt_chars=len(prompt),
                 prompt_lines=prompt.count("\n") + 1,
-                prompt_sha256=self._prompt_sha256(prompt),
+                prompt_sha256=prompt_sha,
                 prompt_artifact=prompt_trace_path,
             )
             outcome = invoke_model(
@@ -6235,7 +6879,11 @@ class Planner:
             if str(item or "").strip()
         ]
         for literal in literal_constraints:
-            if literal not in proposed_content:
+            if not self._proposed_content_preserves_literal_constraint(
+                path=path,
+                literal=literal,
+                proposed_content=proposed_content,
+            ):
                 return ProposedUpdateReview(
                     safe_to_write=False,
                     summary="The proposed update does not preserve an explicit literal constraint from the request.",
@@ -6313,7 +6961,11 @@ class Planner:
             if str(item or "").strip()
         ]
         for literal in literal_constraints:
-            if literal not in proposed_content:
+            if not self._proposed_content_preserves_literal_constraint(
+                path=path,
+                literal=literal,
+                proposed_content=proposed_content,
+            ):
                 return ProposedUpdateReview(
                     safe_to_write=False,
                     summary="The proposed new file misses an explicit literal constraint from the request.",
@@ -6542,7 +7194,7 @@ class Planner:
             return None
 
         sibling_entrypoint = Path(path).with_name("__main__.py").as_posix()
-        sibling_exists = self._current_file_content(session, sibling_entrypoint) is not None or (
+        sibling_exists = self._session_or_current_file_content(session, sibling_entrypoint) is not None or (
             sibling_entrypoint in (session.workspace_snapshot.important_files if session.workspace_snapshot is not None else [])
         )
         if not sibling_exists:
@@ -6610,6 +7262,10 @@ class Planner:
                 blocking_issues.append(
                     f"The proposal composes helper inputs from CLI values ({attr_text}) inside {path} instead of passing a stable helper contract."
                 )
+            elif marker_type == "duplicated_direct_arg":
+                blocking_issues.append(
+                    f"The proposal passes CLI values ({attr_text}) into the helper while {path} still uses the same CLI values outside the helper call."
+                )
             elif marker_type == "wrapped_output":
                 blocking_issues.append(
                     f"The proposal wraps the helper result with extra CLI-derived formatting ({attr_text}) inside {path}, which moves greeting semantics into the CLI wrapper."
@@ -6643,6 +7299,13 @@ class Planner:
             return []
 
         parent_map = self._ast_parent_map(module)
+        external_attrs = self._entrypoint_external_cli_attrs(
+            module,
+            helper_function_names=helper_function_names,
+            helper_aliases=helper_aliases,
+            parse_arg_bindings=parse_arg_bindings,
+            parent_map=parent_map,
+        )
         markers: list[tuple[str, tuple[str, ...]]] = []
         seen: set[tuple[str, tuple[str, ...]]] = set()
         statement_nodes = (
@@ -6673,14 +7336,25 @@ class Planner:
                 continue
 
             helper_attrs: set[str] = set()
+            direct_helper_attrs: set[str] = set()
             for arg_node in [*node.args, *(keyword.value for keyword in node.keywords if keyword.value is not None)]:
                 attrs = self._parse_arg_attrs_in_node(arg_node, parse_arg_bindings)
                 helper_attrs.update(attrs)
-                if attrs and not self._is_direct_parse_arg_reference(arg_node, parse_arg_bindings):
+                is_direct = self._is_direct_parse_arg_reference(arg_node, parse_arg_bindings)
+                if attrs and is_direct:
+                    direct_helper_attrs.update(attrs)
+                if attrs and not is_direct:
                     marker = ("compound_input", tuple(sorted(attrs)))
                     if marker not in seen:
                         seen.add(marker)
                         markers.append(marker)
+
+            duplicated_direct_attrs = sorted(attr for attr in direct_helper_attrs if attr in external_attrs)
+            if duplicated_direct_attrs:
+                marker = ("duplicated_direct_arg", tuple(duplicated_direct_attrs))
+                if marker not in seen:
+                    seen.add(marker)
+                    markers.append(marker)
 
             current = node
             while current in parent_map:
@@ -6749,7 +7423,7 @@ class Planner:
 
         sibling_entrypoint = Path(path).with_name("__main__.py").as_posix()
         sibling_content = (
-            self._current_file_content(session, sibling_entrypoint)
+            self._session_or_current_file_content(session, sibling_entrypoint)
             or self._current_or_last_read_excerpt(session, path=sibling_entrypoint)
         )
         if not sibling_content:
@@ -6980,24 +7654,15 @@ class Planner:
             and bool(str(node.attr or "").strip())
         )
 
-    def _entrypoint_wrapper_cli_attrs(
+    def _entrypoint_external_cli_attrs(
         self,
+        module: ast.AST,
         *,
-        helper_path: str,
-        entrypoint_content: str,
+        helper_function_names: set[str],
+        helper_aliases: set[str],
+        parse_arg_bindings: set[str],
+        parent_map: dict[ast.AST, ast.AST],
     ) -> set[str]:
-        try:
-            module = ast.parse(str(entrypoint_content or ""))
-        except SyntaxError:
-            return set()
-
-        helper_function_names, helper_aliases = self._helper_import_bindings(
-            module,
-            helper_path=helper_path,
-        )
-        parent_map = self._ast_parent_map(module)
-        parse_arg_bindings = self._entrypoint_parse_arg_bindings(module)
-
         def in_parse_args_call(node: ast.AST) -> bool:
             current = node
             while current in parent_map:
@@ -7033,6 +7698,31 @@ class Planner:
                 continue
             attrs.add(str(node.attr or "").strip())
         return {item for item in attrs if item}
+
+    def _entrypoint_wrapper_cli_attrs(
+        self,
+        *,
+        helper_path: str,
+        entrypoint_content: str,
+    ) -> set[str]:
+        try:
+            module = ast.parse(str(entrypoint_content or ""))
+        except SyntaxError:
+            return set()
+
+        helper_function_names, helper_aliases = self._helper_import_bindings(
+            module,
+            helper_path=helper_path,
+        )
+        parent_map = self._ast_parent_map(module)
+        parse_arg_bindings = self._entrypoint_parse_arg_bindings(module)
+        return self._entrypoint_external_cli_attrs(
+            module,
+            helper_function_names=helper_function_names,
+            helper_aliases=helper_aliases,
+            parse_arg_bindings=parse_arg_bindings,
+            parent_map=parent_map,
+        )
 
     def _argv_launcher_runtime_review(
         self,
@@ -7563,6 +8253,8 @@ class Planner:
             if heading in current_headings:
                 continue
             normalized = heading.lower()
+            if self._markdown_heading_allowed_by_request(heading, request_text):
+                continue
             if normalized and normalized not in request_text:
                 unexpected.append(heading)
         return unexpected
@@ -7577,6 +8269,121 @@ class Planner:
             if heading:
                 headings.add(heading)
         return headings
+
+    def _markdown_heading_allowed_by_request(self, heading: str, request_text: str) -> bool:
+        normalized = str(heading or "").strip().lower()
+        if not normalized:
+            return False
+        if normalized in request_text:
+            return True
+        request_tokens = {
+            token
+            for token in re.split(r"[^a-z0-9]+", request_text)
+            if len(token) >= 3
+        }
+        if not request_tokens:
+            return False
+        heading_base = normalized.split(":", 1)[0].strip()
+        heading_tokens = [
+            token
+            for token in re.split(r"[^a-z0-9]+", heading_base)
+            if token
+        ]
+        if not heading_tokens:
+            return False
+        wants_example = any(
+            token in request_tokens
+            for token in {
+                "example",
+                "examples",
+                "usage",
+                "document",
+                "documented",
+                "documenting",
+                "readme",
+                "beispiel",
+                "dokumentiere",
+                "dokumentation",
+            }
+        )
+        if not wants_example:
+            return False
+        return all(
+            token in {"example", "examples", "usage", "output", "outputs"}
+            or token in request_tokens
+            for token in heading_tokens
+        )
+
+    def _proposed_content_preserves_literal_constraint(
+        self,
+        *,
+        path: str,
+        literal: str,
+        proposed_content: str,
+    ) -> bool:
+        normalized = str(literal or "").strip()
+        if not normalized:
+            return True
+        if normalized in proposed_content:
+            return True
+        suffix = Path(path).suffix.lower()
+        if suffix in {".py", ".pyi"} and not self._path_is_test_like(path):
+            return self._python_signature_literal_is_preserved(normalized, proposed_content)
+        return False
+
+    def _python_signature_literal_is_preserved(self, literal: str, proposed_content: str) -> bool:
+        normalized = str(literal or "").strip()
+        if "(" not in normalized or ")" not in normalized:
+            return False
+        callee = str(normalized.split("(", 1)[0] or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", callee):
+            return False
+        parameter_names = self._literal_parameter_names(normalized)
+        if not parameter_names:
+            return False
+        try:
+            tree = ast.parse(proposed_content)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != callee:
+                continue
+            defined_names = [arg.arg for arg in node.args.posonlyargs]
+            defined_names.extend(arg.arg for arg in node.args.args)
+            if node.args.vararg is not None:
+                defined_names.append(node.args.vararg.arg)
+            defined_names.extend(arg.arg for arg in node.args.kwonlyargs)
+            if node.args.kwarg is not None:
+                defined_names.append(node.args.kwarg.arg)
+            if defined_names[: len(parameter_names)] == parameter_names:
+                return True
+        return False
+
+    def _literal_parameter_names(self, literal: str) -> list[str]:
+        normalized = str(literal or "").strip()
+        if "(" not in normalized or ")" not in normalized:
+            return []
+        inside = str(normalized.split("(", 1)[1].rsplit(")", 1)[0] or "").strip()
+        if not inside:
+            return []
+        parameters: list[str] = []
+        for raw_part in inside.split(","):
+            part = str(raw_part or "").strip()
+            if not part:
+                continue
+            part = part.split(":", 1)[0].strip()
+            part = part.lstrip("*").strip()
+            part = part.split("=", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part):
+                parameters.append(part)
+        return parameters
+
+    def _path_is_test_like(self, path: str) -> bool:
+        normalized = str(path or "").strip().replace("\\", "/").lower()
+        name = Path(normalized).name
+        return normalized.startswith("tests/") or "/tests/" in f"/{normalized}" or name.startswith("test_")
 
     def _has_unclosed_markdown_fence(self, text: str) -> bool:
         active_fence: str | None = None
