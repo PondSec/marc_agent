@@ -9500,7 +9500,7 @@ def test_planner_extends_compact_resume_budget_after_timeout_progress(tmp_path):
     )
 
     assert timeout_seconds == 60
-    assert total_timeout_seconds == 210
+    assert total_timeout_seconds == 270
     assert num_ctx == 3072
 
 
@@ -9576,7 +9576,87 @@ def test_planner_retries_resume_once_after_no_start_during_partial_progress_reco
     assert "Partial draft from the previous attempt:" in llm.generate_calls[1]["args"][0]
     assert "print('gui" in llm.generate_calls[2]["args"][0]
     assert llm.generate_calls[2]["kwargs"]["timeout"] >= 60
-    assert llm.generate_calls[2]["kwargs"]["total_timeout"] >= 210
+    assert llm.generate_calls[2]["kwargs"]["total_timeout"] >= 270
+
+
+def test_planner_preserves_progress_budget_for_compact_retry_after_resume_no_start(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "update_artifact",
+                        "reason": "Apply the requested UI update.",
+                    }
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+            )
+        ],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion after 150.0 seconds",
+                reason="total_timeout",
+                partial_text="print('gui",
+                characters=10,
+            ),
+            OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 140.1 seconds",
+                reason="startup_timeout",
+                retryable=True,
+                model_name="qwen2.5-coder:7b",
+                startup_timeout_seconds=140,
+                total_timeout_seconds=270,
+            ),
+            OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 140.1 seconds",
+                reason="startup_timeout",
+                retryable=True,
+                model_name="qwen2.5-coder:7b",
+                startup_timeout_seconds=140,
+                total_timeout_seconds=270,
+            ),
+            "print('gui version')\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Bau eine GUI dazu",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    target = tmp_path / "app.py"
+    target.write_text("print('terminal version')\n", encoding="utf-8")
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            output_excerpt=target.read_text(encoding="utf-8"),
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] == "app.py"
+    assert decision.tool_args["content"] == "print('gui version')"
+    assert len(llm.generate_calls) == 4
+    assert llm.generate_calls[3]["kwargs"]["model"] is None
+    assert llm.generate_calls[3]["kwargs"]["timeout"] >= 60
+    assert llm.generate_calls[3]["kwargs"]["total_timeout"] >= 270
 
 
 def test_planner_classifies_repeated_no_start_as_model_start_failure(tmp_path):

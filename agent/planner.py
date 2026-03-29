@@ -3158,6 +3158,7 @@ class Planner:
             timeout_seconds, total_timeout_seconds, num_ctx = self._content_generation_runtime_for_attempt(
                 attempt,
                 issue,
+                retained_progress_issue=retained_progress_issue,
             )
             self._log(
                 "content_generation_retry_started",
@@ -3503,18 +3504,28 @@ class Planner:
         self,
         attempt: GenerationRecoveryAttempt,
         issue: ExecutionFailure,
+        *,
+        retained_progress_issue: ExecutionFailure | None = None,
     ) -> tuple[int, int, int]:
+        progress_timeout_recovery = (
+            issue.timeout_like and issue.had_progress
+        ) or (
+            issue.no_start_failure
+            and retained_progress_issue is not None
+            and retained_progress_issue.timeout_like
+            and retained_progress_issue.had_progress
+        )
         if attempt.prompt_kind == "resume":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 210 if issue.timeout_like else 150
+            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
             num_ctx = 3072 if attempt.model_name is None else 2048
         elif attempt.prompt_kind == "compact":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 210 if issue.timeout_like else 150
+            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
             num_ctx = 2048
         else:
             base_timeout = 75 if issue.timeout_like else 60
-            total_timeout = 210 if issue.timeout_like else 150
+            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
             num_ctx = 4096 if attempt.model_name is None else 3072
         return (
             max(self._llm_timeout(base_timeout), base_timeout),

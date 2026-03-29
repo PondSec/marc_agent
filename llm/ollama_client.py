@@ -778,6 +778,8 @@ class OllamaClient:
         parameter_hint = OllamaClient._parameter_size_hint(model_name)
         extra_buffer = 20
         minimum_floor = 30
+        startup_share_numerator = 0
+        startup_share_denominator = 1
         if parameter_hint >= 24:
             extra_buffer = 60
             minimum_floor = 480
@@ -787,7 +789,27 @@ class OllamaClient:
         elif parameter_hint >= 7:
             extra_buffer = 40
             minimum_floor = 80
-        return int(min(total_timeout, max(inactivity_timeout + extra_buffer, minimum_floor)))
+            startup_share_numerator = 2
+            startup_share_denominator = 3
+        elif parameter_hint > 0:
+            extra_buffer = 30
+            minimum_floor = 60
+            startup_share_numerator = 3
+            startup_share_denominator = 5
+        shared_floor = 0
+        if startup_share_numerator > 0:
+            # Smaller local models often spend most of a long recovery budget before
+            # the first token arrives, so let startup consume a larger share there.
+            shared_floor = max(
+                (int(total_timeout) * startup_share_numerator) // startup_share_denominator,
+                int(inactivity_timeout),
+            )
+        return int(
+            min(
+                total_timeout,
+                max(inactivity_timeout + extra_buffer, minimum_floor, shared_floor),
+            )
+        )
 
     @staticmethod
     def _expanded_total_timeout(
