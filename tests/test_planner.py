@@ -1931,6 +1931,34 @@ def test_fallback_semantic_review_flags_pending_snapshot_explicit_target(tmp_pat
     assert review.file_hints == ["README.md"]
 
 
+def test_fallback_semantic_review_ignores_deferred_snapshot_explicit_target(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fuege --uppercase hinzu und aktualisiere die README.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["greet_cli/cli.py", "README.md", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/cli.py", "tests/test_cli.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["greet_cli/cli.py"],
+            }
+        ),
+        validation_status="passed",
+        changed_files=[
+            FileChangeRecord(path="README.md", operation="modify"),
+            FileChangeRecord(path="tests/test_cli.py", operation="modify"),
+        ],
+        notes=[f"{DEFERRED_UPDATE_TARGET_NOTE_PREFIX}greet_cli/cli.py"],
+    )
+
+    review = planner._fallback_semantic_change_review(session)
+
+    assert review.requirements_satisfied is True
+    assert "no additional concrete task-to-code mismatch" in review.summary
+
+
 def test_planner_blocks_moving_cli_launcher_logic_into_helper_module(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()

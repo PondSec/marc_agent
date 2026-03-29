@@ -7875,10 +7875,12 @@ class Planner:
         return artifacts
 
     def _fallback_semantic_change_review(self, session: SessionState) -> SemanticChangeReview:
+        deferred_targets = self._active_deferred_update_targets(session)
         pending_snapshot_targets = [
             path
             for path in self._snapshot_explicit_target_paths(session)
             if path not in {item.path for item in session.changed_files}
+            and path not in deferred_targets
         ]
         if session.validation_status == "failed":
             return SemanticChangeReview(
