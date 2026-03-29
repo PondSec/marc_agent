@@ -93,8 +93,8 @@ def _normalize_access_mode(
 @dataclass(slots=True)
 class AppConfig:
     ollama_host: str = "http://127.0.0.1:11434"
-    model_name: str = "qwen3-coder:30b"
-    router_model_name: str | None = "qwen2.5-coder:14b"
+    model_name: str = "qwen3:14b"
+    router_model_name: str | None = "qwen3:8b"
     workspace_root: str = "."
     state_root_override: str | None = None
     access_mode: str = AccessMode.APPROVAL.value

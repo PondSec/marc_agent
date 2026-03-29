@@ -889,7 +889,11 @@ class TaskManager:
         updates: dict[str, Any] = {}
 
         if session.status == "failed" and session.final_response and not session.blockers:
-            if session.validation_status not in {"failed", "blocked"} and not session.stop_requested:
+            if (
+                session.validation_status not in {"failed", "blocked"}
+                and not session.stop_requested
+                and not session.stop_reason
+            ):
                 updates["status"] = "completed"
 
         if session.status in {"queued", "running"}:

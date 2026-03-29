@@ -811,6 +811,34 @@ def test_follow_up_task_clears_old_execution_state_but_keeps_last_paths(tmp_path
     }
 
 
+def test_stale_failed_session_does_not_turn_completed_on_read(tmp_path):
+    config = build_test_config(tmp_path, llm_timeout=1)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    session = SessionState(
+        task="lauf ist haengen geblieben",
+        workspace_root=str(tmp_path),
+        status="failed",
+        workflow_stage="blocked",
+        validation_status="not_run",
+        stop_reason="stale_session",
+        final_response="Der vorherige Lauf wurde nicht sauber abgeschlossen. Bitte starte den Chat erneut.",
+        last_error="Session thread is no longer active.",
+    )
+    session.updated_at = "2026-03-29T10:00:00+00:00"
+    app.state.task_manager.session_store.save(session)
+
+    response = client.get(f"/api/sessions/{session.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["stop_reason"] == "stale_session"
+    assert payload["final_response"].startswith("Der vorherige Lauf wurde nicht sauber abgeschlossen")
+
+
 def test_delete_session_removes_chat_metadata_and_logs(tmp_path):
     config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()

@@ -18,6 +18,7 @@ class LLMProvider(Protocol):
         retries: int | None = None,
         timeout: int | None = None,
         total_timeout: int | None = None,
+        strict_timeouts: bool = False,
         progress_callback: ProgressCallback | None = None,
         num_ctx: int | None = None,
     ) -> str: ...
@@ -31,6 +32,7 @@ class LLMProvider(Protocol):
         retries: int | None = None,
         timeout: int | None = None,
         total_timeout: int | None = None,
+        strict_timeouts: bool = False,
         progress_callback: ProgressCallback | None = None,
         num_ctx: int | None = None,
     ) -> dict[str, Any]: ...

@@ -51,15 +51,45 @@ class TaskStateUpdater:
     ) -> TaskState:
         payload: dict[str, Any] | None = None
         initial_mode = self._initial_prompt_mode(session)
+        local_state = self._fallback_state(user_input, snapshot=snapshot, session=session)
+        if self._should_short_circuit_with_local_state(
+            initial_mode=initial_mode,
+            session=session,
+            state=local_state,
+        ):
+            self._log(
+                "task_state_local_short_circuit",
+                strategy="deterministic_fallback",
+                reason="fresh_compact_shared_model_stack",
+            )
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="Task understanding used conservative local inference to avoid an extra same-model startup hop.",
+                        attempts=[],
+                    ),
+                    semantic_resolution="minimal_inference",
+                ),
+            )
+            self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
+            return local_state
         prompt = task_state_update_prompt(
             user_input,
             snapshot=snapshot,
             session=session,
             mode=initial_mode,
         )
-        initial_timeout = self.timeout if initial_mode == "full" else max(12, min(self.timeout, 18))
-        initial_total_timeout = max(initial_timeout * 2, initial_timeout + 20)
-        initial_num_ctx = self.num_ctx if initial_mode == "full" else min(self.num_ctx, 2048)
+        initial_timeout, initial_total_timeout, initial_num_ctx = self._mode_runtime(initial_mode)
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
         model_candidates = self._model_candidates()
         primary_model = model_candidates[0] if model_candidates else None
@@ -83,6 +113,7 @@ class TaskStateUpdater:
                 retries=0,
                 timeout=initial_timeout,
                 total_timeout=initial_total_timeout,
+                strict_timeouts=initial_mode != "full",
                 num_ctx=initial_num_ctx,
                 progress_callback=progress,
             ),
@@ -139,12 +170,20 @@ class TaskStateUpdater:
             error=str(outcome.exception),
             failure=failure.to_dict() if failure is not None else None,
         )
-        decisions = policy.plan_recovery(
-            failure,
-            primary_model=primary_model,
-            faster_model=reserve_model,
-            history=attempts,
-        ) if failure is not None else []
+        if failure is not None and failure.no_start_failure and initial_mode != "full":
+            self._log(
+                "task_state_recovery_short_circuit",
+                strategy="deterministic_fallback",
+                reason="fresh_compact_no_start",
+            )
+            decisions = []
+        else:
+            decisions = policy.plan_recovery(
+                failure,
+                primary_model=primary_model,
+                faster_model=reserve_model,
+                history=attempts,
+            ) if failure is not None else []
         for decision in decisions:
             self._log(
                 "task_state_recovery_option",
@@ -159,15 +198,17 @@ class TaskStateUpdater:
                 continue
             if decision.candidate.local_only:
                 break
+            retry_mode = self._recovery_prompt_mode(
+                initial_mode=initial_mode,
+                candidate_prompt_variant=decision.candidate.prompt_variant,
+            )
             retry_prompt = task_state_update_prompt(
                 user_input,
                 snapshot=snapshot,
                 session=session,
-                mode="full" if decision.candidate.prompt_variant == "full" else "compact",
+                mode=retry_mode,
             )
-            retry_timeout = self.timeout if decision.candidate.prompt_variant == "full" else max(12, min(self.timeout, 18))
-            retry_total_timeout = max(retry_timeout * 2, retry_timeout + 20)
-            retry_num_ctx = self.num_ctx if decision.candidate.prompt_variant == "full" else min(self.num_ctx, 2048)
+            retry_timeout, retry_total_timeout, retry_num_ctx = self._mode_runtime(retry_mode)
             retry_outcome = invoke_model(
                 lambda progress, prompt_text=retry_prompt, model_name=decision.candidate.model_identifier: self.llm.generate_json(
                     prompt_text,
@@ -176,6 +217,7 @@ class TaskStateUpdater:
                     retries=0,
                     timeout=retry_timeout,
                     total_timeout=retry_total_timeout,
+                    strict_timeouts=retry_mode != "full",
                     num_ctx=retry_num_ctx,
                     progress_callback=progress,
                 ),
@@ -184,7 +226,7 @@ class TaskStateUpdater:
                 attempt_number=len(attempts) + 1,
                 capability_tier=decision.candidate.capability_tier,
                 recovery_strategy=decision.candidate.strategy,
-                prompt_variant=decision.candidate.prompt_variant,
+                prompt_variant=retry_mode,
                 model_identifier=decision.candidate.model_identifier,
                 backend_identifier=self._backend_identifier(),
                 inactivity_timeout_seconds=retry_timeout,
@@ -197,7 +239,7 @@ class TaskStateUpdater:
                 payload = retry_outcome.value
                 resolution = semantic_resolution_from_attempt(
                     capability_tier=decision.candidate.capability_tier,
-                    prompt_variant=decision.candidate.prompt_variant,
+                    prompt_variant=retry_mode,
                     model_identifier=decision.candidate.model_identifier,
                     primary_model=primary_model,
                 )
@@ -289,6 +331,52 @@ class TaskStateUpdater:
             snapshot=snapshot,
             semantic_resolution="minimal_inference",
         )
+
+    def _should_short_circuit_with_local_state(
+        self,
+        *,
+        initial_mode: str,
+        session,
+        state: TaskState,
+    ) -> bool:
+        if initial_mode != "compact":
+            return False
+        config = getattr(self.llm, "config", None)
+        if config is None:
+            return False
+        primary_model = str(getattr(config, "model_name", "") or "").strip()
+        router_model = str(getattr(config, "router_model_name", "") or "").strip()
+        if not primary_model or not router_model or primary_model != router_model:
+            return False
+        if state.needs_clarification or state.ambiguity_level == "high":
+            return False
+        return float(state.confidence or 0.0) >= 0.65
+
+    def _mode_runtime(self, mode: str) -> tuple[int, int, int]:
+        if mode == "full":
+            timeout = self.timeout
+            total_timeout = max(timeout * 2, timeout + 20)
+            num_ctx = self.num_ctx
+            return timeout, total_timeout, num_ctx
+        timeout = max(12, min(self.timeout, 18))
+        # Compact task-state prompts stay small, but JSON responses can still
+        # stream slowly on CPU-only systems. Give them a wider completion budget
+        # without relaxing the inactivity budget.
+        total_timeout = max(timeout * 4, timeout + 40)
+        num_ctx = min(self.num_ctx, 2048)
+        return timeout, total_timeout, num_ctx
+
+    def _recovery_prompt_mode(
+        self,
+        *,
+        initial_mode: str,
+        candidate_prompt_variant: str,
+    ) -> str:
+        if candidate_prompt_variant != "full":
+            return "compact"
+        if initial_mode != "full":
+            return "compact"
+        return "full"
 
     def _log(self, event: str, **payload: Any) -> None:
         if self.logger is None:

@@ -96,6 +96,7 @@ CONFIG_HINTS = (
 )
 
 ENTRYPOINT_NAMES = {
+    "__main__.py",
     "main.py",
     "cli.py",
     "app.py",

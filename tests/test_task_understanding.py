@@ -14,6 +14,7 @@ from agent.task_state import EvidenceItem, TaskState
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
 from agent.understanding import TaskInterpreter
 from config.settings import AppConfig
+from llm.ollama_client import OllamaGenerationError
 from llm.schemas import AgentActionType, RouteActionName, RouteIntent
 from runtime.logger import AgentLogger
 
@@ -65,6 +66,24 @@ class ModelSelectiveLLM(ScriptedLLM):
         if payload is None:
             raise RuntimeError(f"No JSON payload configured for model {model!r}")
         return payload
+
+
+class StartupTimeoutLLM(ScriptedLLM):
+    def __init__(self, *, config=None):
+        super().__init__(json_payloads=[])
+        self.config = config
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        raise OllamaGenerationError(
+            "timed out waiting for the model to start streaming after 38.0 seconds",
+            reason="startup_timeout",
+            retryable=False,
+            model_name=str(kwargs.get("model") or "") or None,
+            startup_timeout_seconds=38,
+            inactivity_timeout_seconds=18,
+            total_timeout_seconds=38,
+        )
 
 
 def build_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
@@ -840,8 +859,324 @@ def test_task_state_uses_reserve_model_before_minimal_inference_for_clear_create
     assert task_state.next_action == "create"
     assert task_state.current_user_intent == "implement"
     assert task_state.execution_strategy == "feature_implementation"
-    assert task_state.semantic_resolution == "reserve_model"
+    assert task_state.semantic_resolution == "reduced_model"
     assert any(call["kwargs"].get("model") == "reserve-b" for call in llm.generate_json_calls)
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] == 18
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] == 72
+    assert llm.generate_json_calls[1]["kwargs"]["num_ctx"] == 2048
+
+
+def test_task_state_uses_larger_primary_model_as_reserve_when_smaller_router_times_out(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen3:8b",
+    )
+    reserve_payload = {
+        "latest_user_turn": "ich brauche ein snake spiel in html",
+        "root_goal": "Build a small Snake game in HTML.",
+        "active_goal": "Create the first playable Snake implementation.",
+        "goal_relation": "new_task",
+        "output_expectation": "Create a small runnable implementation with a conventional default artifact and minimal scope.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "Create the initial implementation and run the most relevant validation or entry command.",
+        "target_artifacts": [
+            {
+                "path": None,
+                "name": "snake",
+                "kind": ".html",
+                "role": "primary_target",
+                "confidence": 0.78,
+            }
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": ["A conventional default artifact is acceptable."],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.84,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": ["Choose a conventional default artifact.", "Implement the smallest runnable version."],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ModelSelectiveLLM(
+        {"qwen3:14b": reserve_payload},
+        failing_models={"qwen3:8b"},
+        config=config,
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        "ich brauche ein snake spiel in html",
+        snapshot=empty_snapshot(tmp_path),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.semantic_resolution == "reduced_model"
+    assert [call["kwargs"].get("model") for call in llm.generate_json_calls[:2]] == [
+        "qwen3:8b",
+        "qwen3:14b",
+    ]
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] == 18
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] == 72
+    assert llm.generate_json_calls[1]["kwargs"]["num_ctx"] == 2048
+
+
+def test_task_state_short_circuits_to_deterministic_fallback_after_fresh_compact_no_start(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen3:8b",
+    )
+    logger = AgentLogger(tmp_path, "task-state-short-circuit")
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm, logger=logger)
+
+    task_state = updater.update_task_state(
+        "ich brauche ein snake spiel in html",
+        snapshot=empty_snapshot(tmp_path),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.next_action == "create"
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert [call["kwargs"].get("model") for call in llm.generate_json_calls] == ["qwen3:8b"]
+    log_text = logger.log_path.read_text(encoding="utf-8")
+    assert "task_state_recovery_short_circuit" in log_text
+
+
+def test_task_state_uses_local_short_circuit_when_primary_and_router_models_match(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    logger = AgentLogger(tmp_path, "task-state-local-short-circuit")
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm, logger=logger)
+
+    task_state = updater.update_task_state(
+        "fix den fehler in app/upload.py",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    assert task_state.current_user_intent == "repair"
+    assert task_state.next_action == "debug"
+    assert task_state.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_local_short_circuit_keeps_relevant_test_artifact_for_cli_feature_requests(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["greet_cli", "tests"],
+        important_files=["greet_cli/cli.py", "greet_cli/__main__.py", "README.md", "tests/test_cli.py"],
+        focus_files=["greet_cli/cli.py", "greet_cli/__main__.py", "tests/test_cli.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["greet_cli/__main__.py", "greet_cli/cli.py"],
+        repo_map=["greet_cli/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_cli"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI package runnable with python -m greet_cli.",
+    )
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        (
+            "Add a --uppercase flag to this CLI without moving the argument parsing out of greet_cli/__main__.py. "
+            "Keep greet_cli/cli.py as a small helper that only returns the greeting string. "
+            "Update the tests and README so the new flag is covered and documented, then run the relevant tests."
+        ),
+        snapshot=snapshot,
+    )
+
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts}
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "greet_cli/__main__.py",
+        "greet_cli/cli.py",
+        "README.md",
+        "tests/test_cli.py",
+    }
+    assert artifact_roles["tests/test_cli.py"] == "validation_target"
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_local_short_circuit_infers_readme_for_empty_workspace_create_request(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        (
+            "Create a small Python CLI called wordfreq.py that reads a text file path argument and prints the most "
+            "common words with counts, ignoring case and punctuation. Add unittest coverage in tests/test_wordfreq.py "
+            "with real assertions, add a short README with usage, and run python -m unittest tests.test_wordfreq."
+        ),
+        snapshot=empty_snapshot(tmp_path),
+    )
+
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts}
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "wordfreq.py",
+        "README.md",
+        "tests/test_wordfreq.py",
+    }
+    assert artifact_roles["README.md"] == "supporting_context"
+    assert artifact_roles["tests/test_wordfreq.py"] == "validation_target"
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_local_short_circuit_preserves_explicit_multi_file_website_targets(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=6,
+        language_counts={"html": 4, "css": 1, "python": 1},
+        top_directories=["tests"],
+        important_files=["tests/test_site.py", "about.html", "contact.html", "index.html", "projects.html", "styles.css"],
+        focus_files=[],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_site.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=["tests/"],
+        project_labels=["website"],
+        likely_commands=["python -m unittest tests.test_site"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Starter portfolio website.",
+    )
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        (
+            "You are working in an existing starter portfolio website. "
+            "Turn it into a polished multi-page portfolio without breaking the current pages. "
+            "Keep index.html and about.html coherent, update projects.html so it contains a visible Case Studies section, "
+            "update contact.html so the form uses class=\"contact-form\", update styles.css so it defines a .site-grid layout "
+            "and keeps the look consistent across pages, then run python -m unittest tests.test_site and finish only when it passes."
+        ),
+        snapshot=snapshot,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts}
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "about.html",
+        "projects.html",
+        "contact.html",
+        "styles.css",
+        "tests/test_site.py",
+    }
+    assert artifact_roles["tests/test_site.py"] == "validation_target"
+    assert {path for path in route.entities.target_paths} >= {
+        "index.html",
+        "about.html",
+        "projects.html",
+        "contact.html",
+        "styles.css",
+        "tests/test_site.py",
+    }
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_local_short_circuit_prioritizes_debug_for_bugfix_prompts_with_search_words(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["textutils", "tests"],
+        important_files=["README.md", "tests/test_normalize.py", "textutils/__init__.py", "textutils/normalize.py"],
+        focus_files=["tests/test_normalize.py", "textutils/normalize.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_normalize.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=["textutils/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small Python helper package with unittest coverage for name normalization.",
+    )
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        (
+            "There is a bug in this repo causing the name normalization tests to fail. "
+            "Find the problem, fix the implementation without changing the intended behavior, "
+            "do not weaken the tests, and run the relevant tests."
+        ),
+        snapshot=snapshot,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "repair"
+    assert task_state.execution_strategy == "debug_repair"
+    assert task_state.next_action == "debug"
+    assert task_state.target_artifacts[0].path == "textutils/normalize.py"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "textutils/normalize.py",
+        "tests/test_normalize.py",
+    }
+    assert route.intent == RouteIntent.DEBUG
+    assert llm.generate_json_calls == []
 
 
 def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
@@ -936,6 +1271,100 @@ def test_task_state_timeout_fallback_prioritizes_update_over_validation_for_comp
     assert "Apply the requested change" in (task_state.verification_target or "")
     assert route.intent == RouteIntent.UPDATE
     assert route.needs_clarification is False
+
+
+def test_task_state_timeout_fallback_prioritizes_package_main_for_cli_feature_requests(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["greet_cli", "tests"],
+        important_files=["greet_cli/cli.py", "greet_cli/__main__.py", "README.md", "tests/test_cli.py"],
+        focus_files=["greet_cli/cli.py", "greet_cli/__main__.py", "tests/test_cli.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["greet_cli/__main__.py", "greet_cli/cli.py"],
+        repo_map=["greet_cli/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_cli"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI package runnable with python -m greet_cli.",
+    )
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Extend the existing greet_cli package so the CLI accepts a --uppercase flag that prints the greeting in uppercase. "
+        "Update only what is needed, update the README usage example, add or update unittests, "
+        "run python -m unittest tests.test_cli, and finish only when the tests pass."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts}
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "modify"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts[0].path == "greet_cli/__main__.py"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "greet_cli/__main__.py",
+        "greet_cli/cli.py",
+        "README.md",
+        "tests/test_cli.py",
+    }
+    assert artifact_roles["tests/test_cli.py"] == "validation_target"
+    assert artifact_roles["README.md"] == "supporting_context"
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_name == "greet_cli/__main__.py"
+
+
+def test_task_state_timeout_fallback_prefers_cli_helper_over_package_init_for_cli_feature_requests(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=5,
+        language_counts={"python": 4, "markdown": 1},
+        top_directories=["greet_cli", "tests"],
+        important_files=["README.md", "tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py", "greet_cli/__init__.py"],
+        focus_files=["tests/test_cli.py", "greet_cli/__main__.py", "greet_cli/cli.py", "greet_cli/__init__.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["greet_cli/__main__.py", "greet_cli/cli.py"],
+        repo_map=["greet_cli/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python3 -m unittest tests.test_cli"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI package runnable with python -m greet_cli.",
+    )
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Extend this existing CLI so it supports --prefix TEXT and --repeat N while keeping --uppercase working. "
+        "Update the implementation, the README, and the unittest coverage. "
+        "The repeated output should print the full greeting on separate lines. "
+        "Finish only when python3 -m unittest tests.test_cli passes."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+
+    assert [artifact.path for artifact in task_state.target_artifacts[:2]] == [
+        "greet_cli/__main__.py",
+        "greet_cli/cli.py",
+    ]
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "greet_cli/__main__.py",
+        "greet_cli/cli.py",
+        "README.md",
+        "tests/test_cli.py",
+    }
+    assert "greet_cli/__init__.py" not in {artifact.path for artifact in task_state.target_artifacts}
 
 
 def test_task_state_model_normalizes_route_style_aliases():
@@ -1668,7 +2097,7 @@ def test_task_state_updater_uses_compact_generation_for_fresh_session(tmp_path):
     prompt = call["args"][0]
     assert "Recent conversation:" not in prompt
     assert call["kwargs"]["timeout"] == 18
-    assert call["kwargs"]["total_timeout"] == 38
+    assert call["kwargs"]["total_timeout"] == 72
     assert call["kwargs"]["num_ctx"] == 2048
 
 

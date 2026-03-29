@@ -6,6 +6,7 @@ import shutil
 from agent.models import (
     DiagnosticRecord,
     FileChangeRecord,
+    RepairAttemptRecord,
     SessionState,
     ValidationCommand,
     ValidationRunRecord,
@@ -65,6 +66,32 @@ def test_validation_planner_marks_failure_when_current_generation_failed():
     assert planner.rollup_status(session) == "failed"
 
 
+def test_validation_planner_treats_generic_unittest_as_satisfied_after_targeted_module_passes():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Fix the failing CLI unittest.",
+        workspace_root="/tmp/demo",
+        validation_plan=[
+            ValidationCommand(command="python -m unittest", kind="test", verification_scope="runtime"),
+        ],
+        verification_commands=["python -m unittest tests.test_cli", "python -m unittest"],
+        changed_files=[FileChangeRecord(path="greet_cli/__main__.py", operation="write")],
+        edit_generation=1,
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.test_cli",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+            edit_generation=1,
+        )
+    )
+
+    assert planner.pending_commands(session) == []
+    assert planner.rollup_status(session) == "passed"
+
+
 def test_validation_planner_treats_unittest_importability_failure_as_discovery_gap(tmp_path):
     planner = ValidationPlanner()
     session = SessionState(
@@ -102,6 +129,394 @@ def test_validation_planner_treats_unittest_importability_failure_as_discovery_g
     assert evidence.artifact_paths[:2] == ["tests/test_wordfreq.py", "tests/__init__.py"]
     assert "tests/__init__.py" in evidence.file_hints
     assert any("test discovery" in item.lower() for item in evidence.repair_requirements)
+
+
+def test_validation_planner_promotes_workspace_traceback_frame_as_runtime_repair_target(tmp_path):
+    planner = ValidationPlanner()
+    workspace = tmp_path / "greet_cli"
+    workspace.mkdir()
+    (workspace / "__main__.py").write_text(
+        "from .cli import greet\n\n"
+        "def main(argv=None):\n"
+        "    return greet('Ada')\n",
+        encoding="utf-8",
+    )
+    (workspace / "cli.py").write_text(
+        "def greet(name):\n    return f\"Hello, {name}!\"\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Add an uppercase CLI flag and keep the greeting helper working.",
+        workspace_root=str(tmp_path),
+        changed_files=[
+            FileChangeRecord(path="greet_cli/cli.py", operation="modify"),
+            FileChangeRecord(path="tests/test_cli.py", operation="modify"),
+        ],
+        edit_generation=2,
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=2,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            ".usage: python3 -m unittest [-h] [name]\n"
+            "python3 -m unittest: error: unrecognized arguments: --uppercase\n"
+            "Traceback (most recent call last):\n"
+            '  File "/home/demo/tests/test_cli.py", line 22, in test_greet_with_uppercase_flag\n'
+            "    __main__.main(['--uppercase', 'Ada'])\n"
+            f'  File "{tmp_path / "greet_cli" / "__main__.py"}", line 7, in main\n'
+            "    args = parser.parse_args(argv)\n"
+            "SystemExit: 2\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "greet_cli/__main__.py"
+    assert evidence.file_hints[0] == "greet_cli/__main__.py"
+    assert "greet_cli/cli.py" in evidence.file_hints
+    assert "tests/test_cli.py" in evidence.file_hints
+    assert 7 in evidence.line_hints
+    assert any("greet_cli/__main__.py" in item for item in evidence.repair_requirements)
+
+
+def test_validation_planner_collects_bare_workspace_file_references_from_runtime_assertions(tmp_path):
+    planner = ValidationPlanner()
+    for relative_path in [
+        "index.html",
+        "about.html",
+        "projects.html",
+        "contact.html",
+        "styles.css",
+        "tests/test_site.py",
+    ]:
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    session = SessionState(
+        task="Extend the starter portfolio site with projects and contact pages.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn=(
+                "Build a multi-page portfolio site with projects.html and contact.html, "
+                "keep navigation consistent, and update the shared stylesheet."
+            ),
+            root_goal="Finish the portfolio site.",
+            active_goal="Create the new pages and repair the failing site validation.",
+            goal_relation="new_task",
+            output_expectation="The site pages and shared styling pass the targeted tests.",
+            current_user_intent="repair",
+            verification_target="python -m unittest tests.test_site",
+            next_action="debug",
+            target_artifacts=[
+                {"path": "projects.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "contact.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_site.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+        changed_files=[
+            FileChangeRecord(path="projects.html", operation="create"),
+            FileChangeRecord(path="contact.html", operation="create"),
+            FileChangeRecord(path="styles.css", operation="write"),
+        ],
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_site",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_navigation_links_all_pages (tests.test_site.TestPortfolioSite.test_navigation_links_all_pages)\n"
+            "AssertionError: 'href=\"projects.html\"' not found in '<!doctype html>...': index.html\n"
+            "FAIL: test_projects_page_has_cards (tests.test_site.TestPortfolioSite.test_projects_page_has_cards)\n"
+            "AssertionError: 'Case Studies' not found in '<!DOCTYPE html>...': projects.html\n"
+            "FAIL: test_contact_page_has_form_fields (tests.test_site.TestPortfolioSite.test_contact_page_has_form_fields)\n"
+            "AssertionError: 'class=\"contact-form\"' not found in '<!DOCTYPE html>...': contact.html\n"
+            "FAIL: test_styles_cover_projects_and_contact (tests.test_site.TestPortfolioSite.test_styles_cover_projects_and_contact)\n"
+            "AssertionError: '.site-grid' not found in 'body { ... }': styles.css\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert "index.html" in evidence.artifact_paths
+    assert "index.html" in evidence.file_hints
+    assert evidence.repair_brief is not None
+    assert "index.html" in evidence.repair_brief.allowed_files
+
+
+def test_validation_planner_prioritizes_non_test_task_targets_for_runtime_failures(tmp_path):
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Fix the failing normalization bug without weakening the tests.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn=(
+                "There is a bug in this repo causing the name normalization tests to fail. "
+                "Find the problem, fix the implementation without changing the intended behavior, "
+                "do not weaken the tests, and run the relevant tests."
+            ),
+            root_goal="Fix the normalization bug.",
+            active_goal="Repair textutils/normalize.py so the tests pass.",
+            goal_relation="new_task",
+            output_expectation="The implementation is fixed and the tests pass.",
+            current_user_intent="repair",
+            execution_strategy="debug_repair",
+            verification_target="python -m unittest tests.test_normalize",
+            next_action="debug",
+            target_artifacts=[
+                {"path": "textutils/normalize.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_normalize.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/home/demo/tests/test_normalize.py", line 11, in test_trims_and_collapses_whitespace\n'
+            '    self.assertEqual(normalize_name("  ada   lovelace  "), "Ada Lovelace")\n'
+            "AssertionError: '  Ada   Lovelace  ' != 'Ada Lovelace'\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "textutils/normalize.py"
+    assert "tests/test_normalize.py" in evidence.artifact_paths
+    assert any("textutils/normalize.py" in item for item in evidence.repair_requirements)
+    assert not any(
+        item == "Change tests/test_normalize.py so the failing runtime or test path can complete successfully."
+        for item in evidence.repair_requirements
+    )
+
+
+def test_validation_planner_builds_repair_brief_with_semantics_and_stable_signature(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text("def main(argv=None):\n    pass\n", encoding="utf-8")
+    (pkg / "cli.py").write_text("def greet(name):\n    return name\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="greet_cli/__main__.py", operation="modify"),
+            FileChangeRecord(path="greet_cli/cli.py", operation="modify"),
+            FileChangeRecord(path="tests/test_cli.py", operation="modify"),
+        ]
+    )
+    excerpt = (
+        "Traceback (most recent call last):\n"
+        f'  File "{tmp_path / "tests" / "test_cli.py"}", line 9, in test_greet_with_title\n'
+        "    self.assertEqual(mock_stdout.getvalue().strip(), 'Hello, Mr. Ada!')\n"
+        f'  File "{tmp_path / "greet_cli" / "__main__.py"}", line 7, in main\n'
+        "    print(greeting)\n"
+        "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'\n"
+        "- Mr. Hello, Ada!\n"
+        "+ Hello, Mr. Ada!\n"
+    )
+    failed_run_a = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=excerpt,
+    )
+    failed_run_b = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="The targeted CLI assertion still fails.",
+        excerpt=excerpt,
+    )
+
+    evidence_a = planner.build_failure_evidence(session, failed_run_a)
+    evidence_b = planner.build_failure_evidence(session, failed_run_b)
+
+    assert evidence_a.repair_brief is not None
+    assert evidence_a.repair_brief.primary_target == "greet_cli/__main__.py"
+    assert evidence_a.repair_brief.expected_semantics == ["Validation should produce: Hello, Mr. Ada!"]
+    assert evidence_a.repair_brief.observed_semantics == ["Validation currently produces: Mr. Hello, Ada!"]
+    assert evidence_a.repair_brief.locked_target == "greet_cli/__main__.py"
+    assert "tests/test_cli.py" in evidence_a.repair_brief.forbidden_files
+    assert evidence_a.repair_brief.failure_signature == evidence_b.repair_brief.failure_signature
+
+
+def test_validation_planner_repair_brief_tracks_recent_failed_attempts_for_same_signature(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text("def main(argv=None):\n    pass\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root=str(tmp_path),
+        edit_generation=2,
+    )
+    session.changed_files.append(FileChangeRecord(path="greet_cli/__main__.py", operation="modify"))
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=2,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_cli.py"}", line 9, in test_greet_with_title\n'
+            "    self.assertEqual(mock_stdout.getvalue().strip(), 'Hello, Mr. Ada!')\n"
+            f'  File "{tmp_path / "greet_cli" / "__main__.py"}", line 7, in main\n'
+            "    print(greeting)\n"
+            "AssertionError: 'Mr. Hello, Ada!' != 'Hello, Mr. Ada!'\n"
+            "- Mr. Hello, Ada!\n"
+            "+ Hello, Mr. Ada!\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+    assert evidence.repair_brief is not None
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="greet_cli/__main__.py",
+            validation_command=failed_run.command,
+            verification_scope="runtime",
+            strategy="validation_targeted",
+            result="no_effective_change",
+            reason="The generated edit left the implicated behavior unchanged.",
+            failure_signature=evidence.repair_brief.failure_signature,
+        )
+    )
+
+    updated = planner.build_failure_evidence(session, failed_run)
+
+    assert updated.repair_brief is not None
+    assert updated.repair_brief.locked_target == "greet_cli/__main__.py"
+    assert updated.repair_brief.recent_failed_attempts
+    assert updated.repair_brief.recent_failed_attempts[0].target == "greet_cli/__main__.py"
+    assert updated.repair_brief.recent_failed_attempts[0].result == "no_effective_change"
+
+
+def test_validation_planner_ignores_separator_noise_in_assertion_semantics(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text("def main(argv=None):\n    pass\n", encoding="utf-8")
+    (pkg / "cli.py").write_text("def greet(name):\n    return name\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="greet_cli/__main__.py", operation="modify"),
+            FileChangeRecord(path="tests/test_cli.py", operation="modify"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "..FF\n"
+            "======================================================================\n"
+            "FAIL: test_title_flag (tests.test_cli.TestCLI.test_title_flag)\n"
+            "----------------------------------------------------------------------\n"
+            f'  File "{tmp_path / "tests" / "test_cli.py"}", line 19, in test_title_flag\n'
+            '    self.assertEqual(self.run_cli(["Ada", "--title", "Dr."]), "Dr. Hello, Ada!")\n'
+            "AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'\n"
+            "- Dr.: Hello, Ada!\n"
+            "+ Dr. Hello, Ada!\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.expected_semantics == ["Validation should produce: Dr. Hello, Ada!"]
+    assert evidence.repair_brief.observed_semantics == ["Validation currently produces: Dr.: Hello, Ada!"]
+
+
+def test_validation_planner_prefers_implementation_region_hint_over_test_line(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text("def main(argv=None):\n    print('hi')\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the CLI greeting formatting.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.append(FileChangeRecord(path="greet_cli/__main__.py", operation="modify"))
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_cli",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_cli.py"}", line 19, in test_title_flag\n'
+            '    self.assertEqual(self.run_cli(["Ada", "--title", "Dr."]), "Dr. Hello, Ada!")\n'
+            f'  File "{tmp_path / "greet_cli" / "__main__.py"}", line 11, in main\n'
+            "    print(greeting)\n"
+            "AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'\n"
+            "- Dr.: Hello, Ada!\n"
+            "+ Dr. Hello, Ada!\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "greet_cli/__main__.py"
+    assert evidence.repair_brief.implicated_region_hint == "greet_cli/__main__.py:line 11"
 
 
 def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypatch):
@@ -229,6 +644,49 @@ def test_validation_planner_includes_explicit_user_requested_validation_command(
     assert plan[0].required is True
 
 
+def test_validation_planner_targets_changed_unittest_module_instead_of_generic_command():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["tests"],
+        important_files=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+        focus_files=["tests/test_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["greet_cli/__main__.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=["python -m unittest"],
+        validation_commands=[
+            ValidationCommand(
+                command="python -m unittest",
+                kind="test",
+                verification_scope="runtime",
+                source="python-test-files",
+                priority=10,
+                reason="unittest-style Python tests detected in the repository.",
+            )
+        ],
+        workflow_commands=[],
+        repo_summary="Small CLI project with unittest coverage.",
+    )
+
+    plan = planner.build_plan(
+        "Create the requested CLI and run the tests.",
+        snapshot,
+        changed_files=["greet_cli/__main__.py", "greet_cli/cli.py", "tests/test_cli.py"],
+    )
+
+    assert plan[0].command == "python -m unittest tests.test_cli"
+    assert all(item.command != "python -m unittest" for item in plan)
+
+
 def test_validation_planner_extracts_multiline_explicit_validation_command_without_following_bullet_text():
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(
@@ -271,6 +729,173 @@ def test_validation_planner_extracts_multiline_explicit_validation_command_witho
 
     assert any(item.command == "python -m unittest discover -s tests -v" for item in plan)
     assert not any("Wenn du Beispieldateien brauchst" in item.command for item in plan)
+
+
+def test_validation_planner_builds_failure_evidence_from_targeted_unittest_command(tmp_path):
+    planner = ValidationPlanner()
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tmp_path / "greet_cli").mkdir()
+    session = SessionState(
+        task="Create a CLI package and run the tests.",
+        workspace_root=str(tmp_path),
+        validation_status="failed",
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="greet_cli/__main__.py", operation="create"),
+            FileChangeRecord(path="greet_cli/cli.py", operation="create"),
+            FileChangeRecord(path="README.md", operation="create"),
+            FileChangeRecord(path="tests/test_cli.py", operation="create"),
+        ]
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.test_cli",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=1,
+            iteration=8,
+            summary="Validation command exited with 1.",
+            excerpt="FAIL: expected Hello, Ada!",
+        )
+    )
+
+    evidence = planner.build_failure_evidence(session, session.validation_runs[-1])
+
+    assert evidence.artifact_paths[0] == "greet_cli/__main__.py"
+    assert "tests/test_cli.py" in evidence.artifact_paths
+
+
+def test_validation_planner_collects_missing_fixture_path_from_runtime_traceback(tmp_path):
+    planner = ValidationPlanner()
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tmp_path / "wordfreq.py").write_text("def wordfreq(path):\n    return []\n", encoding="utf-8")
+    (tests_dir / "test_wordfreq.py").write_text("pass\n", encoding="utf-8")
+    session = SessionState(
+        task="Create wordfreq.py and its tests.",
+        workspace_root=str(tmp_path),
+        validation_status="failed",
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="wordfreq.py", operation="create"),
+            FileChangeRecord(path="tests/test_wordfreq.py", operation="create"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_wordfreq",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        iteration=3,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_wordfreq.py"}", line 6, in test_wordfreq\n'
+            "    result = wordfreq('tests/test_data.txt')\n"
+            f'  File "{tmp_path / "wordfreq.py"}", line 2, in wordfreq\n'
+            "    with open(file_path, 'r') as file:\n"
+            "FileNotFoundError: [Errno 2] No such file or directory: 'tests/test_data.txt'\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert "tests/test_data.txt" in evidence.artifact_paths
+    assert "tests/test_data.txt" in evidence.file_hints
+
+
+def test_validation_planner_strips_trailing_sentence_from_inline_unittest_command():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "python -m unittest tests.test_wordfreq. Finish only when the tests pass."
+    )
+
+    assert normalized == "python -m unittest tests.test_wordfreq"
+
+
+def test_validation_planner_strips_trailing_passes_token_from_inline_unittest_command():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "python -m unittest tests.test_wordfreq passes"
+    )
+
+    assert normalized == "python -m unittest tests.test_wordfreq"
+
+
+def test_validation_planner_strips_trailing_passes_sentence_from_inline_unittest_command():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "python -m unittest tests.test_wordfreq passes."
+    )
+
+    assert normalized == "python -m unittest tests.test_wordfreq"
+
+
+def test_validation_planner_build_plan_normalizes_finish_only_when_unittest_phrase():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["tests"],
+        important_files=["wordfreq.py", "tests/test_wordfreq.py"],
+        focus_files=["wordfreq.py", "tests/test_wordfreq.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_wordfreq.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["wordfreq.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small Python CLI with unittest coverage.",
+    )
+    session = SessionState(
+        task="Create wordfreq.py and finish only when python -m unittest tests.test_wordfreq passes.",
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn="Create wordfreq.py and finish only when python -m unittest tests.test_wordfreq passes.",
+            root_goal="Create the CLI.",
+            active_goal="Create the CLI and make the test pass.",
+            goal_relation="new_task",
+            output_expectation="A working CLI with a targeted unittest.",
+            verification_target="Finish only when python -m unittest tests.test_wordfreq passes.",
+            next_action="create",
+            target_artifacts=[
+                {"path": "wordfreq.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_wordfreq.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["wordfreq.py", "tests/test_wordfreq.py"],
+        session=session,
+    )
+
+    assert [item.command for item in plan] == ["python -m unittest tests.test_wordfreq"]
+
+
+def test_validation_planner_does_not_map_plain_prose_word_to_unittest_path():
+    planner = ValidationPlanner()
+
+    assert planner._path_from_unittest_target("passes") is None
 
 
 def test_validation_planner_does_not_mark_unchecked_changes_as_passed():
