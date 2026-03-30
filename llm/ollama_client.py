@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import socket
 import subprocess
 import time
 from collections.abc import Callable
+from threading import Event, Thread
 from typing import Any, Iterator
 from urllib import error, request
 
@@ -360,6 +362,7 @@ class OllamaClient:
 
         poll_timeout = max(2.0, min(float(inactivity_timeout) / 3.0, 12.0))
         self._set_socket_timeout(response, poll_timeout)
+        line_queue, reader_stop, reader_thread = self._start_stream_reader(response)
         started_at = request_started_at
         last_activity_at = started_at
         last_heartbeat_at = headers_received_at
@@ -384,39 +387,75 @@ class OllamaClient:
                 }
             )
 
-        while True:
-            try:
-                raw_line = response.readline()
-            except Exception as exc:  # noqa: BLE001
-                if not self._is_timeout_like(exc):
+        try:
+            while True:
+                try:
+                    raw_line = self._wait_for_stream_line(
+                        line_queue,
+                        response=response,
+                        model_name=model_name,
+                        started_at=started_at,
+                        last_activity_at=last_activity_at,
+                        last_heartbeat_at=last_heartbeat_at,
+                        activity_count=activity_count,
+                        streamed_parts=streamed_parts,
+                        total_characters=total_characters,
+                        startup_timeout=startup_timeout,
+                        inactivity_timeout=inactivity_timeout,
+                        total_timeout=total_timeout,
+                        startup_warning_sent=startup_warning_sent,
+                        progress_callback=progress_callback,
+                    )
+                except OllamaGenerationError:
+                    self._abort_stream_response(response)
                     raise
+                except Exception:
+                    self._abort_stream_response(response)
+                    raise
+
                 now = time.monotonic()
-                idle_for = now - last_activity_at
-                elapsed = now - started_at
-                if activity_count <= 0 and not streamed_parts:
-                    if progress_callback is not None and not startup_warning_sent and elapsed >= max(startup_timeout - 10.0, startup_timeout * 0.75):
+                if progress_callback is not None:
+                    idle_for = now - last_activity_at
+                    elapsed = now - started_at
+                    if activity_count <= 0 and not streamed_parts:
+                        if (
+                            not startup_warning_sent
+                            and elapsed >= max(startup_timeout - 10.0, startup_timeout * 0.75)
+                        ):
+                            progress_callback(
+                                {
+                                    "type": "status",
+                                    "stage": "startup_timeout_warning",
+                                    "model": model_name,
+                                    "elapsed": round(elapsed, 1),
+                                    "startup_timeout": startup_timeout,
+                                    "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
+                                }
+                            )
+                            startup_warning_sent = True
+                    elif now - last_heartbeat_at >= min(10.0, inactivity_timeout):
                         progress_callback(
                             {
-                                "type": "status",
-                                "stage": "startup_timeout_warning",
-                                "model": model_name,
+                                "type": "heartbeat",
                                 "elapsed": round(elapsed, 1),
-                                "startup_timeout": startup_timeout,
-                                "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
+                                "idle_for": round(idle_for, 1),
+                                "characters": total_characters,
+                                "model": model_name,
                             }
                         )
-                        startup_warning_sent = True
-                    if elapsed >= startup_timeout:
+                        last_heartbeat_at = now
+
+                if not raw_line:
+                    if activity_count <= 0 and not streamed_parts:
+                        elapsed = round(time.monotonic() - started_at, 1)
                         raise OllamaGenerationError(
                             f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
                             reason="startup_timeout",
-                            elapsed=round(elapsed, 1),
-                            idle_for=round(idle_for, 1),
+                            elapsed=elapsed,
+                            idle_for=elapsed,
                             characters=total_characters,
                             activity_count=activity_count,
                             partial_text="".join(streamed_parts),
-                            # A full no-start timeout on Ollama is often a cold-start rather than a hard logic error.
-                            # Allow one higher-level retry so the planner can rerun after the model finishes warming up.
                             retryable=True,
                             model_name=model_name,
                             backend_identifier="ollama",
@@ -424,44 +463,78 @@ class OllamaClient:
                             inactivity_timeout_seconds=inactivity_timeout,
                             total_timeout_seconds=total_timeout,
                             first_output_received=False,
-                        ) from exc
-                    if progress_callback is not None and now - last_heartbeat_at >= min(10.0, max(startup_timeout / 4.0, 4.0)):
-                        progress_callback(
-                            {
-                                "type": "heartbeat",
-                                "phase": "waiting_for_start",
-                                "model": model_name,
-                                "elapsed": round(elapsed, 1),
-                                "idle_for": round(idle_for, 1),
-                                "characters": total_characters,
-                                "startup_timeout": startup_timeout,
-                                "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
-                            }
                         )
-                        last_heartbeat_at = now
+                    break
+
+                last_activity_at = time.monotonic()
+                activity_count += 1
+                if progress_callback is not None and not first_chunk_announced:
+                    progress_callback(
+                        {
+                            "type": "status",
+                            "stage": "first_chunk_received",
+                            "model": model_name,
+                            "elapsed": round(last_activity_at - started_at, 3),
+                            "time_to_header": round(headers_received_at - started_at, 3),
+                            "time_to_first_chunk": round(last_activity_at - started_at, 3),
+                            "startup_timeout": startup_timeout,
+                            "inactivity_timeout": inactivity_timeout,
+                            "total_timeout": total_timeout,
+                        }
+                    )
+                    first_chunk_announced = True
+                if not stream_timeout_promoted:
+                    self._set_socket_timeout(response, float(inactivity_timeout))
+                    stream_timeout_promoted = True
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
                     continue
-                if idle_for >= inactivity_timeout:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("error"):
                     raise OllamaGenerationError(
-                        f"timed out waiting for model progress after {idle_for:.1f} seconds",
-                        reason="inactivity_timeout",
-                        elapsed=round(elapsed, 1),
-                        idle_for=round(idle_for, 1),
+                        str(payload["error"]),
+                        reason="provider_error",
+                        elapsed=round(last_activity_at - started_at, 1),
                         characters=total_characters,
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
+                        retryable=False,
                         model_name=model_name,
                         backend_identifier="ollama",
                         startup_timeout_seconds=startup_timeout,
                         inactivity_timeout_seconds=inactivity_timeout,
                         total_timeout_seconds=total_timeout,
                         first_output_received=bool(streamed_parts),
-                    ) from exc
+                    )
+                chunk = payload.get("response")
+                if chunk:
+                    piece = str(chunk)
+                    streamed_parts.append(piece)
+                    total_characters += len(piece)
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "type": "chunk",
+                                "elapsed": round(last_activity_at - started_at, 1),
+                                "characters": total_characters,
+                                "model": model_name,
+                            }
+                        )
+                    if expect_json and "}" in piece:
+                        completed_json = self._try_coerce_json_object("".join(streamed_parts))
+                        if completed_json is not None:
+                            return json.dumps(completed_json, ensure_ascii=False)
+                if payload.get("done") is True:
+                    break
+                elapsed = round(last_activity_at - started_at, 1)
                 if elapsed >= total_timeout:
                     raise OllamaGenerationError(
                         f"timed out waiting for model completion after {elapsed:.1f} seconds",
                         reason="total_timeout",
-                        elapsed=round(elapsed, 1),
-                        idle_for=round(idle_for, 1),
+                        elapsed=elapsed,
+                        idle_for=0.0,
                         characters=total_characters,
                         activity_count=activity_count,
                         partial_text="".join(streamed_parts),
@@ -471,120 +544,11 @@ class OllamaClient:
                         inactivity_timeout_seconds=inactivity_timeout,
                         total_timeout_seconds=total_timeout,
                         first_output_received=bool(streamed_parts),
-                    ) from exc
-                if progress_callback is not None and now - last_heartbeat_at >= min(10.0, inactivity_timeout):
-                    progress_callback(
-                        {
-                            "type": "heartbeat",
-                            "elapsed": round(elapsed, 1),
-                            "idle_for": round(idle_for, 1),
-                            "characters": total_characters,
-                            "model": model_name,
-                        }
                     )
-                    last_heartbeat_at = now
-                continue
-
-            if not raw_line:
-                if activity_count <= 0 and not streamed_parts:
-                    elapsed = round(time.monotonic() - started_at, 1)
-                    raise OllamaGenerationError(
-                        f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
-                        reason="startup_timeout",
-                        elapsed=elapsed,
-                        idle_for=elapsed,
-                        characters=total_characters,
-                        activity_count=activity_count,
-                        partial_text="".join(streamed_parts),
-                        retryable=True,
-                        model_name=model_name,
-                        backend_identifier="ollama",
-                        startup_timeout_seconds=startup_timeout,
-                        inactivity_timeout_seconds=inactivity_timeout,
-                        total_timeout_seconds=total_timeout,
-                        first_output_received=False,
-                    )
-                break
-
-            last_activity_at = time.monotonic()
-            activity_count += 1
-            if progress_callback is not None and not first_chunk_announced:
-                progress_callback(
-                    {
-                        "type": "status",
-                        "stage": "first_chunk_received",
-                        "model": model_name,
-                        "elapsed": round(last_activity_at - started_at, 3),
-                        "time_to_header": round(headers_received_at - started_at, 3),
-                        "time_to_first_chunk": round(last_activity_at - started_at, 3),
-                        "startup_timeout": startup_timeout,
-                        "inactivity_timeout": inactivity_timeout,
-                        "total_timeout": total_timeout,
-                    }
-                )
-                first_chunk_announced = True
-            if not stream_timeout_promoted:
-                self._set_socket_timeout(response, float(inactivity_timeout))
-                stream_timeout_promoted = True
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            payload = json.loads(line)
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("error"):
-                raise OllamaGenerationError(
-                    str(payload["error"]),
-                    reason="provider_error",
-                    elapsed=round(last_activity_at - started_at, 1),
-                    characters=total_characters,
-                    activity_count=activity_count,
-                    partial_text="".join(streamed_parts),
-                    retryable=False,
-                    model_name=model_name,
-                    backend_identifier="ollama",
-                    startup_timeout_seconds=startup_timeout,
-                    inactivity_timeout_seconds=inactivity_timeout,
-                    total_timeout_seconds=total_timeout,
-                    first_output_received=bool(streamed_parts),
-                )
-            chunk = payload.get("response")
-            if chunk:
-                piece = str(chunk)
-                streamed_parts.append(piece)
-                total_characters += len(piece)
-                if progress_callback is not None:
-                    progress_callback(
-                        {
-                            "type": "chunk",
-                            "elapsed": round(last_activity_at - started_at, 1),
-                            "characters": total_characters,
-                            "model": model_name,
-                        }
-                    )
-                if expect_json and "}" in piece:
-                    completed_json = self._try_coerce_json_object("".join(streamed_parts))
-                    if completed_json is not None:
-                        return json.dumps(completed_json, ensure_ascii=False)
-            if payload.get("done") is True:
-                break
-            elapsed = round(last_activity_at - started_at, 1)
-            if elapsed >= total_timeout:
-                raise OllamaGenerationError(
-                    f"timed out waiting for model completion after {elapsed:.1f} seconds",
-                    reason="total_timeout",
-                    elapsed=elapsed,
-                    idle_for=0.0,
-                    characters=total_characters,
-                    activity_count=activity_count,
-                    partial_text="".join(streamed_parts),
-                    model_name=model_name,
-                    backend_identifier="ollama",
-                    startup_timeout_seconds=startup_timeout,
-                    inactivity_timeout_seconds=inactivity_timeout,
-                    total_timeout_seconds=total_timeout,
-                    first_output_received=bool(streamed_parts),
-                )
+        finally:
+            reader_stop.set()
+            self._abort_stream_response(response)
+            reader_thread.join(timeout=1)
 
         if streamed_parts:
             if progress_callback is not None:
@@ -748,6 +712,160 @@ class OllamaClient:
         if isinstance(exc, (TimeoutError, socket.timeout)):
             return True
         return "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
+
+    @staticmethod
+    def _start_stream_reader(response) -> tuple[queue.Queue[tuple[str, Any]], Event, Thread]:
+        line_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        stop_event = Event()
+
+        def _reader() -> None:
+            try:
+                while not stop_event.is_set():
+                    raw_line = response.readline()
+                    line_queue.put(("line", raw_line))
+                    if not raw_line:
+                        return
+            except Exception as exc:  # noqa: BLE001
+                line_queue.put(("error", exc))
+
+        thread = Thread(target=_reader, daemon=True)
+        thread.start()
+        return line_queue, stop_event, thread
+
+    def _wait_for_stream_line(
+        self,
+        line_queue: queue.Queue[tuple[str, Any]],
+        *,
+        response,
+        model_name: str,
+        started_at: float,
+        last_activity_at: float,
+        last_heartbeat_at: float,
+        activity_count: int,
+        streamed_parts: list[str],
+        total_characters: int,
+        startup_timeout: int,
+        inactivity_timeout: int,
+        total_timeout: int,
+        startup_warning_sent: bool,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> bytes:
+        poll_timeout = max(2.0, min(float(inactivity_timeout) / 3.0, 12.0))
+        while True:
+            try:
+                kind, payload = line_queue.get(timeout=poll_timeout)
+            except queue.Empty:
+                now = time.monotonic()
+                idle_for = now - last_activity_at
+                elapsed = now - started_at
+                if activity_count <= 0 and not streamed_parts:
+                    if (
+                        progress_callback is not None
+                        and not startup_warning_sent
+                        and elapsed >= max(startup_timeout - 10.0, startup_timeout * 0.75)
+                    ):
+                        progress_callback(
+                            {
+                                "type": "status",
+                                "stage": "startup_timeout_warning",
+                                "model": model_name,
+                                "elapsed": round(elapsed, 1),
+                                "startup_timeout": startup_timeout,
+                                "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
+                            }
+                        )
+                    if progress_callback is not None and now - last_heartbeat_at >= min(10.0, max(startup_timeout / 4.0, 4.0)):
+                        progress_callback(
+                            {
+                                "type": "heartbeat",
+                                "phase": "waiting_for_start",
+                                "model": model_name,
+                                "elapsed": round(elapsed, 1),
+                                "idle_for": round(idle_for, 1),
+                                "characters": total_characters,
+                                "startup_timeout": startup_timeout,
+                                "seconds_remaining": round(max(startup_timeout - elapsed, 0.0), 1),
+                            }
+                        )
+                    if elapsed >= startup_timeout:
+                        self._abort_stream_response(response)
+                        raise OllamaGenerationError(
+                            f"timed out waiting for the model to start streaming after {elapsed:.1f} seconds",
+                            reason="startup_timeout",
+                            elapsed=round(elapsed, 1),
+                            idle_for=round(idle_for, 1),
+                            characters=total_characters,
+                            activity_count=activity_count,
+                            partial_text="".join(streamed_parts),
+                            retryable=True,
+                            model_name=model_name,
+                            backend_identifier="ollama",
+                            startup_timeout_seconds=startup_timeout,
+                            inactivity_timeout_seconds=inactivity_timeout,
+                            total_timeout_seconds=total_timeout,
+                            first_output_received=False,
+                        )
+                    continue
+                if idle_for >= inactivity_timeout:
+                    self._abort_stream_response(response)
+                    raise OllamaGenerationError(
+                        f"timed out waiting for model progress after {idle_for:.1f} seconds",
+                        reason="inactivity_timeout",
+                        elapsed=round(elapsed, 1),
+                        idle_for=round(idle_for, 1),
+                        characters=total_characters,
+                        activity_count=activity_count,
+                        partial_text="".join(streamed_parts),
+                        model_name=model_name,
+                        backend_identifier="ollama",
+                        startup_timeout_seconds=startup_timeout,
+                        inactivity_timeout_seconds=inactivity_timeout,
+                        total_timeout_seconds=total_timeout,
+                        first_output_received=bool(streamed_parts),
+                    )
+                if elapsed >= total_timeout:
+                    self._abort_stream_response(response)
+                    raise OllamaGenerationError(
+                        f"timed out waiting for model completion after {elapsed:.1f} seconds",
+                        reason="total_timeout",
+                        elapsed=round(elapsed, 1),
+                        idle_for=round(idle_for, 1),
+                        characters=total_characters,
+                        activity_count=activity_count,
+                        partial_text="".join(streamed_parts),
+                        model_name=model_name,
+                        backend_identifier="ollama",
+                        startup_timeout_seconds=startup_timeout,
+                        inactivity_timeout_seconds=inactivity_timeout,
+                        total_timeout_seconds=total_timeout,
+                        first_output_received=bool(streamed_parts),
+                    )
+                continue
+            if kind == "error":
+                exc = payload
+                if self._is_timeout_like(exc):
+                    continue
+                raise exc
+            return payload
+
+    @staticmethod
+    def _abort_stream_response(response) -> None:
+        try:
+            response.close()
+        except Exception:  # noqa: BLE001
+            pass
+        target = getattr(response, "fp", None)
+        target = getattr(target, "raw", target)
+        sock = getattr(target, "_sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     @staticmethod
     def _set_socket_timeout(response, timeout_seconds: float) -> None:

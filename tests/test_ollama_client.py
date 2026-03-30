@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from urllib import request
 
 import pytest
@@ -60,6 +61,31 @@ class FakeReadlineStreamingResponse:
         if isinstance(event, Exception):
             raise event
         return event
+
+
+class BlockingReadlineStreamingResponse:
+    def __init__(self, first_line: bytes):
+        self.first_line = first_line
+        self.read_calls = 0
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def readline(self):
+        self.read_calls += 1
+        if self.read_calls == 1:
+            return self.first_line
+        while not self.closed:
+            time.sleep(0.01)
+        return b""
+
+    def close(self):
+        self.closed = True
 
 
 class FakeMonotonic:
@@ -334,6 +360,33 @@ def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progres
     assert error.reason == "inactivity_timeout"
     assert error.partial_text == "hel"
     assert error.characters == 3
+    assert error.progress_seen is True
+
+
+def test_ollama_client_detects_blocked_stream_even_without_socket_timeout(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="tiny:1b",
+        llm_timeout=1,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return BlockingReadlineStreamingResponse(
+            (json.dumps({"response": "partial", "done": False}) + "\n").encode("utf-8")
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate("say hello", timeout=1, total_timeout=5, retries=0)
+
+    error = excinfo.value
+    assert error.reason == "inactivity_timeout"
+    assert error.partial_text == "partial"
     assert error.progress_seen is True
 
 
