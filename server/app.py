@@ -6,7 +6,7 @@ import json
 import mimetypes
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -29,11 +29,15 @@ from server.schemas import (
     ModelCatalogResponse,
     SessionSummary,
     SessionUpdateRequest,
+    TerminalSessionCreateRequest,
+    TerminalSessionInputRequest,
+    TerminalSessionResponse,
     TaskCreateRequest,
     WorkspaceCreateRequest,
     WorkspaceRecord,
     WorkspaceUpdateRequest,
 )
+from server.terminal_manager import TerminalManager, TerminalSessionNotFoundError
 from server.task_manager import (
     ExportArchive,
     SessionBusyError,
@@ -42,6 +46,7 @@ from server.task_manager import (
     TaskManager,
     WorkspaceBusyError,
     WorkspaceNotFoundError,
+    WorkspaceOperationError,
     WorkspacePreviewUnavailableError,
     WorkspaceRequiredError,
 )
@@ -52,6 +57,7 @@ class RuntimeBundle:
     config: AppConfig
     task_manager: TaskManager
     model_manager: ModelManager
+    terminal_manager: TerminalManager
     auth_service: AuthService | None
     setup_service: SetupService
     setup_required: bool = False
@@ -77,6 +83,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             if bundle.config.warmup_models_on_startup:
                 asyncio.create_task(asyncio.to_thread(bundle.model_manager.warmup_preferred_models))
         yield
+        bundle.terminal_manager.close_all()
 
     app = FastAPI(title=f"{AGENT_NAME} Web Console", version="1.0.0", lifespan=lifespan)
 
@@ -88,6 +95,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         runtime["bundle"] = bundle
         app.state.task_manager = bundle.task_manager
         app.state.model_manager = bundle.model_manager
+        app.state.terminal_manager = bundle.terminal_manager
         app.state.auth_service = bundle.auth_service
         app.state.setup_service = bundle.setup_service
         app.state.runtime_bundle = bundle
@@ -121,6 +129,15 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             return None
         bundle.auth_service.require_csrf(request, response)
         return None
+
+    async def require_admin(request: Request, response: Response):
+        bundle = current_runtime()
+        context = await require_auth(request, response)
+        if bundle.auth_service is None:
+            return None
+        if context is None or context.user.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required.")
+        return context
 
     async def require_setup_csrf(request: Request, response: Response):
         bundle = current_runtime()
@@ -551,6 +568,85 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace not found.")
         return Response(status_code=204)
 
+    @app.post(
+        "/api/workspaces/{workspace_id}/clear",
+        status_code=204,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
+    async def clear_workspace_contents(workspace_id: str) -> Response:
+        task_manager = current_runtime().task_manager
+        try:
+            cleared = task_manager.clear_workspace_contents(workspace_id)
+        except WorkspaceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not cleared:
+            raise HTTPException(status_code=404, detail="Workspace not found.")
+        return Response(status_code=204)
+
+    @app.post(
+        "/api/admin/terminal/sessions",
+        response_model=TerminalSessionResponse,
+        status_code=201,
+        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
+    )
+    async def create_terminal_session(request: TerminalSessionCreateRequest) -> TerminalSessionResponse:
+        task_manager = current_runtime().task_manager
+        cwd = request.cwd
+        if request.workspace_id:
+            workspace = task_manager.workspace_store.get(request.workspace_id)
+            if workspace is None:
+                raise HTTPException(status_code=404, detail="Workspace not found.")
+            cwd = workspace.path
+        snapshot = current_runtime().terminal_manager.create_session(cwd=cwd)
+        return TerminalSessionResponse.model_validate(asdict(snapshot))
+
+    @app.get(
+        "/api/admin/terminal/sessions/{session_id}",
+        response_model=TerminalSessionResponse,
+        dependencies=[Depends(require_auth), Depends(require_admin)],
+    )
+    async def read_terminal_session(session_id: str, cursor: int = Query(default=0, ge=0)) -> TerminalSessionResponse:
+        try:
+            snapshot = current_runtime().terminal_manager.read(session_id, cursor=cursor)
+        except TerminalSessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return TerminalSessionResponse.model_validate(asdict(snapshot))
+
+    @app.post(
+        "/api/admin/terminal/sessions/{session_id}/input",
+        response_model=TerminalSessionResponse,
+        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
+    )
+    async def write_terminal_session(session_id: str, request: TerminalSessionInputRequest) -> TerminalSessionResponse:
+        try:
+            snapshot = current_runtime().terminal_manager.write(session_id, request.data)
+        except TerminalSessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return TerminalSessionResponse.model_validate(asdict(snapshot))
+
+    @app.post(
+        "/api/admin/terminal/sessions/{session_id}/interrupt",
+        response_model=TerminalSessionResponse,
+        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
+    )
+    async def interrupt_terminal_session(session_id: str) -> TerminalSessionResponse:
+        try:
+            snapshot = current_runtime().terminal_manager.interrupt(session_id)
+        except TerminalSessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return TerminalSessionResponse.model_validate(asdict(snapshot))
+
+    @app.delete(
+        "/api/admin/terminal/sessions/{session_id}",
+        status_code=204,
+        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
+    )
+    async def close_terminal_session(session_id: str) -> Response:
+        current_runtime().terminal_manager.close(session_id)
+        return Response(status_code=204)
+
     @app.get("/api/sessions/{session_id}/events", dependencies=[Depends(require_auth)])
     async def stream_session_events(session_id: str) -> StreamingResponse:
         task_manager = current_runtime().task_manager
@@ -588,6 +684,7 @@ def _build_runtime(base_config: AppConfig) -> RuntimeBundle:
     config.ensure_state_dirs()
     task_manager = TaskManager(config)
     model_manager = ModelManager(config)
+    terminal_manager = TerminalManager(config)
     setup_service = SetupService(config.workspace_path / ".env")
     env_file_present_at_startup = setup_service.has_env_file()
     auth_service: AuthService | None = None
@@ -622,6 +719,7 @@ def _build_runtime(base_config: AppConfig) -> RuntimeBundle:
         config=config,
         task_manager=task_manager,
         model_manager=model_manager,
+        terminal_manager=terminal_manager,
         auth_service=auth_service,
         setup_service=setup_service,
         setup_required=setup_required,

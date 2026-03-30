@@ -43,6 +43,10 @@ class WorkspaceBusyError(RuntimeError):
     pass
 
 
+class WorkspaceOperationError(RuntimeError):
+    pass
+
+
 class SessionNotFoundError(RuntimeError):
     pass
 
@@ -518,6 +522,41 @@ class TaskManager:
 
             deleted_workspace = self.workspace_store.delete(workspace_id)
             return deleted_workspace is not None
+
+    def clear_workspace_contents(self, workspace_id: str) -> bool:
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            return False
+
+        sessions = [
+            session
+            for session in self.session_store.list_sessions(limit=10_000)
+            if session.workspace_id == workspace_id
+        ]
+
+        workspace_root = Path(workspace.path).expanduser().resolve()
+        base_root = self.base_config.workspace_path
+        try:
+            workspace_root.relative_to(base_root)
+        except ValueError as exc:
+            raise WorkspaceOperationError(
+                "Only workspaces inside the configured workspace root can be emptied from the web UI."
+            ) from exc
+        if workspace_root == base_root:
+            raise WorkspaceOperationError("The workspace root itself cannot be emptied from the web UI.")
+
+        with self._lock:
+            if any(self._is_active(session.id) for session in sessions):
+                raise WorkspaceBusyError(
+                    "The workspace still has a running chat and cannot be emptied yet."
+                )
+            workspace_root.mkdir(parents=True, exist_ok=True)
+            for child in workspace_root.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink(missing_ok=True)
+        return True
 
     def update_session(
         self,
