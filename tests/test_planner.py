@@ -8730,6 +8730,110 @@ def test_planner_keeps_attempted_runtime_implementation_ahead_of_unattempted_tes
     assert ordered == ["greet_cli/__main__.py", "tests/test_cli.py"]
 
 
+def test_runtime_repair_pivots_from_locked_python_support_file_to_impl_candidate(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix the failing calcstats runtime test.",
+        workspace_root=str(tmp_path),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_stats",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["calcstats/__init__.py", "calcstats/stats.py", "tests/test_stats.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: Lists differ: [6.0, 9.0, 12.0] != [6.0, 9.0]",
+        failure_summary="window_sums returns too many trailing window sums.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["calcstats/__init__.py", "calcstats/stats.py"],
+        line_hints=[18],
+        action_hints=[],
+        repair_requirements=[],
+        evidence_signature="sig-calcstats-window-sums",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="window-sums-mismatch",
+            primary_target="calcstats/__init__.py",
+            locked_target="calcstats/__init__.py",
+            expected_semantics=["return one sum per accepted trailing window"],
+            observed_semantics=["returns an extra trailing sum"],
+            implicated_symbols=["window_sums"],
+            implicated_region_hint="window_sums trailing-window loop",
+            allowed_files=["calcstats/__init__.py", "calcstats/stats.py"],
+            forbidden_files=["tests/test_stats.py"],
+        ),
+    )
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="calcstats/__init__.py",
+            validation_command="python -m unittest tests.test_stats",
+            verification_scope="runtime",
+            strategy="validation_targeted",
+            result="mutation_planned",
+            reason="updated the export file first",
+            evidence_signature="sig-calcstats-window-sums",
+            failure_signature="window-sums-mismatch",
+            iteration=5,
+        )
+    )
+
+    ordered = planner._repair_candidates_with_unattempted_first(
+        session,
+        repair_context,
+        ["calcstats/__init__.py", "calcstats/stats.py", "tests/test_stats.py"],
+    )
+
+    assert ordered[:2] == ["calcstats/stats.py", "tests/test_stats.py"]
+    assert ordered[-1] == "calcstats/__init__.py"
+
+
+def test_locked_runtime_support_scope_can_yield_to_behavioral_impl_fix(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(task="Fix runtime mismatch", workspace_root=str(tmp_path))
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_stats",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["calcstats/__init__.py", "calcstats/stats.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: Lists differ: [6.0, 9.0, 12.0] != [6.0, 9.0]",
+        failure_summary="runtime output still includes an extra trailing window sum",
+        file_hints=["calcstats/__init__.py", "calcstats/stats.py"],
+        evidence_signature="sig-calcstats-window-sums",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="window-sums-mismatch",
+            primary_target="calcstats/__init__.py",
+            locked_target="calcstats/__init__.py",
+            expected_semantics=["return one sum per accepted trailing window"],
+            observed_semantics=["returns an extra trailing sum"],
+            allowed_files=["calcstats/__init__.py", "calcstats/stats.py"],
+        ),
+    )
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="calcstats/__init__.py",
+            validation_command="python -m unittest tests.test_stats",
+            verification_scope="runtime",
+            strategy="validation_targeted",
+            result="mutation_planned",
+            reason="updated export file once already",
+            evidence_signature="sig-calcstats-window-sums",
+            failure_signature="window-sums-mismatch",
+            iteration=3,
+        )
+    )
+
+    review = planner._repair_target_scope_review(
+        session=session,
+        path="calcstats/stats.py",
+        repair_context=repair_context,
+    )
+
+    assert review is None
+
+
 def test_planner_retries_same_implementation_target_after_identical_repair_generation(tmp_path, monkeypatch):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()

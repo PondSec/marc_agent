@@ -1817,6 +1817,9 @@ class Planner:
 
         locked_target = self._repair_brief_locked_target(repair_context)
         if locked_target and locked_target in candidates:
+            if self._runtime_locked_target_should_yield(session, repair_context, locked_target):
+                remaining = [candidate for candidate in candidates if candidate != locked_target]
+                return [*_order_by_attempt_status(remaining), locked_target]
             remaining = [candidate for candidate in candidates if candidate != locked_target]
             return [locked_target, *_order_by_attempt_status(remaining)]
 
@@ -1894,6 +1897,8 @@ class Planner:
             return False
         path = Path(text)
         suffix = path.suffix.lower()
+        if suffix in {".py", ".pyi"} and self._is_python_runtime_support_module(text, repair_context):
+            return True
         if suffix == ".py":
             return False
         if self._repair_candidate_is_explicitly_referenced(text, repair_context):
@@ -1977,10 +1982,12 @@ class Planner:
             if self._repair_target_can_be_created(session, candidate, repair_context)
         ]
         existing = self._repair_related_existing_context_paths(session, repair_context)
+        locked_target = self._repair_brief_locked_target(repair_context)
+        primary_target = self._repair_brief_primary_target(repair_context)
+        demote_locked = self._runtime_locked_target_should_yield(session, repair_context, locked_target)
         return self._unique_paths(
             [
-                self._repair_brief_locked_target(repair_context),
-                self._repair_brief_primary_target(repair_context),
+                *([] if demote_locked else [locked_target, primary_target]),
                 sticky_target,
                 *self._memory_guided_candidate_paths(session, failure_only=True),
                 *failure_specific_support,
@@ -1992,6 +1999,7 @@ class Planner:
                 *candidates,
                 *existing,
                 *failure_specific_test,
+                *([locked_target] if demote_locked and locked_target else []),
             ]
         )
 
@@ -2092,10 +2100,102 @@ class Planner:
                 continue
             if self.validation_planner._is_test_path(candidate):
                 continue
+            if self._runtime_locked_target_should_yield(session, repair_context, candidate):
+                continue
             if require_current_implication and candidate not in implicated:
                 continue
             return candidate
         return None
+
+    def _is_python_runtime_support_module(
+        self,
+        candidate: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        text = str(candidate or "").strip()
+        if not text:
+            return False
+        path = Path(text)
+        name = path.name.lower()
+        if name == "__init__.py":
+            return True
+        if name != "__main__.py":
+            return False
+        implementation_peers = self._runtime_implementation_candidates(
+            repair_context,
+            exclude={text},
+        )
+        return bool(implementation_peers)
+
+    def _runtime_locked_target_should_yield(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence | None,
+        locked_target: str | None,
+    ) -> bool:
+        target = str(locked_target or "").strip()
+        if repair_context is None or repair_context.verification_scope != "runtime" or not target:
+            return False
+        if not self._is_runtime_support_repair_target(target, repair_context):
+            return False
+        if self._runtime_support_candidates_should_lead([target], repair_context):
+            return False
+        failure_text = "\n".join(
+            part
+            for part in [
+                str(getattr(getattr(repair_context, "repair_brief", None), "failure_type", "") or "").strip(),
+                str(repair_context.failure_summary or "").strip(),
+                str(repair_context.excerpt or "").strip(),
+            ]
+            if part
+        ).lower()
+        behavioral_failure = any(
+            marker in failure_text
+            for marker in (
+                "assertionerror",
+                "assertion mismatch",
+                "lists differ",
+                "expected",
+                "observed",
+                "output",
+                "returned",
+                "prints",
+            )
+        )
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is not None and (brief.expected_semantics or brief.observed_semantics):
+            behavioral_failure = True
+        if not behavioral_failure:
+            return False
+        implementation_alternatives = self._runtime_implementation_candidates(
+            repair_context,
+            exclude={target},
+        )
+        if not implementation_alternatives:
+            return False
+        attempted_failures = self._repair_attempt_failure_count(session, repair_context, target)
+        return attempted_failures >= 1 or bool(implementation_alternatives)
+
+    def _runtime_implementation_candidates(
+        self,
+        repair_context: ValidationFailureEvidence,
+        *,
+        exclude: set[str] | None = None,
+    ) -> list[str]:
+        skipped = {
+            str(item or "").strip()
+            for item in list(exclude or set())
+            if str(item or "").strip()
+        }
+        candidates = self._unique_paths([*repair_context.artifact_paths, *repair_context.file_hints])
+        return [
+            candidate
+            for candidate in candidates
+            if candidate
+            and candidate not in skipped
+            and not self.validation_planner._is_test_path(candidate)
+            and not self._is_runtime_support_repair_target(candidate, repair_context)
+        ]
 
     def _repair_candidate_is_explicitly_referenced(
         self,
@@ -6078,6 +6178,7 @@ class Planner:
             )
         if review is None:
             review = self._repair_target_scope_review(
+                session=session,
                 path=path,
                 repair_context=repair_context,
             )
@@ -6114,6 +6215,7 @@ class Planner:
     def _repair_target_scope_review(
         self,
         *,
+        session: SessionState,
         path: str,
         repair_context: ValidationFailureEvidence | None,
     ) -> ProposedUpdateReview | None:
@@ -6171,6 +6273,7 @@ class Planner:
         if (
             locked_scope
             and locked_scope != normalized_path
+            and not self._runtime_locked_target_should_yield(session, repair_context, locked_scope)
             and not self._is_runtime_support_repair_target(normalized_path, repair_context)
         ):
             return ProposedUpdateReview(
