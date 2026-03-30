@@ -167,6 +167,10 @@ class ValidationPlanner:
     ASSERTION_MISMATCH_PATTERN = re.compile(
         r"AssertionError:\s*(?P<observed>.+?)\s*!=\s*(?P<expected>.+)"
     )
+    UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
+        re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
+        re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
+    )
     TEST_HARNESS_RUNTIME_ERROR_MARKERS = (
         "nameerror",
         "importerror",
@@ -1045,6 +1049,13 @@ class ValidationPlanner:
         if any(pattern.search(lowered) for pattern in self.NO_TESTS_RAN_PATTERNS):
             expected.append("The targeted tests should be discoverable and execute.")
             observed.append("The current validation run executes zero tests.")
+        undefined_symbol, usage_line = self._undefined_runtime_symbol_details(text)
+        if undefined_symbol:
+            expected.append(f"The symbol '{undefined_symbol}' should be bound or imported before it is used.")
+            observed_text = f"The current runtime path uses '{undefined_symbol}' before it is bound or imported."
+            if usage_line:
+                observed_text += f" Current use: {usage_line}"
+            observed.append(observed_text)
         return self._unique_strings(expected), self._unique_strings(observed)
 
     def _assertion_diff_values(self, text: str) -> tuple[str | None, str | None]:
@@ -1164,6 +1175,9 @@ class ValidationPlanner:
     def _implicated_symbols_from_failure_text(self, excerpt: str, failure_summary: str) -> list[str]:
         symbols: list[str] = []
         text = "\n".join(part for part in [excerpt, failure_summary] if part)
+        undefined_symbol, _usage_line = self._undefined_runtime_symbol_details(text)
+        if undefined_symbol:
+            symbols.append(undefined_symbol)
         for match in self.TRACEBACK_FRAME_PATTERN.finditer(text):
             symbol = str(match.group("symbol") or "").strip()
             if symbol and symbol not in symbols:
@@ -1175,6 +1189,42 @@ class ValidationPlanner:
             if name not in symbols:
                 symbols.append(name)
         return symbols
+
+    def _undefined_runtime_symbol_details(self, text: str) -> tuple[str | None, str | None]:
+        symbol_name = self._undefined_runtime_symbol_name(text)
+        if not symbol_name:
+            return None, None
+        usage_line = self._undefined_runtime_symbol_usage_line(text, symbol_name)
+        return symbol_name, usage_line
+
+    def _undefined_runtime_symbol_name(self, text: str) -> str | None:
+        for pattern in self.UNDEFINED_RUNTIME_SYMBOL_PATTERNS:
+            match = pattern.search(str(text or ""))
+            if match is None:
+                continue
+            name = str(match.group("name") or "").strip()
+            if name:
+                return name
+        return None
+
+    def _undefined_runtime_symbol_usage_line(self, text: str, symbol_name: str) -> str | None:
+        target = str(symbol_name or "").strip()
+        if not target:
+            return None
+        symbol_pattern = re.compile(rf"\b{re.escape(target)}\b")
+        for raw in str(text or "").splitlines():
+            stripped = str(raw or "").strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("Traceback", "File ")):
+                continue
+            if "NameError:" in stripped or "UnboundLocalError:" in stripped:
+                continue
+            if stripped.startswith("^"):
+                continue
+            if symbol_pattern.search(stripped):
+                return stripped
+        return None
 
     def _implicated_region_hint(
         self,
@@ -2190,6 +2240,20 @@ class ValidationPlanner:
                 requirements.append(
                     f"Change {primary_target} so the failing runtime or test path can complete successfully."
                 )
+                undefined_symbol = self._undefined_runtime_symbol_name(
+                    "\n".join(
+                        part
+                        for part in [
+                            str(failed_run.excerpt or "").strip(),
+                            str(failed_run.summary or "").strip(),
+                        ]
+                        if part
+                    )
+                )
+                if undefined_symbol:
+                    requirements.append(
+                        f"Bind or import '{undefined_symbol}' before its failing use in {primary_target}, or remove that use if it is unnecessary."
+                    )
         elif scope == "semantic":
             requirements.append(
                 f"Close the remaining task-to-code gaps reported by the semantic review for {primary_target}."

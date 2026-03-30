@@ -10751,6 +10751,127 @@ def test_review_guided_retry_prompt_surfaces_minimal_semantic_delta(tmp_path, mo
     )
 
 
+def test_review_guided_retry_prompt_surfaces_undefined_runtime_symbol_guidance(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "import sys\n"
+            "import unittest\n\n"
+            "class TestWordFreq(unittest.TestCase):\n"
+            "    def test_read_text_stdin(self):\n"
+            "        import io\n"
+            "        sys.stdin = io.StringIO('hello world hello')\n"
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the failing stdin test for wordfreq.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing test module."}],
+        target_paths=["tests/test_wordfreq.py"],
+        target_name="tests/test_wordfreq.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    monkeypatch.setattr(
+        planner,
+        "_pre_write_update_review",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    current_content = (
+        "import unittest\n\n"
+        "class TestWordFreq(unittest.TestCase):\n"
+        "    def test_read_text_stdin(self):\n"
+        "        import io\n"
+        "        sys.stdin = io.StringIO('hello world hello')\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_wordfreq",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/tests/test_wordfreq.py", line 6, in test_read_text_stdin\n'
+            "        sys.stdin = io.StringIO('hello world hello')\n"
+            "NameError: name 'sys' is not defined. Did you forget to import 'sys'?\n"
+        ),
+        failure_summary="NameError: name 'sys' is not defined.",
+        file_hints=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+        line_hints=[6],
+        repair_requirements=[
+            "Change tests/test_wordfreq.py so the failing runtime or test path can complete successfully.",
+            "Bind or import 'sys' before its failing use in tests/test_wordfreq.py, or remove that use if it is unnecessary.",
+        ],
+        evidence_signature="sig-runtime-nameerror-prompt",
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:nameerrorprompt",
+            primary_target="tests/test_wordfreq.py",
+            locked_target="tests/test_wordfreq.py",
+            expected_semantics=["The symbol 'sys' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'sys' before it is bound or imported. Current use: sys.stdin = io.StringIO('hello world hello')"
+            ],
+            implicated_symbols=["sys", "test_read_text_stdin", "StringIO"],
+            implicated_region_hint="tests/test_wordfreq.py:line 6",
+            repair_constraints=[
+                "Bind or import 'sys' before its failing use in tests/test_wordfreq.py, or remove that use if it is unnecessary."
+            ],
+            recent_failed_attempts=[],
+            allowed_files=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+            forbidden_files=["README.md"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="tests/test_wordfreq.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
+            confidence=0.91,
+            blocking_issues=[
+                "The runtime failure still reports 'sys' as undefined in tests/test_wordfreq.py, but the proposal neither binds/imports 'sys' nor removes its failing usage."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Either import or otherwise bind 'sys' in tests/test_wordfreq.py, or remove the failing usage from the implicated line."
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert "import sys" in result.content
+    prompt = llm.generate_calls[0]["args"][0]
+    assert "Expected semantics: The symbol 'sys' should be bound or imported before it is used." in prompt
+    assert "Observed semantics: The current runtime path uses 'sys' before it is bound or imported." in prompt
+    assert "Repair constraints: Bind or import 'sys' before its failing use in tests/test_wordfreq.py" in prompt
+    assert "Repair focus: region=tests/test_wordfreq.py:line 6 symbols=sys" in prompt
+    assert "Resolve the undefined symbol 'sys' in tests/test_wordfreq.py" in prompt
+    assert "6:         sys.stdin = io.StringIO('hello world hello')" in prompt
+    assert "Either import or otherwise bind 'sys' before its current use" in prompt
+
+
 def test_review_guided_retry_can_escalate_to_full_for_broad_updates(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[

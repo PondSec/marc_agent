@@ -13,6 +13,12 @@ from llm.schemas import RouteActionName, RouterOutput
 
 
 REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
+UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
+    re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
+    re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
+    re.compile(r"['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]\s+as undefined"),
+    re.compile(r"undefined symbol ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
+)
 
 
 def system_prompt() -> str:
@@ -1700,6 +1706,16 @@ def _compact_repair_retry_prompt(
             "Minimal semantic delta: "
             + " | ".join(_trim_text(item, 160) for item in semantic_deltas[:2])
         )
+    if repair_brief.get("implicated_region_hint") or repair_brief.get("implicated_symbols"):
+        region_parts: list[str] = []
+        if repair_brief.get("implicated_region_hint"):
+            region_parts.append(f"region={repair_brief['implicated_region_hint']}")
+        if repair_brief.get("implicated_symbols"):
+            region_parts.append(
+                "symbols=" + ", ".join(_trim_text(str(item or "").strip(), 40) for item in repair_brief.get("implicated_symbols", [])[:4])
+            )
+        if region_parts:
+            sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
     if repair_brief.get("allowed_files"):
@@ -1711,6 +1727,31 @@ def _compact_repair_retry_prompt(
         sections.append(
             "Avoid drifting into other files without strong new evidence: "
             + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("forbidden_files", [])[:4])
+        )
+    if repair_brief.get("repair_constraints"):
+        sections.append(
+            "Repair constraints: "
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("repair_constraints", [])[:3])
+        )
+    if repair_brief.get("recent_failed_attempts"):
+        sections.append(
+            "Recent failed repair attempts: "
+            + " | ".join(
+                _trim_text(
+                    " ".join(
+                        part
+                        for part in [
+                            str(item.get("target") or "").strip(),
+                            str(item.get("strategy") or "").strip(),
+                            str(item.get("result") or "").strip(),
+                            str(item.get("reason") or "").strip(),
+                        ]
+                        if part
+                    ),
+                    160,
+                )
+                for item in repair_brief.get("recent_failed_attempts", [])[:3]
+            )
         )
     if runtime_hints:
         sections.append(
@@ -1771,6 +1812,11 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
         )
         lines.append(
             "- For a runtime argv shaped like ['python', '-m', '<module>', ...], sys.argv[3:] is the equivalent slice of only the trailing CLI arguments."
+        )
+    undefined_symbol = _undefined_runtime_symbol_from_text(" ".join(review.blocking_issues + review.repair_hints))
+    if undefined_symbol:
+        lines.append(
+            f"- Either import or otherwise bind '{undefined_symbol}' before its current use, or remove that failing use if it is unnecessary."
         )
     return "\n".join(lines)
 
@@ -2103,6 +2149,13 @@ def _mandatory_mutation_anchors(
                 "Resolve the failure focus tied to this file: "
                 + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
             )
+    undefined_symbol_anchor = _undefined_runtime_symbol_anchor(
+        path=path,
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+    if undefined_symbol_anchor:
+        anchors.append(undefined_symbol_anchor)
 
     for literal_anchor in _repair_required_literal_anchors(
         path=path,
@@ -2130,6 +2183,82 @@ def _mandatory_mutation_anchors(
             )
 
     return anchors[:3]
+
+
+def _undefined_runtime_symbol_from_text(text: str) -> str | None:
+    normalized = str(text or "")
+    for pattern in UNDEFINED_RUNTIME_SYMBOL_PATTERNS:
+        match = pattern.search(normalized)
+        if match is None:
+            continue
+        name = str(match.group("name") or "").strip()
+        if name:
+            return name
+    return None
+
+
+def _undefined_runtime_symbol_from_repair_context(
+    repair_context: ValidationFailureEvidence | None,
+) -> str | None:
+    if repair_context is None or repair_context.verification_scope != "runtime":
+        return None
+    for text in (
+        str(repair_context.excerpt or "").strip(),
+        str(repair_context.failure_summary or "").strip(),
+        str(repair_context.summary or "").strip(),
+    ):
+        symbol_name = _undefined_runtime_symbol_from_text(text)
+        if symbol_name:
+            return symbol_name
+    return None
+
+
+def _python_line_binds_name(line: str, name: str) -> bool:
+    target = str(name or "").strip()
+    if not target:
+        return False
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    if re.search(rf"^(?:from\s+\S+\s+import\s+.*\b{re.escape(target)}\b|import\s+.*\b{re.escape(target)}\b)", stripped):
+        return True
+    if re.search(rf"^{re.escape(target)}\s*=", stripped):
+        return True
+    return False
+
+
+def _undefined_runtime_symbol_anchor(
+    *,
+    path: str,
+    current_content: str,
+    repair_context: ValidationFailureEvidence,
+) -> str | None:
+    if Path(path).suffix.lower() not in {".py", ".pyi"}:
+        return None
+    symbol_name = _undefined_runtime_symbol_from_repair_context(repair_context)
+    if not symbol_name:
+        return None
+    symbol_pattern = re.compile(rf"\b{re.escape(symbol_name)}\b")
+    implicated_lines: list[str] = []
+    for index, raw in enumerate(str(current_content or "").splitlines(), start=1):
+        line = str(raw or "").rstrip()
+        if not line.strip():
+            continue
+        if not symbol_pattern.search(line):
+            continue
+        if _python_line_binds_name(line, symbol_name):
+            continue
+        implicated_lines.append(f"{index}: {line}")
+        if len(implicated_lines) >= 2:
+            break
+    if implicated_lines:
+        return (
+            f"Resolve the undefined symbol '{symbol_name}' in {path}; either import/bind it before use or remove the failing use from these current lines:\n"
+            + "\n".join(implicated_lines)
+        )
+    return (
+        f"Resolve the undefined symbol '{symbol_name}' in {path}; either import/bind it before its current use or remove that failing use if it is unnecessary."
+    )
 
 
 def _repair_target_line_hints(
