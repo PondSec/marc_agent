@@ -38,6 +38,7 @@ from server.schemas import (
     WorkspaceUpdateRequest,
 )
 from server.terminal_manager import TerminalManager, TerminalSessionNotFoundError
+from server.terminal_manager import TerminalAccessDeniedError
 from server.task_manager import (
     ExportArchive,
     SessionBusyError,
@@ -138,6 +139,30 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         if context is None or context.user.role != "admin":
             raise HTTPException(status_code=403, detail="Admin access required.")
         return context
+
+    def record_terminal_event(
+        request: Request,
+        context,
+        *,
+        event_type: str,
+        outcome: str,
+        details: dict | None = None,
+    ) -> None:
+        bundle = current_runtime()
+        if bundle.auth_service is None:
+            return
+        try:
+            bundle.auth_service.store.record_auth_event(
+                event_type=event_type,
+                outcome=outcome,
+                occurred_at=bundle.auth_service.now().isoformat(),
+                email=context.user.email,
+                user_id=context.user.id,
+                ip_address=bundle.auth_service.client_ip(request),
+                details=details or {},
+            )
+        except Exception:
+            return
 
     async def require_setup_csrf(request: Request, response: Response):
         bundle = current_runtime()
@@ -598,62 +623,165 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         "/api/admin/terminal/sessions",
         response_model=TerminalSessionResponse,
         status_code=201,
-        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
     )
-    async def create_terminal_session(request: TerminalSessionCreateRequest) -> TerminalSessionResponse:
+    async def create_terminal_session(
+        request: Request,
+        payload: TerminalSessionCreateRequest,
+        _: None = Depends(require_csrf),
+        context=Depends(require_admin),
+    ) -> TerminalSessionResponse:
         task_manager = current_runtime().task_manager
-        cwd = request.cwd
-        if request.workspace_id:
-            workspace = task_manager.workspace_store.get(request.workspace_id)
+        cwd = payload.cwd
+        if payload.workspace_id:
+            workspace = task_manager.workspace_store.get(payload.workspace_id)
             if workspace is None:
                 raise HTTPException(status_code=404, detail="Workspace not found.")
             cwd = workspace.path
-        snapshot = current_runtime().terminal_manager.create_session(cwd=cwd)
+        snapshot = current_runtime().terminal_manager.create_session(
+            owner_user_id=context.user.id,
+            owner_email=context.user.email,
+            owner_ip=current_runtime().auth_service.client_ip(request) if current_runtime().auth_service else None,
+            cwd=cwd,
+        )
+        record_terminal_event(
+            request,
+            context,
+            event_type="terminal_session",
+            outcome="created",
+            details={"session_id": snapshot.id, "cwd": snapshot.cwd, "shell": snapshot.shell},
+        )
         return TerminalSessionResponse.model_validate(asdict(snapshot))
 
     @app.get(
         "/api/admin/terminal/sessions/{session_id}",
         response_model=TerminalSessionResponse,
-        dependencies=[Depends(require_auth), Depends(require_admin)],
     )
-    async def read_terminal_session(session_id: str, cursor: int = Query(default=0, ge=0)) -> TerminalSessionResponse:
+    async def read_terminal_session(
+        request: Request,
+        session_id: str,
+        cursor: int = Query(default=0, ge=0),
+        context=Depends(require_admin),
+    ) -> TerminalSessionResponse:
         try:
-            snapshot = current_runtime().terminal_manager.read(session_id, cursor=cursor)
+            snapshot = current_runtime().terminal_manager.read(
+                session_id,
+                owner_user_id=context.user.id,
+                cursor=cursor,
+            )
         except TerminalSessionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TerminalAccessDeniedError as exc:
+            record_terminal_event(
+                request,
+                context,
+                event_type="terminal_session",
+                outcome="denied",
+                details={"session_id": session_id, "reason": "owner_mismatch_read"},
+            )
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         return TerminalSessionResponse.model_validate(asdict(snapshot))
 
     @app.post(
         "/api/admin/terminal/sessions/{session_id}/input",
         response_model=TerminalSessionResponse,
-        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
     )
-    async def write_terminal_session(session_id: str, request: TerminalSessionInputRequest) -> TerminalSessionResponse:
+    async def write_terminal_session(
+        request: Request,
+        session_id: str,
+        payload: TerminalSessionInputRequest,
+        _: None = Depends(require_csrf),
+        context=Depends(require_admin),
+    ) -> TerminalSessionResponse:
         try:
-            snapshot = current_runtime().terminal_manager.write(session_id, request.data)
+            snapshot = current_runtime().terminal_manager.write(
+                session_id,
+                context.user.id,
+                payload.data,
+            )
         except TerminalSessionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TerminalAccessDeniedError as exc:
+            record_terminal_event(
+                request,
+                context,
+                event_type="terminal_input",
+                outcome="denied",
+                details={"session_id": session_id, "reason": "owner_mismatch_write"},
+            )
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        record_terminal_event(
+            request,
+            context,
+            event_type="terminal_input",
+            outcome="accepted",
+            details={
+                "session_id": session_id,
+                "chars": len(payload.data),
+                "newline_count": payload.data.count("\n"),
+            },
+        )
         return TerminalSessionResponse.model_validate(asdict(snapshot))
 
     @app.post(
         "/api/admin/terminal/sessions/{session_id}/interrupt",
         response_model=TerminalSessionResponse,
-        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
     )
-    async def interrupt_terminal_session(session_id: str) -> TerminalSessionResponse:
+    async def interrupt_terminal_session(
+        request: Request,
+        session_id: str,
+        _: None = Depends(require_csrf),
+        context=Depends(require_admin),
+    ) -> TerminalSessionResponse:
         try:
-            snapshot = current_runtime().terminal_manager.interrupt(session_id)
+            snapshot = current_runtime().terminal_manager.interrupt(session_id, context.user.id)
         except TerminalSessionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TerminalAccessDeniedError as exc:
+            record_terminal_event(
+                request,
+                context,
+                event_type="terminal_signal",
+                outcome="denied",
+                details={"session_id": session_id, "reason": "owner_mismatch_interrupt"},
+            )
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        record_terminal_event(
+            request,
+            context,
+            event_type="terminal_signal",
+            outcome="sent",
+            details={"session_id": session_id, "signal": "SIGINT"},
+        )
         return TerminalSessionResponse.model_validate(asdict(snapshot))
 
     @app.delete(
         "/api/admin/terminal/sessions/{session_id}",
         status_code=204,
-        dependencies=[Depends(require_auth), Depends(require_csrf), Depends(require_admin)],
     )
-    async def close_terminal_session(session_id: str) -> Response:
-        current_runtime().terminal_manager.close(session_id)
+    async def close_terminal_session(
+        request: Request,
+        session_id: str,
+        _: None = Depends(require_csrf),
+        context=Depends(require_admin),
+    ) -> Response:
+        try:
+            current_runtime().terminal_manager.close(session_id, owner_user_id=context.user.id)
+        except TerminalAccessDeniedError as exc:
+            record_terminal_event(
+                request,
+                context,
+                event_type="terminal_session",
+                outcome="denied",
+                details={"session_id": session_id, "reason": "owner_mismatch_close"},
+            )
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        record_terminal_event(
+            request,
+            context,
+            event_type="terminal_session",
+            outcome="closed",
+            details={"session_id": session_id},
+        )
         return Response(status_code=204)
 
     @app.get("/api/sessions/{session_id}/events", dependencies=[Depends(require_auth)])
