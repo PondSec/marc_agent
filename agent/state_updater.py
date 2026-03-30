@@ -24,6 +24,12 @@ from llm.runtime_resilience import (
 from runtime.logger import AgentLogger
 
 
+ANALYSIS_LIKE_INTENTS = {"explain", "inspect", "search", "plan", "validate"}
+ANALYSIS_LIKE_ACTIONS = {"inspect", "search", "explain", "plan", "test"}
+MUTATION_LIKE_INTENTS = {"implement", "repair", "correct"}
+MUTATION_LIKE_ACTIONS = {"create", "modify", "debug"}
+
+
 class TaskStateUpdater:
     """Updates the central working task state from the latest turn and prior session context."""
 
@@ -134,7 +140,18 @@ class TaskStateUpdater:
         if outcome.exception is None:
             payload = outcome.value
             try:
-                state = self._finalize_state(TaskState.model_validate(payload), semantic_resolution="full_model")
+                state = TaskState.model_validate(payload)
+                reconciled = self._reconcile_with_local_state(state, local_state)
+                if reconciled:
+                    self._log(
+                        "task_state_semantic_reconciled",
+                        reason="prefer_local_mutation_semantics",
+                        model_intent=payload.get("current_user_intent"),
+                        model_strategy=payload.get("execution_strategy"),
+                        local_intent=local_state.current_user_intent,
+                        local_strategy=local_state.execution_strategy,
+                    )
+                state = self._finalize_state(state, semantic_resolution="full_model")
             except ValidationError as exc:
                 self._log(
                     "task_state_validation_failed",
@@ -244,7 +261,18 @@ class TaskStateUpdater:
                     primary_model=primary_model,
                 )
                 try:
-                    state = self._finalize_state(TaskState.model_validate(payload), semantic_resolution=resolution)
+                    state = TaskState.model_validate(payload)
+                    reconciled = self._reconcile_with_local_state(state, local_state)
+                    if reconciled:
+                        self._log(
+                            "task_state_semantic_reconciled",
+                            reason="prefer_local_mutation_semantics",
+                            model_intent=payload.get("current_user_intent"),
+                            model_strategy=payload.get("execution_strategy"),
+                            local_intent=local_state.current_user_intent,
+                            local_strategy=local_state.execution_strategy,
+                        )
+                    state = self._finalize_state(state, semantic_resolution=resolution)
                 except ValidationError as exc:
                     self._log(
                         "task_state_validation_failed",
@@ -331,6 +359,90 @@ class TaskStateUpdater:
             snapshot=snapshot,
             semantic_resolution="minimal_inference",
         )
+
+    def _reconcile_with_local_state(self, state: TaskState, local_state: TaskState) -> bool:
+        if not self._should_prefer_local_mutation_semantics(state, local_state):
+            return False
+
+        local_targets = list(local_state.target_artifacts or [])
+        merged_targets = local_targets + [
+            artifact
+            for artifact in state.target_artifacts
+            if artifact not in local_targets
+        ]
+        local_active = list(local_state.active_artifacts or local_targets)
+        merged_active = local_active + [
+            artifact
+            for artifact in state.active_artifacts
+            if artifact not in local_active
+        ]
+        local_context = list(local_state.relevant_context or [])
+        merged_context = local_context + [
+            item for item in state.relevant_context
+            if item not in local_context
+        ]
+        local_constraints = list(local_state.constraints or [])
+        merged_constraints = local_constraints + [
+            item for item in state.constraints
+            if item not in local_constraints
+        ]
+        local_outline = list(local_state.execution_outline or [])
+        merged_outline = local_outline + [
+            item for item in state.execution_outline
+            if item not in local_outline
+        ]
+        if state.goal_relation in {"validation_request", "clarify", "unknown"}:
+            state.goal_relation = local_state.goal_relation
+        state.current_user_intent = local_state.current_user_intent
+        state.execution_strategy = local_state.execution_strategy
+        state.next_action = local_state.next_action
+        state.next_best_action = local_state.next_best_action
+        state.target_artifacts = merged_targets
+        state.active_artifacts = merged_active
+        state.relevant_context = merged_context[:8]
+        state.constraints = merged_constraints[:8]
+        state.execution_outline = merged_outline[:6]
+        state.output_expectation = local_state.output_expectation
+        state.verification_target = local_state.verification_target
+        if not state.assumptions:
+            state.assumptions = list(local_state.assumptions or [])
+        state.risk_level = local_state.risk_level
+        state.ambiguity_level = local_state.ambiguity_level
+        state.confidence = max(float(state.confidence or 0.0), float(local_state.confidence or 0.0))
+        return True
+
+    def _should_prefer_local_mutation_semantics(self, state: TaskState, local_state: TaskState) -> bool:
+        if state.needs_clarification or local_state.needs_clarification:
+            return False
+        state_intent = str(state.current_user_intent or "").strip()
+        state_strategy = str(state.execution_strategy or "").strip()
+        state_action = str(state.next_best_action or state.next_action or "").strip()
+        local_intent = str(local_state.current_user_intent or "").strip()
+        local_strategy = str(local_state.execution_strategy or "").strip()
+        local_action = str(local_state.next_best_action or local_state.next_action or "").strip()
+
+        state_is_analysis = (
+            state_strategy == "validation_inspection"
+            or state_intent in ANALYSIS_LIKE_INTENTS
+            or state_action in ANALYSIS_LIKE_ACTIONS
+        )
+        local_is_mutation = (
+            local_strategy in {"feature_implementation", "debug_repair", "rollback_correction"}
+            or local_intent in MUTATION_LIKE_INTENTS
+            or local_action in MUTATION_LIKE_ACTIONS
+        )
+        if not state_is_analysis or not local_is_mutation:
+            return False
+        if float(local_state.confidence or 0.0) < 0.65:
+            return False
+        if not local_state.target_artifacts:
+            return False
+        has_local_verification = bool(local_state.verification_target)
+        has_validation_artifact = any(
+            str(artifact.role or "").strip() == "validation_target"
+            for artifact in local_state.target_artifacts
+        )
+        return has_local_verification or has_validation_artifact
 
     def _should_short_circuit_with_local_state(
         self,
