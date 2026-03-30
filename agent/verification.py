@@ -158,6 +158,31 @@ class ValidationPlanner:
         re.IGNORECASE,
     )
     MISSING_REF_PATTERN = re.compile(r"(?P<path>[\w./\\-]+\.(?:html|htm))\s*->\s*(?P<ref>[^\s]+)")
+    FAILURE_EVIDENCE_LINE_MARKERS = (
+        "assertionerror",
+        "traceback",
+        "missing expected",
+        "missing dom ids",
+        "missing html file",
+        "missing html",
+        "not found",
+        "filenotfounderror",
+        "syntaxerror",
+        "indentationerror",
+        "taberror",
+        "nameerror",
+        "importerror",
+        "modulenotfounderror",
+        "unboundlocalerror",
+    )
+    NON_FAILURE_SUMMARY_LINE_MARKERS = (
+        "refs ok",
+        "js parsed:",
+        "js parse skipped:",
+        "markers:",
+        "expected features:",
+        "structural web checks only",
+    )
     NO_TESTS_RAN_PATTERNS = (
         re.compile(r"\bran\s+0\s+tests?\b", re.IGNORECASE),
         re.compile(r"\bno\s+tests\s+ran\b", re.IGNORECASE),
@@ -832,6 +857,16 @@ class ValidationPlanner:
         )
         summary = str(failed_run.summary or "").strip() or "Validation failed."
         excerpt = self._failure_excerpt(failed_run, diagnostics)
+        raw_failure_text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                str(failed_run.summary or "").strip(),
+                *(str(item.excerpt or "").strip() for item in diagnostics),
+                *(str(item.summary or "").strip() for item in diagnostics),
+            ]
+            if part
+        )
         failure_summary = self._failure_summary(
             failed_run,
             diagnostics,
@@ -854,6 +889,7 @@ class ValidationPlanner:
             line_hints=line_hints,
             summary=summary,
             excerpt=excerpt,
+            raw_failure_text=raw_failure_text,
             failure_summary=failure_summary,
             repair_requirements=repair_requirements,
             missing_features=missing_features,
@@ -904,6 +940,7 @@ class ValidationPlanner:
         line_hints: list[int],
         summary: str,
         excerpt: str,
+        raw_failure_text: str,
         failure_summary: str,
         repair_requirements: list[str],
         missing_features: list[str],
@@ -924,7 +961,7 @@ class ValidationPlanner:
         implicated_symbols = self._implicated_symbols_from_failure_text(excerpt, failure_summary)
         target_line_hint = self._target_traceback_line_hint(
             primary_target,
-            text="\n".join(part for part in [excerpt, summary] if part),
+            text=raw_failure_text or "\n".join(part for part in [excerpt, summary] if part),
         )
         implicated_region_hint = self._implicated_region_hint(
             primary_target,
@@ -1427,7 +1464,8 @@ class ValidationPlanner:
         diagnostics: list[DiagnosticRecord],
     ) -> list[str]:
         workspace_root = Path(session.workspace_root).resolve()
-        referenced_paths: list[str] = []
+        failure_paths: list[str] = []
+        fallback_paths: list[str] = []
         texts = [
             str(failed_run.excerpt or "").strip(),
             str(failed_run.summary or "").strip(),
@@ -1438,14 +1476,23 @@ class ValidationPlanner:
         for text in texts:
             if not text:
                 continue
-            for path in self._workspace_paths_from_text(
-                workspace_root,
-                text,
-                require_existing_bare_refs=True,
-            ):
-                if path not in referenced_paths:
-                    referenced_paths.append(path)
-        return referenced_paths
+            for line in self._evidence_lines_from_text(text):
+                line_paths = self._workspace_paths_from_text(
+                    workspace_root,
+                    line,
+                    require_existing_bare_refs=True,
+                )
+                if not line_paths:
+                    continue
+                target = (
+                    failure_paths
+                    if self._line_contains_failure_evidence(line)
+                    else fallback_paths
+                )
+                for path in line_paths:
+                    if path not in target:
+                        target.append(path)
+        return failure_paths or fallback_paths
 
     def _prioritize_failure_scoped_artifact_paths(
         self,
@@ -1494,6 +1541,20 @@ class ValidationPlanner:
                 require_exists=require_existing_bare_refs,
             )
         return referenced_paths
+
+    def _evidence_lines_from_text(self, text: str) -> list[str]:
+        lines = [str(line or "").strip() for line in str(text or "").splitlines()]
+        return [line for line in lines if line]
+
+    def _line_contains_failure_evidence(self, line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return False
+        if self.MISSING_REF_PATTERN.search(line):
+            return True
+        if any(marker in lowered for marker in self.FAILURE_EVIDENCE_LINE_MARKERS):
+            return True
+        return not any(marker in lowered for marker in self.NON_FAILURE_SUMMARY_LINE_MARKERS) and " fail" in f" {lowered}"
 
     def _traceback_workspace_frames(
         self,
@@ -2231,6 +2292,17 @@ class ValidationPlanner:
         failed_run: ValidationRunRecord,
         diagnostics: list[DiagnosticRecord],
     ) -> str | None:
+        focused_lines: list[str] = []
+        for text in [
+            str(failed_run.excerpt or "").strip(),
+            *(str(item.excerpt or "").strip() for item in diagnostics),
+            *(str(item.summary or "").strip() for item in diagnostics),
+        ]:
+            for line in self._evidence_lines_from_text(text):
+                if self._line_contains_failure_evidence(line) and line not in focused_lines:
+                    focused_lines.append(line)
+        if focused_lines:
+            return "\n".join(focused_lines[:8])
         for text in [
             str(failed_run.excerpt or "").strip(),
             *(str(item.excerpt or "").strip() for item in diagnostics),
