@@ -952,6 +952,47 @@ def _is_package_init_path(path: str) -> bool:
     return Path(normalized).name.lower() == "__init__.py" and "/tests/" not in f"/{normalized.lower()}"
 
 
+def _generic_support_basename(path: str) -> bool:
+    name = Path(str(path or "").strip()).name.lower()
+    return name in {"__init__.py", "__main__.py", "conftest.py"}
+
+
+def _snapshot_match_candidate_paths(snapshot) -> list[str]:
+    candidate_paths: list[str] = []
+    if snapshot is None:
+        return candidate_paths
+    for group in (
+        getattr(snapshot, "focus_files", []),
+        getattr(snapshot, "important_files", []),
+        getattr(snapshot, "manifests", []),
+        getattr(snapshot, "test_files", []),
+        getattr(snapshot, "entrypoints", []),
+    ):
+        for item in group[:12]:
+            path = str(item or "").strip()
+            if path and path not in candidate_paths:
+                candidate_paths.append(path)
+    return candidate_paths
+
+
+def _basename_is_ambiguous_in_snapshot(snapshot, path: str) -> bool:
+    basename = Path(str(path or "").strip()).name.lower()
+    if not basename:
+        return False
+    matches = 0
+    for candidate in _snapshot_match_candidate_paths(snapshot):
+        if Path(candidate).name.lower() != basename:
+            continue
+        matches += 1
+        if matches > 1:
+            return True
+    return False
+
+
+def _should_require_contextual_path_match(snapshot, path: str) -> bool:
+    return _generic_support_basename(path) or _basename_is_ambiguous_in_snapshot(snapshot, path)
+
+
 def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
     if snapshot is None:
         return []
@@ -1145,18 +1186,7 @@ def _explicit_snapshot_request_paths(
     request_space: str,
     snapshot,
 ) -> list[str]:
-    candidate_paths: list[str] = []
-    for group in (
-        getattr(snapshot, "focus_files", []),
-        getattr(snapshot, "important_files", []),
-        getattr(snapshot, "manifests", []),
-        getattr(snapshot, "test_files", []),
-        getattr(snapshot, "entrypoints", []),
-    ):
-        for item in group[:12]:
-            path = str(item or "").strip()
-            if path and path not in candidate_paths:
-                candidate_paths.append(path)
+    candidate_paths = _snapshot_match_candidate_paths(snapshot)
 
     generic_stems = {"app", "cli", "doc", "docs", "guide", "index", "main", "test", "tests"}
     explicit: list[str] = []
@@ -1169,14 +1199,17 @@ def _explicit_snapshot_request_paths(
         normalized_stem = re.sub(r"[^0-9a-zäöüß]+", " ", stem).strip()
 
         matches_request = False
-        if basename and basename in request_lower:
+        require_context = _should_require_contextual_path_match(snapshot, path)
+        if normalized_path and f" {normalized_path} " in request_space:
             matches_request = True
-        elif normalized_path and f" {normalized_path} " in request_space:
+        elif not require_context and basename and basename in request_lower:
             matches_request = True
-        elif normalized_basename and f" {normalized_basename} " in request_space:
+        elif not require_context and normalized_basename and f" {normalized_basename} " in request_space:
             matches_request = True
         elif (
-            normalized_stem
+            not require_context
+            and not _generic_support_basename(path)
+            and normalized_stem
             and normalized_stem not in generic_stems
             and f" {normalized_stem} " in request_space
         ):

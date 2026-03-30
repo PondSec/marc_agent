@@ -2757,7 +2757,24 @@ class Planner:
         if not request_lower.strip():
             return []
 
+        candidate_paths = self._snapshot_match_candidate_paths(snapshot)
+
+        generic_stems = {"app", "cli", "doc", "docs", "guide", "index", "main", "test", "tests"}
+        explicit: list[str] = []
+        for path in candidate_paths:
+            if self._path_matches_explicit_request(session, path, generic_stems=generic_stems):
+                explicit.append(path)
+
+        return self._unique_paths(explicit)
+
+    def _generic_support_basename(self, path: str) -> bool:
+        name = Path(str(path or "").strip()).name.lower()
+        return name in {"__init__.py", "__main__.py", "conftest.py"}
+
+    def _snapshot_match_candidate_paths(self, snapshot) -> list[str]:
         candidate_paths: list[str] = []
+        if snapshot is None:
+            return candidate_paths
         for group in (
             getattr(snapshot, "focus_files", []),
             getattr(snapshot, "important_files", []),
@@ -2769,14 +2786,23 @@ class Planner:
                 path = str(item or "").strip()
                 if path and path not in candidate_paths:
                     candidate_paths.append(path)
+        return candidate_paths
 
-        generic_stems = {"app", "cli", "doc", "docs", "guide", "index", "main", "test", "tests"}
-        explicit: list[str] = []
-        for path in candidate_paths:
-            if self._path_matches_explicit_request(session, path, generic_stems=generic_stems):
-                explicit.append(path)
+    def _basename_is_ambiguous_in_snapshot(self, session: SessionState, path: str) -> bool:
+        basename = Path(str(path or "").strip()).name.lower()
+        if not basename:
+            return False
+        matches = 0
+        for candidate in self._snapshot_match_candidate_paths(session.workspace_snapshot):
+            if Path(candidate).name.lower() != basename:
+                continue
+            matches += 1
+            if matches > 1:
+                return True
+        return False
 
-        return self._unique_paths(explicit)
+    def _should_require_contextual_path_match(self, session: SessionState, path: str) -> bool:
+        return self._generic_support_basename(path) or self._basename_is_ambiguous_in_snapshot(session, path)
 
     def _semantic_review_pending_snapshot_targets(
         self,
@@ -2843,15 +2869,17 @@ class Planner:
         normalized_path = re.sub(r"[^0-9a-zäöüß]+", " ", path_lower).strip()
         normalized_basename = re.sub(r"[^0-9a-zäöüß]+", " ", basename).strip()
         normalized_stem = re.sub(r"[^0-9a-zäöüß]+", " ", stem).strip()
+        require_context = self._should_require_contextual_path_match(session, text)
 
-        if basename and basename in request_lower:
-            return True
         if normalized_path and f" {normalized_path} " in request_space:
             return True
-        if normalized_basename and f" {normalized_basename} " in request_space:
+        if not require_context and basename and basename in request_lower:
+            return True
+        if not require_context and normalized_basename and f" {normalized_basename} " in request_space:
             return True
         return bool(
-            normalized_stem
+            not require_context
+            and normalized_stem
             and normalized_stem not in generic_stems
             and f" {normalized_stem} " in request_space
         )

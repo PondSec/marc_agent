@@ -1571,6 +1571,59 @@ def test_task_state_updater_reconciles_explain_misclassification_for_existing_re
     assert route.intent == RouteIntent.UPDATE
 
 
+def test_task_state_avoids_unrelated_test_package_init_when_request_targets_other_init(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=5,
+        language_counts={"python": 4, "markdown": 1},
+        top_directories=["textutils", "tests"],
+        important_files=[
+            "textutils/__init__.py",
+            "textutils/normalize.py",
+            "tests/test_normalize.py",
+            "tests/__init__.py",
+            "README.md",
+        ],
+        focus_files=[
+            "textutils/normalize.py",
+            "textutils/__init__.py",
+            "tests/test_normalize.py",
+            "tests/__init__.py",
+        ],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_normalize.py", "tests/__init__.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["textutils/normalize.py"],
+        repo_map=["textutils/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small Python utility package with unittest coverage.",
+    )
+    prompt = (
+        "Implement the missing public helper slugify(text) in textutils/normalize.py, "
+        "export it from textutils/__init__.py, update README.md with a short usage example if needed, "
+        "run python -m unittest tests.test_normalize, and finish only after the tests are green."
+    )
+
+    task_state = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out")).update_task_state(
+        prompt,
+        snapshot=snapshot,
+    )
+
+    artifact_paths = {artifact.path for artifact in task_state.target_artifacts}
+
+    assert "textutils/normalize.py" in artifact_paths
+    assert "textutils/__init__.py" in artifact_paths
+    assert "tests/test_normalize.py" in artifact_paths
+    assert "README.md" in artifact_paths
+    assert "tests/__init__.py" not in artifact_paths
+
+
 def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_empty_workspace(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 

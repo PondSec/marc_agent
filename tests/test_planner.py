@@ -8334,6 +8334,81 @@ def test_actionable_explicit_update_targets_keep_requested_validation_target(tmp
     ]
 
 
+def test_actionable_explicit_update_targets_drop_unrelated_ambiguous_package_init(tmp_path):
+    package_dir = tmp_path / "textutils"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from .normalize import normalize_spaces\n", encoding="utf-8")
+    (package_dir / "normalize.py").write_text("def normalize_spaces(text):\n    return text\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# textutils\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text("import unittest\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Implement slugify in textutils/normalize.py, export it from textutils/__init__.py, "
+            "update README.md if needed, run python -m unittest tests.test_normalize, and finish when it passes."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": [
+                    "textutils/normalize.py",
+                    "textutils/__init__.py",
+                    "tests/test_normalize.py",
+                    "tests/__init__.py",
+                    "README.md",
+                ],
+                "focus_files": [
+                    "textutils/normalize.py",
+                    "textutils/__init__.py",
+                    "tests/test_normalize.py",
+                    "tests/__init__.py",
+                ],
+                "test_files": ["tests/test_normalize.py", "tests/__init__.py"],
+                "likely_commands": ["python -m unittest tests.test_normalize"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Implement slugify."},
+            {"step": 2, "action": "update_artifact", "reason": "Export it from the package init."},
+            {"step": 3, "action": "run_validation", "reason": "Run the requested unittest module."},
+        ],
+        target_paths=[
+            "textutils/normalize.py",
+            "textutils/__init__.py",
+            "README.md",
+            "tests/test_normalize.py",
+            "tests/__init__.py",
+        ],
+        target_name="textutils/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_normalize and finish only when it passes.",
+    )
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="textutils/normalize.py", name="normalize.py", kind=".py", role="primary_target", confidence=0.98),
+        TaskArtifact(path="textutils/__init__.py", name="__init__.py", kind=".py", role="primary_target", confidence=0.92),
+        TaskArtifact(path="README.md", name="README.md", kind=".md", role="supporting_context", confidence=0.9),
+        TaskArtifact(path="tests/test_normalize.py", name="test_normalize.py", kind="test", role="validation_target", confidence=0.86),
+        TaskArtifact(path="tests/__init__.py", name="__init__.py", kind=".py", role="validation_target", confidence=0.8),
+    ]
+
+    assert planner._actionable_explicit_target_paths(session.router_result, session) == [
+        "textutils/normalize.py",
+        "textutils/__init__.py",
+        "README.md",
+    ]
+
+
 def test_planner_keeps_runtime_repair_on_last_implicated_implementation_target(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
