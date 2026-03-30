@@ -150,9 +150,18 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         return None
 
     @app.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
-        return FileResponse(
-            static_dir / "index.html",
+    async def index() -> HTMLResponse:
+        app_js = static_dir / "app.js"
+        styles_css = static_dir / "styles.css"
+        version = max(
+            (app_js.stat().st_mtime_ns if app_js.exists() else 0),
+            (styles_css.stat().st_mtime_ns if styles_css.exists() else 0),
+        )
+        markup = (static_dir / "index.html").read_text(encoding="utf-8")
+        markup = markup.replace("/static/styles.css", f"/static/styles.css?v={version}")
+        markup = markup.replace("/static/app.js", f"/static/app.js?v={version}")
+        return HTMLResponse(
+            markup,
             headers={"Cache-Control": "no-store, max-age=0"},
         )
 
