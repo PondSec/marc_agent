@@ -1014,6 +1014,35 @@ def test_clear_workspace_contents_removes_files_but_keeps_workspace(tmp_path):
     assert list(workspace_root.iterdir()) == []
 
 
+def test_workspaces_are_recovered_from_workspace_root_when_store_is_empty(tmp_path):
+    alpha = tmp_path / "alpha-project"
+    beta = tmp_path / "beta-project"
+    alpha.mkdir()
+    beta.mkdir()
+    (alpha / "README.md").write_text("# Alpha\n", encoding="utf-8")
+    (beta / "main.py").write_text("print('beta')\n", encoding="utf-8")
+
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    (config.state_root / "workspaces.json").write_text('{"workspaces": []}', encoding="utf-8")
+
+    app = create_app(config)
+    client = build_test_client(app)
+
+    response = client.get("/api/workspaces")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["name"] for item in payload] == ["alpha-project", "beta-project"]
+    assert {item["path"] for item in payload} == {
+        str(alpha.resolve()),
+        str(beta.resolve()),
+    }
+
+    persisted = json.loads((config.state_root / "workspaces.json").read_text(encoding="utf-8"))
+    assert len(persisted["workspaces"]) == 2
+
+
 def test_admin_terminal_session_executes_command(tmp_path):
     config = build_test_config(tmp_path)
     config.ensure_state_dirs()

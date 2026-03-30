@@ -86,6 +86,7 @@ class TaskManager:
         self.workspace_store = WorkspaceStore(self.base_config.state_root / "workspaces.json")
         self._active_session_dir = self.base_config.state_root / "active_sessions"
         self._active_session_dir.mkdir(parents=True, exist_ok=True)
+        self._heal_workspace_store_from_workspace_root()
         self._sync_workspace_state_to_base()
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
@@ -960,6 +961,31 @@ class TaskManager:
                 workspace_state_root / "reports",
                 self.base_config.report_dir_path,
             )
+
+    def _heal_workspace_store_from_workspace_root(self) -> None:
+        workspace_root = self.base_config.workspace_path
+        if not workspace_root.exists():
+            return
+
+        ignored_names = {
+            self.base_config.state_dir_name,
+            "__pycache__",
+        }
+        existing_by_path = {
+            str(Path(item.path).expanduser().resolve()): item
+            for item in self.workspace_store.list_workspaces()
+        }
+
+        for child in sorted(workspace_root.iterdir()):
+            if not child.is_dir() or child.is_symlink():
+                continue
+            if child.name.startswith(".") or child.name in ignored_names:
+                continue
+            resolved = str(child.expanduser().resolve())
+            if resolved in existing_by_path:
+                continue
+            workspace = self.workspace_store.create(child.name, resolved)
+            existing_by_path[resolved] = workspace
 
     def _copy_newer_files(self, source_dir: Path, target_dir: Path) -> None:
         if not source_dir.exists():
