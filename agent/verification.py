@@ -123,7 +123,22 @@ class ValidationPlanner:
         "menu": ("menu", "menue", "menü", "navigation", "nav"),
         "highscore": ("highscore", "high score", "scoreboard", "leaderboard", "best score", "bestenliste"),
         "score": ("score", "punkte", "punktestand", "scoreboard"),
-        "start_controls": ("start", "play", "pause", "resume", "restart", "reset"),
+        "start_controls": ("start", "play", "pause", "resume", "restart", "reset", "reload", "neustart", "fortsetzen"),
+        "keyboard_controls": (
+            "keyboard",
+            "keyboard control",
+            "keyboard controls",
+            "tastatur",
+            "tastatursteuerung",
+            "keydown",
+            "keyup",
+            "arrow key",
+            "arrow keys",
+            "arrow",
+            "pfeiltaste",
+            "pfeiltasten",
+        ),
+        "game_over": ("game over", "game-over", "gameover", "neustart", "restart", "reset"),
         "dialog": ("dialog", "modal", "popup", "overlay"),
         "canvas": ("canvas", "spielfeld", "game board"),
         "settings": ("settings", "options", "config", "einstellungen"),
@@ -638,6 +653,55 @@ class ValidationPlanner:
             run.status == "passed" and run.verification_scope == "structural"
             for run in self._runtime_runs(session, current_generation_only=current_generation_only)
         )
+
+    def web_structural_proxy_sufficient(
+        self,
+        session: SessionState,
+        *,
+        current_generation_only: bool = True,
+    ) -> bool:
+        if not self.web_functional_verification_required(session):
+            return False
+        if not self.has_structural_web_success(session, current_generation_only=current_generation_only):
+            return False
+        if self.has_runtime_success(session, current_generation_only=current_generation_only):
+            return True
+
+        changed_paths = [
+            item.path
+            for item in session.changed_files
+            if item.path
+        ]
+        if not changed_paths or len(changed_paths) > 4:
+            return False
+
+        allowed_suffixes = {".html", ".htm", ".css", ".js", ".mjs", ".cjs"}
+        if any(Path(path).suffix.lower() not in allowed_suffixes for path in changed_paths):
+            return False
+
+        html_files = [path for path in changed_paths if Path(path).suffix.lower() in {".html", ".htm"}]
+        if len(html_files) != 1:
+            return False
+
+        snapshot = session.workspace_snapshot
+        if snapshot is not None and snapshot.file_count > 20:
+            return False
+
+        if any(
+            command.required and command.verification_scope == "runtime"
+            for command in session.validation_plan
+        ):
+            return False
+
+        task_text = (
+            session.task_state.latest_user_turn
+            if session.task_state is not None and session.task_state.latest_user_turn
+            else session.task
+        )
+        expected_features = self._expected_web_features(task_text)
+        if self._interactive_web_request(task_text) and len(expected_features) < 2:
+            return False
+        return True
 
     def has_semantic_review(
         self,
@@ -1729,6 +1793,29 @@ class ValidationPlanner:
             if any(self._normalized_keyword_space(marker) in token_space for marker in markers):
                 expected.append(feature)
         return expected
+
+    def _interactive_web_request(self, task: str) -> bool:
+        token_space = self._normalized_keyword_space(task)
+        markers = (
+            " game ",
+            " spiel ",
+            " interaktiv ",
+            " interactive ",
+            " keyboard ",
+            " tastatur ",
+            " keydown ",
+            " click ",
+            " klick ",
+            " drag ",
+            " score ",
+            " punktestand ",
+            " restart ",
+            " neustart ",
+            " form ",
+            " dialog ",
+            " modal ",
+        )
+        return any(marker in token_space for marker in markers)
 
     def _normalized_keyword_space(self, value: str) -> str:
         lowered = str(value or "").lower()

@@ -506,6 +506,116 @@ def test_planner_keeps_primary_semantic_review_for_large_change_sets(tmp_path):
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
 
 
+def test_fallback_semantic_review_accepts_small_standalone_web_structural_proxy(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Erstelle ein kleines spielbares Snake-Spiel als HTML-Datei mit Tastatursteuerung, Punktestand und Game-Over-Neustart.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=1,
+            language_counts={"html": 1},
+            top_directories=[],
+            important_files=["index.html"],
+            focus_files=["index.html"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small standalone web artifact.",
+        ),
+        validation_status="passed",
+        changed_files=[FileChangeRecord(path="index.html", operation="create")],
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"index.html","expected_features":["score","keyboard_controls","game_over","start_controls"]}]',
+            kind="check",
+            verification_scope="structural",
+            status="passed",
+            edit_generation=0,
+        )
+    )
+
+    review = planner._fallback_semantic_change_review(session)
+
+    assert review.requirements_satisfied is True
+    assert "standalone web artifact" in review.summary
+
+
+def test_planner_skips_model_backed_semantic_review_for_small_standalone_web_proxy(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 3, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["index.html"],
+        target_name="index.html",
+    )
+    session = SessionState(
+        task="Erstelle ein kleines spielbares Snake-Spiel als HTML-Datei mit Tastatursteuerung, Punktestand und Game-Over-Neustart.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=1,
+            language_counts={"html": 1},
+            top_directories=[],
+            important_files=["index.html"],
+            focus_files=["index.html"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small standalone web artifact.",
+        ),
+        validation_status="passed",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="Verify the generated web artifact.")
+    session.changed_files.append(FileChangeRecord(path="index.html", operation="create"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"index.html","expected_features":["score","keyboard_controls","game_over","start_controls"]}]',
+            kind="check",
+            verification_scope="structural",
+            status="passed",
+            edit_generation=0,
+        )
+    )
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
+
+
 def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
