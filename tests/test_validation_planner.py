@@ -1285,6 +1285,10 @@ def test_validation_planner_prioritizes_structural_failure_paths_over_generic_ar
         edit_generation=1,
         summary="Structural web validation failed.",
         excerpt=(
+            "index.html: refs ok; JS parse skipped: node unavailable (0 source(s)); expected features: menu; markers: no obvious interactive markers.\n"
+            "about.html: refs ok; JS parse skipped: node unavailable (0 source(s)); expected features: menu; markers: no obvious interactive markers.\n"
+            "contact.html: refs ok; JS parse skipped: node unavailable (0 source(s)); expected features: menu; markers: form, input, button.\n"
+            "Structural web checks only; no browser/runtime smoke test was executed.\n"
             "projects.html -> projekt1.jpg\n"
             "projects.html -> projekt2.jpg\n"
             "projects.html -> projekt3.jpg"
@@ -1294,6 +1298,7 @@ def test_validation_planner_prioritizes_structural_failure_paths_over_generic_ar
     evidence = planner.build_failure_evidence(session, failed_run)
 
     assert evidence.artifact_paths[0] == "projects.html"
+    assert evidence.excerpt.startswith("projects.html -> projekt1.jpg")
     assert evidence.repair_brief.primary_target == "projects.html"
     assert evidence.failure_summary.startswith("projects.html -> projekt1.jpg")
     assert any("projects.html" in item for item in evidence.repair_requirements)
