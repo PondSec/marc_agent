@@ -176,6 +176,17 @@ class RepoMemoryStore:
         }
         for item in insights[: min(16, len(insights))]:
             item.summary = file_briefs.get(item.path)
+        test_mappings = [
+            f"{test_path} -> {source_path}"
+            for test_path, source_path in self._infer_test_mappings(test_files, important_files)
+        ]
+        deep_repo_paths = self._deep_repo_analysis_candidates(
+            important_files=important_files,
+            focus_files=focus_files,
+            entrypoints=entrypoints,
+            test_files=test_files,
+        )
+        symbol_index, import_hotspots, service_files = self._deep_repo_signals(deep_repo_paths)
 
         validation_commands, workflow_commands = self._detect_commands(
             manifests=manifests,
@@ -184,7 +195,14 @@ class RepoMemoryStore:
             deploy_files=deploy_files,
         )
         likely_commands = [item.command for item in validation_commands]
-        repo_map = self._build_repo_map(directory_counts, manifests, entrypoints)
+        repo_map = self._build_repo_map(
+            directory_counts,
+            manifests,
+            entrypoints,
+            test_mappings=test_mappings,
+            service_files=service_files,
+            import_hotspots=import_hotspots,
+        )
         project_labels = self._project_labels(
             language_counts=language_counts,
             manifests=manifests,
@@ -219,6 +237,10 @@ class RepoMemoryStore:
             deploy_files=deploy_files[:20],
             entrypoints=entrypoints[:20],
             repo_map=repo_map,
+            test_mappings=test_mappings[:12],
+            service_files=service_files[:12],
+            import_hotspots=import_hotspots[:12],
+            symbol_index={path: symbols[:8] for path, symbols in list(symbol_index.items())[:16]},
             project_labels=project_labels,
             likely_commands=likely_commands,
             validation_commands=validation_commands,
@@ -267,6 +289,14 @@ class RepoMemoryStore:
             lines.extend(["", "Repo map:"])
             for line in snapshot.repo_map[:8]:
                 lines.append(f"- {line}")
+        if snapshot.service_files:
+            lines.extend(["", "Service files:"])
+            for path in snapshot.service_files[:6]:
+                lines.append(f"- {path}")
+        if snapshot.import_hotspots:
+            lines.extend(["", "Import hotspots:"])
+            for path in snapshot.import_hotspots[:6]:
+                lines.append(f"- {path}")
         lines.extend(["", "Summary:", snapshot.repo_summary])
         return "\n".join(lines)
 
@@ -659,6 +689,10 @@ class RepoMemoryStore:
         directory_counts: Counter[str],
         manifests: list[str],
         entrypoints: list[str],
+        *,
+        test_mappings: list[str] | None = None,
+        service_files: list[str] | None = None,
+        import_hotspots: list[str] | None = None,
     ) -> list[str]:
         lines = [
             f"{name}/ ({count} files)"
@@ -669,7 +703,132 @@ class RepoMemoryStore:
             lines.append("manifests: " + ", ".join(manifests[:6]))
         if entrypoints:
             lines.append("entrypoints: " + ", ".join(entrypoints[:6]))
+        if test_mappings:
+            lines.append("test-mappings: " + ", ".join(test_mappings[:4]))
+        if service_files:
+            lines.append("services: " + ", ".join(service_files[:4]))
+        if import_hotspots:
+            lines.append("import-hotspots: " + ", ".join(import_hotspots[:4]))
         return lines[:10]
+
+    def _deep_repo_analysis_candidates(
+        self,
+        *,
+        important_files: list[str],
+        focus_files: list[str],
+        entrypoints: list[str],
+        test_files: list[str],
+    ) -> list[str]:
+        candidates: list[str] = []
+        candidates.extend(important_files[:24])
+        candidates.extend(focus_files[:12])
+        candidates.extend(entrypoints[:8])
+        candidates.extend(test_files[:8])
+        return list(dict.fromkeys(path for path in candidates if path))
+
+    def _deep_repo_signals(
+        self,
+        relative_paths: list[str],
+    ) -> tuple[dict[str, list[str]], list[str], list[str]]:
+        symbol_index: dict[str, list[str]] = {}
+        import_scores: list[tuple[str, int]] = []
+        service_files: list[str] = []
+        for relative_path in relative_paths:
+            content = self._read_text_excerpt(relative_path, limit=6_000)
+            if not content:
+                continue
+            symbols = self._extract_symbols(relative_path, content)
+            if symbols:
+                symbol_index[relative_path] = symbols[:8]
+            import_score = self._import_signal_count(relative_path, content)
+            if import_score > 0:
+                import_scores.append((relative_path, import_score))
+            if self._looks_like_service_file(relative_path, content):
+                service_files.append(relative_path)
+        import_scores.sort(key=lambda item: (-item[1], item[0]))
+        return (
+            symbol_index,
+            [path for path, _ in import_scores[:12]],
+            list(dict.fromkeys(service_files))[:12],
+        )
+
+    def _read_text_excerpt(self, relative_path: str, *, limit: int = 4_000) -> str:
+        target = self.workspace.resolve_path(relative_path)
+        try:
+            return target.read_text(encoding="utf-8")[:limit]
+        except Exception:
+            return ""
+
+    def _extract_symbols(self, relative_path: str, content: str) -> list[str]:
+        suffix = Path(relative_path).suffix.lower()
+        patterns: tuple[str, ...]
+        if suffix in {".py", ".pyi"}:
+            patterns = (
+                r"^\s*(?:async\s+def|def)\s+([A-Za-z_][\w]*)",
+                r"^\s*class\s+([A-Za-z_][\w]*)",
+            )
+        elif suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            patterns = (
+                r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][\w]*)",
+                r"^\s*(?:export\s+)?class\s+([A-Za-z_][\w]*)",
+                r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][\w]*)\s*=",
+            )
+        else:
+            patterns = ()
+        symbols: list[str] = []
+        for raw_line in content.splitlines()[:160]:
+            for pattern in patterns:
+                match = re.match(pattern, raw_line.rstrip())
+                if match:
+                    name = str(match.group(1) or "").strip()
+                    if name and name not in symbols:
+                        symbols.append(name)
+            if len(symbols) >= 8:
+                break
+        return symbols
+
+    def _import_signal_count(self, relative_path: str, content: str) -> int:
+        suffix = Path(relative_path).suffix.lower()
+        count = 0
+        for raw_line in content.splitlines()[:220]:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if suffix in {".py", ".pyi"}:
+                if line.startswith("import ") or line.startswith("from "):
+                    count += 1
+            elif suffix in {".js", ".jsx", ".ts", ".tsx"}:
+                if line.startswith("import ") or " from " in line or "require(" in line:
+                    count += 1
+        return count
+
+    def _looks_like_service_file(self, relative_path: str, content: str) -> bool:
+        lowered_path = str(relative_path or "").lower()
+        tokens = (
+            "service",
+            "router",
+            "route",
+            "controller",
+            "handler",
+            "endpoint",
+            "api",
+            "server",
+            "store",
+        )
+        if any(token in lowered_path for token in tokens):
+            return True
+        lowered = content[:1_200].lower()
+        return any(marker in lowered for marker in ("fastapi", "flask", "express", "router =", "app ="))
+
+    def _infer_test_mappings(self, test_files: list[str], important_files: list[str]) -> list[tuple[str, str]]:
+        mappings: list[tuple[str, str]] = []
+        source_by_stem = {Path(path).stem.replace("test_", ""): path for path in important_files}
+        for test_path in test_files[:12]:
+            stem = Path(test_path).stem.replace("test_", "").replace("_test", "")
+            source = source_by_stem.get(stem)
+            if source:
+                mappings.append((test_path, source))
+        return mappings
 
     def _project_labels(
         self,

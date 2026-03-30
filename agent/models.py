@@ -284,13 +284,18 @@ class ProjectMemoryEntry(MemoryEntryBase):
     memory_type: Literal["project"] = "project"
     repo_summary: str = ""
     module_roles: dict[str, str] = Field(default_factory=dict)
+    directory_map: list[str] = Field(default_factory=list)
     entrypoints: list[str] = Field(default_factory=list)
+    service_files: list[str] = Field(default_factory=list)
+    import_hotspots: list[str] = Field(default_factory=list)
     common_file_relationships: list[str] = Field(default_factory=list)
     test_mappings: list[str] = Field(default_factory=list)
+    symbol_index: dict[str, list[str]] = Field(default_factory=dict)
     architecture_notes: list[str] = Field(default_factory=list)
     known_hotspots: list[str] = Field(default_factory=list)
     conventions: list[str] = Field(default_factory=list)
     workflow_hints: list[str] = Field(default_factory=list)
+    co_change_hints: list[str] = Field(default_factory=list)
     subsystem_summaries: dict[str, str] = Field(default_factory=dict)
 
 
@@ -356,6 +361,7 @@ class RetrievalRequest(StrictModel):
     session_id: str | None = None
     target_paths: list[str] = Field(default_factory=list)
     symbol_names: list[str] = Field(default_factory=list)
+    error_terms: list[str] = Field(default_factory=list)
     failure_signature: str | None = None
     current_goal: str | None = None
     current_subtask: str | None = None
@@ -378,6 +384,8 @@ class MemoryRetrievalResult(StrictModel):
     summary: str = ""
     recall_brief: str = ""
     suggested_files: list[str] = Field(default_factory=list)
+    suggested_symbols: list[str] = Field(default_factory=list)
+    repo_map_hints: list[str] = Field(default_factory=list)
     related_sessions: list[str] = Field(default_factory=list)
     related_projects: list[str] = Field(default_factory=list)
     total_candidates: int = 0
@@ -421,6 +429,10 @@ class WorkspaceSnapshot(StrictModel):
     deploy_files: list[str] = Field(default_factory=list)
     entrypoints: list[str] = Field(default_factory=list)
     repo_map: list[str] = Field(default_factory=list)
+    test_mappings: list[str] = Field(default_factory=list)
+    service_files: list[str] = Field(default_factory=list)
+    import_hotspots: list[str] = Field(default_factory=list)
+    symbol_index: dict[str, list[str]] = Field(default_factory=dict)
     project_labels: list[str] = Field(default_factory=list)
     likely_commands: list[str] = Field(default_factory=list)
     validation_commands: list[ValidationCommand] = Field(default_factory=list)

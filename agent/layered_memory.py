@@ -71,10 +71,37 @@ class AgentMemoryStore(RepoMemoryStore):
         current = session.memory_context
         if current is not None and self._retrieval_request_signature(current.request) == self._retrieval_request_signature(request):
             return
+        repo_files, repo_symbols, repo_hints = self._repo_map_signal_bundle(
+            session.workspace_snapshot,
+            request,
+        )
         if not self._should_retrieve_persistent_memory(request):
-            session.memory_context = MemoryRetrievalResult(request=request, summary="No relevant persistent memory selected.")
+            summary = "No relevant persistent memory selected."
+            if repo_hints:
+                summary = self._render_repo_hint_summary(repo_hints, request.summary_budget_chars)
+            session.memory_context = MemoryRetrievalResult(
+                request=request,
+                summary=summary,
+                suggested_files=repo_files[:8],
+                suggested_symbols=repo_symbols[:8],
+                repo_map_hints=repo_hints[:6],
+            )
             return
-        session.memory_context = self.retrieve(request)
+        result = self.retrieve(request)
+        merged_files = self._unique_strings([*repo_files, *result.suggested_files])[:8]
+        merged_symbols = self._unique_strings([*repo_symbols, *result.suggested_symbols])[:8]
+        merged_hints = self._unique_strings([*repo_hints, *result.repo_map_hints])[:6]
+        summary = result.summary
+        if merged_hints:
+            summary = self._merge_repo_hints_into_summary(summary, merged_hints, request.summary_budget_chars)
+        session.memory_context = result.model_copy(
+            update={
+                "summary": summary,
+                "suggested_files": merged_files,
+                "suggested_symbols": merged_symbols,
+                "repo_map_hints": merged_hints,
+            }
+        )
 
     def persist_session_memory(self, session: SessionState) -> None:
         resolved_project_id = self._resolve_project_id(session.workspace_snapshot)
@@ -166,16 +193,36 @@ class AgentMemoryStore(RepoMemoryStore):
             self._trim_text(item.summary, 120)
             for item in session.diagnostics[-4:]
         ]
+        repo_files, repo_symbols, _ = self._repo_map_signal_bundle(
+            session.workspace_snapshot,
+            RetrievalRequest(
+                query=str(session.task or "").strip(),
+                use_case=self._infer_use_case(str(session.task or ""), session),
+                project_id=session.project_id or self.project_id,
+                workspace_root=session.workspace_root,
+                session_id=session.id,
+                target_paths=list(session.candidate_files[:8]),
+                error_terms=self._request_error_terms(session),
+                include_types=["project"],
+                max_hits=0,
+                max_per_type=0,
+                summary_budget_chars=240,
+            ),
+        )
         relevant_files = self._unique_strings(
             [
                 *[item.path for item in session.changed_files[-8:]],
                 *(getattr(repair_context, "artifact_paths", []) if repair_context is not None else []),
                 *(getattr(repair_context, "file_hints", []) if repair_context is not None else []),
+                *repo_files[:6],
                 *session.candidate_files[:12],
             ]
         )[:8]
         relevant_symbols = self._unique_strings(
-            list(getattr(repair_brief, "implicated_symbols", []) or [])
+            [
+                *list(getattr(repair_brief, "implicated_symbols", []) or []),
+                *repo_symbols[:6],
+            ]
         )[:6]
         last_effective_strategy = next(
             (
@@ -285,6 +332,7 @@ class AgentMemoryStore(RepoMemoryStore):
             session_id=session.id,
             target_paths=target_paths,
             symbol_names=list(working.relevant_symbols[:6] if working is not None else []),
+            error_terms=self._request_error_terms(session),
             failure_signature=working.active_failure_signature if working is not None else None,
             current_goal=working.current_goal if working is not None else None,
             current_subtask=working.current_subtask if working is not None else None,
@@ -320,6 +368,9 @@ class AgentMemoryStore(RepoMemoryStore):
         suggested_files = self._unique_strings(
             [path for item in selected for path in item.file_paths]
         )[:8]
+        suggested_symbols = self._unique_strings(
+            [name for item in selected for name in item.symbol_names]
+        )[:8]
         related_sessions = self._unique_strings(
             [str(item.session_id or "").strip() for item in selected if str(item.session_id or "").strip()]
         )[:6]
@@ -341,6 +392,8 @@ class AgentMemoryStore(RepoMemoryStore):
             summary=summary,
             recall_brief=recall_brief,
             suggested_files=suggested_files,
+            suggested_symbols=suggested_symbols,
+            repo_map_hints=[],
             related_sessions=related_sessions,
             related_projects=related_projects,
             total_candidates=len(candidate_ids),
@@ -518,7 +571,13 @@ class AgentMemoryStore(RepoMemoryStore):
             ),
             tags=self._unique_strings(snapshot.project_labels[:8]),
             file_paths=snapshot.important_files[:10],
-            symbol_names=[],
+            symbol_names=self._unique_strings(
+                [
+                    symbol
+                    for symbols in list(snapshot.symbol_index.values())[:10]
+                    for symbol in list(symbols or [])[:6]
+                ]
+            )[:10],
             retention="long",
             ttl_days=RETENTION_DAYS["project"],
             importance=0.88,
@@ -526,13 +585,18 @@ class AgentMemoryStore(RepoMemoryStore):
             dedupe_key=f"project:{session.project_id or self.project_id}",
             repo_summary=snapshot.repo_summary,
             module_roles=module_roles,
+            directory_map=list(snapshot.repo_map[:10]),
             entrypoints=list(snapshot.entrypoints[:8]),
+            service_files=list(snapshot.service_files[:8]),
+            import_hotspots=list(snapshot.import_hotspots[:8]),
             common_file_relationships=common_file_relationships[:8],
             test_mappings=[f"{left} -> {right}" for left, right in self._infer_test_mappings(snapshot.test_files, snapshot.important_files)][:8],
+            symbol_index={path: symbols[:6] for path, symbols in list(snapshot.symbol_index.items())[:10]},
             architecture_notes=[self._trim_text(item, 180) for item in snapshot.repo_map[:8]],
             known_hotspots=list(snapshot.important_files[:8]),
             conventions=[self._trim_text(item, 120) for item in snapshot.project_labels[:6]],
             workflow_hints=workflow_hints,
+            co_change_hints=self._project_co_change_hints(session.project_id or self.project_id),
             subsystem_summaries={path: self._trim_text(brief, 160) for path, brief in file_briefs[:6]},
         )
 
@@ -800,7 +864,13 @@ class AgentMemoryStore(RepoMemoryStore):
             buckets.extend(self._index.get("by_term", {}).get(Path(path).name.lower(), []))
             buckets.extend(self._index.get("by_term", {}).get(Path(path).stem.lower(), []))
         for symbol in request.symbol_names:
-            buckets.extend(self._index.get("by_symbol", {}).get(symbol, []))
+            normalized_symbol = str(symbol or "").strip()
+            if not normalized_symbol:
+                continue
+            buckets.extend(self._index.get("by_symbol", {}).get(normalized_symbol, []))
+            buckets.extend(self._index.get("by_symbol", {}).get(normalized_symbol.lower(), []))
+        for term in request.error_terms:
+            buckets.extend(self._index.get("by_term", {}).get(term, []))
         for term in self._query_terms(request):
             buckets.extend(self._index.get("by_term", {}).get(term, []))
 
@@ -824,6 +894,8 @@ class AgentMemoryStore(RepoMemoryStore):
         if request.use_case in {"repair_assistance", "project_context", "user_recall"}:
             return True
         if request.failure_signature or request.target_paths or request.changed_files:
+            return True
+        if request.error_terms or request.symbol_names:
             return True
         project_entries = self._index.get("by_project", {}).get(str(request.project_id or "").strip(), [])
         return bool(project_entries)
@@ -1026,6 +1098,9 @@ class AgentMemoryStore(RepoMemoryStore):
             self._index_list_add(index["by_file"], key, entry_id)
         for key in metadata.get("symbol_names", []):
             self._index_list_add(index["by_symbol"], key, entry_id)
+            lowered = str(key or "").strip().lower()
+            if lowered and lowered != key:
+                self._index_list_add(index["by_symbol"], lowered, entry_id)
         for key in metadata.get("tags", []):
             self._index_list_add(index["by_tag"], key, entry_id)
         for key in metadata.get("terms", []):
@@ -1080,7 +1155,21 @@ class AgentMemoryStore(RepoMemoryStore):
         if isinstance(entry, EpisodicMemoryEntry):
             chunks.extend([entry.problem_type or "", *entry.strategy_used, *entry.failure_signatures, *entry.what_worked, *entry.what_failed])
         elif isinstance(entry, ProjectMemoryEntry):
-            chunks.extend([entry.repo_summary, *entry.entrypoints, *entry.workflow_hints, *entry.known_hotspots])
+            chunks.extend(
+                [
+                    entry.repo_summary,
+                    *entry.directory_map,
+                    *entry.entrypoints,
+                    *entry.service_files,
+                    *entry.import_hotspots,
+                    *entry.workflow_hints,
+                    *entry.known_hotspots,
+                    *entry.co_change_hints,
+                ]
+            )
+            for path, symbols in list(entry.symbol_index.items())[:10]:
+                chunks.append(path)
+                chunks.extend(symbols[:6])
         elif isinstance(entry, FailureMemoryEntry):
             chunks.extend([entry.failure_signature, *entry.tried_strategies, *entry.successful_repair_patterns, *entry.bad_retry_patterns, *entry.chosen_targets])
         elif isinstance(entry, ConversationMemoryEntry):
@@ -1154,13 +1243,18 @@ class AgentMemoryStore(RepoMemoryStore):
                     **common_update,
                     "repo_summary": incoming.repo_summary or existing.repo_summary,
                     "module_roles": merged_roles,
+                    "directory_map": self._unique_strings([*existing.directory_map, *incoming.directory_map])[:10],
                     "entrypoints": self._unique_strings([*existing.entrypoints, *incoming.entrypoints])[:10],
+                    "service_files": self._unique_strings([*existing.service_files, *incoming.service_files])[:10],
+                    "import_hotspots": self._unique_strings([*existing.import_hotspots, *incoming.import_hotspots])[:10],
                     "common_file_relationships": self._unique_strings([*existing.common_file_relationships, *incoming.common_file_relationships])[:10],
                     "test_mappings": self._unique_strings([*existing.test_mappings, *incoming.test_mappings])[:10],
+                    "symbol_index": self._merge_symbol_indexes(existing.symbol_index, incoming.symbol_index),
                     "architecture_notes": self._unique_strings([*existing.architecture_notes, *incoming.architecture_notes])[:10],
                     "known_hotspots": self._unique_strings([*existing.known_hotspots, *incoming.known_hotspots])[:10],
                     "conventions": self._unique_strings([*existing.conventions, *incoming.conventions])[:10],
                     "workflow_hints": self._unique_strings([*existing.workflow_hints, *incoming.workflow_hints])[:10],
+                    "co_change_hints": self._unique_strings([*existing.co_change_hints, *incoming.co_change_hints])[:10],
                     "subsystem_summaries": merged_subsystems,
                 }
             )
@@ -1225,6 +1319,7 @@ class AgentMemoryStore(RepoMemoryStore):
                         request.current_subtask or "",
                         " ".join(request.target_paths),
                         " ".join(request.symbol_names),
+                        " ".join(request.error_terms),
                         request.failure_signature or "",
                     ]
                     if part
@@ -1235,8 +1330,8 @@ class AgentMemoryStore(RepoMemoryStore):
     def _exact_entity_relevance(self, request: RetrievalRequest, metadata: dict[str, Any]) -> float:
         target_paths = {item for item in request.target_paths if item}
         file_paths = set(metadata.get("file_paths", []))
-        symbol_names = {item for item in request.symbol_names if item}
-        stored_symbols = set(metadata.get("symbol_names", []))
+        symbol_names = {str(item).strip().lower() for item in request.symbol_names if str(item).strip()}
+        stored_symbols = {str(item).strip().lower() for item in metadata.get("symbol_names", []) if str(item).strip()}
         matches = 0.0
         total = 0.0
         if target_paths:
@@ -1261,6 +1356,124 @@ class AgentMemoryStore(RepoMemoryStore):
         if failure_signature in candidate or candidate in failure_signature:
             return 0.7
         return 0.0
+
+    def _request_error_terms(self, session: SessionState) -> list[str]:
+        chunks: list[str] = []
+        for item in session.diagnostics[-4:]:
+            chunks.extend([str(item.summary or "").strip(), str(item.excerpt or "").strip()])
+        repair_context = session.active_repair_context
+        if repair_context is not None:
+            chunks.extend(
+                [
+                    str(repair_context.failure_summary or "").strip(),
+                    str(repair_context.summary or "").strip(),
+                    str(repair_context.excerpt or "").strip(),
+                ]
+            )
+        return self._terms_from_text(" ".join(chunk for chunk in chunks if chunk))[:16]
+
+    def _repo_map_signal_bundle(
+        self,
+        snapshot: Any | None,
+        request: RetrievalRequest,
+    ) -> tuple[list[str], list[str], list[str]]:
+        if snapshot is None:
+            return [], [], []
+        query_terms = self._query_terms(request)
+        if not query_terms and not request.target_paths and not request.symbol_names and not request.error_terms:
+            return [], [], []
+        ranked: list[tuple[float, str]] = []
+        exact_targets = {str(path or "").strip() for path in request.target_paths if str(path or "").strip()}
+        exact_names = {Path(path).name.lower() for path in exact_targets}
+        requested_symbols = {
+            str(symbol or "").strip().lower()
+            for symbol in request.symbol_names
+            if str(symbol or "").strip()
+        }
+        symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        candidate_paths = self._unique_strings(
+            [
+                *list(getattr(snapshot, "focus_files", []) or []),
+                *list(getattr(snapshot, "important_files", []) or []),
+                *list(getattr(snapshot, "entrypoints", []) or []),
+                *list(getattr(snapshot, "service_files", []) or []),
+                *list(getattr(snapshot, "import_hotspots", []) or []),
+                *list(symbol_index.keys()),
+            ]
+        )
+        for path in candidate_paths:
+            path_terms = set(self._terms_from_text(path))
+            score = 0.0
+            if path in exact_targets:
+                score += 3.2
+            if Path(path).name.lower() in exact_names:
+                score += 1.6
+            matched_terms = query_terms & path_terms
+            if matched_terms:
+                score += min(2.0, 0.6 * len(matched_terms))
+            path_symbols = [str(item or "").strip() for item in symbol_index.get(path, []) if str(item or "").strip()]
+            lowered_symbols = {item.lower() for item in path_symbols}
+            if requested_symbols & lowered_symbols:
+                score += 2.2
+            symbol_term_matches = query_terms & lowered_symbols
+            if symbol_term_matches:
+                score += min(1.8, 0.7 * len(symbol_term_matches))
+            if path in list(getattr(snapshot, "entrypoints", []) or []) and query_terms & {"main", "entry", "cli", "server"}:
+                score += 0.35
+            if path in list(getattr(snapshot, "service_files", []) or []) and query_terms & {"service", "route", "router", "handler", "api", "auth", "server"}:
+                score += 0.4
+            if path in list(getattr(snapshot, "import_hotspots", []) or []) and query_terms & {"import", "dependency", "module", "package"}:
+                score += 0.4
+            if score >= 0.6:
+                ranked.append((score, path))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        suggested_files = [path for _, path in ranked[:8]]
+        suggested_symbols = self._unique_strings(
+            [
+                symbol
+                for path in suggested_files[:4]
+                for symbol in list(symbol_index.get(path, []) or [])[:6]
+                if requested_symbols or str(symbol).lower() in query_terms
+            ]
+        )[:8]
+        repo_hints = self._repo_map_hints(snapshot, suggested_files)
+        return suggested_files, suggested_symbols, repo_hints
+
+    def _repo_map_hints(self, snapshot: Any, suggested_files: list[str]) -> list[str]:
+        hints: list[str] = []
+        test_mappings = list(getattr(snapshot, "test_mappings", []) or [])
+        import_hotspots = set(getattr(snapshot, "import_hotspots", []) or [])
+        symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        for path in suggested_files[:4]:
+            for mapping in test_mappings:
+                if path in mapping and mapping not in hints:
+                    hints.append(mapping)
+            if path in import_hotspots:
+                hints.append(f"{path} is an import hotspot")
+            symbols = list(symbol_index.get(path, []) or [])[:4]
+            if symbols:
+                hints.append(f"{path} symbols: {', '.join(symbols)}")
+        return self._unique_strings(hints)[:6]
+
+    def _render_repo_hint_summary(self, repo_hints: list[str], budget_chars: int) -> str:
+        if not repo_hints:
+            return "No relevant persistent memory selected."
+        lines = ["Repo map hints:"]
+        remaining = max(int(budget_chars or 0), 240) - len(lines[0]) - 1
+        for hint in repo_hints[:4]:
+            line = self._trim_text(f"- {hint}", min(max(remaining, 80), 180))
+            lines.append(line)
+            remaining -= len(line) + 1
+            if remaining <= 40:
+                break
+        return "\n".join(lines)
+
+    def _merge_repo_hints_into_summary(self, summary: str, repo_hints: list[str], budget_chars: int) -> str:
+        repo_summary = self._render_repo_hint_summary(repo_hints, max(180, budget_chars // 2))
+        if not summary or summary == "No relevant persistent memory selected.":
+            return repo_summary
+        merged = f"{summary}\n{repo_summary}"
+        return self._trim_text(merged, max(int(budget_chars or 0), 240))
 
     def _recency_score(self, metadata: dict[str, Any]) -> tuple[float, bool]:
         timestamp = str(metadata.get("updated_at") or metadata.get("created_at") or "").strip()
@@ -1421,6 +1634,32 @@ class AgentMemoryStore(RepoMemoryStore):
 
     def _hash_text(self, text: str) -> str:
         return hashlib.sha1(str(text or "").encode("utf-8")).hexdigest()[:12]
+
+    def _merge_symbol_indexes(
+        self,
+        left: dict[str, list[str]],
+        right: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        merged: dict[str, list[str]] = {}
+        for path, symbols in list(left.items()) + list(right.items()):
+            existing = merged.get(path, [])
+            merged[path] = self._unique_strings([*existing, *list(symbols or [])])[:8]
+        return merged
+
+    def _project_co_change_hints(self, project_id: str) -> list[str]:
+        counts: defaultdict[tuple[str, str], int] = defaultdict(int)
+        for entry in self.list_entries("episodic", project_id=project_id):
+            changed = [
+                str(path or "").strip()
+                for path in list(getattr(entry, "changed_files", []) or [])[:8]
+                if str(path or "").strip()
+            ]
+            for index, left in enumerate(changed):
+                for right in changed[index + 1 :]:
+                    pair = tuple(sorted((left, right)))
+                    counts[pair] += 1
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return [f"{left} <-> {right} ({count}x)" for (left, right), count in ranked[:6]]
 
     def _age_days(self, timestamp: str) -> float:
         try:

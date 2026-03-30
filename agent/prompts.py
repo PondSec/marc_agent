@@ -1090,7 +1090,11 @@ def _compact_memory_context(session: SessionState | None) -> dict[str, object]:
     include_persistent = _should_include_persistent_memory(memory_context)
     if memory_context.recall_brief:
         payload["recall"] = _trim_text(memory_context.recall_brief, 320)
-    if not include_persistent:
+    has_repo_map_signal = bool(
+        getattr(memory_context, "repo_map_hints", None)
+        or getattr(memory_context, "suggested_symbols", None)
+    )
+    if not include_persistent and not has_repo_map_signal:
         return payload
     if memory_context.summary and memory_context.summary != "No relevant persistent memory selected.":
         payload["retrieval_summary"] = _trim_text(memory_context.summary, 420)
@@ -1124,6 +1128,10 @@ def _compact_memory_context(session: SessionState | None) -> dict[str, object]:
         payload["retrieved"] = selected_payload
     if memory_context.suggested_files:
         payload["suggested_files"] = memory_context.suggested_files[:6]
+    if getattr(memory_context, "suggested_symbols", None):
+        payload["suggested_symbols"] = list(memory_context.suggested_symbols[:6])
+    if getattr(memory_context, "repo_map_hints", None):
+        payload["repo_map_hints"] = [_trim_text(item, 140) for item in list(memory_context.repo_map_hints[:4])]
     payload["metrics"] = {
         "latency_ms": memory_context.latency_ms,
         "total_hits": memory_context.total_hits,
@@ -1144,6 +1152,10 @@ def _should_include_persistent_memory(memory_context) -> bool:
     if memory_context.useful_recall_rate >= 0.34:
         return True
     if getattr(memory_context, "suggested_files", None):
+        return True
+    if getattr(memory_context, "repo_map_hints", None):
+        return True
+    if getattr(memory_context, "suggested_symbols", None):
         return True
     for item in memory_context.selected:
         reasons = set(getattr(item, "reasons", []) or [])
@@ -1188,6 +1200,9 @@ def _compact_workspace_snapshot(
         "top_directories": snapshot.top_directories[:8],
         "manifests": snapshot.manifests[:6],
         "entrypoints": snapshot.entrypoints[:6],
+        "service_files": snapshot.service_files[:4],
+        "import_hotspots": snapshot.import_hotspots[:4],
+        "test_mappings": snapshot.test_mappings[:4],
         "focus_files": snapshot.focus_files[:focus_limit],
         "important_files": snapshot.important_files[:important_limit],
         "repo_summary": _trim_text(snapshot.repo_summary, 320),
@@ -1198,6 +1213,10 @@ def _compact_workspace_snapshot(
             path: _trim_text(snapshot.file_briefs.get(path, ""), 120)
             for path in snapshot.important_files[:4]
             if snapshot.file_briefs.get(path)
+        }
+        payload["symbol_index"] = {
+            path: list(symbols[:4])
+            for path, symbols in list(snapshot.symbol_index.items())[:4]
         }
     return payload
 

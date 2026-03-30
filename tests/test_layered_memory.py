@@ -518,7 +518,61 @@ def test_project_memory_exposes_relevant_repo_hints_without_noise(tmp_path):
 
     assert len(project_entries) == 1
     assert len(project_entries[0].workflow_hints) <= 6
-    assert "app/auth.py" in project_entries[0].known_hotspots
+
+
+def test_repo_map_signal_bundle_prefers_symbol_and_test_mappings(tmp_path):
+    store = build_store(tmp_path)
+    session = build_session(store, "Trace check_role behavior in the auth tests")
+    session.workspace_snapshot = session.workspace_snapshot.model_copy(
+        update={
+            "test_mappings": ["tests/test_main.py -> app/main.py"],
+            "symbol_index": {
+                "app/auth.py": ["check_role"],
+                "app/main.py": ["login"],
+            },
+            "service_files": ["app/auth.py"],
+            "import_hotspots": ["app/main.py"],
+        }
+    )
+
+    store.refresh_session_memory(session.task, session)
+
+    assert session.memory_context is not None
+    assert "app/auth.py" in session.memory_context.suggested_files
+    assert "check_role" in session.memory_context.suggested_symbols
+    assert any("tests/test_main.py -> app/main.py" in item for item in session.memory_context.repo_map_hints)
+
+
+def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(tmp_path):
+    store = build_store(tmp_path)
+    previous = build_session(store, "Fix auth flow")
+    previous.changed_files = [
+        FileChangeRecord(path="app/auth.py", operation="update"),
+        FileChangeRecord(path="tests/test_main.py", operation="update"),
+    ]
+    previous.final_response = "Updated auth flow and tests."
+    previous.status = "completed"
+    previous.validation_status = "passed"
+    store.refresh_session_memory(previous.task, previous)
+    store.persist_session_memory(previous)
+
+    session = build_session(store, "Inspect the auth architecture")
+    session.workspace_snapshot = session.workspace_snapshot.model_copy(
+        update={
+            "symbol_index": {"app/auth.py": ["check_role"]},
+            "import_hotspots": ["app/main.py"],
+            "service_files": ["app/auth.py"],
+        }
+    )
+    store.persist_session_memory(session)
+
+    project_entry = store.list_entries("project")[0]
+
+    assert project_entry.symbol_index["app/auth.py"] == ["check_role"]
+    assert project_entry.import_hotspots == ["app/main.py"]
+    assert project_entry.service_files == ["app/auth.py"]
+    assert any("app/auth.py <-> tests/test_main.py" in item for item in project_entry.co_change_hints)
+    assert "app/auth.py" in project_entry.known_hotspots
 
 
 def test_project_identity_stays_stable_across_fresh_workspace_copies(tmp_path):

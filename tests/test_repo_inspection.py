@@ -10,7 +10,7 @@ from runtime.workspace import WorkspaceManager
 def test_repo_snapshot_detects_manifests_validation_and_repo_map(tmp_path):
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.py").write_text("def main():\n    return 'ok'\n", encoding="utf-8")
+    (tmp_path / "src" / "app.py").write_text("import json\n\ndef main():\n    return 'ok'\n", encoding="utf-8")
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text(
@@ -38,6 +38,9 @@ line-length = 100
     assert any(item.command == "python -m pytest" for item in snapshot.validation_commands)
     assert any(item.command == "ruff check ." for item in snapshot.validation_commands)
     assert snapshot.repo_map
+    assert "src/app.py" in snapshot.import_hotspots
+    assert snapshot.test_mappings == ["tests/test_app.py -> src/app.py"]
+    assert snapshot.symbol_index["src/app.py"] == ["main"]
     assert "python" in snapshot.project_labels
     assert any(item.path == "tests/test_app.py" for item in snapshot.file_insights)
 
@@ -87,3 +90,30 @@ def test_repo_snapshot_detects_unittest_command_from_python_test_files_without_m
     snapshot = memory.build_snapshot("cli unittest")
 
     assert any(item.command == "python -m unittest" for item in snapshot.validation_commands)
+
+
+def test_repo_snapshot_collects_service_files_and_symbols_for_repo_map(tmp_path):
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "router.py").write_text(
+        "from .service import fetch_user\n\n"
+        "def route_request(user_id):\n"
+        "    return fetch_user(user_id)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app" / "service.py").write_text(
+        "class AuthService:\n"
+        "    pass\n\n"
+        "def fetch_user(user_id):\n"
+        "    return {'id': user_id}\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    memory = RepoMemoryStore(config, WorkspaceManager(tmp_path))
+
+    snapshot = memory.build_snapshot("service auth router")
+
+    assert "app/router.py" in snapshot.service_files
+    assert "app/service.py" in snapshot.service_files
+    assert snapshot.symbol_index["app/service.py"][:2] == ["AuthService", "fetch_user"]
