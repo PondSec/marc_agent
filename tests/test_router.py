@@ -185,6 +185,18 @@ def test_router_recognizes_tictactoe_without_spaces():
     assert route.entities.target_name in {"tic tac toe", "tictactoe"}
 
 
+def test_router_minimal_fallback_prefers_explicit_html_file_over_embedded_js_mentions():
+    router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
+
+    route = router.interpret_user_request(
+        "Erstelle ein Snake-Spiel als HTML-Datei mit eingebettetem JavaScript und CSS.",
+        None,
+    )
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.relevant_extensions == [".html"]
+
+
 def test_router_treats_computer_opponent_follow_up_as_update():
     router = IntentRouter(ScriptedLLM(fail=True, fail_message="should not be called"))
     session = SessionState(task="vorheriger prompt", workspace_root=".")

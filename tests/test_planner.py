@@ -41,7 +41,7 @@ from agent.task_state import TaskState
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
 from llm.runtime_resilience import ExecutionFailure
-from llm.schemas import AgentActionType, AgentDecision, RouteIntent
+from llm.schemas import AgentActionType, AgentDecision, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
 
 
@@ -142,6 +142,45 @@ def empty_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
         workflow_commands=[],
         repo_summary="Empty workspace.",
     )
+
+
+def test_choose_create_path_prefers_index_html_for_empty_workspace_web_requests(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    llm = ScriptedLLM(config=config)
+    planner = Planner(llm, logger=AgentLogger(tmp_path, "planner"))
+    session = SessionState(task="build a snake game", workspace_root=str(tmp_path))
+    session.workspace_snapshot = empty_snapshot(tmp_path)
+    route = RouterOutput.model_validate(
+        {
+            "user_goal": "Build a snake game as a single HTML file.",
+            "intent": "create",
+            "entities": {
+                "target_type": "artifact",
+                "target_name": "snake",
+                "target_paths": [],
+                "attributes": [],
+                "constraints": [],
+            },
+            "requested_outcome": "Build a snake game as a single HTML file.",
+            "action_plan": [
+                {
+                    "step": 1,
+                    "action": "create_artifact",
+                    "reason": "Create the requested artifact.",
+                }
+            ],
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.9,
+            "safe_to_execute": True,
+            "repo_context_needed": True,
+            "search_terms": ["snake game", "html"],
+            "relevant_extensions": [".html"],
+            "direct_response": None,
+        }
+    )
+
+    assert planner._choose_create_path(route, session) == "index.html"
 
 
 def route_payload(
