@@ -1814,6 +1814,7 @@ pre {
 }
 
 .terminal-output-shell {
+  position: relative;
   min-height: 420px;
   max-height: min(56vh, 560px);
   overflow: auto;
@@ -1835,12 +1836,49 @@ pre {
   word-break: break-word;
 }
 
-.terminal-input {
-  font-family: "SFMono-Regular", "SF Mono", Menlo, Monaco, Consolas, monospace;
+.terminal-capture-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  resize: none;
+  opacity: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+}
+
+.terminal-capture-input:focus {
+  outline: none;
+}
+
+.terminal-caret {
+  display: inline-block;
+  width: 0.66ch;
+  height: 1.15em;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  border-radius: 2px;
+  background: rgba(220, 230, 247, 0.92);
+  animation: terminal-caret-blink 1s steps(1) infinite;
 }
 
 .terminal-error {
   color: #ffb6b0;
+}
+
+@keyframes terminal-caret-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
 }
 
 .settings-toggle {

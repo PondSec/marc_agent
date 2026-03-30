@@ -820,9 +820,50 @@ function scheduleTerminalPoll(delayMs = 700) {
   }, delayMs);
 }
 
+function sanitizeTerminalOutput(value) {
+  return String(value || "")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b[@-_]/g, "")
+    .replace(/\r(?!\n)/g, "");
+}
+
+function terminalDisplayMarkup() {
+  const terminal = state.ui.terminal;
+  const text = terminal.output || (terminal.starting ? "Terminal wird gestartet ..." : "");
+  return `${escapeHtml(text + terminal.input)}<span class="terminal-caret" aria-hidden="true"></span>`;
+}
+
+function focusTerminalCapture() {
+  window.requestAnimationFrame(() => {
+    const input = document.getElementById("terminalCaptureInput");
+    if (input && typeof input.focus === "function") {
+      try {
+        input.focus({ preventScroll: true });
+      } catch (error) {
+        input.focus();
+      }
+    }
+  });
+}
+
+function syncTerminalViewport() {
+  const output = document.getElementById("terminalOutput");
+  if (!output) {
+    renderApp();
+    focusTerminalCapture();
+    return;
+  }
+  output.innerHTML = terminalDisplayMarkup();
+  if (output.parentElement) {
+    output.parentElement.scrollTop = output.parentElement.scrollHeight;
+  }
+}
+
 async function openTerminalModal() {
   if (state.ui.terminal.open && state.ui.terminal.sessionId) {
     renderApp();
+    focusTerminalCapture();
     scheduleTerminalPoll(100);
     return;
   }
@@ -844,7 +885,7 @@ async function openTerminalModal() {
       starting: false,
       sessionId: payload.id,
       cursor: payload.cursor || 0,
-      output: payload.output || "",
+      output: sanitizeTerminalOutput(payload.output || ""),
       cwd: payload.cwd || "",
       shell: payload.shell || "",
       status: payload.status || "running",
@@ -852,12 +893,7 @@ async function openTerminalModal() {
       error: "",
     };
     renderApp();
-    window.requestAnimationFrame(() => {
-      const input = document.getElementById("terminalInput");
-      if (input && typeof input.focus === "function") {
-        input.focus({ preventScroll: true });
-      }
-    });
+    focusTerminalCapture();
     scheduleTerminalPoll(150);
   } catch (error) {
     resetTerminalState();
@@ -893,17 +929,11 @@ async function pollTerminalSession() {
   state.ui.terminal.exitCode = payload.exit_code ?? state.ui.terminal.exitCode;
   state.ui.terminal.error = "";
   if (payload.reset) {
-    state.ui.terminal.output = payload.output || "";
+    state.ui.terminal.output = sanitizeTerminalOutput(payload.output || "");
   } else if (payload.output) {
-    state.ui.terminal.output += payload.output;
+    state.ui.terminal.output += sanitizeTerminalOutput(payload.output);
   }
-  renderApp();
-  window.requestAnimationFrame(() => {
-    const output = document.getElementById("terminalOutput");
-    if (output && output.parentElement) {
-      output.parentElement.scrollTop = output.parentElement.scrollHeight;
-    }
-  });
+  syncTerminalViewport();
   if (payload.status === "running") {
     scheduleTerminalPoll(700);
   }
@@ -912,23 +942,24 @@ async function pollTerminalSession() {
 async function sendTerminalInput() {
   const sessionId = state.ui.terminal.sessionId;
   const input = state.ui.terminal.input;
-  if (!sessionId || !input.trim()) {
+  if (!sessionId || !input) {
     return;
   }
   const nextInput = input.endsWith("\n") ? input : `${input}\n`;
   state.ui.terminal.input = "";
-  renderApp();
+  syncTerminalViewport();
   try {
     await fetchJSON(`/api/admin/terminal/sessions/${sessionId}/input`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ data: nextInput }),
     });
+    focusTerminalCapture();
     scheduleTerminalPoll(50);
   } catch (error) {
     state.ui.terminal.input = input;
     showToast(`Terminal-Eingabe fehlgeschlagen: ${error.message}`, "error");
-    renderApp();
+    syncTerminalViewport();
   }
 }
 
@@ -1238,13 +1269,13 @@ function handleClick(event) {
     return;
   }
 
-  if (action === "close-terminal-modal") {
-    closeTerminalModal();
+  if (action === "focus-terminal-input") {
+    focusTerminalCapture();
     return;
   }
 
-  if (action === "send-terminal-input") {
-    sendTerminalInput();
+  if (action === "close-terminal-modal") {
+    closeTerminalModal();
     return;
   }
 
@@ -1374,8 +1405,12 @@ function handleInput(event) {
     state.ui.workspaceName = event.target.value;
     return;
   }
-  if (event.target.id === "terminalInput") {
-    state.ui.terminal.input = event.target.value;
+  if (event.target.id === "terminalCaptureInput") {
+    if (event.target.value) {
+      state.ui.terminal.input += event.target.value;
+      event.target.value = "";
+      syncTerminalViewport();
+    }
   }
 }
 
@@ -1453,9 +1488,34 @@ function handleKeydown(event) {
       renderApp();
     }
   }
-  if (event.key === "Enter" && !event.shiftKey && event.target.id === "terminalInput") {
-    event.preventDefault();
-    sendTerminalInput();
+  if (event.target.id === "terminalCaptureInput") {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      sendTerminalInput();
+      return;
+    }
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      state.ui.terminal.input = state.ui.terminal.input.slice(0, -1);
+      syncTerminalViewport();
+      return;
+    }
+    if (event.key === "Tab") {
+      event.preventDefault();
+      state.ui.terminal.input += "\t";
+      syncTerminalViewport();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      if (state.ui.terminal.input) {
+        state.ui.terminal.input = "";
+        syncTerminalViewport();
+      } else {
+        interruptTerminalSession();
+      }
+      return;
+    }
   }
 }
 
@@ -3597,26 +3657,26 @@ function renderTerminalModal() {
               </button>
             </div>
           </div>
-          <div class="terminal-output-shell">
-            <pre class="terminal-output" id="terminalOutput">${escapeHtml(terminal.output || (terminal.starting ? "Terminal wird gestartet ..." : ""))}</pre>
-          </div>
-          <label class="modal-field">
-            <span>Befehl oder Shell-Input</span>
+          <div class="terminal-output-shell" data-action="focus-terminal-input">
+            <pre class="terminal-output" id="terminalOutput">${terminalDisplayMarkup()}</pre>
             <textarea
-              id="terminalInput"
-              class="terminal-input"
-              rows="3"
-              placeholder="z. B. systemctl status marc-a1.service"
-            >${escapeHtml(terminal.input)}</textarea>
-            <small>Enter sendet direkt an die Shell. Fuer neue Zeilen kannst du Text mit Zeilenumbruechen einfuegen und dann senden.</small>
-          </label>
+              id="terminalCaptureInput"
+              class="terminal-capture-input"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              autocorrect="off"
+              aria-label="Server-Terminal"
+            ></textarea>
+          </div>
+          <p class="modal-note">Klicke ins Terminal und tippe direkt dort. Enter sendet an die Shell, Backspace loescht lokal, Ctrl+C sendet ein Interrupt.</p>
           ${terminal.error ? `<p class="modal-note terminal-error">${escapeHtml(terminal.error)}</p>` : ""}
         </div>
         <footer class="modal-actions">
           <button class="button-secondary" type="button" data-action="close-terminal-modal">Schliessen</button>
-          <button class="button-primary settings-action-with-icon" type="button" data-action="send-terminal-input" ${terminal.sessionId ? "" : "disabled"}>
-            ${icon("arrow")}
-            <span>Eingabe senden</span>
+          <button class="button-primary settings-action-with-icon" type="button" data-action="focus-terminal-input" ${terminal.sessionId ? "" : "disabled"}>
+            ${icon("terminal")}
+            <span>Terminal fokussieren</span>
           </button>
         </footer>
       </section>
