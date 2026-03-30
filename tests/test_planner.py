@@ -2555,6 +2555,56 @@ def test_fallback_semantic_review_ignores_deferred_snapshot_explicit_target(tmp_
     assert "no additional concrete task-to-code mismatch" in review.summary
 
 
+def test_fallback_semantic_review_ignores_supporting_doc_snapshot_target_for_passed_repair(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Fix the existing calcstats bug so moving_average returns one average per full window only, "
+            "keeps raising ValueError for invalid window sizes, updates the README example if needed, "
+            "and runs python -m unittest tests.test_stats before finishing."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["calcstats/stats.py", "README.md", "tests/test_stats.py"],
+                "focus_files": ["calcstats/stats.py", "tests/test_stats.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_stats.py"],
+                "entrypoints": ["calcstats/stats.py"],
+            }
+        ),
+        validation_status="passed",
+        changed_files=[FileChangeRecord(path="calcstats/stats.py", operation="modify")],
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing implementation."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["calcstats/stats.py", "README.md", "tests/test_stats.py"],
+        target_name="calcstats/stats.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        goal_relation="report_problem",
+        open_problem="Fix the moving_average bug without regressing the validated implementation.",
+        verification_target="python -m unittest tests.test_stats",
+    )
+    session.task_state.current_user_intent = "repair"
+    artifact_roles = {item.path: item for item in session.task_state.target_artifacts if item.path}
+    artifact_roles["calcstats/stats.py"].role = "primary_target"
+    artifact_roles["README.md"].role = "supporting_context"
+    artifact_roles["tests/test_stats.py"].role = "validation_target"
+
+    review = planner._fallback_semantic_change_review(session)
+
+    assert review.requirements_satisfied is True
+    assert "no additional concrete task-to-code mismatch" in review.summary
+
+
 def test_planner_blocks_moving_cli_launcher_logic_into_helper_module(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()

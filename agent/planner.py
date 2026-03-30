@@ -2556,6 +2556,38 @@ class Planner:
 
         return self._unique_paths(explicit)
 
+    def _semantic_review_pending_snapshot_targets(
+        self,
+        session: SessionState,
+        *,
+        deferred_targets: set[str],
+    ) -> list[str]:
+        pending_targets = [
+            path
+            for path in self._snapshot_explicit_target_paths(session)
+            if path not in {item.path for item in session.changed_files}
+            and path not in deferred_targets
+        ]
+        if not pending_targets:
+            return []
+
+        task_state = session.task_state
+        current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
+        if session.validation_status != "passed" or current_intent not in {"repair", "debug"}:
+            return pending_targets
+
+        supporting_doc_paths = {
+            path
+            for artifact in getattr(task_state, "target_artifacts", []) or []
+            for path in [str(getattr(artifact, "path", "") or "").strip()]
+            if path
+            and str(getattr(artifact, "role", "") or "").strip().lower() == "supporting_context"
+            and self.validation_planner._is_documentation_path(path)
+        }
+        if not supporting_doc_paths:
+            return pending_targets
+        return [path for path in pending_targets if path not in supporting_doc_paths]
+
     def _path_matches_explicit_request(
         self,
         session: SessionState,
@@ -8876,12 +8908,10 @@ class Planner:
 
     def _fallback_semantic_change_review(self, session: SessionState) -> SemanticChangeReview:
         deferred_targets = self._active_deferred_update_targets(session)
-        pending_snapshot_targets = [
-            path
-            for path in self._snapshot_explicit_target_paths(session)
-            if path not in {item.path for item in session.changed_files}
-            and path not in deferred_targets
-        ]
+        pending_snapshot_targets = self._semantic_review_pending_snapshot_targets(
+            session,
+            deferred_targets=deferred_targets,
+        )
         if session.validation_status == "failed":
             return SemanticChangeReview(
                 requirements_satisfied=False,
