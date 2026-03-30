@@ -1489,6 +1489,88 @@ def test_task_state_updater_keeps_empty_workspace_create_requests_out_of_debug_f
     assert route.action_plan[0].action.value == "create_artifact"
 
 
+def test_task_state_updater_reconciles_explain_misclassification_for_existing_repo_feature_request(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["textutils", "tests"],
+        important_files=["textutils/__init__.py", "textutils/normalize.py", "tests/test_normalize.py", "README.md"],
+        focus_files=["textutils/normalize.py", "textutils/__init__.py", "tests/test_normalize.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_normalize.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["textutils/normalize.py"],
+        repo_map=["textutils/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small Python utility package with unittest coverage.",
+    )
+    prompt = (
+        "Extend the existing textutils module with a slugify(text) helper that lowercases, replaces whitespace "
+        "with hyphens, removes punctuation, export it from __init__.py, add unittests, update the README examples, "
+        "and run python -m unittest tests.test_normalize before finishing."
+    )
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": "Review the existing textutils behavior.",
+        "active_goal": "Inspect how slug handling should work in this repository.",
+        "goal_relation": "new_task",
+        "output_expectation": "Explain the current textutils behavior and summarize the relevant files.",
+        "current_user_intent": "explain",
+        "execution_strategy": "validation_inspection",
+        "open_problem": None,
+        "verification_target": None,
+        "target_artifacts": [
+            {"path": "textutils/normalize.py", "name": "normalize.py", "kind": "file", "role": "primary_target", "confidence": 0.92},
+            {"path": "README.md", "name": "README.md", "kind": "doc", "role": "supporting_context", "confidence": 0.74},
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "relevant_context": ["Inspect the existing implementation before answering."],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.83,
+        "next_action": "inspect",
+        "next_best_action": "explain",
+        "execution_outline": [
+            "Inspect the relevant files.",
+            "Summarize the current implementation.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        prompt,
+        snapshot=snapshot,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "modify"
+    assert task_state.next_best_action == "modify"
+    assert task_state.target_artifacts[0].path == "textutils/normalize.py"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "textutils/normalize.py",
+        "textutils/__init__.py",
+        "README.md",
+        "tests/test_normalize.py",
+    }
+    assert "Apply the requested change" in task_state.output_expectation
+    assert "Apply the requested change" in (task_state.verification_target or "")
+    assert route.intent == RouteIntent.UPDATE
+
+
 def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_empty_workspace(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 
