@@ -6474,6 +6474,23 @@ class Planner:
         current_content: str,
         proposed_content: str,
     ) -> ProposedUpdateReview:
+        repair_context = session.active_repair_context
+        review = self._validation_repair_relevance_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        )
+        if review is not None:
+            return review
+        review = self._repair_no_effective_change_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        )
+        if review is not None:
+            return review
         current_length = max(len(current_content), 1)
         proposed_length = max(len(proposed_content), 1)
         current_lines = max(len(current_content.splitlines()), 1)
@@ -7094,6 +7111,14 @@ class Planner:
             for identifier in identifiers
             if identifier in current_content or identifier in proposed_content
         ]
+        undefined_symbol_review = self._undefined_runtime_symbol_repair_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        )
+        if undefined_symbol_review is not None:
+            return undefined_symbol_review
         target_evidence = self._runtime_target_evidence_lines(path, repair_context)
         if not relevant_identifiers:
             evidence_hint = f" near {' | '.join(target_evidence[:2])}" if target_evidence else ""
@@ -7133,6 +7158,131 @@ class Planner:
                 *self._runtime_target_repair_hints(path, repair_context, evidence_lines=target_evidence),
             ],
         )
+
+    def _undefined_runtime_symbol_repair_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> ProposedUpdateReview | None:
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        undefined_symbol = self._undefined_runtime_symbol(repair_context)
+        if not undefined_symbol:
+            return None
+        current_uses = [line.strip() for line in str(current_content or "").splitlines() if undefined_symbol in line]
+        proposed_uses = [line.strip() for line in str(proposed_content or "").splitlines() if undefined_symbol in line]
+        if not current_uses and not proposed_uses:
+            return None
+        if current_uses and not proposed_uses:
+            return None
+        if self._python_content_binds_name(proposed_content, undefined_symbol):
+            return None
+        evidence_lines = self._runtime_target_evidence_lines(path, repair_context)
+        evidence_hint = f" near {' | '.join(evidence_lines[:2])}" if evidence_lines else ""
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
+            confidence=0.91,
+            blocking_issues=[
+                (
+                    f"The runtime failure still reports '{undefined_symbol}' as undefined in {path}, "
+                    f"but the proposal neither binds/imports '{undefined_symbol}' nor removes its failing usage{evidence_hint}."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                f"Either import or otherwise bind '{undefined_symbol}' in {path}, or remove the failing usage from the implicated line.",
+                *self._runtime_target_repair_hints(path, repair_context, evidence_lines=evidence_lines),
+            ],
+        )
+
+    def _undefined_runtime_symbol(self, repair_context: ValidationFailureEvidence | None) -> str | None:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return None
+        texts = [
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ]
+        patterns = (
+            re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
+            re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
+        )
+        for text in texts:
+            if not text:
+                continue
+            for pattern in patterns:
+                match = pattern.search(text)
+                if match:
+                    return str(match.group("name") or "").strip()
+        return None
+
+    def _python_content_binds_name(
+        self,
+        content: str,
+        name: str,
+    ) -> bool:
+        target = str(name or "").strip()
+        if not target:
+            return False
+        try:
+            module = ast.parse(str(content or ""))
+        except SyntaxError:
+            return False
+
+        def _binds_target(node: ast.AST) -> bool:
+            if isinstance(node, ast.Name):
+                return node.id == target and isinstance(node.ctx, ast.Store)
+            if isinstance(node, (ast.Tuple, ast.List)):
+                return any(_binds_target(item) for item in node.elts)
+            if isinstance(node, ast.Starred):
+                return _binds_target(node.value)
+            return False
+
+        for node in ast.walk(module):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    alias_name = alias.asname or alias.name.split(".", 1)[0]
+                    if alias_name == target:
+                        return True
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    alias_name = alias.asname or alias.name
+                    if alias_name == target:
+                        return True
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = getattr(node, "targets", None) or [getattr(node, "target", None)]
+                if any(target_node is not None and _binds_target(target_node) for target_node in targets):
+                    return True
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                if _binds_target(node.target):
+                    return True
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                if any(item.optional_vars is not None and _binds_target(item.optional_vars) for item in node.items):
+                    return True
+            elif isinstance(node, ast.ExceptHandler):
+                if str(getattr(node, "name", "") or "").strip() == target:
+                    return True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == target:
+                    return True
+                all_args = [
+                    *getattr(node.args, "posonlyargs", []),
+                    *getattr(node.args, "args", []),
+                    *getattr(node.args, "kwonlyargs", []),
+                ]
+                if node.args.vararg is not None:
+                    all_args.append(node.args.vararg)
+                if node.args.kwarg is not None:
+                    all_args.append(node.args.kwarg)
+                if any(arg.arg == target for arg in all_args):
+                    return True
+            elif isinstance(node, ast.ClassDef) and node.name == target:
+                return True
+        return False
 
     def _runtime_support_file_relevance_review(
         self,

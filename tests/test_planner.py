@@ -9141,6 +9141,112 @@ def test_validation_repair_relevance_review_surfaces_target_runtime_evidence(tmp
     assert any("argument handling" in hint.lower() for hint in review.repair_hints)
 
 
+def test_validation_repair_relevance_review_rejects_unresolved_undefined_symbol(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_wordfreq",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/tests/test_wordfreq.py", line 13, in test_read_text_stdin\n'
+            '    sys.stdin = io.StringIO("hello world hello")\n'
+            "NameError: name 'sys' is not defined. Did you forget to import 'sys'?\n"
+        ),
+        failure_summary="NameError: name 'sys' is not defined.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+        line_hints=[13],
+        action_hints=[],
+        repair_requirements=["Change tests/test_wordfreq.py so the failing runtime or test path can complete successfully."],
+        evidence_signature="sig-runtime-nameerror",
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="tests/test_wordfreq.py",
+        current_content=(
+            "import unittest\n\n"
+            "class TestWordFreq(unittest.TestCase):\n"
+            "    def test_read_text_stdin(self):\n"
+            "        import io\n"
+            "        sys.stdin = io.StringIO(\"hello world hello\")\n"
+        ),
+        proposed_content=(
+            "import unittest\n\n"
+            "class TestWordFreq(unittest.TestCase):\n"
+            "    def test_read_text_stdin(self):\n"
+            "        import io\n"
+            "        sys.stdin = io.StringIO(\"hello world hello\\n\")\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "undefined runtime symbol" in review.summary.lower()
+    assert any("binds/imports 'sys'" in issue for issue in review.blocking_issues)
+
+
+def test_fallback_proposed_update_review_reuses_runtime_symbol_review_after_model_timeout(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(task="Repair tests/test_wordfreq.py", workspace_root=str(tmp_path))
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_wordfreq",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/tests/test_wordfreq.py", line 13, in test_read_text_stdin\n'
+            '    sys.stdin = io.StringIO("hello world hello")\n'
+            "NameError: name 'sys' is not defined. Did you forget to import 'sys'?\n"
+        ),
+        failure_summary="NameError: name 'sys' is not defined.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+        line_hints=[13],
+        action_hints=[],
+        repair_requirements=["Change tests/test_wordfreq.py so the failing runtime or test path can complete successfully."],
+        evidence_signature="sig-runtime-nameerror-fallback",
+    )
+    session.active_repair_context = repair_context
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing test module."}],
+        target_paths=["tests/test_wordfreq.py"],
+        target_name="tests/test_wordfreq.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._fallback_proposed_update_review(
+        session.router_result,
+        session,
+        path="tests/test_wordfreq.py",
+        current_content=(
+            "import unittest\n\n"
+            "class TestWordFreq(unittest.TestCase):\n"
+            "    def test_read_text_stdin(self):\n"
+            "        import io\n"
+            "        sys.stdin = io.StringIO(\"hello world hello\")\n"
+        ),
+        proposed_content=(
+            "import unittest\n\n"
+            "class TestWordFreq(unittest.TestCase):\n"
+            "    def test_read_text_stdin(self):\n"
+            "        import io\n"
+            "        sys.stdin = io.StringIO(\"hello world hello\\n\")\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "undefined runtime symbol" in review.summary.lower()
+
+
 def test_validation_repair_relevance_review_allows_python_body_change_with_same_function_signature(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(
