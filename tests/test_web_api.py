@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import time
 import zipfile
 from threading import Event
@@ -837,6 +838,63 @@ def test_stale_failed_session_does_not_turn_completed_on_read(tmp_path):
     assert payload["status"] == "failed"
     assert payload["stop_reason"] == "stale_session"
     assert payload["final_response"].startswith("Der vorherige Lauf wurde nicht sauber abgeschlossen")
+
+
+def test_running_session_with_fresh_active_lease_stays_running_on_read(tmp_path):
+    config = build_test_config(tmp_path, llm_timeout=1)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    session = SessionState(
+        task="lauf laeuft auf anderem worker",
+        workspace_root=str(tmp_path),
+        status="running",
+        workflow_stage="plan",
+        validation_status="not_run",
+    )
+    session.updated_at = "2026-03-29T10:00:00+00:00"
+    app.state.task_manager.session_store.save(session)
+    app.state.task_manager._touch_active_session_lease(session.id)
+
+    response = client.get(f"/api/sessions/{session.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["stop_reason"] is None
+    assert payload["final_response"] is None
+    assert session.id in app.state.task_manager.active_sessions()
+
+
+def test_stale_active_lease_does_not_block_stale_session_detection(tmp_path):
+    config = build_test_config(tmp_path, llm_timeout=1)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    session = SessionState(
+        task="lauf ist wirklich haengen geblieben",
+        workspace_root=str(tmp_path),
+        status="running",
+        workflow_stage="act",
+        validation_status="not_run",
+    )
+    session.updated_at = "2026-03-29T10:00:00+00:00"
+    app.state.task_manager.session_store.save(session)
+
+    lease_path = app.state.task_manager._active_session_lease_path(session.id)
+    lease_path.touch()
+    stale_timestamp = time.time() - (app.state.task_manager._stale_session_threshold_seconds() + 10)
+    os.utime(lease_path, (stale_timestamp, stale_timestamp))
+
+    response = client.get(f"/api/sessions/{session.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["stop_reason"] == "stale_session"
+    assert not lease_path.exists()
 
 
 def test_delete_session_removes_chat_metadata_and_logs(tmp_path):

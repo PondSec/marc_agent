@@ -80,6 +80,8 @@ class TaskManager:
         self.base_config.ensure_state_dirs()
         self.session_store = SessionStore(self.base_config.session_dir_path)
         self.workspace_store = WorkspaceStore(self.base_config.state_root / "workspaces.json")
+        self._active_session_dir = self.base_config.state_root / "active_sessions"
+        self._active_session_dir.mkdir(parents=True, exist_ok=True)
         self._sync_workspace_state_to_base()
         self._lock = Lock()
         self._threads: dict[str, Thread] = {}
@@ -183,6 +185,7 @@ class TaskManager:
             session.append_message("user", prompt)
             session.touch()
             self.session_store.save(session)
+            self._touch_active_session_lease(session.id)
 
             stop_event = Event()
             self._stop_events[session.id] = stop_event
@@ -556,7 +559,7 @@ class TaskManager:
             ]
             for session_id in inactive:
                 self._threads.pop(session_id, None)
-            return sorted(self._threads.keys())
+            return sorted({*self._threads.keys(), *self._fresh_active_session_leases()})
 
     def _run_task_thread(
         self,
@@ -566,7 +569,15 @@ class TaskManager:
         stop_event: Event,
     ) -> None:
         agent = AgentCore(config)
+        heartbeat_stop = Event()
+        heartbeat_thread = Thread(
+            target=self._heartbeat_active_session_lease,
+            args=(session.id, heartbeat_stop),
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
+            self._touch_active_session_lease(session.id)
             agent.run_task(prompt, session=session, should_stop=stop_event.is_set)
         except Exception as exc:
             session.status = "failed"
@@ -583,6 +594,9 @@ class TaskManager:
             )
             agent.session_store.save(session)
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
+            self._clear_active_session_lease(session.id)
             with self._lock:
                 self._threads.pop(session.id, None)
                 self._stop_events.pop(session.id, None)
@@ -706,7 +720,42 @@ class TaskManager:
 
     def _is_active(self, session_id: str) -> bool:
         thread = self._threads.get(session_id)
-        return thread is not None and thread.is_alive()
+        if thread is not None and thread.is_alive():
+            return True
+        return self._active_session_lease_is_fresh(session_id)
+
+    def _active_session_lease_path(self, session_id: str) -> Path:
+        return self._active_session_dir / f"{session_id}.lease"
+
+    def _touch_active_session_lease(self, session_id: str) -> None:
+        path = self._active_session_lease_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    def _clear_active_session_lease(self, session_id: str) -> None:
+        self._active_session_lease_path(session_id).unlink(missing_ok=True)
+
+    def _active_session_lease_is_fresh(self, session_id: str) -> bool:
+        path = self._active_session_lease_path(session_id)
+        if not path.exists():
+            return False
+        age_seconds = (datetime.now(timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)).total_seconds()
+        if age_seconds <= self._stale_session_threshold_seconds():
+            return True
+        path.unlink(missing_ok=True)
+        return False
+
+    def _fresh_active_session_leases(self) -> list[str]:
+        session_ids: list[str] = []
+        for lease in self._active_session_dir.glob("*.lease"):
+            session_id = lease.stem
+            if self._active_session_lease_is_fresh(session_id):
+                session_ids.append(session_id)
+        return session_ids
+
+    def _heartbeat_active_session_lease(self, session_id: str, stop_event: Event) -> None:
+        while not stop_event.wait(15):
+            self._touch_active_session_lease(session_id)
 
     def _resolve_workspace(
         self,
@@ -931,7 +980,10 @@ class TaskManager:
         except ValueError:
             return False
         age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
-        return age_seconds > max(self.base_config.llm_timeout * 3, 90)
+        return age_seconds > self._stale_session_threshold_seconds()
+
+    def _stale_session_threshold_seconds(self) -> int:
+        return max(self.base_config.llm_timeout * 3, 90)
 
     def _transient_workspace(
         self,
