@@ -87,6 +87,28 @@ class WorkspaceUpdateRequest(StrictModel):
     path: str | None = Field(default=None, min_length=1)
 
 
+class TerminalSessionCreateRequest(StrictModel):
+    workspace_id: str | None = None
+    cwd: str | None = Field(default=None, min_length=1)
+
+
+class TerminalSessionInputRequest(StrictModel):
+    data: str = Field(..., min_length=1, max_length=20_000)
+
+
+class TerminalSessionResponse(StrictModel):
+    id: str
+    cwd: str
+    shell: str
+    created_at: str
+    updated_at: str
+    status: Literal["running", "exited"]
+    cursor: int
+    output: str = ""
+    exit_code: int | None = None
+    reset: bool = False
+
+
 class ModelInventory(StrictModel):
     name: str
     size: int | None = None

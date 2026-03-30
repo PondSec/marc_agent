@@ -7,6 +7,7 @@ let modelRefreshHandle = null;
 let authTickerHandle = null;
 let scheduledSessionRefreshHandle = null;
 let scheduledModelRefreshHandle = null;
+let terminalPollHandle = null;
 
 const refreshControllers = {
   sessions: createRefreshController({ baseIntervalMs: 8000, maxIntervalMs: 30000, minGapMs: 1200 }),
@@ -90,6 +91,19 @@ const state = {
     editingWorkspaceId: null,
     workspaceName: "",
     workspacePath: "",
+    terminal: {
+      open: false,
+      starting: false,
+      sessionId: null,
+      cursor: 0,
+      output: "",
+      input: "",
+      cwd: "",
+      shell: "",
+      status: "idle",
+      exitCode: null,
+      error: "",
+    },
     toast: null,
     toastTimer: null,
     chatScroll: {
@@ -340,6 +354,7 @@ function applyAuthState(payload) {
 
 function clearApplicationState({ preserveAuthInputs = false, preserveRoute = false } = {}) {
   disconnectStream();
+  resetTerminalState();
   state.config = null;
   state.health = { ok: false, active_sessions: [] };
   state.models = { installed_models: [], recommended_models: [] };
@@ -360,6 +375,26 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
     state.auth.login.password = "";
     state.auth.login.totpCode = "";
   }
+}
+
+function resetTerminalState() {
+  if (terminalPollHandle) {
+    window.clearTimeout(terminalPollHandle);
+    terminalPollHandle = null;
+  }
+  state.ui.terminal = {
+    open: false,
+    starting: false,
+    sessionId: null,
+    cursor: 0,
+    output: "",
+    input: "",
+    cwd: "",
+    shell: "",
+    status: "idle",
+    exitCode: null,
+    error: "",
+  };
 }
 
 async function refreshHealth() {
@@ -738,6 +773,178 @@ async function deleteWorkspace(workspaceId) {
   }
 }
 
+async function clearWorkspaceContents(workspaceId) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) {
+    return;
+  }
+  if (isWorkspaceBusy(workspaceId)) {
+    showToast("Projekte mit laufenden Threads koennen nicht geleert werden.", "error");
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Den Inhalt von "${workspace.name}" jetzt wirklich auf der Platte loeschen?\n\nDer Projektordner bleibt bestehen, aber alle Dateien und Unterordner darin werden entfernt.`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    await fetchJSON(`/api/workspaces/${workspaceId}/clear`, { method: "POST" });
+    await Promise.all([refreshWorkspaces(), refreshSessions()]);
+    if (state.activeSession?.workspace_id === workspaceId) {
+      clearActiveSession();
+    }
+    renderApp();
+    showToast("Projektordner geleert.", "success");
+  } catch (error) {
+    showToast(`Projektordner konnte nicht geleert werden: ${error.message}`, "error");
+  }
+}
+
+function scheduleTerminalPoll(delayMs = 700) {
+  if (terminalPollHandle) {
+    window.clearTimeout(terminalPollHandle);
+  }
+  if (!state.ui.terminal.open || !state.ui.terminal.sessionId) {
+    terminalPollHandle = null;
+    return;
+  }
+  terminalPollHandle = window.setTimeout(() => {
+    terminalPollHandle = null;
+    pollTerminalSession().catch((error) => {
+      state.ui.terminal.error = error.message;
+      renderApp();
+    });
+  }, delayMs);
+}
+
+async function openTerminalModal() {
+  if (state.ui.terminal.open && state.ui.terminal.sessionId) {
+    renderApp();
+    scheduleTerminalPoll(100);
+    return;
+  }
+  resetTerminalState();
+  state.ui.terminal.open = true;
+  state.ui.terminal.starting = true;
+  renderApp();
+
+  try {
+    const workspaceId = activeWorkspaceId();
+    const payload = await fetchJSON("/api/admin/terminal/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(workspaceId ? { workspace_id: workspaceId } : {}),
+    });
+    state.ui.terminal = {
+      ...state.ui.terminal,
+      open: true,
+      starting: false,
+      sessionId: payload.id,
+      cursor: payload.cursor || 0,
+      output: payload.output || "",
+      cwd: payload.cwd || "",
+      shell: payload.shell || "",
+      status: payload.status || "running",
+      exitCode: payload.exit_code ?? null,
+      error: "",
+    };
+    renderApp();
+    window.requestAnimationFrame(() => {
+      const input = document.getElementById("terminalInput");
+      if (input && typeof input.focus === "function") {
+        input.focus({ preventScroll: true });
+      }
+    });
+    scheduleTerminalPoll(150);
+  } catch (error) {
+    resetTerminalState();
+    showToast(`Terminal konnte nicht gestartet werden: ${error.message}`, "error");
+    renderApp();
+  }
+}
+
+async function closeTerminalModal() {
+  const sessionId = state.ui.terminal.sessionId;
+  resetTerminalState();
+  renderApp();
+  if (!sessionId) {
+    return;
+  }
+  try {
+    await fetchJSON(`/api/admin/terminal/sessions/${sessionId}`, { method: "DELETE" });
+  } catch (error) {
+    showToast(`Terminal konnte nicht sauber beendet werden: ${error.message}`, "error");
+  }
+}
+
+async function pollTerminalSession() {
+  const sessionId = state.ui.terminal.sessionId;
+  if (!state.ui.terminal.open || !sessionId) {
+    return;
+  }
+  const payload = await fetchJSON(`/api/admin/terminal/sessions/${sessionId}?cursor=${state.ui.terminal.cursor}`);
+  state.ui.terminal.cursor = payload.cursor || 0;
+  state.ui.terminal.cwd = payload.cwd || state.ui.terminal.cwd;
+  state.ui.terminal.shell = payload.shell || state.ui.terminal.shell;
+  state.ui.terminal.status = payload.status || state.ui.terminal.status;
+  state.ui.terminal.exitCode = payload.exit_code ?? state.ui.terminal.exitCode;
+  state.ui.terminal.error = "";
+  if (payload.reset) {
+    state.ui.terminal.output = payload.output || "";
+  } else if (payload.output) {
+    state.ui.terminal.output += payload.output;
+  }
+  renderApp();
+  window.requestAnimationFrame(() => {
+    const output = document.getElementById("terminalOutput");
+    if (output && output.parentElement) {
+      output.parentElement.scrollTop = output.parentElement.scrollHeight;
+    }
+  });
+  if (payload.status === "running") {
+    scheduleTerminalPoll(700);
+  }
+}
+
+async function sendTerminalInput() {
+  const sessionId = state.ui.terminal.sessionId;
+  const input = state.ui.terminal.input;
+  if (!sessionId || !input.trim()) {
+    return;
+  }
+  const nextInput = input.endsWith("\n") ? input : `${input}\n`;
+  state.ui.terminal.input = "";
+  renderApp();
+  try {
+    await fetchJSON(`/api/admin/terminal/sessions/${sessionId}/input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: nextInput }),
+    });
+    scheduleTerminalPoll(50);
+  } catch (error) {
+    state.ui.terminal.input = input;
+    showToast(`Terminal-Eingabe fehlgeschlagen: ${error.message}`, "error");
+    renderApp();
+  }
+}
+
+async function interruptTerminalSession() {
+  const sessionId = state.ui.terminal.sessionId;
+  if (!sessionId) {
+    return;
+  }
+  try {
+    await fetchJSON(`/api/admin/terminal/sessions/${sessionId}/interrupt`, { method: "POST" });
+    scheduleTerminalPoll(50);
+  } catch (error) {
+    showToast(`Ctrl+C konnte nicht gesendet werden: ${error.message}`, "error");
+  }
+}
+
 async function stopSession() {
   if (!state.activeSessionId || !isSessionRunning(state.activeSession)) {
     return;
@@ -1011,6 +1218,11 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "clear-workspace-contents") {
+    clearWorkspaceContents(target.dataset.workspaceId);
+    return;
+  }
+
   if (action === "delete-session") {
     deleteSession(target.dataset.sessionId);
     return;
@@ -1018,6 +1230,32 @@ function handleClick(event) {
 
   if (action === "close-workspace-modal") {
     closeWorkspaceModal();
+    return;
+  }
+
+  if (action === "open-terminal-modal") {
+    openTerminalModal();
+    return;
+  }
+
+  if (action === "close-terminal-modal") {
+    closeTerminalModal();
+    return;
+  }
+
+  if (action === "send-terminal-input") {
+    sendTerminalInput();
+    return;
+  }
+
+  if (action === "interrupt-terminal-session") {
+    interruptTerminalSession();
+    return;
+  }
+
+  if (action === "clear-terminal-output") {
+    state.ui.terminal.output = "";
+    renderApp();
     return;
   }
 
@@ -1136,8 +1374,8 @@ function handleInput(event) {
     state.ui.workspaceName = event.target.value;
     return;
   }
-  if (event.target.id === "workspacePathInput") {
-    state.ui.workspacePath = event.target.value;
+  if (event.target.id === "terminalInput") {
+    state.ui.terminal.input = event.target.value;
   }
 }
 
@@ -1197,6 +1435,10 @@ function handleKeydown(event) {
     }
   }
   if (event.key === "Escape") {
+    if (state.ui.terminal.open) {
+      closeTerminalModal();
+      return;
+    }
     if (state.ui.workspaceModalOpen) {
       closeWorkspaceModal();
       return;
@@ -1210,6 +1452,10 @@ function handleKeydown(event) {
       state.setup.error = "";
       renderApp();
     }
+  }
+  if (event.key === "Enter" && !event.shiftKey && event.target.id === "terminalInput") {
+    event.preventDefault();
+    sendTerminalInput();
   }
 }
 
@@ -1227,6 +1473,31 @@ function handlePopState() {
     disconnectStream();
     renderApp();
   }
+}
+
+function normalizeWorkspaceFolderName(value) {
+  const text = String(value || "")
+    .trim()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const slug = text
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-_.]+|[-_.]+$/g, "");
+  return slug || "projekt";
+}
+
+function derivedWorkspacePath(name, { keepExisting = false } = {}) {
+  if (keepExisting && state.ui.workspacePath) {
+    return state.ui.workspacePath;
+  }
+  const workspaceRoot = String(state.config?.workspace_root || "").trim().replace(/\/+$/g, "");
+  const folderName = normalizeWorkspaceFolderName(name);
+  if (!workspaceRoot) {
+    return folderName;
+  }
+  return `${workspaceRoot}/${folderName}`;
 }
 
 function openWorkspaceModal(mode, workspaceId = null) {
@@ -1267,9 +1538,9 @@ function closeSettingsPage() {
 
 async function saveWorkspace() {
   const name = state.ui.workspaceName.trim();
-  const path = state.ui.workspacePath.trim();
+  const path = derivedWorkspacePath(name, { keepExisting: state.ui.workspaceMode === "edit" });
   if (!name || !path) {
-    showToast("Name und Pfad werden beide benoetigt.", "error");
+    showToast("Bitte gib mindestens einen Ordnernamen an.", "error");
     return;
   }
 
@@ -1326,6 +1597,7 @@ function renderApp() {
     ? `
         ${renderSettingsPage()}
         ${renderWorkspaceModal()}
+        ${renderTerminalModal()}
         ${renderToast()}
       `
     : `
@@ -1340,6 +1612,7 @@ function renderApp() {
           </main>
         </div>
         ${renderWorkspaceModal()}
+        ${renderTerminalModal()}
         ${renderToast()}
       `;
   if (!settingsPage) {
@@ -1926,6 +2199,21 @@ function renderSidebarProject(workspace) {
             ${icon("edit")}
           </button>
           <button
+            class="workspace-action warning-button"
+            type="button"
+            data-action="clear-workspace-contents"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projektordner leeren"
+            title="${escapeAttribute(
+              disabled
+                ? "Projekt kann erst geleert werden, wenn keine Threads mehr laufen."
+                : "Dateien und Unterordner auf der Platte loeschen, Projekt behalten",
+            )}"
+            ${disabled ? "disabled" : ""}
+          >
+            ${icon("broom")}
+          </button>
+          <button
             class="workspace-action danger-button"
             type="button"
             data-action="delete-workspace"
@@ -2108,6 +2396,21 @@ function renderWorkspaceItem(workspace) {
           aria-label="Projekt bearbeiten"
         >
           ${icon("edit")}
+        </button>
+        <button
+          class="workspace-action warning-button"
+          type="button"
+          data-action="clear-workspace-contents"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+          aria-label="Projektordner leeren"
+          title="${escapeAttribute(
+            disabled
+              ? "Projekt kann erst geleert werden, wenn keine Threads mehr laufen."
+              : "Dateien und Unterordner auf der Platte loeschen, Projekt behalten",
+          )}"
+          ${disabled ? "disabled" : ""}
+        >
+          ${icon("broom")}
         </button>
         <button
           class="workspace-action danger-button"
@@ -2979,6 +3282,7 @@ function renderSettingsPage() {
   const config = state.config || {};
   const currentWorkspace = workspaceForSession(state.activeSession) || selectedWorkspace();
   const installedModels = Array.isArray(state.models?.installed_models) ? state.models.installed_models : [];
+  const canOpenTerminal = state.auth.user?.role === "admin";
   return `
     <main class="settings-page">
       <div class="settings-page-inner">
@@ -3000,6 +3304,16 @@ function renderSettingsPage() {
             <button class="button-secondary" type="button" data-action="open-workspace-modal">
               Projekt anlegen
             </button>
+            ${
+              canOpenTerminal
+                ? `
+                  <button class="button-ghost settings-action-with-icon" type="button" data-action="open-terminal-modal">
+                    ${icon("terminal")}
+                    <span>Server-Terminal</span>
+                  </button>
+                `
+                : ""
+            }
             <button class="button-ghost" type="button" data-action="ensure-models">
               Modelle aktualisieren
             </button>
@@ -3137,6 +3451,33 @@ function renderSettingsPage() {
                 ${renderSettingsInfoCard("Public Base URL", config.public_base_url || "Nicht gesetzt", "Optional fuer Reverse Proxy / externe URL")}
               </div>
             </section>
+            ${
+              canOpenTerminal
+                ? `
+                  <section class="surface-panel settings-page-panel">
+                    <div class="settings-panel-head">
+                      <div>
+                        <p class="panel-kicker">Server</p>
+                        <h3>Remote-Terminal</h3>
+                      </div>
+                      <button class="button-secondary settings-action-with-icon" type="button" data-action="open-terminal-modal">
+                        ${icon("terminal")}
+                        <span>${state.ui.terminal.open ? "Terminal offen" : "Terminal starten"}</span>
+                      </button>
+                    </div>
+                    <p class="settings-panel-copy">
+                      Direkter Shell-Zugriff auf den Server fuer Wartung, Hotfixes und Agent-Debugging unterwegs.
+                    </p>
+                    <div class="settings-info-grid">
+                      ${renderSettingsInfoCard("Startpfad", state.ui.terminal.cwd || currentWorkspace?.path || config.workspace_root || "-", "Neue Sessions starten im aktiven Projekt oder im Workspace-Root")}
+                      ${renderSettingsInfoCard("Shell", state.ui.terminal.shell || "-", "Interaktive Shell des laufenden Server-Users")}
+                      ${renderSettingsInfoCard("Status", state.ui.terminal.status === "running" ? "Verbunden" : state.ui.terminal.status === "exited" ? "Beendet" : "Bereit", "Nur fuer angemeldete Admins sichtbar")}
+                      ${renderSettingsInfoCard("Rolle", state.auth.user?.role || "-", "Admin-only Zugriff")}
+                    </div>
+                  </section>
+                `
+                : ""
+            }
           </div>
         </div>
       </div>
@@ -3167,6 +3508,7 @@ function renderWorkspaceModal() {
   }
 
   const edit = state.ui.workspaceMode === "edit";
+  const derivedPath = derivedWorkspacePath(state.ui.workspaceName, { keepExisting: edit });
   return `
     <div class="modal-backdrop" data-action="close-workspace-modal"></div>
     <div class="modal-layer">
@@ -3182,18 +3524,100 @@ function renderWorkspaceModal() {
         </header>
         <div class="modal-body">
           <label class="modal-field">
-            <span>Name</span>
+            <span>${edit ? "Projektname" : "Ordnername"}</span>
             <input id="workspaceNameInput" type="text" placeholder="z. B. agent_ai" value="${escapeAttribute(state.ui.workspaceName)}" />
+            <small>${edit ? "Der bestehende Projektordner bleibt erhalten, nur der Anzeigename aendert sich." : "Der Ordner wird automatisch unter dem konfigurierten Workspace-Root angelegt."}</small>
           </label>
-          <label class="modal-field">
-            <span>Ordnerpfad</span>
-            <input id="workspacePathInput" type="text" placeholder="/Users/.../projekt" value="${escapeAttribute(state.ui.workspacePath)}" />
-          </label>
-          <p class="modal-note">Der Projektpfad wird in dieser Browser-Oberflaeche direkt als lokaler Ordnerpfad eingetragen.</p>
+          <div class="modal-preview-card">
+            <span>Projektpfad</span>
+            <strong>${escapeHtml(derivedPath || "-")}</strong>
+            <small>${edit ? "Dieser Pfad bleibt fuer das bestehende Projekt fixiert." : `Automatisch aus Workspace Root und dem sicheren Ordnernamen "${normalizeWorkspaceFolderName(state.ui.workspaceName)}" erzeugt.`}</small>
+          </div>
+          <p class="modal-note">Die WebUI nimmt nur noch den Ordnernamen entgegen. Den vollen Serverpfad setzt das System selbst.</p>
         </div>
         <footer class="modal-actions">
           <button class="button-secondary" type="button" data-action="close-workspace-modal">Abbrechen</button>
           <button class="button-primary" type="button" data-action="save-workspace">${edit ? "Speichern" : "Anlegen"}</button>
+        </footer>
+      </section>
+    </div>
+  `;
+}
+
+function renderTerminalModal() {
+  if (!state.ui.terminal.open) {
+    return "";
+  }
+
+  const terminal = state.ui.terminal;
+  const statusLabel =
+    terminal.status === "running"
+      ? "Verbunden"
+      : terminal.status === "exited"
+        ? terminal.exitCode === 0
+          ? "Beendet"
+          : `Beendet (${terminal.exitCode})`
+        : terminal.starting
+          ? "Wird gestartet"
+          : "Bereit";
+
+  return `
+    <div class="modal-backdrop" data-action="close-terminal-modal"></div>
+    <div class="modal-layer modal-layer-wide">
+      <section class="modal-card terminal-modal">
+        <header class="modal-head">
+          <div>
+            <p class="modal-kicker">Server-Terminal</p>
+            <h3>Direkter Shell-Zugriff</h3>
+          </div>
+          <div class="terminal-head-actions">
+            ${renderStatusBadge(statusLabel, terminal.status === "running" ? "success" : terminal.error ? "danger" : "muted", {
+              compact: true,
+            })}
+            <button class="icon-button modal-close" type="button" data-action="close-terminal-modal" aria-label="Schliessen">
+              <span class="modal-close-glyph" aria-hidden="true">X</span>
+            </button>
+          </div>
+        </header>
+        <div class="modal-body terminal-modal-body">
+          <div class="terminal-meta-row">
+            <div class="modal-preview-card terminal-meta-card">
+              <span>Aktiver Pfad</span>
+              <strong>${escapeHtml(terminal.cwd || state.config?.workspace_root || "-")}</strong>
+              <small>${escapeHtml(terminal.shell || "Shell wird gestartet...")}</small>
+            </div>
+            <div class="terminal-toolbar">
+              <button class="button-ghost settings-action-with-icon" type="button" data-action="clear-terminal-output">
+                ${icon("broom")}
+                <span>Ansicht leeren</span>
+              </button>
+              <button class="button-ghost settings-action-with-icon" type="button" data-action="interrupt-terminal-session" ${terminal.sessionId ? "" : "disabled"}>
+                ${icon("stop")}
+                <span>Ctrl+C</span>
+              </button>
+            </div>
+          </div>
+          <div class="terminal-output-shell">
+            <pre class="terminal-output" id="terminalOutput">${escapeHtml(terminal.output || (terminal.starting ? "Terminal wird gestartet ..." : ""))}</pre>
+          </div>
+          <label class="modal-field">
+            <span>Befehl oder Shell-Input</span>
+            <textarea
+              id="terminalInput"
+              class="terminal-input"
+              rows="3"
+              placeholder="z. B. systemctl status marc-a1.service"
+            >${escapeHtml(terminal.input)}</textarea>
+            <small>Enter sendet direkt an die Shell. Fuer neue Zeilen kannst du Text mit Zeilenumbruechen einfuegen und dann senden.</small>
+          </label>
+          ${terminal.error ? `<p class="modal-note terminal-error">${escapeHtml(terminal.error)}</p>` : ""}
+        </div>
+        <footer class="modal-actions">
+          <button class="button-secondary" type="button" data-action="close-terminal-modal">Schliessen</button>
+          <button class="button-primary settings-action-with-icon" type="button" data-action="send-terminal-input" ${terminal.sessionId ? "" : "disabled"}>
+            ${icon("arrow")}
+            <span>Eingabe senden</span>
+          </button>
         </footer>
       </section>
     </div>
@@ -5740,6 +6164,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>',
     trash:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5.5 6.5h9M8 6.5V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M7 8.5v6M10 8.5v6M13 8.5v6M6.5 6.5l.6 9a1.8 1.8 0 0 0 1.8 1.5h2.2a1.8 1.8 0 0 0 1.8-1.5l.6-9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
+    broom:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M11.8 3.7 16.3 8.2M10.2 5.3 14.7 9.8M8.7 6.8l4.5 4.5M5.7 9.8l4.5 4.5M4.4 11.1c2.4-.1 4.5.8 6.2 2.6l1.6 1.6c.4.4.4 1 0 1.4l-.6.6c-.4.4-1 .4-1.4 0l-1.6-1.6c-1.8-1.8-2.7-3.9-2.6-6.2z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.4"/></svg>',
     "git-push":
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 14.5h8a2 2 0 0 0 2-2V9.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><path d="M10 12.5V4.5M6.8 7.7 10 4.5l3.2 3.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
     download:
@@ -5754,6 +6180,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><circle cx="8.5" cy="8.5" r="4.8" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m12.2 12.2 3.6 3.6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.6"/></svg>',
     spark:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M10 3.5 11.8 8.2 16.5 10l-4.7 1.8L10 16.5l-1.8-4.7L3.5 10l4.7-1.8z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
+    terminal:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M3.5 5.5h13v9h-13z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/><path d="m6 8 2 2-2 2M9.8 12h4.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
   };
   return icons[name] || icons.spark;
 }

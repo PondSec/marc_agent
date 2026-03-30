@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import time
 import zipfile
 from threading import Event
@@ -976,6 +977,81 @@ def test_delete_workspace_removes_workspace_and_associated_chats(tmp_path):
     sessions_response = client.get("/api/sessions")
     assert sessions_response.status_code == 200
     assert sessions_response.json() == []
+
+
+def test_clear_workspace_contents_removes_files_but_keeps_workspace(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    nested_dir = workspace_root / "src"
+    nested_dir.mkdir()
+    (nested_dir / "main.py").write_text("print('ready')\n", encoding="utf-8")
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+
+    response = client.post(f"/api/workspaces/{workspace['id']}/clear")
+
+    assert response.status_code == 204
+    workspaces_response = client.get("/api/workspaces")
+    assert workspaces_response.status_code == 200
+    assert workspaces_response.json()[0]["id"] == workspace["id"]
+    assert workspace_root.exists()
+    assert list(workspace_root.iterdir()) == []
+
+
+def test_admin_terminal_session_executes_command(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+
+    create_response = client.post("/api/admin/terminal/sessions", json={"workspace_id": workspace["id"]})
+
+    assert create_response.status_code == 201
+    payload = create_response.json()
+    session_id = payload["id"]
+    cursor = payload["cursor"]
+
+    write_response = client.post(
+        f"/api/admin/terminal/sessions/{session_id}/input",
+        json={"data": "printf 'terminal-ok\\n'\n"},
+    )
+    assert write_response.status_code == 200
+
+    collected = payload.get("output", "")
+    deadline = time.time() + 5
+    while time.time() < deadline and "terminal-ok" not in collected:
+        read_response = client.get(f"/api/admin/terminal/sessions/{session_id}?cursor={cursor}")
+        assert read_response.status_code == 200
+        read_payload = read_response.json()
+        cursor = read_payload["cursor"]
+        collected += read_payload.get("output", "")
+        if "terminal-ok" in collected:
+            break
+        time.sleep(0.1)
+
+    assert "terminal-ok" in collected
+    close_response = client.delete(f"/api/admin/terminal/sessions/{session_id}")
+    assert close_response.status_code == 204
+
+
+def test_admin_terminal_requires_admin_role(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    with sqlite3.connect(config.auth_db_path) as connection:
+        connection.execute("UPDATE users SET role = 'member' WHERE email = ?", (TEST_ADMIN_EMAIL,))
+        connection.commit()
+
+    response = client.post("/api/admin/terminal/sessions", json={})
+
+    assert response.status_code == 403
 
 
 def test_session_handoff_download_contains_changed_files_and_metadata(tmp_path):
