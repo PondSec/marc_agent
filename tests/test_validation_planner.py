@@ -556,6 +556,77 @@ def test_validation_planner_repair_brief_tracks_recent_failed_attempts_for_same_
     assert updated.repair_brief.recent_failed_attempts[0].result == "no_effective_change"
 
 
+def test_validation_planner_prioritizes_absolute_workspace_script_path_from_called_process_error(tmp_path):
+    planner = ValidationPlanner()
+    package_dir = tmp_path / "wordaudit"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from .report import duplicate_words\n", encoding="utf-8")
+    (package_dir / "report.py").write_text("def duplicate_words(lines):\n    return []\n", encoding="utf-8")
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "build_duplicates.py").write_text(
+        "from wordaudit import duplicate_words\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_report.py"
+    test_path.write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the wordaudit runtime flow.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn=(
+                "Refactor the existing wordaudit workflow so comment lines are ignored by both "
+                "the library and scripts/build_duplicates.py."
+            ),
+            root_goal="Repair the wordaudit runtime flow.",
+            active_goal="Repair the runtime flow.",
+            goal_relation="new_task",
+            output_expectation="Working library and script behavior with validation.",
+            verification_target="python -m unittest tests.test_report",
+            next_action="modify",
+            target_artifacts=[
+                {"path": "wordaudit/report.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "scripts/build_duplicates.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_report.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="wordaudit/report.py", operation="modify"))
+    session.changed_files.append(FileChangeRecord(path="scripts/build_duplicates.py", operation="modify"))
+
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_report",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            ".E\n"
+            "======================================================================\n"
+            f'ERROR: test_script_output_ignores_comment_lines ({test_path})\n'
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 22, in test_script_output_ignores_comment_lines\n'
+            "    result = subprocess.run(..., check=True)\n"
+            "subprocess.CalledProcessError: "
+            f"Command '['/usr/bin/python3', '{scripts_dir / 'build_duplicates.py'}', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "scripts/build_duplicates.py"
+    assert evidence.file_hints[0] == "scripts/build_duplicates.py"
+    assert evidence.repair_brief.primary_target == "scripts/build_duplicates.py"
+    assert "wordaudit/report.py" in evidence.artifact_paths
+
+
 def test_validation_planner_ignores_separator_noise_in_assertion_semantics(tmp_path):
     planner = ValidationPlanner()
     pkg = tmp_path / "greet_cli"

@@ -160,6 +160,7 @@ class ValidationPlanner:
     MISSING_REF_PATTERN = re.compile(r"(?P<path>[\w./\\-]+\.(?:html|htm))\s*->\s*(?P<ref>[^\s]+)")
     FAILURE_EVIDENCE_LINE_MARKERS = (
         "assertionerror",
+        "calledprocesserror",
         "traceback",
         "missing expected",
         "missing dom ids",
@@ -1521,9 +1522,12 @@ class ValidationPlanner:
             normalized = str(raw_path or "").strip().replace("\\", "/").removeprefix("./")
             if not normalized:
                 return
-            if normalized.startswith("/") or normalized.startswith("../") or "/../" in f"/{normalized}":
-                return
-            candidate = (workspace_root / normalized).resolve()
+            if normalized.startswith("/"):
+                candidate = Path(normalized).expanduser().resolve()
+            else:
+                if normalized.startswith("../") or "/../" in f"/{normalized}":
+                    return
+                candidate = (workspace_root / normalized).resolve()
             if require_exists and not candidate.exists():
                 return
             try:
@@ -1540,6 +1544,11 @@ class ValidationPlanner:
                 str(match.group("path") or ""),
                 require_exists=require_existing_bare_refs,
             )
+        for raw_token in str(text or "").split():
+            token = str(raw_token or "").strip().strip("\"'`,;:()[]{}")
+            if not token.startswith("/") or not Path(token).suffix:
+                continue
+            add_candidate(token, require_exists=False)
         return referenced_paths
 
     def _evidence_lines_from_text(self, text: str) -> list[str]:
