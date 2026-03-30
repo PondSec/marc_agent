@@ -374,6 +374,68 @@ def test_validation_planner_prefers_test_target_for_runtime_harness_nameerror(tm
     assert "wordfreq/__main__.py" in evidence.artifact_paths
 
 
+def test_validation_planner_builds_undefined_symbol_semantics_for_runtime_failure(tmp_path):
+    planner = ValidationPlanner()
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_wordfreq.py").write_text(
+        "import unittest\n"
+        "from wordfreq.cli import read_text\n\n"
+        "class TestWordFreq(unittest.TestCase):\n"
+        "    def test_read_text_stdin(self):\n"
+        "        import io\n"
+        "        sys.stdin = io.StringIO('hello world hello')\n",
+        encoding="utf-8",
+    )
+    pkg = tmp_path / "wordfreq"
+    pkg.mkdir()
+    (pkg / "cli.py").write_text("def read_text(source):\n    return source\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the failing stdin test for wordfreq.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            important_files=["tests/test_wordfreq.py", "wordfreq/cli.py"],
+            test_files=["tests/test_wordfreq.py"],
+        ),
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_wordfreq",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "ERROR: test_read_text_stdin (tests.test_wordfreq.TestWordFreq.test_read_text_stdin)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_wordfreq.py"}", line 6, in test_read_text_stdin\n'
+            "    sys.stdin = io.StringIO('hello world hello')\n"
+            "NameError: name 'sys' is not defined. Did you forget to import 'sys'?\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "tests/test_wordfreq.py"
+    assert evidence.repair_brief.implicated_symbols[0] == "sys"
+    assert any(
+        "The symbol 'sys' should be bound or imported before it is used." == item
+        for item in evidence.repair_brief.expected_semantics
+    )
+    assert any(
+        "The current runtime path uses 'sys' before it is bound or imported." in item
+        for item in evidence.repair_brief.observed_semantics
+    )
+    assert any(
+        "Bind or import 'sys' before its failing use in tests/test_wordfreq.py" in item
+        for item in evidence.repair_requirements
+    )
+
+
 def test_validation_planner_builds_repair_brief_with_semantics_and_stable_signature(tmp_path):
     planner = ValidationPlanner()
     pkg = tmp_path / "greet_cli"
