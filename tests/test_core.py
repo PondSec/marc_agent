@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from agent.core import AgentCore
+from agent.layered_memory import AgentMemoryStore
+from agent.memory import RepoMemoryStore
 from agent.models import FileChangeRecord, SessionState, ValidationCommand, ValidationRunRecord
 from agent.task_state import TaskState
 from config.settings import AppConfig
@@ -23,6 +25,27 @@ def test_core_marks_unvalidated_changed_files_as_partial(tmp_path):
 
     assert status == "partial"
     assert stop_reason == "validation_missing"
+
+
+def test_core_uses_a2_memory_profile_by_default(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+
+    assert isinstance(core._build_memory_store(), AgentMemoryStore)
+
+
+def test_core_can_switch_back_to_a1_memory_profile(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Inspect the repo",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a1"},
+    )
+
+    assert isinstance(core._build_memory_store(session), RepoMemoryStore)
 
 
 def test_core_requires_semantic_review_before_marking_changed_run_complete(tmp_path):

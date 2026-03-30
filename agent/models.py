@@ -21,6 +21,14 @@ AgentPhase = Literal[
     "blocked",
     "completed",
 ]
+MemoryType = Literal["working", "episodic", "project", "failure", "conversation"]
+MemoryUseCase = Literal[
+    "task_continuation",
+    "repair_assistance",
+    "similar_task_lookup",
+    "project_context",
+    "user_recall",
+]
 ValidationStatus = Literal["not_run", "passed", "failed", "blocked"]
 WorkflowStage = Literal[
     "discover",
@@ -193,6 +201,195 @@ class FollowUpContext(StrictModel):
     last_error: str | None = None
 
 
+class MemoryProvenance(StrictModel):
+    source_type: Literal[
+        "session",
+        "workspace_snapshot",
+        "validation",
+        "diagnostic",
+        "repair",
+        "conversation",
+        "report",
+    ] = "session"
+    session_id: str | None = None
+    project_id: str | None = None
+    workspace_root: str | None = None
+    detail: str | None = None
+    file_paths: list[str] = Field(default_factory=list)
+    command: str | None = None
+    created_at: str = Field(default_factory=utc_now)
+
+
+class MemorySummary(StrictModel):
+    title: str
+    summary: str
+    key_points: list[str] = Field(default_factory=list)
+    why_relevant: str | None = None
+
+
+class MemoryEntryBase(StrictModel):
+    id: str = Field(default_factory=lambda: uuid4().hex[:16])
+    memory_type: MemoryType
+    project_id: str | None = None
+    workspace_root: str | None = None
+    session_id: str | None = None
+    summary: MemorySummary
+    provenance: MemoryProvenance
+    tags: list[str] = Field(default_factory=list)
+    file_paths: list[str] = Field(default_factory=list)
+    symbol_names: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+    last_accessed_at: str | None = None
+    importance: float = 0.5
+    confidence: float = 0.5
+    dedupe_key: str | None = None
+    duplicate_count: int = 0
+    retention: Literal["transient", "short", "medium", "long"] = "short"
+    ttl_days: int | None = None
+
+
+class WorkingMemoryEntry(MemoryEntryBase):
+    memory_type: Literal["working"] = "working"
+    current_goal: str | None = None
+    current_subtask: str | None = None
+    primary_target: str | None = None
+    verification_target: str | None = None
+    active_constraints: list[str] = Field(default_factory=list)
+    active_failure_signature: str | None = None
+    recent_attempts: list[str] = Field(default_factory=list)
+    recent_successes: list[str] = Field(default_factory=list)
+    recent_failures: list[str] = Field(default_factory=list)
+    relevant_files: list[str] = Field(default_factory=list)
+    relevant_symbols: list[str] = Field(default_factory=list)
+    last_effective_strategy: str | None = None
+    last_ineffective_strategy: str | None = None
+    compact_state_summary: str = ""
+
+
+class EpisodicMemoryEntry(MemoryEntryBase):
+    memory_type: Literal["episodic"] = "episodic"
+    problem_type: str | None = None
+    strategy_used: list[str] = Field(default_factory=list)
+    result: Literal["completed", "partial", "failed", "blocked"] = "completed"
+    what_worked: list[str] = Field(default_factory=list)
+    what_failed: list[str] = Field(default_factory=list)
+    important_constraints: list[str] = Field(default_factory=list)
+    final_outcome: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    failure_signatures: list[str] = Field(default_factory=list)
+
+
+class ProjectMemoryEntry(MemoryEntryBase):
+    memory_type: Literal["project"] = "project"
+    repo_summary: str = ""
+    module_roles: dict[str, str] = Field(default_factory=dict)
+    entrypoints: list[str] = Field(default_factory=list)
+    common_file_relationships: list[str] = Field(default_factory=list)
+    test_mappings: list[str] = Field(default_factory=list)
+    architecture_notes: list[str] = Field(default_factory=list)
+    known_hotspots: list[str] = Field(default_factory=list)
+    conventions: list[str] = Field(default_factory=list)
+    workflow_hints: list[str] = Field(default_factory=list)
+    subsystem_summaries: dict[str, str] = Field(default_factory=dict)
+
+
+class FailureMemoryEntry(MemoryEntryBase):
+    memory_type: Literal["failure"] = "failure"
+    failure_signature: str
+    expected_semantics: list[str] = Field(default_factory=list)
+    observed_semantics: list[str] = Field(default_factory=list)
+    chosen_targets: list[str] = Field(default_factory=list)
+    tried_strategies: list[str] = Field(default_factory=list)
+    successful_repair_patterns: list[str] = Field(default_factory=list)
+    bad_retry_patterns: list[str] = Field(default_factory=list)
+    review_rejection_reasons: list[str] = Field(default_factory=list)
+    no_effective_change_count: int = 0
+    last_result: str | None = None
+
+
+class ConversationMemoryEntry(MemoryEntryBase):
+    memory_type: Literal["conversation"] = "conversation"
+    request_summary: str
+    delivered_summary: str | None = None
+    projects_touched: list[str] = Field(default_factory=list)
+    decision_notes: list[str] = Field(default_factory=list)
+    implemented_features: list[str] = Field(default_factory=list)
+    referenced_sessions: list[str] = Field(default_factory=list)
+
+
+class RetrievedMemoryItem(StrictModel):
+    entry_id: str
+    memory_type: MemoryType
+    project_id: str | None = None
+    session_id: str | None = None
+    entry: (
+        WorkingMemoryEntry
+        | EpisodicMemoryEntry
+        | ProjectMemoryEntry
+        | FailureMemoryEntry
+        | ConversationMemoryEntry
+        | None
+    ) = None
+    summary: MemorySummary
+    provenance: MemoryProvenance
+    file_paths: list[str] = Field(default_factory=list)
+    symbol_names: list[str] = Field(default_factory=list)
+    failure_signature: str | None = None
+    score: float = 0.0
+    similarity: float = 0.0
+    recency: float = 0.0
+    project_relevance: float = 0.0
+    failure_relevance: float = 0.0
+    exact_entity_relevance: float = 0.0
+    confidence: float = 0.0
+    duplicate_count: int = 0
+    is_stale: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class RetrievalRequest(StrictModel):
+    query: str
+    use_case: MemoryUseCase = "task_continuation"
+    project_id: str | None = None
+    workspace_root: str | None = None
+    session_id: str | None = None
+    target_paths: list[str] = Field(default_factory=list)
+    symbol_names: list[str] = Field(default_factory=list)
+    failure_signature: str | None = None
+    current_goal: str | None = None
+    current_subtask: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    include_types: list[MemoryType] = Field(
+        default_factory=lambda: ["episodic", "project", "failure", "conversation"]
+    )
+    max_hits: int = 6
+    max_per_type: int = 2
+    summary_budget_chars: int = 900
+    allow_cross_project: bool = False
+
+
+MemoryQuery = RetrievalRequest
+
+
+class MemoryRetrievalResult(StrictModel):
+    request: RetrievalRequest
+    selected: list[RetrievedMemoryItem] = Field(default_factory=list)
+    summary: str = ""
+    recall_brief: str = ""
+    suggested_files: list[str] = Field(default_factory=list)
+    related_sessions: list[str] = Field(default_factory=list)
+    related_projects: list[str] = Field(default_factory=list)
+    total_candidates: int = 0
+    total_hits: int = 0
+    hit_count_by_type: dict[str, int] = Field(default_factory=dict)
+    latency_ms: float = 0.0
+    prompt_char_cost: int = 0
+    duplicate_rate: float = 0.0
+    stale_recall_rate: float = 0.0
+    useful_recall_rate: float = 0.0
+
+
 class SessionReport(StrictModel):
     summary: str
     status: str
@@ -273,6 +470,7 @@ class SessionState(StrictModel):
     title: str | None = None
     status: Literal["queued", "running", "completed", "failed", "partial"] = "running"
     workspace_root: str
+    project_id: str | None = None
     workspace_id: str | None = None
     workspace_label: str | None = None
     access_mode: str = "approval"
@@ -307,6 +505,8 @@ class SessionState(StrictModel):
     runtime_executions: list[dict[str, Any]] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     follow_up_context: FollowUpContext | None = None
+    working_memory: WorkingMemoryEntry | None = None
+    memory_context: MemoryRetrievalResult | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
     runtime_options: dict[str, Any] = Field(default_factory=dict)
     stop_requested: bool = False

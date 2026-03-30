@@ -440,19 +440,14 @@ class AppConfig:
         data["router_preferred_model_name"] = self.router_model_name
         data["agent_profiles"] = [
             {
-                "id": "core",
-                "label": "MARC A1 Core",
-                "description": "Allround-Run fuer neue Features, Refactors und Analysen.",
+                "id": "a2",
+                "label": "MARC A2 Memory",
+                "description": "Mehrschichtiges Memory fuer Cross-Run-Recall, Repair-Muster und Repo-Kontext.",
             },
             {
-                "id": "review",
-                "label": "Code Review",
-                "description": "Fokus auf Risiken, Regressionen und Validierung.",
-            },
-            {
-                "id": "repair",
-                "label": "Repair Loop",
-                "description": "Fehler beheben, Checks erneut ausfuehren und stabilisieren.",
+                "id": "a1",
+                "label": "MARC A1 Classic",
+                "description": "Leichter Legacy-Pfad ohne das neue Layered-Memory-System.",
             },
         ]
         data["execution_profiles"] = [

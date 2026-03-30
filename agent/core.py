@@ -5,6 +5,7 @@ from typing import Callable, Iterable
 
 from agent.diagnostics import FailureAnalyzer
 from agent.executor import Executor
+from agent.layered_memory import AgentMemoryStore
 from agent.memory import RepoMemoryStore
 from agent.models import (
     DiagnosticRecord,
@@ -56,7 +57,7 @@ class AgentCore:
             allow_outside_root=config.full_access,
         )
         self.safety = SafetyManager(config, self.workspace)
-        self.memory = RepoMemoryStore(config, self.workspace)
+        self.memory = self._build_memory_store()
         self.session_store = SessionStore(config.session_dir_path)
         self.failure_analyzer = FailureAnalyzer(
             self.workspace,
@@ -85,6 +86,8 @@ class AgentCore:
             session.task = task
         session.status = "running"
         session.access_mode = self.config.access_mode
+        self.memory = self._build_memory_store(session)
+        session.project_id = session.project_id or getattr(self.memory, "project_id", None)
         session.runtime_options = self._runtime_options()
         session.touch()
 
@@ -101,10 +104,13 @@ class AgentCore:
 
         if session.workspace_snapshot is None:
             session.workspace_snapshot = self.memory.build_snapshot(task)
+        self._refresh_memory_session(task, session)
         if not session.plan:
             self._initialize_session(task, session, planner)
+            self._refresh_memory_session(task, session)
         else:
             self._refresh_session_context(task, session)
+            self._refresh_memory_session(task, session)
         self.session_store.save(session)
 
         logger.log_event(
@@ -184,6 +190,7 @@ class AgentCore:
             self._add_diagnostics(session, result)
             self._update_session_after_result(task, session, decision, result)
             self._advance_plan(session, result)
+            self._refresh_memory_session(task, session)
             session.touch()
             self.session_store.save(session)
 
@@ -201,6 +208,8 @@ class AgentCore:
             draft_response=final_response,
         )
         session.append_message("assistant", session.final_response)
+        self._refresh_memory_session(task, session)
+        self._persist_memory_session(session)
 
         if session.status == "completed":
             session.current_phase = "completed"
@@ -326,6 +335,7 @@ class AgentCore:
             )
         candidate_files = [
             *session.candidate_files,
+            *self._memory_guided_candidate_files(session),
             *task_state_files,
             *understanding_files,
             *follow_up_files,
@@ -354,6 +364,46 @@ class AgentCore:
                 "Changes were validated with the project-aware command plan or blocked with a clear reason.",
                 "Final output includes changed files, commands, diagnostics, and stop reason.",
             ]
+
+    def _build_memory_store(self, session: SessionState | None = None):
+        profile = self._agent_profile(session)
+        if profile == "a1":
+            return RepoMemoryStore(self.config, self.workspace)
+        return AgentMemoryStore(self.config, self.workspace)
+
+    def _agent_profile(self, session: SessionState | None = None) -> str:
+        runtime_options = getattr(session, "runtime_options", {}) or {}
+        raw = str(runtime_options.get("agent_profile") or "").strip().lower()
+        if raw == "a1":
+            return "a1"
+        return "a2"
+
+    def _memory_guided_candidate_files(self, session: SessionState) -> list[str]:
+        memory_context = getattr(session, "memory_context", None)
+        if memory_context is None:
+            return []
+        candidates: list[str] = []
+        candidates.extend(memory_context.suggested_files[:8])
+        for item in memory_context.selected:
+            candidates.extend(item.file_paths[:6])
+            entry = item.entry
+            if entry is None:
+                continue
+            candidates.extend(list(getattr(entry, "chosen_targets", []) or [])[:6])
+            candidates.extend(list(getattr(entry, "changed_files", []) or [])[:4])
+            candidates.extend(list(getattr(entry, "known_hotspots", []) or [])[:4])
+        return self._unique(candidates)
+
+    def _refresh_memory_session(self, task: str, session: SessionState) -> None:
+        if hasattr(self.memory, "refresh_session_memory"):
+            self.memory.refresh_session_memory(task, session)
+            return
+        session.working_memory = None
+        session.memory_context = None
+
+    def _persist_memory_session(self, session: SessionState) -> None:
+        if hasattr(self.memory, "persist_session_memory"):
+            self.memory.persist_session_memory(session)
 
     def _append_note(self, session: SessionState, result) -> None:
         if result.data.get("snapshot"):

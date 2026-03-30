@@ -331,6 +331,13 @@ class Planner:
                 route.direct_response,
             )
 
+        memory_recall_response = self._memory_recall_response(route, session)
+        if memory_recall_response is not None and not session.tool_calls and not session.changed_files:
+            return self._final_decision(
+                "The request is a memory recall query that can be answered from retrieved memory.",
+                memory_recall_response,
+            )
+
         if session.changed_files and (
             self._has_pending_explicit_update_targets(route, session)
             or self._has_pending_explicit_create_targets(route, session)
@@ -1208,6 +1215,11 @@ class Planner:
     ) -> list[str]:
         if repair_context is None:
             return ["default"]
+        preferred_patterns, blocked_patterns = self._historical_repair_pattern_hints(
+            session,
+            repair_context,
+            target,
+        )
         if self._repair_attempt_needs_new_evidence(session, repair_context, target):
             return []
         if self._repair_attempt_seen(
@@ -1225,8 +1237,110 @@ class Planner:
             strategy=TARGETED_REPAIR_STRATEGY,
             results={"no_effective_change", "blocked", "generation_failed"},
         ):
-            return [ESCALATED_REPAIR_STRATEGY]
-        return [TARGETED_REPAIR_STRATEGY, ESCALATED_REPAIR_STRATEGY]
+            strategies = [ESCALATED_REPAIR_STRATEGY]
+        else:
+            strategies = [TARGETED_REPAIR_STRATEGY, ESCALATED_REPAIR_STRATEGY]
+        strategies = [item for item in strategies if item not in blocked_patterns]
+        if not strategies:
+            return []
+        strategies.sort(
+            key=lambda item: (
+                0 if item in preferred_patterns else 1,
+                0 if item == TARGETED_REPAIR_STRATEGY else 1,
+            )
+        )
+        return strategies
+
+    def _historical_repair_pattern_hints(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        target: str,
+    ) -> tuple[set[str], set[str]]:
+        memory_context = session.memory_context
+        if memory_context is None:
+            return set(), set()
+        failure_signature = self._repair_failure_signature(repair_context)
+        target_name = Path(str(target or "").strip()).name
+        preferred: set[str] = set()
+        blocked: set[str] = set()
+        for item in memory_context.selected:
+            if item.memory_type != "failure" or item.entry is None:
+                continue
+            entry = item.entry
+            entry_signature = str(getattr(entry, "failure_signature", "") or "").strip()
+            if failure_signature and entry_signature and entry_signature != failure_signature:
+                continue
+            chosen_targets = [
+                str(candidate or "").strip()
+                for candidate in list(getattr(entry, "chosen_targets", []) or [])
+                if str(candidate or "").strip()
+            ]
+            if chosen_targets and target_name:
+                entry_target_names = {Path(candidate).name for candidate in chosen_targets}
+                if str(target or "").strip() not in chosen_targets and target_name not in entry_target_names:
+                    continue
+            preferred.update(
+                str(candidate or "").strip()
+                for candidate in list(getattr(entry, "successful_repair_patterns", []) or [])
+                if str(candidate or "").strip()
+            )
+            blocked.update(
+                str(candidate or "").strip()
+                for candidate in list(getattr(entry, "bad_retry_patterns", []) or [])
+                if str(candidate or "").strip()
+            )
+        return preferred, blocked
+
+    def _memory_recall_response(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> str | None:
+        memory_context = session.memory_context
+        if memory_context is None:
+            return None
+        request = getattr(memory_context, "request", None)
+        if str(getattr(request, "use_case", "") or "").strip() != "user_recall":
+            return None
+        recall_brief = str(getattr(memory_context, "recall_brief", "") or "").strip()
+        if not recall_brief:
+            return None
+        if route.intent not in {
+            RouteIntent.EXPLAIN,
+            RouteIntent.PLAN,
+            RouteIntent.UNKNOWN,
+            RouteIntent.SEARCH,
+        }:
+            return None
+        if route.entities.target_paths:
+            return None
+        return recall_brief
+
+    def _memory_guided_candidate_paths(
+        self,
+        session: SessionState,
+        *,
+        failure_only: bool = False,
+    ) -> list[str]:
+        memory_context = session.memory_context
+        if memory_context is None:
+            return []
+        candidates: list[str] = []
+        candidates.extend(memory_context.suggested_files[:8])
+        for item in memory_context.selected:
+            if failure_only and item.memory_type != "failure":
+                continue
+            candidates.extend(item.file_paths[:6])
+            entry = item.entry
+            if entry is None:
+                continue
+            candidates.extend(list(getattr(entry, "chosen_targets", []) or [])[:6])
+            if failure_only:
+                continue
+            candidates.extend(list(getattr(entry, "changed_files", []) or [])[:4])
+            candidates.extend(list(getattr(entry, "known_hotspots", []) or [])[:4])
+        return self._unique_paths(candidates)
 
     def _repair_attempt_seen(
         self,
@@ -1649,6 +1763,7 @@ class Planner:
         candidates: list[str] = []
         if repair_context is not None:
             candidates.extend(self._prioritized_repair_target_candidates(session, repair_context))
+            candidates.extend(self._memory_guided_candidate_paths(session, failure_only=True))
         candidates.extend(self._paths_from_internal_validation_command(str(failed_run.command or "")))
         for item in reversed(session.diagnostics):
             candidates.extend(item.file_hints)
@@ -1867,6 +1982,7 @@ class Planner:
                 self._repair_brief_locked_target(repair_context),
                 self._repair_brief_primary_target(repair_context),
                 sticky_target,
+                *self._memory_guided_candidate_paths(session, failure_only=True),
                 *failure_specific_support,
                 *(leading_support_candidates if support_should_lead else []),
                 *failure_specific_non_test,
@@ -2449,6 +2565,7 @@ class Planner:
         target_name_path = self._target_name_path_candidate(route)
         if target_name_path is not None:
             candidates.append(target_name_path)
+        candidates.extend(self._memory_guided_candidate_paths(session))
         candidates.extend(session.candidate_files)
         if session.follow_up_context is not None:
             candidates.extend(session.follow_up_context.target_paths)

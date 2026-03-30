@@ -155,6 +155,7 @@ def task_state_update_prompt(
         "Update the central task state for this turn.",
         f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
+        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Previous task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
         f"Workspace context: {json.dumps(_compact_workspace_snapshot(snapshot, detail='router' if not compact else 'decision'), ensure_ascii=False)}",
         "State update rules:",
@@ -237,6 +238,7 @@ def task_understanding_prompt(
         "Normalize the user's latest request into a task understanding object.",
         f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
+        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Current task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
         f"Workspace context: {json.dumps(workspace, ensure_ascii=False)}",
         "Interpretation rules:",
@@ -269,6 +271,7 @@ def router_prompt(
     recent_messages = _compact_recent_messages(session)
     recent_calls = _compact_recent_calls(session)
     follow_up_context = _compact_follow_up_context(session)
+    memory_context = _compact_memory_context(session)
     recent_diagnostics = _compact_recent_diagnostics(session)
     changed_files = [item.path for item in session.changed_files[-6:]] if session else []
     action_catalog = [
@@ -353,6 +356,7 @@ def router_prompt(
         "Interpret the user's latest request.",
         f"User request: {_trim_text(task, 600 if not compact else 400)}",
         f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}",
+        f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}",
         f"Recently changed files: {_format_list(changed_files)}",
         f"Workspace context: {json.dumps(workspace, ensure_ascii=False)}",
         f"Allowed actions: {json.dumps(action_catalog, ensure_ascii=False)}",
@@ -426,6 +430,7 @@ def generate_content_prompt(
                 "Produce the full file content for exactly one file.",
                 f"Latest user request: {_trim_text(session.task, 360)}",
                 f"Target path: {path}",
+                f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
             ]
             if explicit_constraints != "none":
                 sections.append(f"Explicit constraints: {explicit_constraints}")
@@ -531,6 +536,7 @@ def generate_content_prompt(
         f"Validated route: {json.dumps(_compact_route(route), ensure_ascii=False)}",
         f"Task state: {json.dumps(_compact_task_state(session.task_state), ensure_ascii=False)}",
         f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding), ensure_ascii=False)}",
+        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Target path: {path}",
         f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
         f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
@@ -634,6 +640,7 @@ def generate_content_retry_prompt(
             f"User goal: {_trim_text(route.user_goal, 240)}",
             f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
             f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
+            f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
             f"Task focus: {json.dumps(task_focus, ensure_ascii=False)}",
             f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
             _single_file_boundary_instruction(path, route.entities.target_paths),
@@ -676,6 +683,7 @@ def generate_content_retry_prompt(
         f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
         f"Task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
         f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}",
+        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Target path: {path}",
         f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
         f"Search hints: {_format_list(route.search_terms[:6])}",
@@ -740,6 +748,7 @@ def generate_content_continuation_prompt(
         f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
         f"Task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
         f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}",
+        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Target path: {path}",
         f"Search hints: {_format_list(route.search_terms[:6])}",
         _single_file_boundary_instruction(path, route.entities.target_paths),
@@ -811,6 +820,7 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
         "route": _compact_route(route),
         "task_state": _compact_task_state(session.task_state),
         "task_understanding": _compact_task_understanding(session.task_understanding),
+        "memory_context": _compact_memory_context(session),
         "changed_files": [item.path for item in session.changed_files[-8:]],
         "validation_status": session.validation_status,
         "recent_tool_calls": recent_calls,
@@ -1046,6 +1056,100 @@ def _compact_follow_up_context(session: SessionState | None) -> dict[str, object
         "last_error": _trim_text(follow_up.last_error or "", 240),
         "notes": [_trim_text(item, 140) for item in follow_up.notes[-6:]],
     }
+
+
+def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
+    if session is None or session.working_memory is None:
+        return {}
+    working = session.working_memory
+    return {
+        "current_goal": _trim_text(working.current_goal or "", 180),
+        "current_subtask": _trim_text(working.current_subtask or "", 160),
+        "primary_target": working.primary_target,
+        "verification_target": _trim_text(working.verification_target or "", 180),
+        "active_constraints": [_trim_text(item, 120) for item in working.active_constraints[:6]],
+        "active_failure_signature": _trim_text(working.active_failure_signature or "", 180),
+        "relevant_files": working.relevant_files[:6],
+        "relevant_symbols": working.relevant_symbols[:6],
+        "last_effective_strategy": working.last_effective_strategy,
+        "last_ineffective_strategy": working.last_ineffective_strategy,
+        "summary": _trim_text(working.compact_state_summary, 260),
+    }
+
+
+def _compact_memory_context(session: SessionState | None) -> dict[str, object]:
+    if session is None:
+        return {}
+    payload: dict[str, object] = {}
+    working = _compact_working_memory(session)
+    if working:
+        payload["working"] = working
+    memory_context = session.memory_context
+    if memory_context is None:
+        return payload
+    include_persistent = _should_include_persistent_memory(memory_context)
+    if memory_context.recall_brief:
+        payload["recall"] = _trim_text(memory_context.recall_brief, 320)
+    if not include_persistent:
+        return payload
+    if memory_context.summary and memory_context.summary != "No relevant persistent memory selected.":
+        payload["retrieval_summary"] = _trim_text(memory_context.summary, 420)
+    selected_payload: list[dict[str, object]] = []
+    for item in memory_context.selected[:4]:
+        entry = item.entry
+        detail: dict[str, object] = {
+            "type": item.memory_type,
+            "title": _trim_text(item.summary.title, 120),
+            "summary": _trim_text(item.summary.summary, 180),
+            "why": _trim_text(item.summary.why_relevant or "", 140),
+            "reasons": item.reasons[:3],
+            "session_id": item.session_id,
+            "source_type": item.provenance.source_type,
+            "file_paths": item.file_paths[:4],
+            "score": round(item.score, 3),
+        }
+        if entry is not None:
+            if hasattr(entry, "what_worked"):
+                detail["what_worked"] = [_trim_text(value, 120) for value in list(getattr(entry, "what_worked", []))[:2]]
+            if hasattr(entry, "what_failed"):
+                detail["what_failed"] = [_trim_text(value, 120) for value in list(getattr(entry, "what_failed", []))[:2]]
+            if hasattr(entry, "workflow_hints"):
+                detail["workflow_hints"] = [_trim_text(value, 120) for value in list(getattr(entry, "workflow_hints", []))[:2]]
+            if hasattr(entry, "successful_repair_patterns"):
+                detail["successful_repair_patterns"] = list(getattr(entry, "successful_repair_patterns", []))[:2]
+            if hasattr(entry, "bad_retry_patterns"):
+                detail["bad_retry_patterns"] = list(getattr(entry, "bad_retry_patterns", []))[:2]
+        selected_payload.append(detail)
+    if selected_payload:
+        payload["retrieved"] = selected_payload
+    if memory_context.suggested_files:
+        payload["suggested_files"] = memory_context.suggested_files[:6]
+    payload["metrics"] = {
+        "latency_ms": memory_context.latency_ms,
+        "total_hits": memory_context.total_hits,
+        "prompt_char_cost": memory_context.prompt_char_cost,
+        "stale_recall_rate": memory_context.stale_recall_rate,
+        "useful_recall_rate": memory_context.useful_recall_rate,
+    }
+    return payload
+
+
+def _should_include_persistent_memory(memory_context) -> bool:
+    request = getattr(memory_context, "request", None)
+    use_case = str(getattr(request, "use_case", "") or "").strip()
+    if use_case in {"repair_assistance", "project_context", "user_recall"}:
+        return bool(memory_context.selected or memory_context.recall_brief)
+    if not memory_context.selected:
+        return False
+    if memory_context.useful_recall_rate >= 0.34:
+        return True
+    if getattr(memory_context, "suggested_files", None):
+        return True
+    for item in memory_context.selected:
+        reasons = set(getattr(item, "reasons", []) or [])
+        if reasons & {"same_project", "exact_entity_match", "failure_match"}:
+            return True
+    return False
 
 
 def _compact_recent_diagnostics(session: SessionState | None) -> list[dict[str, object]]:

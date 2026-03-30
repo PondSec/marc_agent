@@ -76,7 +76,7 @@ const state = {
   },
   composer: {
     prompt: "",
-    agentProfile: "core",
+    agentProfile: "a2",
     accessMode: "approval",
     modelName: "",
     executionProfile: "balanced",
@@ -2566,7 +2566,7 @@ function renderThreadItem(session) {
 function renderAgentProfileOptions() {
   const profiles = getAgentProfiles();
   if (!profiles.length) {
-    return `<option value="${escapeHtml(state.composer.agentProfile || "core")}" selected>${escapeHtml(state.composer.agentProfile || "core")}</option>`;
+    return `<option value="${escapeHtml(state.composer.agentProfile || "a2")}" selected>${escapeHtml(state.composer.agentProfile || "a2")}</option>`;
   }
 
   return profiles
