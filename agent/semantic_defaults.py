@@ -91,6 +91,14 @@ _EXTENSION_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (".java", ("java",)),
 )
 
+_EXPLICIT_EXTENSION_PHRASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (".html", ("html datei", "html file", "html page", "als html")),
+    (".css", ("css datei", "css file", "als css")),
+    (".js", ("javascript datei", "javascript file", "js datei", "js file", "als javascript", "als js")),
+    (".ts", ("typescript datei", "typescript file", "ts datei", "ts file", "als typescript", "als ts")),
+    (".py", ("python datei", "python file", "als python")),
+)
+
 _GENERIC_MEDIUM_TOKENS = {
     "bash",
     "html",
@@ -388,10 +396,16 @@ def _contains_implementation_noun(normalized: str) -> bool:
 
 def infer_requested_extension(*texts: str | None) -> str | None:
     normalized = " ".join(normalize_text(text or "") for text in texts if text)
+    for extension, phrases in _EXPLICIT_EXTENSION_PHRASES:
+        if any(phrase in normalized for phrase in phrases):
+            return extension
+    matched_extensions: list[str] = []
     for extension, hints in _EXTENSION_HINTS:
         if any(hint in normalized for hint in hints):
-            return extension
-    return None
+            matched_extensions.append(extension)
+    if ".html" in matched_extensions and any(item in matched_extensions for item in {".js", ".css"}):
+        return ".html"
+    return matched_extensions[0] if matched_extensions else None
 
 
 def infer_scope_tokens(*texts: str | None) -> list[str]:

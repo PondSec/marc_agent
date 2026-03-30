@@ -2833,7 +2833,7 @@ class Planner:
             return route.entities.target_name
         snapshot = session.workspace_snapshot
         if snapshot is not None and snapshot.file_count == 0:
-            path = self._default_new_path(route)
+            path = self._empty_workspace_default_path(route)
             self._log("path_generation_skipped", path=path, reason="empty_workspace_fast_path")
             return path
         prompt = choose_path_prompt(route, session)
@@ -4466,6 +4466,19 @@ class Planner:
         if not slug.endswith(extension):
             return f"{slug}{extension}"
         return slug
+
+    def _empty_workspace_default_path(self, route: RouterOutput) -> str:
+        preferred_extension = self._preferred_extension(route)
+        if not str(route.entities.target_name or "").strip() or not self._looks_like_path(str(route.entities.target_name or "").strip()):
+            conventional = {
+                ".html": "index.html",
+                ".css": "styles.css",
+                ".js": "app.js",
+                ".ts": "app.ts",
+            }.get(preferred_extension)
+            if conventional is not None:
+                return conventional
+        return self._default_new_path(route)
 
     def _path_seed_from_route(self, route: RouterOutput) -> str:
         explicit = str(route.entities.target_name or "").strip()
