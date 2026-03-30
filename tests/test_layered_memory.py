@@ -16,7 +16,7 @@ from agent.models import (
     SessionState,
     ValidationFailureEvidence,
 )
-from agent.planner import ESCALATED_REPAIR_STRATEGY, Planner
+from agent.planner import ESCALATED_REPAIR_STRATEGY, Planner, TARGETED_REPAIR_STRATEGY
 from agent.prompts import generate_content_prompt
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
@@ -209,8 +209,10 @@ def make_failure_entry(
         observed_semantics=["old role remains cached"],
         chosen_targets=["app/auth.py"],
         tried_strategies=["validation_targeted", ESCALATED_REPAIR_STRATEGY],
-        successful_repair_patterns=list(good_patterns or [ESCALATED_REPAIR_STRATEGY]),
-        bad_retry_patterns=list(bad_patterns or ["validation_targeted"]),
+        successful_repair_patterns=list(
+            [ESCALATED_REPAIR_STRATEGY] if good_patterns is None else good_patterns
+        ),
+        bad_retry_patterns=list(["validation_targeted"] if bad_patterns is None else bad_patterns),
         review_rejection_reasons=["test-only change did not fix runtime path"],
         no_effective_change_count=1,
         last_result="mutation_planned",
@@ -344,6 +346,29 @@ def test_failure_memory_guides_repair_strategy_order(tmp_path):
     strategies = planner._repair_generation_strategies(session, session.active_repair_context, "app/auth.py")
 
     assert strategies == [ESCALATED_REPAIR_STRATEGY]
+
+
+def test_failure_memory_does_not_exhaust_fresh_session_before_local_repair_attempt(tmp_path):
+    store = build_store(tmp_path)
+    store.upsert_entry(
+        make_failure_entry(
+            store,
+            bad_patterns=[TARGETED_REPAIR_STRATEGY, ESCALATED_REPAIR_STRATEGY],
+            good_patterns=[],
+        )
+    )
+    session = build_session(store, "Fix the auth cache mismatch")
+    session.active_repair_context = build_failure_context()
+    store.refresh_session_memory(session.task, session)
+    planner = Planner(
+        DummyLLM(AppConfig(workspace_root=str(tmp_path))),
+        "tools",
+        logger=AgentLogger(store.config.log_dir_path, "memtest-fresh-repair"),
+    )
+
+    strategies = planner._repair_generation_strategies(session, session.active_repair_context, "app/auth.py")
+
+    assert strategies == [TARGETED_REPAIR_STRATEGY, ESCALATED_REPAIR_STRATEGY]
 
 
 def test_memory_retrieval_respects_hit_and_summary_budgets(tmp_path):

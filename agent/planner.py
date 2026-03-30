@@ -1240,7 +1240,11 @@ class Planner:
             strategies = [ESCALATED_REPAIR_STRATEGY]
         else:
             strategies = [TARGETED_REPAIR_STRATEGY, ESCALATED_REPAIR_STRATEGY]
-        strategies = [item for item in strategies if item not in blocked_patterns]
+        filtered_strategies = [item for item in strategies if item not in blocked_patterns]
+        if filtered_strategies:
+            strategies = filtered_strategies
+        elif self._repair_attempted_in_session(session, repair_context, target):
+            return []
         if not strategies:
             return []
         strategies.sort(
@@ -1291,6 +1295,18 @@ class Planner:
                 if str(candidate or "").strip()
             )
         return preferred, blocked
+
+    def _repair_attempted_in_session(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        target: str,
+    ) -> bool:
+        return any(
+            item.evidence_signature == repair_context.evidence_signature
+            and item.artifact_path == target
+            for item in session.repair_history
+        )
 
     def _memory_recall_response(
         self,
