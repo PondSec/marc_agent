@@ -1094,6 +1094,13 @@ class ValidationPlanner:
             expected.append("Referenced runtime inputs should exist and load successfully.")
             if missing_path:
                 observed.append(f"The current runtime path cannot open: {missing_path}")
+        called_process_command, exit_code = self._called_process_error_details(text)
+        if called_process_command:
+            expected.append("The exercised runtime command should exit successfully.")
+            observed_text = f"The current runtime command exits non-zero when invoking: {called_process_command}"
+            if exit_code is not None:
+                observed_text += f" (exit status {exit_code})"
+            observed.append(observed_text)
         if any(pattern.search(lowered) for pattern in self.NO_TESTS_RAN_PATTERNS):
             expected.append("The targeted tests should be discoverable and execute.")
             observed.append("The current validation run executes zero tests.")
@@ -1220,23 +1227,85 @@ class ValidationPlanner:
                 return parts[-1]
         return None
 
+    def _called_process_error_details(self, text: str) -> tuple[str | None, int | None]:
+        pattern = re.compile(
+            r"CalledProcessError:\s+Command\s+'?(?P<command>\[[^\]]+\])'?\s+returned non-zero exit status\s+(?P<code>\d+)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(str(text or ""))
+        if match is None:
+            return None, None
+        command = str(match.group("command") or "").strip()
+        if not command:
+            return None, None
+        try:
+            exit_code = int(match.group("code") or 0)
+        except ValueError:
+            exit_code = None
+        return command, exit_code
+
     def _implicated_symbols_from_failure_text(self, excerpt: str, failure_summary: str) -> list[str]:
         symbols: list[str] = []
         text = "\n".join(part for part in [excerpt, failure_summary] if part)
         undefined_symbol, _usage_line = self._undefined_runtime_symbol_details(text)
         if undefined_symbol:
             symbols.append(undefined_symbol)
+        missing_module = self._missing_module_name(text)
+        if missing_module and missing_module not in symbols:
+            symbols.append(missing_module)
         for match in self.TRACEBACK_FRAME_PATTERN.finditer(text):
             symbol = str(match.group("symbol") or "").strip()
-            if symbol and symbol not in symbols:
+            if symbol and not self._is_generic_runtime_failure_symbol(symbol) and symbol not in symbols:
                 symbols.append(symbol)
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\(", text):
             name = str(match.group(1) or "").strip()
-            if not name or name in {"self", "print", "open"} or name.startswith("test_"):
+            if (
+                not name
+                or name in {"self", "print", "open"}
+                or name.startswith("test_")
+                or self._is_generic_runtime_failure_symbol(name)
+            ):
                 continue
             if name not in symbols:
                 symbols.append(name)
         return symbols
+
+    def _missing_module_name(self, text: str) -> str | None:
+        for pattern in (
+            re.compile(r"ModuleNotFoundError:\s+No module named ['\"](?P<name>[A-Za-z_][A-Za-z0-9_.]*)['\"]"),
+            re.compile(r"ImportError:\s+No module named ['\"](?P<name>[A-Za-z_][A-Za-z0-9_.]*)['\"]"),
+        ):
+            match = pattern.search(str(text or ""))
+            if match is None:
+                continue
+            name = str(match.group("name") or "").strip()
+            if name:
+                return name
+        return None
+
+    def _is_generic_runtime_failure_symbol(self, symbol: str) -> bool:
+        lowered = str(symbol or "").strip().lower()
+        if not lowered:
+            return True
+        if lowered in {
+            "assertionerror",
+            "calledprocesserror",
+            "command",
+            "error",
+            "errors",
+            "fail",
+            "failed",
+            "file",
+            "output",
+            "process",
+            "retcode",
+            "run",
+            "stderr",
+            "stdout",
+            "traceback",
+        }:
+            return True
+        return False
 
     def _undefined_runtime_symbol_details(self, text: str) -> tuple[str | None, str | None]:
         symbol_name = self._undefined_runtime_symbol_name(text)

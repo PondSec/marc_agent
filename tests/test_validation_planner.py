@@ -627,6 +627,56 @@ def test_validation_planner_prioritizes_absolute_workspace_script_path_from_call
     assert "wordaudit/report.py" in evidence.artifact_paths
 
 
+def test_validation_planner_called_process_error_tracks_command_exit_without_noise_symbol(tmp_path):
+    planner = ValidationPlanner()
+    package_dir = tmp_path / "wordaudit"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from .report import duplicate_words\n", encoding="utf-8")
+    (package_dir / "report.py").write_text("def duplicate_words(lines):\n    return []\n", encoding="utf-8")
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "build_duplicates.py").write_text(
+        "from wordaudit import duplicate_words\n",
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Repair the wordaudit runtime flow.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.append(FileChangeRecord(path="scripts/build_duplicates.py", operation="modify"))
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_report",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            "raise CalledProcessError(retcode, process.args,\n"
+            "subprocess.CalledProcessError: "
+            f"Command '['/usr/bin/python3', '{scripts_dir / 'build_duplicates.py'}', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+            "FAILED (errors=1)\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "scripts/build_duplicates.py"
+    assert "CalledProcessError" not in evidence.repair_brief.implicated_symbols
+    assert evidence.repair_brief.expected_semantics == ["The exercised runtime command should exit successfully."]
+    assert evidence.repair_brief.observed_semantics == [
+        (
+            "The current runtime command exits non-zero when invoking: "
+            f"['/usr/bin/python3', '{scripts_dir / 'build_duplicates.py'}', '/tmp/tmpwords.txt'] (exit status 1)"
+        )
+    ]
+
+
 def test_validation_planner_ignores_separator_noise_in_assertion_semantics(tmp_path):
     planner = ValidationPlanner()
     pkg = tmp_path / "greet_cli"

@@ -2003,6 +2003,11 @@ class Planner:
         candidate: str,
         repair_context: ValidationFailureEvidence,
     ) -> bool:
+        brief = getattr(repair_context, "repair_brief", None)
+        locked_target = str(getattr(brief, "locked_target", "") or "").strip()
+        primary_target = str(getattr(brief, "primary_target", "") or "").strip()
+        if candidate and candidate in {locked_target, primary_target}:
+            return True
         reference_tokens = self._repair_candidate_reference_tokens(candidate)
         if not reference_tokens:
             return False
@@ -8210,9 +8215,18 @@ class Planner:
                     frame_match = re.search(r"\bin (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*$", stripped)
                     if frame_match:
                         identifiers.append(frame_match.group("name"))
-                    if index + 1 < len(lines):
+                    frame_like = (
+                        self.validation_planner.TRACEBACK_FRAME_PATTERN.search(stripped) is not None
+                        or re.match(r"[\w./\\-]+\.py:\d+(?::\d+)?", stripped) is not None
+                    )
+                    if frame_like and index + 1 < len(lines):
                         code_line = lines[index + 1].strip()
-                        if code_line and not code_line.startswith("File ") and not code_line.startswith("Traceback"):
+                        if (
+                            code_line
+                            and not code_line.startswith("File ")
+                            and not code_line.startswith("Traceback")
+                            and not self._is_runtime_failure_noise_line(code_line)
+                        ):
                             identifiers.extend(
                                 match.group(0)
                                 for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*\b", code_line)
@@ -8249,9 +8263,15 @@ class Planner:
         if lowered in {
             "and",
             "as",
+            "calledprocesserror",
             "class",
+            "command",
             "def",
+            "error",
+            "errors",
             "else",
+            "fail",
+            "failed",
             "false",
             "file",
             "for",
@@ -8262,14 +8282,35 @@ class Planner:
             "line",
             "none",
             "open",
+            "output",
+            "process",
             "print",
             "r",
+            "retcode",
             "return",
+            "run",
             "self",
+            "stderr",
+            "stdout",
             "traceback",
             "true",
             "with",
         }:
+            return True
+        return False
+
+    def _is_runtime_failure_noise_line(self, line: str) -> bool:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return True
+        lowered = stripped.lower()
+        if re.fullmatch(r"[=\-]{5,}", stripped):
+            return True
+        if lowered.startswith(("traceback", "during handling")):
+            return True
+        if re.match(r"^(?:fail|failed|error|errors|ok|ran \d+ tests?)\b", lowered):
+            return True
+        if "returned non-zero exit status" in lowered:
             return True
         return False
 
@@ -8320,7 +8361,15 @@ class Planner:
                 identifiers.extend([match.group("module"), match.group("name")])
         blocked = {"self", "cls", "unittest", "tests"}
         return self._unique_paths(
-            [identifier for identifier in identifiers if identifier and identifier not in blocked]
+            [
+                identifier
+                for identifier in identifiers
+                if (
+                    identifier
+                    and identifier not in blocked
+                    and not self._is_generic_runtime_repair_identifier(identifier)
+                )
+            ]
         )[:6]
 
     def _is_test_helper_failure_identifier(
