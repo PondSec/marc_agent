@@ -1259,6 +1259,94 @@ def test_validation_planner_builds_structured_failure_evidence_for_web_validatio
     assert any("Do not stop at an equivalent" in item for item in evidence.repair_requirements)
 
 
+def test_validation_planner_prioritizes_structural_failure_paths_over_generic_artifact_order(tmp_path):
+    planner = ValidationPlanner()
+    for name in ["index.html", "about.html", "projects.html", "contact.html", "styles.css"]:
+        (tmp_path / name).write_text("", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the generated portfolio site.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    failed_run = ValidationRunRecord(
+        command=(
+            'internal:web_artifact:['
+            '{"path":"index.html","expected_features":["menu"]},'
+            '{"path":"about.html","expected_features":["team"]},'
+            '{"path":"projects.html","expected_features":["cards"]},'
+            '{"path":"contact.html","expected_features":["form"]},'
+            '{"path":"styles.css","expected_features":["layout"]}'
+            "]"
+        ),
+        kind="check",
+        verification_scope="structural",
+        status="failed",
+        edit_generation=1,
+        summary="Structural web validation failed.",
+        excerpt=(
+            "projects.html -> projekt1.jpg\n"
+            "projects.html -> projekt2.jpg\n"
+            "projects.html -> projekt3.jpg"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "projects.html"
+    assert evidence.repair_brief.primary_target == "projects.html"
+    assert evidence.failure_summary.startswith("projects.html -> projekt1.jpg")
+    assert any("projects.html" in item for item in evidence.repair_requirements)
+
+
+def test_validation_planner_uses_structural_diagnostic_file_mentions_as_primary_target(tmp_path):
+    planner = ValidationPlanner()
+    for name in ["index.html", "about.html", "projects.html", "contact.html", "styles.css"]:
+        (tmp_path / name).write_text("", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the generated portfolio site.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    failed_run = ValidationRunRecord(
+        command=(
+            'internal:web_artifact:['
+            '{"path":"index.html","expected_features":["menu"]},'
+            '{"path":"about.html","expected_features":["team"]},'
+            '{"path":"projects.html","expected_features":["cards"]},'
+            '{"path":"contact.html","expected_features":["contact-form"]},'
+            '{"path":"styles.css","expected_features":["layout"]}'
+            "]"
+        ),
+        kind="check",
+        verification_scope="structural",
+        status="failed",
+        edit_generation=1,
+        summary="Structural web validation failed.",
+        excerpt="Portfolio validation still reports missing required features.",
+    )
+    session.diagnostics.append(
+        DiagnosticRecord(
+            source="run_tests",
+            category="command_failure",
+            summary="contact.html is still missing the required contact-form marker.",
+            tool_name="run_tests",
+            command=failed_run.command,
+            file_hints=["contact.html"],
+            excerpt="contact.html: missing expected web features (contact-form)",
+        )
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "contact.html"
+    assert evidence.repair_brief.primary_target == "contact.html"
+    assert evidence.missing_features == ["contact-form"]
+    assert evidence.failure_summary == "contact.html is missing validation-required features: contact-form."
+    assert any("contact.html" in item for item in evidence.repair_requirements)
+
+
 def test_validation_planner_prioritizes_test_artifacts_for_no_test_execution_failures():
     planner = ValidationPlanner()
     session = SessionState(

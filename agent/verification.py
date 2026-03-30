@@ -789,12 +789,21 @@ class ValidationPlanner:
                 *referenced_workspace_paths,
             ]
         )
+        diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
+        failure_scoped_paths = self._failure_scoped_workspace_paths(
+            session,
+            failed_run,
+            diagnostics,
+        )
+        artifact_paths = self._prioritize_failure_scoped_artifact_paths(
+            artifact_paths,
+            failure_scoped_paths,
+        )
         artifact_paths = self._prioritize_runtime_artifact_paths(
             artifact_paths,
             failed_run,
             prefer_test_runtime_target=prefer_test_runtime_target,
         )
-        diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
         missing_unittest_package_inits = self._missing_unittest_package_inits(
             session,
             failed_run,
@@ -804,6 +813,7 @@ class ValidationPlanner:
         missing_features = self._missing_features_from_failure(failed_run, diagnostics)
         file_hints = self._unique_paths(
             [
+                *failure_scoped_paths,
                 *artifact_paths,
                 *traceback_file_hints,
                 *referenced_workspace_paths,
@@ -1394,6 +1404,71 @@ class ValidationPlanner:
     ) -> list[str]:
         workspace_root = Path(session.workspace_root).resolve()
         referenced_paths: list[str] = []
+        texts = [
+            str(failed_run.excerpt or "").strip(),
+            str(failed_run.summary or "").strip(),
+        ]
+        for text in texts:
+            if not text:
+                continue
+            for path in self._workspace_paths_from_text(
+                workspace_root,
+                text,
+                require_existing_bare_refs=True,
+            ):
+                if path not in referenced_paths:
+                    referenced_paths.append(path)
+        return referenced_paths
+
+    def _failure_scoped_workspace_paths(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        diagnostics: list[DiagnosticRecord],
+    ) -> list[str]:
+        workspace_root = Path(session.workspace_root).resolve()
+        referenced_paths: list[str] = []
+        texts = [
+            str(failed_run.excerpt or "").strip(),
+            str(failed_run.summary or "").strip(),
+        ]
+        for diagnostic in diagnostics:
+            texts.append(str(diagnostic.excerpt or "").strip())
+            texts.append(str(diagnostic.summary or "").strip())
+        for text in texts:
+            if not text:
+                continue
+            for path in self._workspace_paths_from_text(
+                workspace_root,
+                text,
+                require_existing_bare_refs=True,
+            ):
+                if path not in referenced_paths:
+                    referenced_paths.append(path)
+        return referenced_paths
+
+    def _prioritize_failure_scoped_artifact_paths(
+        self,
+        artifact_paths: list[str],
+        failure_scoped_paths: list[str],
+    ) -> list[str]:
+        if not failure_scoped_paths:
+            return artifact_paths
+        ordered: list[str] = []
+        for path in [*failure_scoped_paths, *artifact_paths]:
+            normalized = str(path or "").strip()
+            if normalized and normalized not in ordered:
+                ordered.append(normalized)
+        return ordered or artifact_paths
+
+    def _workspace_paths_from_text(
+        self,
+        workspace_root: Path,
+        text: str,
+        *,
+        require_existing_bare_refs: bool,
+    ) -> list[str]:
+        referenced_paths: list[str] = []
 
         def add_candidate(raw_path: str, *, require_exists: bool) -> None:
             normalized = str(raw_path or "").strip().replace("\\", "/").removeprefix("./")
@@ -1411,17 +1486,13 @@ class ValidationPlanner:
             if relative and relative not in referenced_paths:
                 referenced_paths.append(relative)
 
-        texts = [
-            str(failed_run.excerpt or "").strip(),
-            str(failed_run.summary or "").strip(),
-        ]
-        for text in texts:
-            if not text:
-                continue
-            for match in self.WORKSPACE_REFERENCE_PATTERN.finditer(text):
-                add_candidate(str(match.group("path") or ""), require_exists=False)
-            for match in self.BARE_WORKSPACE_REFERENCE_PATTERN.finditer(text):
-                add_candidate(str(match.group("path") or ""), require_exists=True)
+        for match in self.WORKSPACE_REFERENCE_PATTERN.finditer(text):
+            add_candidate(str(match.group("path") or ""), require_exists=False)
+        for match in self.BARE_WORKSPACE_REFERENCE_PATTERN.finditer(text):
+            add_candidate(
+                str(match.group("path") or ""),
+                require_exists=require_existing_bare_refs,
+            )
         return referenced_paths
 
     def _traceback_workspace_frames(
