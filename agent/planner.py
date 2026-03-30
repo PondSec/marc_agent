@@ -8465,6 +8465,36 @@ class Planner:
         artifacts = self._semantic_review_artifacts(session)
         primary_model = self._primary_generation_model_name()
         reserve_model = self._lightweight_generation_model_name()
+        if (
+            reserve_model is None
+            and session.validation_status == "passed"
+            and self.validation_planner.web_structural_proxy_sufficient(session)
+        ):
+            review = self._fallback_semantic_change_review(session)
+            if review.requirements_satisfied:
+                self._log(
+                    "semantic_change_review_skipped",
+                    reason="single_model_small_web_structural_proxy",
+                    model=primary_model,
+                )
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="semantic_change_review",
+                        task_class="semantic_change_review",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=True,
+                        summary="A small standalone web change used structural verification plus local requirements review instead of a second same-model semantic review hop.",
+                        attempts=[],
+                    ),
+                )
+                self._record_semantic_change_review(session, review)
+                return
         attempts: list[ExecutionAttemptRecord] = []
         prefer_lightweight = self._should_prefer_lightweight_semantic_review(
             route,
@@ -8720,6 +8750,13 @@ class Planner:
                 repair_hints=["Complete the explicitly requested file updates before declaring the task done."],
                 file_hints=pending_snapshot_targets[:6],
             )
+        if self.validation_planner.web_structural_proxy_sufficient(session):
+            return SemanticChangeReview(
+                requirements_satisfied=True,
+                summary="Structural web validation plus the local requirements review covered the changed standalone web artifact without a separate browser runtime step.",
+                confidence=0.66,
+                file_hints=[item.path for item in session.changed_files[:4]],
+            )
         if self._functional_validation_missing(session):
             return SemanticChangeReview(
                 requirements_satisfied=False,
@@ -8760,6 +8797,11 @@ class Planner:
         if session.changed_files and self.validation_planner.runtime_verification_required(session):
             return not self.validation_planner.has_runtime_success(session)
         if session.changed_files and self.validation_planner.web_functional_verification_required(session):
+            if (
+                self.validation_planner.has_semantic_review_success(session)
+                and self.validation_planner.web_structural_proxy_sufficient(session)
+            ):
+                return False
             return not self.validation_planner.has_runtime_success(session)
         return False
 

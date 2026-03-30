@@ -769,6 +769,11 @@ class AgentCore:
             return False
         if not self.validation_planner.has_structural_web_success(session):
             return False
+        if (
+            self.validation_planner.has_semantic_review_success(session)
+            and self.validation_planner.web_structural_proxy_sufficient(session)
+        ):
+            return False
         return not self.validation_planner.has_runtime_success(session)
 
     def _requirements_review_missing(self, session: SessionState) -> bool:

@@ -121,6 +121,46 @@ def test_shell_structural_web_validation_checks_dom_refs_and_js(monkeypatch, tmp
     assert "expected features: menu, highscore" in result["stdout"]
 
 
+def test_shell_structural_web_validation_accepts_interactive_snake_markers(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<canvas id='gameCanvas' width='400' height='400'></canvas>"
+            "<div id='scoreBoard'>Score: 0</div>"
+            "<script>"
+            "document.addEventListener('keydown', (event) => {"
+            "  if (event.key === 'ArrowUp') window.direction = 'up';"
+            "});"
+            "function endGame(){ alert('Game Over!'); document.location.reload(); }"
+            "</script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    monkeypatch.setattr("tools.shell.shutil.which", lambda name: "/usr/bin/node" if name == "node" else None)
+    monkeypatch.setattr(
+        "tools.shell.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr=""),
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_artifact:[{"path":"index.html","expected_features":["score","keyboard_controls","game_over","start_controls"]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "expected features: score, keyboard_controls, game_over, start_controls" in result["stdout"]
+
+
 def test_shell_structural_web_validation_catches_dom_id_mismatch_across_referenced_files(monkeypatch, tmp_path):
     (tmp_path / "index.html").write_text(
         (

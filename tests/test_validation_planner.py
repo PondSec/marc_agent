@@ -987,6 +987,86 @@ def test_validation_planner_does_not_infer_canvas_from_keyboard_accessible_copy(
     assert "canvas" not in payload[0]["expected_features"]
 
 
+def test_validation_planner_infers_interactive_snake_features():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"html": 1},
+        top_directories=[],
+        important_files=["index.html"],
+        focus_files=["index.html"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small standalone web artifact.",
+    )
+
+    plan = planner.build_plan(
+        "Erstelle ein kleines spielbares Snake-Spiel als HTML-Datei mit Tastatursteuerung, Punktestand und Game-Over-Neustart.",
+        snapshot,
+        changed_files=["index.html"],
+    )
+
+    structural = next(item for item in plan if item.command.startswith("internal:web_artifact:"))
+    payload = json.loads(structural.command.partition("internal:web_artifact:")[2])
+
+    assert "score" in payload[0]["expected_features"]
+    assert "keyboard_controls" in payload[0]["expected_features"]
+    assert "game_over" in payload[0]["expected_features"]
+    assert "start_controls" in payload[0]["expected_features"]
+
+
+def test_validation_planner_accepts_small_standalone_web_structural_proxy():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Erstelle ein kleines spielbares Snake-Spiel als HTML-Datei mit Tastatursteuerung, Punktestand und Game-Over-Neustart.",
+        workspace_root="/tmp/demo",
+        edit_generation=1,
+        workspace_snapshot=WorkspaceSnapshot(
+            root="/tmp/demo",
+            file_count=1,
+            language_counts={"html": 1},
+            top_directories=[],
+            important_files=["index.html"],
+            focus_files=["index.html"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small standalone web artifact.",
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="index.html", operation="create"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"index.html","expected_features":["score","keyboard_controls","game_over","start_controls"]}]',
+            verification_scope="structural",
+            status="passed",
+            edit_generation=1,
+        )
+    )
+
+    assert planner.web_structural_proxy_sufficient(session) is True
+
+
 def test_validation_planner_tracks_semantic_review_runs_separately_from_runtime_checks():
     planner = ValidationPlanner()
     session = SessionState(

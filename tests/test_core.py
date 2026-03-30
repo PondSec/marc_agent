@@ -434,6 +434,38 @@ def test_core_marks_small_web_artifact_with_only_structural_checks_as_partial(tm
     assert stop_reason == "functional_validation_missing"
 
 
+def test_core_accepts_small_web_artifact_after_structural_and_semantic_signoff(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Erstelle ein kleines spielbares Snake-Spiel als HTML-Datei mit Tastatursteuerung, Punktestand und Game-Over-Neustart.",
+        workspace_root=str(tmp_path),
+        validation_status="passed",
+    )
+    session.changed_files.append(FileChangeRecord(path="index.html", operation="create"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:web_artifact:[{"path":"index.html","expected_features":["score","keyboard_controls","game_over","start_controls"]}]',
+            verification_scope="structural",
+            status="passed",
+        )
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command='internal:semantic_review:[{"path":"index.html"}]',
+            verification_scope="semantic",
+            status="passed",
+        )
+    )
+
+    status = core._resolve_final_status(session, final_action=True)
+    stop_reason = core._derive_stop_reason(session)
+
+    assert status == "completed"
+    assert stop_reason == "validated"
+
+
 def test_core_does_not_offer_identical_failed_validation_again_without_progress(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()
