@@ -167,6 +167,15 @@ class ValidationPlanner:
     ASSERTION_MISMATCH_PATTERN = re.compile(
         r"AssertionError:\s*(?P<observed>.+?)\s*!=\s*(?P<expected>.+)"
     )
+    TEST_HARNESS_RUNTIME_ERROR_MARKERS = (
+        "nameerror",
+        "importerror",
+        "modulenotfounderror",
+        "syntaxerror",
+        "indentationerror",
+        "taberror",
+        "unboundlocalerror",
+    )
 
     def build_plan(
         self,
@@ -750,9 +759,20 @@ class ValidationPlanner:
         session: SessionState,
         failed_run: ValidationRunRecord,
     ) -> ValidationFailureEvidence:
+        traceback_frames = self._traceback_workspace_frames(
+            session,
+            failed_run,
+        )
+        prefer_test_runtime_target = self._test_harness_runtime_failure(
+            session,
+            failed_run,
+            traceback_frames=traceback_frames,
+        )
         traceback_file_hints, traceback_line_hints = self._traceback_workspace_hints(
             session,
             failed_run,
+            traceback_frames=traceback_frames,
+            prefer_test_runtime_target=prefer_test_runtime_target,
         )
         referenced_workspace_paths = self._referenced_workspace_paths(
             session,
@@ -768,6 +788,7 @@ class ValidationPlanner:
         artifact_paths = self._prioritize_runtime_artifact_paths(
             artifact_paths,
             failed_run,
+            prefer_test_runtime_target=prefer_test_runtime_target,
         )
         diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
         missing_unittest_package_inits = self._missing_unittest_package_inits(
@@ -822,6 +843,7 @@ class ValidationPlanner:
             failure_summary=failure_summary,
             repair_requirements=repair_requirements,
             missing_features=missing_features,
+            prefer_test_runtime_target=prefer_test_runtime_target,
         )
         evidence_signature = json.dumps(
             {
@@ -871,11 +893,13 @@ class ValidationPlanner:
         failure_summary: str,
         repair_requirements: list[str],
         missing_features: list[str],
+        prefer_test_runtime_target: bool = False,
     ) -> RepairBrief:
         primary_target = self._primary_repair_target(
             artifact_paths=artifact_paths,
             file_hints=file_hints,
             verification_scope=failed_run.verification_scope,
+            prefer_test_runtime_target=prefer_test_runtime_target,
         )
         expected_semantics, observed_semantics = self._failure_semantics(
             failed_run,
@@ -945,9 +969,14 @@ class ValidationPlanner:
         artifact_paths: list[str],
         file_hints: list[str],
         verification_scope: str,
+        prefer_test_runtime_target: bool = False,
     ) -> str | None:
         candidates = self._unique_paths([*artifact_paths, *file_hints])
         if verification_scope == "runtime":
+            if prefer_test_runtime_target:
+                validation = [path for path in candidates if path and self._is_test_path(path)]
+                if validation:
+                    return validation[0]
             implementation = [
                 path
                 for path in candidates
@@ -1345,14 +1374,14 @@ class ValidationPlanner:
                 add_candidate(str(match.group("path") or ""), require_exists=True)
         return referenced_paths
 
-    def _traceback_workspace_hints(
+    def _traceback_workspace_frames(
         self,
         session: SessionState,
         failed_run: ValidationRunRecord,
-    ) -> tuple[list[str], list[int]]:
+    ) -> list[tuple[str, int]]:
         workspace_root = Path(session.workspace_root).resolve()
-        paths: list[str] = []
-        lines: list[int] = []
+        frames: list[tuple[str, int]] = []
+        seen_frames: set[tuple[str, int]] = set()
         texts = [
             str(failed_run.excerpt or "").strip(),
             str(failed_run.summary or "").strip(),
@@ -1369,18 +1398,67 @@ class ValidationPlanner:
                     relative = candidate.relative_to(workspace_root).as_posix()
                 except ValueError:
                     continue
-                if relative and relative not in paths:
-                    paths.append(relative)
                 try:
                     line = int(match.group("line") or 0)
                 except ValueError:
                     line = 0
-                if line > 0 and line not in lines:
-                    lines.append(line)
+                if not relative:
+                    continue
+                frame = (relative, line if line > 0 else 0)
+                if frame in seen_frames:
+                    continue
+                seen_frames.add(frame)
+                frames.append(frame)
+        return frames
 
+    def _traceback_workspace_hints(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        *,
+        traceback_frames: list[tuple[str, int]] | None = None,
+        prefer_test_runtime_target: bool = False,
+    ) -> tuple[list[str], list[int]]:
+        frames = traceback_frames if traceback_frames is not None else self._traceback_workspace_frames(session, failed_run)
+        paths: list[str] = []
+        lines: list[int] = []
+        for relative, line in frames:
+            if relative and relative not in paths:
+                paths.append(relative)
+            if line > 0 and line not in lines:
+                lines.append(line)
+        if prefer_test_runtime_target:
+            test_paths = [path for path in paths if self._is_test_path(path)]
+            implementation_paths = [path for path in paths if not self._is_test_path(path)]
+            return [*test_paths, *implementation_paths], lines
         implementation_paths = [path for path in paths if not self._is_test_path(path)]
         test_paths = [path for path in paths if self._is_test_path(path)]
         return [*implementation_paths, *test_paths], lines
+
+    def _test_harness_runtime_failure(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        *,
+        traceback_frames: list[tuple[str, int]] | None = None,
+    ) -> bool:
+        if failed_run.verification_scope != "runtime" or self._no_tests_executed(failed_run):
+            return False
+        frames = traceback_frames if traceback_frames is not None else self._traceback_workspace_frames(session, failed_run)
+        if not frames:
+            return False
+        innermost_workspace_frame = next((path for path, _line in reversed(frames) if path), "")
+        if not innermost_workspace_frame or not self._is_test_path(innermost_workspace_frame):
+            return False
+        failure_text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        ).lower()
+        return any(marker in failure_text for marker in self.TEST_HARNESS_RUNTIME_ERROR_MARKERS)
 
     def can_repeat_command(
         self,
@@ -1881,6 +1959,8 @@ class ValidationPlanner:
         self,
         artifact_paths: list[str],
         failed_run: ValidationRunRecord,
+        *,
+        prefer_test_runtime_target: bool = False,
     ) -> list[str]:
         if failed_run.verification_scope != "runtime" or self._no_tests_executed(failed_run):
             return artifact_paths
@@ -1894,6 +1974,9 @@ class ValidationPlanner:
             for path in artifact_paths
             if path and self._is_test_path(path)
         ]
+        if prefer_test_runtime_target:
+            ordered = [*validation_paths, *implementation_paths]
+            return ordered or artifact_paths
         ordered = [*implementation_paths, *validation_paths]
         return ordered or artifact_paths
 
