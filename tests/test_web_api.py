@@ -79,6 +79,18 @@ def build_test_client(app, *, authenticate: bool = True) -> TestClient:
     return client
 
 
+def login_as(client: TestClient, *, email: str, password: str) -> None:
+    session_response = client.get("/api/auth/session")
+    assert session_response.status_code == 200
+    apply_csrf_headers(client)
+    login_response = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": password},
+    )
+    assert login_response.status_code == 200
+    apply_csrf_headers(client)
+
+
 def complete_setup_flow(
     client: TestClient,
     workspace_root,
@@ -1052,6 +1064,38 @@ def test_admin_terminal_requires_admin_role(tmp_path):
     response = client.post("/api/admin/terminal/sessions", json={})
 
     assert response.status_code == 403
+
+
+def test_admin_terminal_session_is_bound_to_the_creator(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    auth_service = app.state.auth_service
+    assert auth_service is not None
+    other_email = "second-admin@example.com"
+    other_password = "AnotherStrongPassword!2026"
+    now = auth_service.now().isoformat()
+    auth_service.store.create_user(
+        user_id="second-admin-user",
+        email=other_email,
+        display_name="Second Admin",
+        password_hash=auth_service.password_hasher.hash(other_password),
+        role="admin",
+        totp_secret=None,
+        now=now,
+    )
+
+    create_response = client.post("/api/admin/terminal/sessions", json={})
+    assert create_response.status_code == 201
+    session_id = create_response.json()["id"]
+
+    other_client = TestClient(app, base_url=TEST_ORIGIN)
+    login_as(other_client, email=other_email, password=other_password)
+
+    read_response = other_client.get(f"/api/admin/terminal/sessions/{session_id}?cursor=0")
+    assert read_response.status_code == 403
 
 
 def test_session_handoff_download_contains_changed_files_and_metadata(tmp_path):

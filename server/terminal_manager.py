@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import pty
 import signal
 import subprocess
@@ -15,6 +16,10 @@ from config.settings import AppConfig
 
 
 class TerminalSessionNotFoundError(RuntimeError):
+    pass
+
+
+class TerminalAccessDeniedError(RuntimeError):
     pass
 
 
@@ -35,6 +40,9 @@ class TerminalSnapshot:
 @dataclass(slots=True)
 class _TerminalSession:
     id: str
+    owner_user_id: str
+    owner_email: str
+    owner_ip: str | None
     cwd: str
     shell: str
     process: subprocess.Popen[bytes]
@@ -62,20 +70,28 @@ class TerminalManager:
         self.config = config
         self._lock = Lock()
         self._sessions: dict[str, _TerminalSession] = {}
-        self._idle_timeout_seconds = 1800
+        self._idle_timeout_seconds = 600
         self._max_buffer_chars = 200_000
+        self._max_sessions_total = 3
+        self._max_sessions_per_owner = 1
 
-    def create_session(self, *, cwd: str | None = None) -> TerminalSnapshot:
+    def create_session(
+        self,
+        *,
+        owner_user_id: str,
+        owner_email: str,
+        owner_ip: str | None = None,
+        cwd: str | None = None,
+    ) -> TerminalSnapshot:
         self._prune_expired_sessions()
+        self._close_owner_sessions(owner_user_id)
         working_dir = self._resolve_cwd(cwd)
         shell = self._default_shell()
+        shell_command = self._shell_command(shell)
         master_fd, slave_fd = pty.openpty()
-        env = os.environ.copy()
-        env.setdefault("TERM", "xterm-256color")
-        env.setdefault("COLORTERM", "truecolor")
-        env.setdefault("HOME", str(Path.home()))
+        env = self._build_env(shell)
         process = subprocess.Popen(
-            [shell, "-i"],
+            shell_command,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -89,6 +105,9 @@ class TerminalManager:
         now = utc_now()
         session = _TerminalSession(
             id=uuid4().hex[:12],
+            owner_user_id=owner_user_id,
+            owner_email=owner_email,
+            owner_ip=owner_ip,
             cwd=str(working_dir),
             shell=shell,
             process=process,
@@ -99,13 +118,14 @@ class TerminalManager:
         )
         reader = Thread(target=self._reader_loop, args=(session.id,), daemon=True)
         with self._lock:
+            self._evict_if_needed_locked()
             self._sessions[session.id] = session
         reader.start()
-        return self.read(session.id, cursor=0)
+        return self.read(session.id, owner_user_id=owner_user_id, cursor=0)
 
-    def read(self, session_id: str, *, cursor: int = 0) -> TerminalSnapshot:
+    def read(self, session_id: str, *, owner_user_id: str, cursor: int = 0) -> TerminalSnapshot:
         self._prune_expired_sessions()
-        session = self._require_session(session_id)
+        session = self._require_session_for_owner(session_id, owner_user_id=owner_user_id)
         with session.lock:
             session.last_used_monotonic = monotonic()
             reset = cursor < session.buffer_base_cursor
@@ -126,10 +146,10 @@ class TerminalManager:
                 reset=reset,
             )
 
-    def write(self, session_id: str, data: str) -> TerminalSnapshot:
+    def write(self, session_id: str, owner_user_id: str, data: str) -> TerminalSnapshot:
         if not data:
-            return self.read(session_id)
-        session = self._require_session(session_id)
+            return self.read(session_id, owner_user_id=owner_user_id)
+        session = self._require_session_for_owner(session_id, owner_user_id=owner_user_id)
         with session.lock:
             session.last_used_monotonic = monotonic()
             if session.exit_code is not None:
@@ -138,8 +158,8 @@ class TerminalManager:
             session.updated_at = utc_now()
             return self._snapshot_locked(session, output="", reset=False)
 
-    def interrupt(self, session_id: str) -> TerminalSnapshot:
-        session = self._require_session(session_id)
+    def interrupt(self, session_id: str, owner_user_id: str) -> TerminalSnapshot:
+        session = self._require_session_for_owner(session_id, owner_user_id=owner_user_id)
         with session.lock:
             session.last_used_monotonic = monotonic()
             if session.exit_code is None:
@@ -150,11 +170,15 @@ class TerminalManager:
                 session.updated_at = utc_now()
             return self._snapshot_locked(session, output="", reset=False)
 
-    def close(self, session_id: str) -> None:
+    def close(self, session_id: str, *, owner_user_id: str | None = None) -> None:
         with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
             return
+        if owner_user_id and session.owner_user_id != owner_user_id:
+            with self._lock:
+                self._sessions[session_id] = session
+            raise TerminalAccessDeniedError("Terminal session belongs to a different user.")
         self._close_session(session)
 
     def close_all(self) -> None:
@@ -238,6 +262,28 @@ class TerminalManager:
             raise TerminalSessionNotFoundError("Terminal session not found.")
         return session
 
+    def _require_session_for_owner(self, session_id: str, *, owner_user_id: str) -> _TerminalSession:
+        session = self._require_session(session_id)
+        if session.owner_user_id != owner_user_id:
+            raise TerminalAccessDeniedError("Terminal session belongs to a different user.")
+        return session
+
+    def _close_owner_sessions(self, owner_user_id: str) -> None:
+        stale: list[_TerminalSession] = []
+        with self._lock:
+            for session_id, session in list(self._sessions.items()):
+                if session.owner_user_id == owner_user_id:
+                    stale.append(self._sessions.pop(session_id))
+        for session in stale:
+            self._close_session(session)
+
+    def _evict_if_needed_locked(self) -> None:
+        if len(self._sessions) < self._max_sessions_total:
+            return
+        oldest_session = min(self._sessions.values(), key=lambda item: item.last_used_monotonic)
+        self._sessions.pop(oldest_session.id, None)
+        self._close_session(oldest_session)
+
     def _prune_expired_sessions(self) -> None:
         now = monotonic()
         expired: list[_TerminalSession] = []
@@ -260,3 +306,27 @@ class TerminalManager:
             if candidate and Path(candidate).exists():
                 return candidate
         return "/bin/sh"
+
+    def _shell_command(self, shell: str) -> list[str]:
+        name = Path(shell).name
+        if name == "bash":
+            return [shell, "--noprofile", "--norc", "-i"]
+        if name == "zsh":
+            return [shell, "-f", "-i"]
+        return [shell, "-i"]
+
+    def _build_env(self, shell: str) -> dict[str, str]:
+        user_name = pwd.getpwuid(os.getuid()).pw_name
+        home = str(Path.home())
+        return {
+            "TERM": "xterm-256color",
+            "COLORTERM": "truecolor",
+            "HOME": home,
+            "USER": user_name,
+            "LOGNAME": user_name,
+            "SHELL": shell,
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PWD": home,
+        }
