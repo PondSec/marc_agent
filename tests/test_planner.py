@@ -7705,6 +7705,88 @@ def test_planner_prefers_implementation_target_before_validation_target_for_runt
     assert next_target == "greet_cli/__main__.py"
 
 
+def test_planner_prefers_test_target_for_runtime_harness_nameerror(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Create a wordfreq CLI and repair failing tests.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["wordfreq/__main__.py", "wordfreq/cli.py", "tests/test_wordfreq.py"],
+                "focus_files": ["tests/test_wordfreq.py", "wordfreq/__main__.py"],
+                "test_files": ["tests/test_wordfreq.py"],
+                "likely_commands": ["python -m unittest tests.test_wordfreq"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_wordfreq",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_wordfreq"],
+    )
+    (tmp_path / "wordfreq").mkdir()
+    (tmp_path / "wordfreq" / "__main__.py").write_text("from .cli import main\n", encoding="utf-8")
+    (tmp_path / "wordfreq" / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_wordfreq.py").write_text("import unittest\n", encoding="utf-8")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Create the requested CLI and tests."},
+            {"step": 2, "action": "run_validation", "reason": "Run the targeted unittest module."},
+        ],
+        target_paths=["wordfreq/__main__.py", "wordfreq/cli.py", "tests/test_wordfreq.py"],
+        target_name="wordfreq/__main__.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_wordfreq",
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="wordfreq/__main__.py", operation="write"),
+            FileChangeRecord(path="wordfreq/cli.py", operation="write"),
+            FileChangeRecord(path="tests/test_wordfreq.py", operation="write"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_wordfreq",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        iteration=6,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "ERROR: test_file_input (tests.test_wordfreq.TestWordFreq.test_file_input)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_wordfreq.py"}", line 19, in test_file_input\n'
+            "    result = subprocess.run([sys.executable, '-m', 'wordfreq', sample_path], check=True)\n"
+            "NameError: name 'sys' is not defined\n"
+        ),
+    )
+
+    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
+    next_target = planner._repair_target_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    assert repair_context.repair_brief is not None
+    assert repair_context.repair_brief.primary_target == "tests/test_wordfreq.py"
+    assert next_target == "tests/test_wordfreq.py"
+
+
 def test_planner_repairs_missing_runtime_fixture_before_reediting_implementation(tmp_path):
     (tmp_path / "wordfreq.py").write_text(
         "def wordfreq(file_path):\n"
