@@ -11193,6 +11193,97 @@ def test_runtime_repair_review_ignores_called_process_error_summary_noise(tmp_pa
     assert review is None
 
 
+def test_compact_runtime_repair_prompt_anchors_direct_python_script_execution(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the dataflow script runtime path.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the runtime script path."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["scripts/build_duplicates.py", "wordaudit/report.py", "README.md"],
+        target_name="build_duplicates.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_report")
+
+    current_content = (
+        "import sys\n\n"
+        "from wordaudit import duplicate_words\n\n\n"
+        "def main(argv=None):\n"
+        "    argv = list(sys.argv[1:] if argv is None else argv)\n"
+        "    with open(argv[0], 'r', encoding='utf-8') as handle:\n"
+        "        lines = handle.readlines()\n"
+        "        duplicates = duplicate_words([line for line in lines if not line.strip().startswith('#')])\n"
+        "    for word in duplicates:\n"
+        "        print(word)\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_report",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["scripts/build_duplicates.py", "wordaudit/report.py", "README.md", "tests/test_report.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            "raise CalledProcessError(retcode, process.args,\n"
+            "subprocess.CalledProcessError: "
+            "Command '['/usr/bin/python3', '/tmp/demo/scripts/build_duplicates.py', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+            "FAILED (errors=1)\n"
+        ),
+        failure_summary=(
+            "Traceback (most recent call last):\n"
+            "raise CalledProcessError(retcode, process.args,\n"
+            "subprocess.CalledProcessError: "
+            "Command '['/usr/bin/python3', '/tmp/demo/scripts/build_duplicates.py', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+            "FAILED (errors=1)\n"
+        ),
+        file_hints=["scripts/build_duplicates.py", "wordaudit/report.py", "README.md", "tests/test_report.py"],
+        repair_requirements=[
+            "Change scripts/build_duplicates.py so the failing runtime or test path can complete successfully."
+        ],
+        evidence_signature="sig-direct-script-anchor",
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:directscriptanchor",
+            primary_target="scripts/build_duplicates.py",
+            locked_target="scripts/build_duplicates.py",
+            expected_semantics=["The exercised runtime command should exit successfully."],
+            observed_semantics=[
+                "The current runtime command exits non-zero when invoking: ['/usr/bin/python3', '/tmp/demo/scripts/build_duplicates.py', '/tmp/tmpwords.txt'] (exit status 1)"
+            ],
+            implicated_symbols=[],
+            implicated_region_hint="scripts/build_duplicates.py",
+            repair_constraints=[
+                "Change scripts/build_duplicates.py so the failing runtime or test path can complete successfully."
+            ],
+            recent_failed_attempts=[],
+            allowed_files=["scripts/build_duplicates.py", "wordaudit/report.py"],
+            forbidden_files=["README.md", "tests/test_report.py"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="scripts/build_duplicates.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "This file is executed directly as a Python script in the failing command." in prompt
+    assert "Keep scripts/build_duplicates.py runnable in that mode" in prompt
+    assert "1: import sys" in prompt
+    assert "3: from wordaudit import duplicate_words" in prompt
+
+
 def test_review_guided_retry_can_escalate_to_full_for_broad_updates(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[

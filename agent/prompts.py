@@ -2272,6 +2272,13 @@ def _mandatory_mutation_anchors(
                 "Resolve the failure focus tied to this file: "
                 + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
             )
+    direct_script_anchor = _direct_python_script_execution_anchor(
+        path=path,
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+    if direct_script_anchor:
+        anchors.append(direct_script_anchor)
     undefined_symbol_anchor = _undefined_runtime_symbol_anchor(
         path=path,
         current_content=current_content,
@@ -2306,6 +2313,103 @@ def _mandatory_mutation_anchors(
             )
 
     return anchors[:3]
+
+
+def _direct_python_script_execution_anchor(
+    *,
+    path: str,
+    current_content: str,
+    repair_context: ValidationFailureEvidence,
+) -> str | None:
+    if Path(path).suffix.lower() not in {".py", ".pyi"}:
+        return None
+    if not _runtime_failure_invokes_python_script_target(repair_context, target_path=path):
+        return None
+
+    anchor_lines: list[str] = []
+    for index, raw in enumerate(str(current_content or "").splitlines(), start=1):
+        line = str(raw or "").rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if (
+            index <= 4
+            or stripped.startswith(("import ", "from ", "if __name__", "ROOT", "HERE", "BASE_DIR"))
+            or "sys.path" in stripped
+        ):
+            anchor_lines.append(f"{index}: {line}")
+        if len(anchor_lines) >= 4 or index >= 12:
+            break
+
+    if anchor_lines:
+        return (
+            f"This file is executed directly as a Python script in the failing command. "
+            f"Keep {path} runnable in that mode and fix any module-level import/bootstrap issue in these current lines:\n"
+            + "\n".join(anchor_lines)
+        )
+
+    return (
+        f"This file is executed directly as a Python script in the failing command. "
+        f"Keep {path} runnable in that mode, especially around module-level imports and startup/bootstrap code."
+    )
+
+
+def _runtime_failure_invokes_python_script_target(
+    repair_context: ValidationFailureEvidence | None,
+    *,
+    target_path: str,
+) -> bool:
+    if repair_context is None or repair_context.verification_scope != "runtime":
+        return False
+    command = _called_process_python_script_target(
+        "\n".join(
+            part
+            for part in [
+                str(repair_context.excerpt or "").strip(),
+                str(repair_context.failure_summary or "").strip(),
+                str(repair_context.summary or "").strip(),
+            ]
+            if part
+        )
+    )
+    if not command:
+        return False
+    normalized_target = str(target_path or "").strip().replace("\\", "/")
+    normalized_command = command.replace("\\", "/")
+    return normalized_command == normalized_target or normalized_command.endswith(f"/{normalized_target}")
+
+
+def _called_process_python_script_target(text: str) -> str | None:
+    match = re.search(
+        r"CalledProcessError:\s+Command\s+'?(?P<command>\[[^\]]+\])'?\s+returned non-zero exit status\s+\d+",
+        str(text or ""),
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    raw_command = str(match.group("command") or "").strip()
+    if not raw_command:
+        return None
+    try:
+        parsed = ast.literal_eval(raw_command)
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(parsed, (list, tuple)):
+        return None
+
+    args = [str(item or "").strip() for item in parsed if str(item or "").strip()]
+    if len(args) < 2:
+        return None
+
+    for candidate in args[1:]:
+        if candidate in {"-m", "-c"}:
+            return None
+        if candidate.startswith("-"):
+            continue
+        if candidate.lower().endswith(".py"):
+            return candidate
+        break
+    return None
 
 
 def _undefined_runtime_symbol_from_text(text: str) -> str | None:
