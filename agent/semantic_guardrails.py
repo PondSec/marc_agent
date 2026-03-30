@@ -110,6 +110,22 @@ _PATH_RE = re.compile(
 _CONVENTIONAL_ARTIFACT_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\breadme(?:\.md)?\b", flags=re.IGNORECASE), "README.md"),
 )
+_BACKTICK_SYMBOL_RE = re.compile(r"`(?P<name>[A-Za-z_][A-Za-z0-9_]*)`")
+_CONTEXTUAL_SYMBOL_RE = re.compile(
+    r"\b(?:function|method|symbol|helper|class|service|module)\s+(?:named|called)?\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?",
+    flags=re.IGNORECASE,
+)
+_SNAKE_SYMBOL_RE = re.compile(r"\b(?P<name>[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+)(?:\(\))?\b")
+_CAMEL_SYMBOL_RE = re.compile(r"\b(?P<name>[a-z]+[A-Z][A-Za-z0-9]*)(?:\(\))?\b")
+_GENERIC_SYMBOL_REQUEST_STOPWORDS = {
+    "python",
+    "python3",
+    "pytest",
+    "unittest",
+    "readme",
+    "main",
+    "index",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,12 +151,23 @@ def build_minimal_task_state(
     context = _context_anchor(session)
     signal = _minimal_semantic_signal(request, context=context)
     inferred_snapshot_targets = _snapshot_target_artifacts(request, snapshot)
+    unresolved_explicit_symbols = _unresolved_explicit_snapshot_symbols(
+        request,
+        snapshot=snapshot,
+        signal=signal,
+        context=context,
+    )
     signal_targets = _target_artifacts_for_signal(
         request,
         signal=signal,
         anchor_artifacts=context["artifacts"],
     )
-    if signal.intent == "update" and signal.needs_clarification and inferred_snapshot_targets:
+    if (
+        signal.intent == "update"
+        and signal.needs_clarification
+        and inferred_snapshot_targets
+        and not unresolved_explicit_symbols
+    ):
         signal = MinimalSemanticSignal(
             intent=signal.intent,
             goal_relation=signal.goal_relation,
@@ -157,6 +184,18 @@ def build_minimal_task_state(
         target_artifacts = signal_targets
     else:
         target_artifacts = inferred_snapshot_targets or signal_targets
+    if unresolved_explicit_symbols:
+        target_artifacts = []
+        signal = MinimalSemanticSignal(
+            intent=signal.intent,
+            goal_relation=signal.goal_relation,
+            confidence=min(signal.confidence, 0.42),
+            use_context=signal.use_context,
+            needs_clarification=True,
+            requested_extension=signal.requested_extension,
+            artifact_name_hint=signal.artifact_name_hint,
+            explicit_path=signal.explicit_path,
+        )
     if _prefer_create_in_empty_workspace(
         request,
         snapshot=snapshot,
@@ -203,13 +242,24 @@ def build_minimal_task_state(
         assumptions.append("Current-turn wording is treated as a same-task reference only because there is one safe active anchor.")
     elif inferred_snapshot_targets:
         assumptions.append("The target artifacts were inferred conservatively from strong lexical overlap between the request and workspace filenames.")
+    if unresolved_explicit_symbols:
+        assumptions.append(
+            "Avoid inferring a different target from filename overlap when the explicitly requested symbol is absent from the repo map."
+        )
 
     if signal.needs_clarification:
         current_user_intent = "unknown"
         ambiguity_level = "high"
         next_action = "clarify"
-        missing_info.append(_clarification_missing_info(signal, context=context))
-        execution_outline = ["Ask for the exact artifact, scope, or task boundary before acting."]
+        if unresolved_explicit_symbols:
+            missing_info.append(_missing_explicit_symbol_message(unresolved_explicit_symbols))
+            execution_outline = [
+                "Confirm whether the named symbol should already exist or whether it needs to be added.",
+                "Avoid editing a lexically similar implementation until the intended symbol is clear.",
+            ]
+        else:
+            missing_info.append(_clarification_missing_info(signal, context=context))
+            execution_outline = ["Ask for the exact artifact, scope, or task boundary before acting."]
     elif signal.intent == "create":
         current_user_intent = "implement"
         execution_strategy = "feature_implementation"
@@ -928,6 +978,84 @@ def _extract_explicit_paths(text: str) -> list[str]:
 def _extract_explicit_name(text: str) -> str | None:
     candidate = infer_artifact_name_hint(text)
     return candidate if candidate and len(candidate) >= 3 else None
+
+
+def _requested_symbol_candidates(text: str) -> list[str]:
+    source = str(text or "")
+    requested: list[str] = []
+
+    def add(name: str, *, start: int, end: int) -> None:
+        candidate = str(name or "").strip().rstrip("()")
+        if len(candidate) < 3:
+            return
+        lowered = candidate.lower()
+        if lowered in _GENERIC_SYMBOL_REQUEST_STOPWORDS or lowered.startswith("test_"):
+            return
+        if start > 0 and source[start - 1] in {".", "/", "-"}:
+            return
+        if end < len(source) and source[end : end + 1] in {".", "/", "-"}:
+            return
+        if candidate not in requested:
+            requested.append(candidate)
+
+    for pattern in (_BACKTICK_SYMBOL_RE, _CONTEXTUAL_SYMBOL_RE, _SNAKE_SYMBOL_RE, _CAMEL_SYMBOL_RE):
+        for match in pattern.finditer(source):
+            add(str(match.group("name") or ""), start=match.start("name"), end=match.end("name"))
+    return requested[:6]
+
+
+def _snapshot_symbol_names(snapshot) -> set[str]:
+    symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+    names: set[str] = set()
+    for symbols in symbol_index.values():
+        for raw in symbols or []:
+            text = str(raw or "").strip().lower()
+            if text:
+                names.add(text)
+    return names
+
+
+def _unresolved_explicit_snapshot_symbols(
+    request: str,
+    *,
+    snapshot,
+    signal: MinimalSemanticSignal,
+    context: dict[str, Any],
+) -> list[str]:
+    if snapshot is None:
+        return []
+    if _extract_explicit_paths(request):
+        return []
+    if signal.use_context and context.get("artifacts"):
+        return []
+
+    requested_symbols = _requested_symbol_candidates(request)
+    if not requested_symbols:
+        return []
+
+    snapshot_symbols = _snapshot_symbol_names(snapshot)
+    if not snapshot_symbols:
+        return []
+
+    missing = [symbol for symbol in requested_symbols if symbol.lower() not in snapshot_symbols]
+    if len(missing) != len(requested_symbols):
+        return []
+    return missing[:2]
+
+
+def _missing_explicit_symbol_message(symbols: list[str]) -> str:
+    if not symbols:
+        return "The request names a symbol that is not visible in the current repo map."
+    if len(symbols) == 1:
+        return (
+            f"The request names symbol '{symbols[0]}', but it does not appear in the current repo map. "
+            "Clarify whether it should be added or whether another existing symbol is intended."
+        )
+    joined = ", ".join(f"'{symbol}'" for symbol in symbols)
+    return (
+        f"The request names symbols {joined}, but none of them appear in the current repo map. "
+        "Clarify whether they should be added or whether different existing symbols are intended."
+    )
 
 
 def _looks_like_test_artifact(path: str) -> bool:

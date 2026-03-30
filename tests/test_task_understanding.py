@@ -106,6 +106,13 @@ def build_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
         deploy_files=[],
         entrypoints=["app/main.py"],
         repo_map=["app/", "tests/"],
+        service_files=["app/auth.py"],
+        import_hotspots=["app/auth.py"],
+        symbol_index={
+            "app/main.py": ["main"],
+            "app/auth.py": ["check_role", "login_user"],
+            "app/upload.py": ["upload_file"],
+        },
         project_labels=["python"],
         likely_commands=["python -m pytest"],
         validation_commands=[],
@@ -130,11 +137,48 @@ def empty_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
         deploy_files=[],
         entrypoints=[],
         repo_map=[],
+        service_files=[],
+        import_hotspots=[],
+        symbol_index={},
         project_labels=[],
         likely_commands=[],
         validation_commands=[],
         workflow_commands=[],
         repo_summary="Empty workspace.",
+    )
+
+
+def calcstats_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
+    return WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 4},
+        top_directories=["calcstats", "tests"],
+        important_files=["calcstats/stats.py", "calcstats/__init__.py", "tests/test_stats.py", "README.md"],
+        focus_files=["calcstats/stats.py"],
+        file_briefs={
+            "calcstats/stats.py": "Numeric report helpers.",
+            "tests/test_stats.py": "Validation for the stats helpers.",
+        },
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_stats.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=["calcstats/", "tests/"],
+        test_mappings=["tests/test_stats.py -> calcstats/stats.py"],
+        service_files=[],
+        import_hotspots=["calcstats/__init__.py"],
+        symbol_index={
+            "calcstats/stats.py": ["moving_average"],
+            "calcstats/__init__.py": ["moving_average"],
+        },
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_stats"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Python utilities for numeric reports.",
     )
 
 
@@ -1830,6 +1874,50 @@ def test_task_state_fallback_clarifies_when_multiple_active_artifacts_compete(tm
     assert task_state.next_action == "clarify"
     assert task_state.needs_clarification is True
     assert "mehrere" in task_state.missing_info[0].lower() or "multiple" in task_state.missing_info[0].lower()
+
+
+def test_task_state_fallback_clarifies_when_requested_symbol_is_absent_from_repo_map(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM())
+    prompt = (
+        "Fix the existing calcstats bug so median_value returns the correct median for even-length "
+        "numeric lists and run python -m unittest tests.test_stats."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=calcstats_snapshot(tmp_path))
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=calcstats_snapshot(tmp_path),
+        session=SessionState(task=prompt, workspace_root=str(tmp_path)),
+    )
+
+    assert task_state.next_action == "clarify"
+    assert task_state.needs_clarification is True
+    assert any("median_value" in item for item in task_state.missing_info)
+    assert not any(artifact.path == "calcstats/stats.py" for artifact in task_state.target_artifacts)
+    assert route.needs_clarification is True
+    assert route.action_plan[0].action == RouteActionName.ASK_CLARIFICATION
+
+
+def test_task_state_fallback_keeps_repo_target_when_requested_symbol_exists_in_repo_map(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM())
+    prompt = (
+        "Fix the existing calcstats bug so moving_average returns one average per full window only "
+        "and run python -m unittest tests.test_stats."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=calcstats_snapshot(tmp_path))
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=calcstats_snapshot(tmp_path),
+        session=SessionState(task=prompt, workspace_root=str(tmp_path)),
+    )
+
+    assert task_state.needs_clarification is False
+    assert task_state.next_action == "debug"
+    assert task_state.target_artifacts
+    assert task_state.target_artifacts[0].path == "calcstats/stats.py"
+    assert route.needs_clarification is False
+    assert route.intent == RouteIntent.DEBUG
 
 
 def test_task_state_timeout_fallback_keeps_clear_build_request_executable_even_with_follow_up_context(tmp_path):
