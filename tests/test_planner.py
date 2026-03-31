@@ -6953,6 +6953,46 @@ def test_targeted_runtime_prompt_hints_detect_launcher_failure_even_when_support
     assert any("strip a leading python -m launcher prefix" in hint for hint in hints)
 
 
+def test_targeted_runtime_prompt_hints_prioritize_bootstrap_for_direct_script_execution():
+    hints = _targeted_runtime_prompt_hints(
+        path="scripts/build_duplicates.py",
+        current_content=(
+            "import sys\n"
+            "\n"
+            "from wordaudit import duplicate_words\n"
+            "\n"
+            "\n"
+            "def main(argv=None):\n"
+            "    argv = list(sys.argv[1:] if argv is None else argv)\n"
+            "    with open(argv[0], 'r', encoding='utf-8') as handle:\n"
+            "        duplicates = duplicate_words(handle.readlines())\n"
+            "    for word in duplicates:\n"
+            "        print(word)\n"
+        ),
+        supporting_context=(
+            "tests/test_report.py:\n"
+            '10: SCRIPT = ROOT / "scripts" / "build_duplicates.py"\n'
+        ),
+        targeted_context={
+            "failure_summary": (
+                "subprocess.CalledProcessError: "
+                "Command '['/usr/bin/python3', '/tmp/demo/scripts/build_duplicates.py', '/tmp/tmpwords.txt']' "
+                "returned non-zero exit status 1."
+            ),
+            "excerpt": (
+                "subprocess.CalledProcessError: "
+                "Command '['/usr/bin/python3', '/tmp/demo/scripts/build_duplicates.py', '/tmp/tmpwords.txt']' "
+                "returned non-zero exit status 1."
+            ),
+            "failure_focus": [],
+            "file_hints": ["tests/test_report.py", "wordaudit/report.py"],
+        },
+    )
+
+    assert any("runs this file directly by script path" in hint for hint in hints)
+    assert any("script directory is guaranteed on sys.path" in hint for hint in hints)
+
+
 def test_targeted_runtime_failure_focus_keeps_adjacent_code_lines_for_runtime_repairs():
     focus = _targeted_runtime_failure_focus_lines(
         (
@@ -11279,9 +11319,12 @@ def test_compact_runtime_repair_prompt_anchors_direct_python_script_execution(tm
     )
 
     assert "This file is executed directly as a Python script in the failing command." in prompt
+    assert "Treat the top-of-file import/bootstrap path as the primary repair surface." in prompt
     assert "Keep scripts/build_duplicates.py runnable in that mode" in prompt
     assert "1: import sys" in prompt
     assert "3: from wordaudit import duplicate_words" in prompt
+    assert "Change the implicated current lines in scripts/build_duplicates.py:" not in prompt
+    assert "The failing command runs this file directly by script path." in prompt
 
 
 def test_review_guided_retry_can_escalate_to_full_for_broad_updates(tmp_path, monkeypatch):

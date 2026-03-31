@@ -2231,47 +2231,6 @@ def _mandatory_mutation_anchors(
     review_feedback: ProposedUpdateReview | None,
 ) -> list[str]:
     anchors: list[str] = []
-
-    line_excerpt = ""
-    focused_line_hints = _repair_target_line_hints(
-        path=path,
-        current_content=current_content,
-        repair_context=repair_context,
-    )
-    if focused_line_hints:
-        line_excerpt = _line_focused_excerpt(
-            current_content,
-            line_hints=focused_line_hints,
-            limit=220,
-            before_radius=0,
-            after_radius=0,
-        )
-    if line_excerpt:
-        anchors.append(f"Change the implicated current lines in {path}:\n{line_excerpt}")
-    elif repair_context.verification_scope == "runtime":
-        focus_lines = [
-            line
-            for line in _targeted_runtime_failure_focus_lines(
-                "\n".join(
-                    part
-                    for part in [
-                        str(repair_context.excerpt or "").strip(),
-                        str(repair_context.failure_summary or "").strip(),
-                        str(repair_context.summary or "").strip(),
-                    ]
-                    if part
-                ),
-                target_path=path,
-                other_paths=_repair_other_paths(repair_context, target_path=path),
-                limit=4,
-            )
-            if line and not line.startswith("File ") and not line.startswith("Traceback")
-        ]
-        if focus_lines:
-            anchors.append(
-                "Resolve the failure focus tied to this file: "
-                + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
-            )
     direct_script_anchor = _direct_python_script_execution_anchor(
         path=path,
         current_content=current_content,
@@ -2279,6 +2238,47 @@ def _mandatory_mutation_anchors(
     )
     if direct_script_anchor:
         anchors.append(direct_script_anchor)
+    else:
+        line_excerpt = ""
+        focused_line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if focused_line_hints:
+            line_excerpt = _line_focused_excerpt(
+                current_content,
+                line_hints=focused_line_hints,
+                limit=220,
+                before_radius=0,
+                after_radius=0,
+            )
+        if line_excerpt:
+            anchors.append(f"Change the implicated current lines in {path}:\n{line_excerpt}")
+        elif repair_context.verification_scope == "runtime":
+            focus_lines = [
+                line
+                for line in _targeted_runtime_failure_focus_lines(
+                    "\n".join(
+                        part
+                        for part in [
+                            str(repair_context.excerpt or "").strip(),
+                            str(repair_context.failure_summary or "").strip(),
+                            str(repair_context.summary or "").strip(),
+                        ]
+                        if part
+                    ),
+                    target_path=path,
+                    other_paths=_repair_other_paths(repair_context, target_path=path),
+                    limit=4,
+                )
+                if line and not line.startswith("File ") and not line.startswith("Traceback")
+            ]
+            if focus_lines:
+                anchors.append(
+                    "Resolve the failure focus tied to this file: "
+                    + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
+                )
     undefined_symbol_anchor = _undefined_runtime_symbol_anchor(
         path=path,
         current_content=current_content,
@@ -2344,12 +2344,14 @@ def _direct_python_script_execution_anchor(
     if anchor_lines:
         return (
             f"This file is executed directly as a Python script in the failing command. "
+            f"Treat the top-of-file import/bootstrap path as the primary repair surface. "
             f"Keep {path} runnable in that mode and fix any module-level import/bootstrap issue in these current lines:\n"
             + "\n".join(anchor_lines)
         )
 
     return (
         f"This file is executed directly as a Python script in the failing command. "
+        f"Treat the top-of-file import/bootstrap path as the primary repair surface. "
         f"Keep {path} runnable in that mode, especially around module-level imports and startup/bootstrap code."
     )
 
@@ -2597,8 +2599,9 @@ def _targeted_runtime_prompt_hints(
         return []
 
     lowered_current = str(current_content or "").lower()
-    if not any(token in lowered_current for token in ("parse_args(", "parse_known_args(", "argparse.argumentparser")):
-        return []
+    has_argparse_runtime = any(
+        token in lowered_current for token in ("parse_args(", "parse_known_args(", "argparse.argumentparser")
+    )
 
     lowered_support = str(supporting_context or "").lower()
     focus_text = "\n".join(
@@ -2621,6 +2624,19 @@ def _targeted_runtime_prompt_hints(
     lowered_failure = failure_text.lower()
 
     hints: list[str] = []
+    direct_script_target = _called_process_python_script_target(failure_text)
+    normalized_path = str(path or "").strip().replace("\\", "/")
+    if direct_script_target:
+        normalized_target = str(direct_script_target or "").strip().replace("\\", "/")
+        if normalized_target == normalized_path or normalized_target.endswith(f"/{normalized_path}"):
+            hints.append(
+                "The failing command runs this file directly by script path. Prioritize the top-of-file import/bootstrap path before changing downstream logic."
+            )
+            hints.append(
+                "When a repo Python file is executed this way, only the script directory is guaranteed on sys.path. If this file imports repo-local modules, add the smallest startup/bootstrap needed near the top so those imports can resolve before they run."
+            )
+    if not has_argparse_runtime:
+        return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure
     python_m_launcher = (
         "'-m'" in supporting_context
