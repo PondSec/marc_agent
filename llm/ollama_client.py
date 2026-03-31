@@ -267,6 +267,8 @@ class OllamaClient:
                     inactivity_timeout=inactivity_timeout,
                     total_timeout=overall_timeout,
                 )
+                if isinstance(normalized, OllamaGenerationError) and normalized.no_start_failure:
+                    self._stop_running_model(effective_model)
                 if isinstance(normalized, OllamaGenerationError) and not normalized.retryable:
                     raise normalized
                 if isinstance(normalized, OllamaClientError) and not self._is_timeout_like(normalized):
