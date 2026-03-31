@@ -29,7 +29,15 @@ MemoryUseCase = Literal[
     "project_context",
     "user_recall",
 ]
-ValidationStatus = Literal["not_run", "passed", "failed", "blocked"]
+BootstrapStatus = Literal["none", "bootstrap_failed", "bootstrap_reset_required"]
+ValidationStatus = Literal[
+    "not_run",
+    "passed",
+    "failed",
+    "blocked",
+    "bootstrap_failed",
+    "bootstrap_reset_required",
+]
 WorkflowStage = Literal[
     "discover",
     "plan",
@@ -86,6 +94,9 @@ class ValidationRunRecord(StrictModel):
     edit_generation: int = 0
     summary: str | None = None
     excerpt: str | None = None
+    failure_signature: str | None = None
+    root_cause_summary: str | None = None
+    bootstrap_status: BootstrapStatus = "none"
     timestamp: str = Field(default_factory=utc_now)
 
 
@@ -101,6 +112,9 @@ class RepairBrief(StrictModel):
     failure_signature: str | None = None
     primary_target: str | None = None
     locked_target: str | None = None
+    root_cause_summary: str | None = None
+    bootstrap_status: BootstrapStatus = "none"
+    bootstrap_reason: str | None = None
     expected_semantics: list[str] = Field(default_factory=list)
     observed_semantics: list[str] = Field(default_factory=list)
     implicated_symbols: list[str] = Field(default_factory=list)
@@ -126,6 +140,8 @@ class ValidationFailureEvidence(StrictModel):
     action_hints: list[str] = Field(default_factory=list)
     repair_requirements: list[str] = Field(default_factory=list)
     evidence_signature: str | None = None
+    root_cause_summary: str | None = None
+    bootstrap_status: BootstrapStatus = "none"
     repair_brief: RepairBrief | None = None
 
 
@@ -174,6 +190,14 @@ class RepairAttemptRecord(StrictModel):
     evidence_signature: str | None = None
     failure_signature: str | None = None
     region_hint: str | None = None
+    root_cause_summary: str | None = None
+    productive_change: bool | None = None
+    before_hash: str | None = None
+    after_hash: str | None = None
+    change_labels: list[str] = Field(default_factory=list)
+    post_validation_failure_signature: str | None = None
+    behavior_changed: bool | None = None
+    independent_verification: bool | None = None
     iteration: int | None = None
     timestamp: str = Field(default_factory=utc_now)
 

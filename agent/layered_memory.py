@@ -1288,7 +1288,7 @@ class AgentMemoryStore(RepoMemoryStore):
 
     def _infer_use_case(self, task: str, session: SessionState) -> str:
         lowered = str(task or "").strip().lower()
-        if session.validation_status == "failed" or session.active_repair_context is not None:
+        if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"} or session.active_repair_context is not None:
             return "repair_assistance"
         recall_markers = (
             "haben wir",

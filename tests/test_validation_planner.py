@@ -6,6 +6,7 @@ import shutil
 from agent.models import (
     DiagnosticRecord,
     FileChangeRecord,
+    RepairBrief,
     RepairAttemptRecord,
     SessionState,
     ValidationCommand,
@@ -675,6 +676,105 @@ def test_validation_planner_called_process_error_tracks_command_exit_without_noi
             f"['/usr/bin/python3', '{scripts_dir / 'build_duplicates.py'}', '/tmp/tmpwords.txt'] (exit status 1)"
         )
     ]
+
+
+def test_validation_planner_classifies_direct_script_import_failure_as_bootstrap_failed(tmp_path):
+    planner = ValidationPlanner()
+    package_dir = tmp_path / "wordaudit"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from .report import duplicate_words\n", encoding="utf-8")
+    (package_dir / "report.py").write_text("def duplicate_words(lines):\n    return []\n", encoding="utf-8")
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "build_duplicates.py"
+    script_path.write_text("from wordaudit import duplicate_words\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_report.py"
+    test_path.write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the wordaudit runtime flow.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.append(FileChangeRecord(path="scripts/build_duplicates.py", operation="modify"))
+
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_report",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{script_path}", line 1, in <module>\n'
+            "    from wordaudit import duplicate_words\n"
+            "ModuleNotFoundError: No module named 'wordaudit'\n"
+            "subprocess.CalledProcessError: "
+            f"Command '['/usr/bin/python3', '{script_path}', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+            f'  File "{test_path}", line 22, in test_script_output_ignores_comment_lines\n'
+            "    result = subprocess.run(..., check=True)\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.bootstrap_status == "bootstrap_failed"
+    assert evidence.root_cause_summary is not None
+    assert "bootstrap" in evidence.root_cause_summary.lower()
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.bootstrap_status == "bootstrap_failed"
+    assert evidence.repair_brief.primary_target == "scripts/build_duplicates.py"
+
+
+def test_validation_planner_requires_bootstrap_reset_after_two_same_failures_without_behavior_change():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Repair the direct script bootstrap path.",
+        workspace_root="/tmp/demo",
+    )
+    repair_brief = RepairBrief(
+        failure_type="import_failure",
+        failure_signature="runtime:import_failure:abc123",
+        primary_target="scripts/build_duplicates.py",
+        locked_target="scripts/build_duplicates.py",
+        bootstrap_status="bootstrap_failed",
+        root_cause_summary="scripts/build_duplicates.py still fails during bootstrap import.",
+    )
+    session.repair_history.extend(
+        [
+            RepairAttemptRecord(
+                artifact_path="scripts/build_duplicates.py",
+                validation_command="python -m unittest tests.test_report",
+                verification_scope="runtime",
+                strategy="validation_targeted",
+                result="no_effective_change",
+                reason="comment-only change",
+                failure_signature="runtime:import_failure:abc123",
+                productive_change=False,
+                change_labels=["comment_only"],
+            ),
+            RepairAttemptRecord(
+                artifact_path="scripts/build_duplicates.py",
+                validation_command="python -m unittest tests.test_report",
+                verification_scope="runtime",
+                strategy="validation_escalated",
+                result="mutation_planned",
+                reason="substantive mutation prepared",
+                failure_signature="runtime:import_failure:abc123",
+                productive_change=True,
+                independent_verification=False,
+                behavior_changed=False,
+                post_validation_failure_signature="runtime:import_failure:abc123",
+            ),
+        ]
+    )
+
+    assert planner.same_failure_without_behavior_change_count(session, repair_brief) == 2
+    assert planner.should_require_bootstrap_reset(session, repair_brief) is True
 
 
 def test_validation_planner_ignores_separator_noise_in_assertion_semantics(tmp_path):

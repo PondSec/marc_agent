@@ -486,9 +486,11 @@ class AgentCore:
         return excerpt[: self.config.max_read_chars]
 
     def _determine_phase(self, session: SessionState) -> str:
+        if session.validation_status == "bootstrap_reset_required":
+            return "blocked"
         if session.blockers:
             return "blocked"
-        if session.validation_status == "failed":
+        if session.validation_status in {"failed", "bootstrap_failed"}:
             return "repairing"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "verifying"
@@ -524,9 +526,13 @@ class AgentCore:
     ) -> AgentDecision:
         if (
             session.repair_attempts >= self.config.max_repair_attempts
-            and session.validation_status == "failed"
+            and session.validation_status in {"failed", "bootstrap_failed"}
         ):
-            session.stop_reason = "max_repair_attempts_reached"
+            if session.validation_status == "bootstrap_failed":
+                session.validation_status = "bootstrap_reset_required"
+                session.stop_reason = "needs_human_or_bootstrap_reset"
+            else:
+                session.stop_reason = "max_repair_attempts_reached"
             return AgentDecision(
                 thought_summary="Repair limit reached after repeated failed validation.",
                 action_type=AgentActionType.FINAL,
@@ -586,7 +592,7 @@ class AgentCore:
             )[:24]
 
         if decision.tool_name in WRITE_TOOLS and result.success:
-            if session.validation_status == "failed":
+            if session.validation_status in {"failed", "bootstrap_failed"}:
                 session.repair_attempts += 1
             session.edit_generation += 1
             session.validation_status = "not_run"
@@ -600,24 +606,45 @@ class AgentCore:
             self._refresh_session_context(task, session)
 
         if decision.tool_name in VERIFY_TOOLS:
-            self._record_validation_run(session, decision, result)
+            run = self._record_validation_run(session, decision, result)
+            failure_evidence = None
+            if run.status in {"failed", "timeout"}:
+                failure_evidence = self.validation_planner.build_failure_evidence(session, run)
+                self._decorate_failed_validation_run(run, failure_evidence)
+                self._mark_repair_attempt_verification_outcome(
+                    session,
+                    run,
+                    failure_evidence=failure_evidence,
+                )
+                if self.validation_planner.should_require_bootstrap_reset(session, failure_evidence.repair_brief):
+                    run.bootstrap_status = "bootstrap_reset_required"
+                    failure_evidence.bootstrap_status = "bootstrap_reset_required"
+                    if failure_evidence.repair_brief is not None:
+                        failure_evidence.repair_brief.bootstrap_status = "bootstrap_reset_required"
+            elif run.status == "passed":
+                self._mark_repair_attempt_verification_outcome(session, run)
             session.validation_status = self.validation_planner.rollup_status(session)
-            if session.validation_status == "failed":
+            if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"}:
                 failed_run = self.validation_planner.latest_failed_run(
                     session,
                     current_generation_only=False,
                 )
                 if failed_run is not None:
-                    session.active_repair_context = self.validation_planner.build_failure_evidence(
+                    session.active_repair_context = failure_evidence or self.validation_planner.build_failure_evidence(
                         session,
                         failed_run,
                     )
                     session.last_error = (
-                        failed_run.excerpt
+                        getattr(session.active_repair_context, "root_cause_summary", None)
+                        or failed_run.excerpt
                         or failed_run.summary
                         or self._build_output_excerpt(result.data)
                         or result.message
                     )
+                    self._append_validation_note(session, failed_run)
+                    if session.validation_status == "bootstrap_reset_required" and session.last_error:
+                        self._add_blocker(session, session.last_error)
+                        session.stop_reason = "needs_human_or_bootstrap_reset"
                 else:
                     session.active_repair_context = None
                     session.last_error = self._build_output_excerpt(result.data) or result.message
@@ -631,7 +658,7 @@ class AgentCore:
         if not result.success and result.data.get("blocked"):
             self._add_blocker(session, result.message)
 
-    def _record_validation_run(self, session: SessionState, decision, result) -> None:
+    def _record_validation_run(self, session: SessionState, decision, result) -> ValidationRunRecord:
         command_text = result.data.get("command") or decision.tool_args.get("command", "")
         command_identity = self.validation_planner.command_identity(command_text)
         plan_item = next(
@@ -668,6 +695,67 @@ class AgentCore:
         )
         session.validation_runs.append(run)
         session.validation_runs = session.validation_runs[-20:]
+        return run
+
+    def _decorate_failed_validation_run(
+        self,
+        run: ValidationRunRecord,
+        failure_evidence,
+    ) -> None:
+        brief = getattr(failure_evidence, "repair_brief", None)
+        run.failure_signature = str(getattr(brief, "failure_signature", "") or "").strip() or None
+        run.root_cause_summary = str(getattr(failure_evidence, "root_cause_summary", "") or "").strip() or None
+        bootstrap_status = str(getattr(failure_evidence, "bootstrap_status", "") or "").strip()
+        if bootstrap_status in {"bootstrap_failed", "bootstrap_reset_required"}:
+            run.bootstrap_status = bootstrap_status
+
+    def _latest_pending_repair_attempt(self, session: SessionState):
+        return next(
+            (
+                attempt
+                for attempt in reversed(session.repair_history)
+                if attempt.result == "mutation_planned" and attempt.independent_verification is None
+            ),
+            None,
+        )
+
+    def _mark_repair_attempt_verification_outcome(
+        self,
+        session: SessionState,
+        run: ValidationRunRecord,
+        *,
+        failure_evidence=None,
+    ) -> None:
+        attempt = self._latest_pending_repair_attempt(session)
+        if attempt is None:
+            return
+        if run.status == "passed":
+            attempt.independent_verification = True
+            attempt.behavior_changed = True
+            attempt.post_validation_failure_signature = None
+            return
+        attempt.independent_verification = False
+        if failure_evidence is None or getattr(failure_evidence, "repair_brief", None) is None:
+            return
+        post_signature = str(getattr(failure_evidence.repair_brief, "failure_signature", "") or "").strip() or None
+        attempt.post_validation_failure_signature = post_signature
+        attempt.behavior_changed = not bool(
+            post_signature
+            and str(attempt.failure_signature or "").strip()
+            and post_signature == str(attempt.failure_signature or "").strip()
+        )
+
+    def _append_validation_note(self, session: SessionState, run: ValidationRunRecord) -> None:
+        root_cause = str(getattr(run, "root_cause_summary", "") or "").strip()
+        if not root_cause:
+            return
+        status = str(getattr(run, "bootstrap_status", "") or "").strip() or "failed"
+        if status == "none":
+            status = "failed"
+        note = f"Validation classified as {status}: {root_cause}"
+        if note not in session.notes:
+            session.notes.append(note)
+            session.notes = session.notes[-20:]
 
     def _add_blocker(self, session: SessionState, message: str) -> None:
         if message not in session.blockers:
@@ -729,7 +817,7 @@ class AgentCore:
             return "partial"
         if self._web_functional_validation_missing(session):
             return "partial"
-        if session.blockers or session.validation_status in {"failed", "blocked"}:
+        if session.blockers or session.validation_status in {"failed", "blocked", "bootstrap_failed", "bootstrap_reset_required"}:
             return "partial"
         if session.changed_files and session.validation_status == "not_run":
             return "partial"
@@ -742,6 +830,10 @@ class AgentCore:
         return "failed"
 
     def _derive_stop_reason(self, session: SessionState) -> str:
+        if session.validation_status == "bootstrap_reset_required":
+            return "needs_human_or_bootstrap_reset"
+        if session.validation_status == "bootstrap_failed":
+            return "bootstrap_failed"
         if session.blockers:
             return "blocked"
         if self._semantic_fallback_uncertain(session):

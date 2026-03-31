@@ -317,7 +317,7 @@ class ValidationPlanner:
             if any(run.status == "blocked" for run in current_runs):
                 return "blocked"
             if any(run.status in {"failed", "timeout"} for run in current_runs):
-                return "failed"
+                return self._failed_validation_status(current_runs)
             if any(run.status == "passed" for run in current_runs):
                 return "passed"
             return "not_run"
@@ -330,10 +330,22 @@ class ValidationPlanner:
         if any(run.status == "blocked" for run in current_runs):
             return "blocked"
         if any(run.status in {"failed", "timeout"} for run in current_runs):
-            return "failed"
+            return self._failed_validation_status(current_runs)
         if not self.pending_commands(session):
             return "passed"
         return "not_run"
+
+    def _failed_validation_status(self, runs: list[ValidationRunRecord]) -> str:
+        latest_failed = next(
+            (run for run in reversed(runs) if run.status in {"failed", "timeout"}),
+            None,
+        )
+        if latest_failed is None:
+            return "failed"
+        bootstrap_status = str(getattr(latest_failed, "bootstrap_status", "") or "").strip()
+        if bootstrap_status in {"bootstrap_failed", "bootstrap_reset_required"}:
+            return bootstrap_status
+        return "failed"
 
     def build_diagnostic_plan(self, session: SessionState) -> list[ValidationCommand]:
         snapshot = session.workspace_snapshot
@@ -928,6 +940,8 @@ class ValidationPlanner:
             action_hints=action_hints,
             repair_requirements=repair_requirements,
             evidence_signature=evidence_signature,
+            root_cause_summary=repair_brief.root_cause_summary if repair_brief is not None else None,
+            bootstrap_status=repair_brief.bootstrap_status if repair_brief is not None else "none",
             repair_brief=repair_brief,
         )
 
@@ -960,6 +974,17 @@ class ValidationPlanner:
             missing_features=missing_features,
         )
         implicated_symbols = self._implicated_symbols_from_failure_text(excerpt, failure_summary)
+        failure_type = self._failure_type(
+            failed_run,
+            excerpt=excerpt,
+            failure_summary=failure_summary,
+            missing_features=missing_features,
+        )
+        if failure_type == "import_failure":
+            script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
+            normalized_script = self._workspace_relative_path(session, script_target)
+            if normalized_script:
+                primary_target = normalized_script
         target_line_hint = self._target_traceback_line_hint(
             primary_target,
             text=raw_failure_text or "\n".join(part for part in [excerpt, summary] if part),
@@ -969,12 +994,6 @@ class ValidationPlanner:
             target_line_hint=target_line_hint,
             implicated_symbols=implicated_symbols,
         )
-        failure_type = self._failure_type(
-            failed_run,
-            excerpt=excerpt,
-            failure_summary=failure_summary,
-            missing_features=missing_features,
-        )
         failure_signature = self._failure_signature(
             failed_run,
             failure_type=failure_type,
@@ -982,6 +1001,23 @@ class ValidationPlanner:
             expected_semantics=expected_semantics,
             observed_semantics=observed_semantics,
             implicated_symbols=implicated_symbols,
+        )
+        bootstrap_status = self._bootstrap_status(
+            failed_run,
+            failure_type=failure_type,
+            raw_failure_text=raw_failure_text,
+            primary_target=primary_target,
+            target_line_hint=target_line_hint,
+        )
+        root_cause_summary = self._root_cause_summary(
+            failed_run,
+            failure_type=failure_type,
+            raw_failure_text=raw_failure_text,
+            primary_target=primary_target,
+            expected_semantics=expected_semantics,
+            observed_semantics=observed_semantics,
+            missing_features=missing_features,
+            bootstrap_status=bootstrap_status,
         )
         locked_target = self._locked_repair_target(
             session,
@@ -1005,6 +1041,9 @@ class ValidationPlanner:
             failure_signature=failure_signature,
             primary_target=primary_target,
             locked_target=locked_target,
+            root_cause_summary=root_cause_summary,
+            bootstrap_status=bootstrap_status,
+            bootstrap_reason=root_cause_summary if bootstrap_status != "none" else None,
             expected_semantics=expected_semantics[:3],
             observed_semantics=observed_semantics[:3],
             implicated_symbols=implicated_symbols[:6],
@@ -1409,6 +1448,195 @@ class ValidationPlanner:
             json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()[:16]
         return f"{failed_run.verification_scope}:{failure_type}:{digest}"
+
+    def _bootstrap_status(
+        self,
+        failed_run: ValidationRunRecord,
+        *,
+        failure_type: str,
+        raw_failure_text: str,
+        primary_target: str | None,
+        target_line_hint: int | None,
+    ) -> str:
+        if failed_run.verification_scope != "runtime":
+            return "none"
+        if self._no_tests_executed(failed_run):
+            return "bootstrap_failed"
+        if failure_type != "import_failure":
+            return "none"
+
+        script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
+        if script_target:
+            return "bootstrap_failed"
+        if target_line_hint is not None and 0 < target_line_hint <= 12:
+            return "bootstrap_failed"
+        return "none"
+
+    def _root_cause_summary(
+        self,
+        failed_run: ValidationRunRecord,
+        *,
+        failure_type: str,
+        raw_failure_text: str,
+        primary_target: str | None,
+        expected_semantics: list[str],
+        observed_semantics: list[str],
+        missing_features: list[str],
+        bootstrap_status: str,
+    ) -> str:
+        target = str(primary_target or "").strip() or "the implicated artifact"
+        missing_module = self._missing_module_name(raw_failure_text)
+        script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
+
+        if bootstrap_status == "bootstrap_failed":
+            if self._no_tests_executed(failed_run):
+                return (
+                    "The requested validation is failing in its bootstrap or discovery path before the intended "
+                    f"tests execute, so {target} or the adjacent test/package wiring must be repaired first."
+                )
+            if failure_type == "import_failure" and script_target:
+                subject = script_target if "/" in script_target or script_target.endswith(".py") else target
+                if missing_module:
+                    return (
+                        f"{subject} is failing during direct script bootstrap because the startup import path cannot "
+                        f"resolve '{missing_module}' before runtime logic begins."
+                    )
+                return (
+                    f"{subject} is failing during direct script bootstrap before the intended runtime path can start."
+                )
+            return f"The active runtime path is failing during import/bootstrap before {target} can reach its intended behavior."
+
+        if failure_type == "structural_missing_feature" and missing_features:
+            return f"{target} is missing validation-required behavior or structure: {', '.join(missing_features[:3])}."
+        if failure_type == "assertion_mismatch" and expected_semantics and observed_semantics:
+            return f"{target} still produces the wrong behavior: expected {expected_semantics[0]} but observed {observed_semantics[0]}."
+        if failure_type == "runtime_argument_parsing":
+            return f"{target} rejects the exercised runtime invocation instead of accepting the intended arguments."
+        if failure_type == "missing_artifact":
+            return f"{target} cannot complete because a required runtime artifact is missing or unresolved."
+        if failure_type == "import_failure":
+            if missing_module:
+                return f"{target} fails because the active runtime path cannot import '{missing_module}'."
+            return f"{target} fails during import before the requested runtime behavior can execute."
+        if failure_type == "test_discovery_gap":
+            return "The requested validation command is not reaching the intended tests, so the discovery or package layout must be repaired first."
+        if failure_type == "runtime_failure" and observed_semantics:
+            return f"{target} still fails on the exercised runtime path: {observed_semantics[0]}"
+        summary = str(failed_run.summary or "").strip()
+        if summary:
+            return summary[:220]
+        return f"The current {failed_run.verification_scope} validation still fails for {target}."
+
+    def _python_script_target_from_failure(
+        self,
+        failed_run: ValidationRunRecord,
+        raw_failure_text: str,
+    ) -> str | None:
+        from_called_process = self._called_process_python_script_target(raw_failure_text)
+        if from_called_process:
+            return from_called_process
+        return self._python_script_target_from_command(failed_run.command)
+
+    def _workspace_relative_path(
+        self,
+        session: SessionState,
+        candidate: str | None,
+    ) -> str | None:
+        text = str(candidate or "").strip()
+        if not text:
+            return None
+        normalized = text.replace("\\", "/")
+        workspace_root = str(session.workspace_root or "").strip()
+        if not workspace_root:
+            return normalized
+        try:
+            resolved_candidate = Path(text).resolve()
+            resolved_workspace = Path(workspace_root).resolve()
+            relative = resolved_candidate.relative_to(resolved_workspace)
+        except (ValueError, OSError):
+            return normalized
+        return relative.as_posix()
+
+    def _python_script_target_from_command(self, command: str) -> str | None:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return None
+        if len(tokens) < 2:
+            return None
+        lowered = [token.lower() for token in tokens]
+        if lowered[0] not in {"python", "python3"}:
+            return None
+        for candidate in tokens[1:]:
+            cleaned = str(candidate or "").strip()
+            if not cleaned:
+                continue
+            if cleaned in {"-m", "-c"}:
+                return None
+            if cleaned.startswith("-"):
+                continue
+            if cleaned.lower().endswith(".py"):
+                return cleaned
+            break
+        return None
+
+    def _called_process_python_script_target(self, text: str) -> str | None:
+        command_text, _exit_code = self._called_process_error_details(text)
+        if not command_text:
+            return None
+        try:
+            parsed = ast.literal_eval(command_text)
+        except (SyntaxError, ValueError):
+            return None
+        if not isinstance(parsed, (list, tuple)):
+            return None
+        tokens = [str(item or "").strip() for item in parsed if str(item or "").strip()]
+        if len(tokens) < 2:
+            return None
+        for candidate in tokens[1:]:
+            if candidate in {"-m", "-c"}:
+                return None
+            if candidate.startswith("-"):
+                continue
+            if candidate.lower().endswith(".py"):
+                return candidate
+            break
+        return None
+
+    def same_failure_without_behavior_change_count(
+        self,
+        session: SessionState,
+        repair_brief: RepairBrief | None,
+    ) -> int:
+        if repair_brief is None:
+            return 0
+        failure_signature = str(repair_brief.failure_signature or "").strip()
+        if not failure_signature:
+            return 0
+        count = 0
+        for attempt in reversed(session.repair_history):
+            if str(attempt.failure_signature or "").strip() != failure_signature:
+                continue
+            if attempt.result == "no_effective_change":
+                count += 1
+            elif (
+                attempt.result == "mutation_planned"
+                and attempt.independent_verification is False
+                and attempt.behavior_changed is False
+            ):
+                count += 1
+        return count
+
+    def should_require_bootstrap_reset(
+        self,
+        session: SessionState,
+        repair_brief: RepairBrief | None,
+    ) -> bool:
+        if repair_brief is None:
+            return False
+        if str(repair_brief.bootstrap_status or "").strip() != "bootstrap_failed":
+            return False
+        return self.same_failure_without_behavior_change_count(session, repair_brief) >= 2
 
     def _locked_repair_target(
         self,

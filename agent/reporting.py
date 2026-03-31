@@ -94,6 +94,22 @@ class SessionReporter:
                     en=f"Repair blocker: the validation evidence still did not support a substantive, non-equivalent fix ({repair_summary}).",
                 )
             )
+        elif session.validation_status == "bootstrap_failed":
+            details.append(
+                self._localized_text(
+                    language,
+                    de="Validierung scheitert aktuell im Bootstrap- oder Discovery-Pfad und ist noch nicht im normalen Repair-Fall.",
+                    en="Validation is currently failing in the bootstrap or discovery path and is not yet in a normal repair case.",
+                )
+            )
+        elif session.validation_status == "bootstrap_reset_required":
+            details.append(
+                self._localized_text(
+                    language,
+                    de="Der Bootstrap-Pfad braucht vor weiteren Retries einen Reset oder menschliche Entscheidung.",
+                    en="The bootstrap path needs a reset or human intervention before more retries.",
+                )
+            )
         elif session.validation_status == "failed":
             details.append(
                 self._localized_text(
@@ -336,6 +352,34 @@ class SessionReporter:
                     en=f"Validation: passed ({latest.command}).",
                 )
             return self._localized_text(language, de="Validierung: bestanden.", en="Validation: passed.")
+
+        if session.validation_status == "bootstrap_failed":
+            if report.validation:
+                latest = report.validation[-1]
+                return self._localized_text(
+                    language,
+                    de=f"Validierung: Bootstrap-/Discovery-Fehler ({latest.command}).",
+                    en=f"Validation: bootstrap/discovery failure ({latest.command}).",
+                )
+            return self._localized_text(
+                language,
+                de="Validierung: Bootstrap-/Discovery-Fehler.",
+                en="Validation: bootstrap/discovery failure.",
+            )
+
+        if session.validation_status == "bootstrap_reset_required":
+            if report.validation:
+                latest = report.validation[-1]
+                return self._localized_text(
+                    language,
+                    de=f"Validierung: bootstrap_reset_required ({latest.command}).",
+                    en=f"Validation: bootstrap_reset_required ({latest.command}).",
+                )
+            return self._localized_text(
+                language,
+                de="Validierung: bootstrap_reset_required.",
+                en="Validation: bootstrap_reset_required.",
+            )
 
         if session.validation_status == "failed":
             if report.validation:

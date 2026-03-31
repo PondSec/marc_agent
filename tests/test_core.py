@@ -90,6 +90,24 @@ def test_core_marks_generation_failure_without_changes_as_partial(tmp_path):
     assert status == "partial"
 
 
+def test_core_uses_bootstrap_reset_stop_reason_and_partial_status(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Repair the bootstrap path",
+        workspace_root=str(tmp_path),
+        validation_status="bootstrap_reset_required",
+    )
+    session.changed_files.append(FileChangeRecord(path="scripts/build_duplicates.py", operation="modify"))
+
+    stop_reason = core._derive_stop_reason(session)
+    status = core._resolve_final_status(session, final_action=True)
+
+    assert stop_reason == "needs_human_or_bootstrap_reset"
+    assert status == "partial"
+
+
 def test_core_marks_model_start_failure_without_changes_as_partial(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

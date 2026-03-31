@@ -1004,7 +1004,7 @@ class TaskManager:
 
         if session.status == "failed" and session.final_response and not session.blockers:
             if (
-                session.validation_status not in {"failed", "blocked"}
+                session.validation_status not in {"failed", "blocked", "bootstrap_failed", "bootstrap_reset_required"}
                 and not session.stop_requested
                 and not session.stop_reason
             ):
