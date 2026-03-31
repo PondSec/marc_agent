@@ -78,12 +78,44 @@ class StartupTimeoutLLM(ScriptedLLM):
         raise OllamaGenerationError(
             "timed out waiting for the model to start streaming after 38.0 seconds",
             reason="startup_timeout",
-            retryable=False,
+            retryable=True,
             model_name=str(kwargs.get("model") or "") or None,
             startup_timeout_seconds=38,
             inactivity_timeout_seconds=18,
             total_timeout_seconds=38,
         )
+
+
+class SelectiveStartupTimeoutLLM(ScriptedLLM):
+    def __init__(
+        self,
+        payload_by_model: dict[str, dict],
+        *,
+        failing_models: set[str] | None = None,
+        config=None,
+    ):
+        super().__init__(json_payloads=[])
+        self.payload_by_model = dict(payload_by_model)
+        self.failing_models = set(failing_models or set())
+        self.config = config
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        model = str(kwargs.get("model") or "")
+        if model in self.failing_models:
+            raise OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 38.0 seconds",
+                reason="startup_timeout",
+                retryable=True,
+                model_name=model or None,
+                startup_timeout_seconds=38,
+                inactivity_timeout_seconds=18,
+                total_timeout_seconds=38,
+            )
+        payload = self.payload_by_model.get(model)
+        if payload is None:
+            raise RuntimeError(f"No JSON payload configured for model {model!r}")
+        return payload
 
 
 def build_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
@@ -903,11 +935,11 @@ def test_task_state_uses_reserve_model_before_minimal_inference_for_clear_create
     assert task_state.next_action == "create"
     assert task_state.current_user_intent == "implement"
     assert task_state.execution_strategy == "feature_implementation"
-    assert task_state.semantic_resolution == "reduced_model"
+    assert task_state.semantic_resolution == "reserve_model"
     assert any(call["kwargs"].get("model") == "reserve-b" for call in llm.generate_json_calls)
-    assert llm.generate_json_calls[1]["kwargs"]["timeout"] == 18
-    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] == 72
-    assert llm.generate_json_calls[1]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] == 20
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] == 40
+    assert llm.generate_json_calls[1]["kwargs"]["num_ctx"] == 4096
 
 
 def test_task_state_uses_larger_primary_model_as_reserve_when_smaller_router_times_out(tmp_path):
@@ -965,17 +997,17 @@ def test_task_state_uses_larger_primary_model_as_reserve_when_smaller_router_tim
     assert task_state.next_action == "create"
     assert task_state.current_user_intent == "implement"
     assert task_state.execution_strategy == "feature_implementation"
-    assert task_state.semantic_resolution == "reduced_model"
+    assert task_state.semantic_resolution == "reserve_model"
     assert [call["kwargs"].get("model") for call in llm.generate_json_calls[:2]] == [
         "qwen3:8b",
         "qwen3:14b",
     ]
-    assert llm.generate_json_calls[1]["kwargs"]["timeout"] == 18
-    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] == 72
-    assert llm.generate_json_calls[1]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] == 20
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] == 40
+    assert llm.generate_json_calls[1]["kwargs"]["num_ctx"] == 4096
 
 
-def test_task_state_short_circuits_to_deterministic_fallback_after_fresh_compact_no_start(tmp_path):
+def test_task_state_runs_real_recovery_before_deterministic_fallback_after_fresh_no_start(tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
         model_name="qwen3:14b",
@@ -993,9 +1025,13 @@ def test_task_state_short_circuits_to_deterministic_fallback_after_fresh_compact
     assert task_state.goal_relation == "new_task"
     assert task_state.next_action == "create"
     assert task_state.semantic_resolution == "minimal_inference"
-    assert [call["kwargs"].get("model") for call in llm.generate_json_calls] == ["qwen3:8b"]
+    assert [call["kwargs"].get("model") for call in llm.generate_json_calls] == [
+        "qwen3:8b",
+        "qwen3:8b",
+        "qwen3:8b",
+    ]
     log_text = logger.log_path.read_text(encoding="utf-8")
-    assert "task_state_recovery_short_circuit" in log_text
+    assert "task_state_recovery_short_circuit" not in log_text
 
 
 def test_task_state_uses_local_short_circuit_when_primary_and_router_models_match(tmp_path):
@@ -1048,7 +1084,7 @@ def test_task_state_local_short_circuit_keeps_relevant_test_artifact_for_cli_fea
     )
     llm = ScriptedLLM()
     llm.config = config
-    updater = TaskStateUpdater(llm)
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
 
     task_state = updater.update_task_state(
         (
@@ -1112,7 +1148,7 @@ def test_task_state_local_short_circuit_inferrs_named_package_code_before_docs_i
     )
     llm = ScriptedLLM()
     llm.config = config
-    updater = TaskStateUpdater(llm)
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
 
     prompt = (
         "Create a small Python package named calcstats with library helpers and a CLI entrypoint. "
@@ -1420,6 +1456,111 @@ def test_task_state_a2_preserves_full_retry_mode_for_semantic_recovery(tmp_path)
         and call["kwargs"]["num_ctx"] == updater.num_ctx
         for call in llm.generate_json_calls[1:]
     )
+
+
+def test_task_state_a2_skips_larger_reserve_model_for_no_start_recovery(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+        model_candidates=("qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen3-coder:30b"),
+    )
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    models = [call["kwargs"].get("model") for call in llm.generate_json_calls]
+
+    assert task_state.semantic_resolution == "blocked"
+    assert models[:3] == [
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:7b",
+    ]
+    assert "qwen2.5-coder:14b" not in models
+
+
+def test_task_state_a2_uses_smaller_reserve_model_when_available_for_no_start(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:14b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    reserve_payload = {
+        "latest_user_turn": "Fix the upload bug in app/upload.py without weakening the tests.",
+        "root_goal": "Fix the upload bug in app/upload.py without weakening the tests.",
+        "active_goal": "Diagnose and fix the upload bug in the current repo.",
+        "goal_relation": "report_problem",
+        "output_expectation": "Diagnose the issue, apply the smallest safe fix, and verify the result.",
+        "current_user_intent": "repair",
+        "execution_strategy": "debug_repair",
+        "open_problem": "Upload bug in app/upload.py.",
+        "verification_target": "Reproduce the bug and rerun the relevant tests.",
+        "target_artifacts": [
+            {"path": "app/upload.py", "name": "upload.py", "kind": ".py", "role": "primary_target", "confidence": 0.92},
+            {"path": "tests/test_auth.py", "name": "test_auth.py", "kind": ".py", "role": "validation_target", "confidence": 0.78},
+        ],
+        "active_artifacts": [
+            {"path": "app/upload.py", "name": "upload.py", "kind": ".py", "role": "primary_target", "confidence": 0.92},
+        ],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "confidence": 0.83,
+        "next_action": "debug",
+        "next_best_action": "debug",
+        "execution_outline": [
+            "Read the strongest target first.",
+            "Reproduce the failure before editing.",
+            "Apply the smallest safe fix and rerun tests.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = SelectiveStartupTimeoutLLM(
+        {"qwen2.5-coder:7b": reserve_payload},
+        failing_models={"qwen2.5-coder:14b"},
+        config=config,
+    )
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "reserve_model"
+    assert task_state.execution_strategy == "debug_repair"
+    assert [call["kwargs"].get("model") for call in llm.generate_json_calls[:3]] == [
+        "qwen2.5-coder:14b",
+        "qwen2.5-coder:14b",
+        "qwen2.5-coder:7b",
+    ]
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] == 18
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[2]["kwargs"]["timeout"] == updater.timeout
+    assert llm.generate_json_calls[2]["kwargs"]["num_ctx"] == updater.num_ctx
 
 
 def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):

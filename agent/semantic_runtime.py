@@ -15,47 +15,93 @@ SemanticResolution = Literal[
 
 def semantic_model_candidates(preferred_model: str | None, config: object | None) -> list[str]:
     primary = str(preferred_model or "").strip()
+    explicit_primary = bool(primary)
+    discovered_pool = _configured_candidate_pool(config)
+    configured_pool = _configured_model_pool(config)
     if not primary:
-        for raw in (
-            getattr(config, "router_model_name", None) if config is not None else None,
-            getattr(config, "model_name", None) if config is not None else None,
-        ):
-            text = str(raw or "").strip()
-            if text:
-                primary = text
+        for candidate in [*discovered_pool, *configured_pool]:
+            primary = str(candidate or "").strip()
+            if primary:
                 break
     if not primary:
         return []
+    if discovered_pool:
+        return _rank_model_candidates(
+            primary,
+            discovered_pool,
+            allow_larger_if_needed=True,
+        )
+    return _rank_model_candidates(
+        primary,
+        configured_pool,
+        allow_larger_if_needed=not explicit_primary,
+    )
 
-    candidates = [primary]
-    alternatives: list[str] = []
+
+def _configured_model_pool(config: object | None) -> list[str]:
+    candidates: list[str] = []
     for raw in (
         getattr(config, "router_model_name", None) if config is not None else None,
         getattr(config, "model_name", None) if config is not None else None,
     ):
         text = str(raw or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
+def _configured_candidate_pool(config: object | None) -> list[str]:
+    raw_candidates = getattr(config, "model_candidates", ()) if config is not None else ()
+    if isinstance(raw_candidates, str):
+        raw_candidates = [raw_candidates]
+    candidates: list[str] = []
+    for raw in raw_candidates or ():
+        text = str(raw or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
+def _rank_model_candidates(
+    primary: str,
+    candidate_pool: list[str],
+    *,
+    allow_larger_if_needed: bool,
+) -> list[str]:
+    candidates = [primary]
+    alternatives: list[str] = []
+    for raw in candidate_pool:
+        text = str(raw or "").strip()
         if text and text != primary and text not in alternatives:
             alternatives.append(text)
 
     primary_size = _estimated_model_size_billions(primary)
-    ranked_smaller_or_equal: list[tuple[float, str]] = []
-    ranked_larger: list[tuple[float, str]] = []
-    unknown_size: list[str] = []
+    primary_family = _model_family(primary)
+    ranked_smaller_or_equal: list[tuple[int, float, float, str]] = []
+    ranked_larger: list[tuple[int, float, float, str]] = []
+    unknown_size: list[tuple[int, str]] = []
     for candidate in alternatives:
         candidate_size = _estimated_model_size_billions(candidate)
+        family_penalty = 0 if primary_family and _model_family(candidate) == primary_family else 1
         if candidate_size is None:
-            unknown_size.append(candidate)
+            unknown_size.append((family_penalty, candidate))
             continue
         if primary_size is not None and candidate_size > primary_size:
-            ranked_larger.append((candidate_size, candidate))
+            if not allow_larger_if_needed:
+                continue
+            ranked_larger.append((family_penalty, candidate_size - primary_size, candidate_size, candidate))
             continue
-        ranked_smaller_or_equal.append((candidate_size, candidate))
+        distance = abs(candidate_size - primary_size) if primary_size is not None else 0.0
+        ranked_smaller_or_equal.append((family_penalty, distance, -candidate_size, candidate))
 
-    candidates.extend(candidate for _, candidate in sorted(ranked_smaller_or_equal, key=lambda item: item[0]))
-    candidates.extend(candidate for _, candidate in sorted(ranked_larger, key=lambda item: item[0]))
-    if primary_size is None:
-        candidates.extend(unknown_size)
+    candidates.extend(candidate for _, _, _, candidate in sorted(ranked_smaller_or_equal))
+    candidates.extend(candidate for _, _, _, candidate in sorted(ranked_larger))
+    candidates.extend(candidate for _, candidate in sorted(unknown_size))
     return candidates
+
+
+def _model_family(model_name: str) -> str:
+    return str(model_name or "").strip().lower().partition(":")[0]
 
 
 def _estimated_model_size_billions(model_name: str) -> float | None:
@@ -90,6 +136,25 @@ def semantic_resolution_from_attempt(
     if model_identifier and primary_model and model_identifier != primary_model:
         return "reserve_model"
     return "full_model"
+
+
+def availability_recovery_model(
+    primary_model: str | None,
+    candidate_model: str | None,
+) -> str | None:
+    primary = str(primary_model or "").strip()
+    candidate = str(candidate_model or "").strip()
+    if not candidate:
+        return None
+    if not primary:
+        return candidate
+    primary_size = _estimated_model_size_billions(primary)
+    candidate_size = _estimated_model_size_billions(candidate)
+    if primary_size is None or candidate_size is None:
+        return candidate
+    if candidate_size <= primary_size:
+        return candidate
+    return None
 
 
 def secondary_semantics_limited(resolution: SemanticResolution) -> bool:

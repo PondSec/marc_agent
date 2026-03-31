@@ -9,6 +9,7 @@ from agent.prompts import task_state_system_prompt, task_state_update_prompt
 from agent.semantic_guardrails import build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
+    availability_recovery_model,
     secondary_semantics_limited,
     semantic_model_candidates,
     semantic_resolution_from_attempt,
@@ -56,6 +57,7 @@ class TaskStateUpdater:
         session=None,
     ) -> TaskState:
         payload: dict[str, Any] | None = None
+        a2_semantic_mode = self._agent_profile(session) == "a2"
         initial_mode = self._initial_prompt_mode(session)
         local_state = self._fallback_state(user_input, snapshot=snapshot, session=session)
         strict_semantic_execution = self._requires_semantic_model_execution(session, local_state)
@@ -107,7 +109,7 @@ class TaskStateUpdater:
             allow_smaller_faster_model=bool(reserve_model),
             allow_reduce_request_complexity=True,
             allow_minimal_generation=True,
-            allow_deterministic_fallback=not strict_semantic_execution,
+            allow_deterministic_fallback=not a2_semantic_mode and not strict_semantic_execution,
             max_same_backend_retries=1,
             max_total_attempts=4,
         )
@@ -142,7 +144,9 @@ class TaskStateUpdater:
             payload = outcome.value
             try:
                 state = TaskState.model_validate(payload)
-                reconciled = self._reconcile_with_local_state(state, local_state)
+                reconciled = False
+                if not a2_semantic_mode:
+                    reconciled = self._reconcile_with_local_state(state, local_state)
                 if reconciled:
                     self._log(
                         "task_state_semantic_reconciled",
@@ -188,25 +192,17 @@ class TaskStateUpdater:
             error=str(outcome.exception),
             failure=failure.to_dict() if failure is not None else None,
         )
-        if (
-            failure is not None
-            and failure.no_start_failure
-            and initial_mode != "full"
-            and not strict_semantic_execution
-        ):
-            self._log(
-                "task_state_recovery_short_circuit",
-                strategy="deterministic_fallback",
-                reason="fresh_compact_no_start",
-            )
-            decisions = []
-        else:
-            decisions = policy.plan_recovery(
-                failure,
-                primary_model=primary_model,
-                faster_model=reserve_model,
-                history=attempts,
-            ) if failure is not None else []
+        recovery_model = self._recovery_model_for_failure(
+            primary_model=primary_model,
+            reserve_model=reserve_model,
+            failure=failure,
+        )
+        decisions = policy.plan_recovery(
+            failure,
+            primary_model=primary_model,
+            faster_model=recovery_model,
+            history=attempts,
+        ) if failure is not None else []
         for decision in decisions:
             self._log(
                 "task_state_recovery_option",
@@ -269,7 +265,9 @@ class TaskStateUpdater:
                 )
                 try:
                     state = TaskState.model_validate(payload)
-                    reconciled = self._reconcile_with_local_state(state, local_state)
+                    reconciled = False
+                    if not a2_semantic_mode:
+                        reconciled = self._reconcile_with_local_state(state, local_state)
                     if reconciled:
                         self._log(
                             "task_state_semantic_reconciled",
@@ -321,7 +319,7 @@ class TaskStateUpdater:
             )
 
         self._log("task_state_fallback", error=str(outcome.exception), payload=payload or {})
-        if strict_semantic_execution:
+        if a2_semantic_mode or strict_semantic_execution:
             state = self._blocked_state_for_missing_semantics(user_input, local_state)
             self._append_runtime_execution(
                 session,
@@ -336,7 +334,7 @@ class TaskStateUpdater:
                         honest_blocked=True,
                         artifact_bytes_generated=0,
                         validation_possible=False,
-                        summary="A2 refused to execute a mutation task from deterministic fallback without semantic model understanding.",
+                        summary="A2 refused to continue without semantic model understanding after exhausting semantic recovery.",
                         attempts=attempts,
                     ),
                     semantic_resolution="blocked",
@@ -481,6 +479,8 @@ class TaskStateUpdater:
         session,
         state: TaskState,
     ) -> bool:
+        if self._agent_profile(session) == "a2":
+            return False
         if self._requires_semantic_model_execution(session, state):
             return False
         if initial_mode != "compact":
@@ -577,13 +577,25 @@ class TaskStateUpdater:
         candidate_prompt_variant: str,
         preserve_full_retry: bool = False,
     ) -> str:
-        if candidate_prompt_variant != "full":
-            return "compact"
-        if preserve_full_retry:
+        normalized = str(candidate_prompt_variant or "").strip().lower()
+        if normalized == "full":
             return "full"
-        if initial_mode != "full":
-            return "compact"
-        return "full"
+        if normalized in {"resume", "minimal"}:
+            return normalized
+        return "compact"
+
+    def _recovery_model_for_failure(
+        self,
+        *,
+        primary_model: str | None,
+        reserve_model: str | None,
+        failure,
+    ) -> str | None:
+        if failure is None:
+            return reserve_model
+        if failure.no_start_failure:
+            return availability_recovery_model(primary_model, reserve_model)
+        return reserve_model
 
     def _log(self, event: str, **payload: Any) -> None:
         if self.logger is None:
