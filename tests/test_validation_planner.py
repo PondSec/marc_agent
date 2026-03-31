@@ -279,6 +279,92 @@ def test_validation_planner_prefers_symbol_resolved_runtime_implementation_over_
     assert not any(item.startswith("Change README.md") for item in evidence.repair_requirements)
 
 
+def test_validation_planner_keeps_single_changed_doc_target_for_content_assertion_runtime_failure(tmp_path):
+    planner = ValidationPlanner()
+    for relative_path, content in {
+        "README.md": "# Inventory App\n",
+        "docs/repo-map.md": "# Repo Map\n",
+        "tests/test_repo_map.py": "import unittest\n",
+        "tests/test_auth.py": "import unittest\n",
+        "inventory_app/api.py": "def handle_request(request):\n    return {}\n",
+        "inventory_app/auth.py": "class AuthGate:\n    pass\n",
+        "inventory_app/rate_limit.py": "class RateLimiter:\n    pass\n",
+    }.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    session = SessionState(
+        task="Create docs/repo-map.md and run python -m unittest tests.test_repo_map before finishing.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=7,
+            important_files=[
+                "README.md",
+                "docs/repo-map.md",
+                "inventory_app/api.py",
+                "inventory_app/auth.py",
+                "inventory_app/rate_limit.py",
+                "tests/test_auth.py",
+                "tests/test_repo_map.py",
+            ],
+            focus_files=["docs/repo-map.md", "tests/test_repo_map.py"],
+            test_files=["tests/test_auth.py", "tests/test_repo_map.py"],
+            import_hotspots=["inventory_app/api.py"],
+            symbol_index={
+                "inventory_app/api.py": ["handle_request"],
+                "inventory_app/auth.py": ["AuthGate"],
+                "inventory_app/rate_limit.py": ["RateLimiter"],
+            },
+        ),
+        task_state=TaskState(
+            latest_user_turn="Create docs/repo-map.md and run python -m unittest tests.test_repo_map before finishing.",
+            root_goal="Document the repository structure.",
+            active_goal="Write the repo map and pass the targeted unittest.",
+            goal_relation="new_task",
+            output_expectation="A concise repo map that names the important runtime and test files.",
+            verification_target="python -m unittest tests.test_repo_map",
+            next_action="create",
+            target_artifacts=[
+                {"path": "docs/repo-map.md", "kind": "doc", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_repo_map.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+        changed_files=[FileChangeRecord(path="docs/repo-map.md", operation="create")],
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_repo_map",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_repo_map.py"}", line 21, in test_repo_map_mentions_key_files\n'
+            "    self.assertIn('tests/test_auth.py', repo_map)\n"
+            "AssertionError: 'tests/test_auth.py' not found in "
+            "'# Repo Map\\n\\n"
+            "- Entrypoint: inventory_app/api.py\\n"
+            "- Request flow: inventory_app/api.py -> inventory_app/auth.py -> inventory_app/rate_limit.py\\n"
+            "- Relevant tests: tests/test_repo_map.py\\n'\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.failure_type == "assertion_mismatch"
+    assert evidence.artifact_paths[0] == "docs/repo-map.md"
+    assert evidence.file_hints[0] == "docs/repo-map.md"
+    assert evidence.repair_brief.primary_target == "docs/repo-map.md"
+    assert evidence.repair_brief.locked_target == "docs/repo-map.md"
+    assert "docs/repo-map.md" in evidence.repair_brief.allowed_files
+    assert "inventory_app/api.py" in evidence.artifact_paths
+
+
 def test_validation_planner_collects_bare_workspace_file_references_from_runtime_assertions(tmp_path):
     planner = ValidationPlanner()
     for relative_path in [

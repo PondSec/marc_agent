@@ -193,6 +193,10 @@ class ValidationPlanner:
     ASSERTION_MISMATCH_PATTERN = re.compile(
         r"AssertionError:\s*(?P<observed>.+?)\s*!=\s*(?P<expected>.+)"
     )
+    ASSERTION_CONTAINMENT_PATTERN = re.compile(
+        r"AssertionError:\s*(?P<expected>.+?)\s+not found in\s+(?P<observed>.+)",
+        re.IGNORECASE,
+    )
     UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
         re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
         re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -205,6 +209,21 @@ class ValidationPlanner:
         "indentationerror",
         "taberror",
         "unboundlocalerror",
+    )
+    NON_ASSERT_RUNTIME_ERROR_MARKERS = (
+        "attributeerror",
+        "calledprocesserror",
+        "filenotfounderror",
+        "importerror",
+        "indentationerror",
+        "keyerror",
+        "modulenotfounderror",
+        "nameerror",
+        "runtimeerror",
+        "syntaxerror",
+        "typeerror",
+        "unboundlocalerror",
+        "valueerror",
     )
 
     def build_plan(
@@ -838,16 +857,22 @@ class ValidationPlanner:
             ]
             if part
         )
+        content_assertion_target = self._single_changed_content_assertion_target(
+            session,
+            failed_run,
+            runtime_failure_text,
+        )
         implicated_symbols = (
             self._implicated_symbols_from_failure_text(runtime_failure_text, runtime_failure_text)
             if failed_run.verification_scope == "runtime"
+            and content_assertion_target is None
             else []
         )
         symbol_resolved_paths = self._symbol_resolved_workspace_paths(
             session,
             implicated_symbols,
         )
-        artifact_paths = self._unique_paths([*artifact_paths, *symbol_resolved_paths])
+        artifact_paths = self._unique_paths([content_assertion_target, *artifact_paths, *symbol_resolved_paths])
         failure_scoped_paths = self._failure_scoped_workspace_paths(
             session,
             failed_run,
@@ -861,7 +886,9 @@ class ValidationPlanner:
             artifact_paths,
             failed_run,
             prefer_test_runtime_target=prefer_test_runtime_target,
+            prefer_content_runtime_target=content_assertion_target is not None,
         )
+        artifact_paths = self._unique_paths([content_assertion_target, *artifact_paths])
         missing_unittest_package_inits = self._missing_unittest_package_inits(
             session,
             failed_run,
@@ -873,7 +900,7 @@ class ValidationPlanner:
             [
                 *artifact_paths,
                 *failure_scoped_paths,
-                *symbol_resolved_paths,
+                *(symbol_resolved_paths if content_assertion_target is None else []),
                 *traceback_file_hints,
                 *referenced_workspace_paths,
                 *missing_unittest_package_inits,
@@ -930,6 +957,7 @@ class ValidationPlanner:
             repair_requirements=repair_requirements,
             missing_features=missing_features,
             prefer_test_runtime_target=prefer_test_runtime_target,
+            prefer_content_runtime_target=content_assertion_target is not None,
             implicated_symbols=implicated_symbols,
         )
         evidence_signature = json.dumps(
@@ -984,6 +1012,7 @@ class ValidationPlanner:
         repair_requirements: list[str],
         missing_features: list[str],
         prefer_test_runtime_target: bool = False,
+        prefer_content_runtime_target: bool = False,
         implicated_symbols: list[str] | None = None,
     ) -> RepairBrief:
         primary_target = self._primary_repair_target(
@@ -991,6 +1020,7 @@ class ValidationPlanner:
             file_hints=file_hints,
             verification_scope=failed_run.verification_scope,
             prefer_test_runtime_target=prefer_test_runtime_target,
+            prefer_content_runtime_target=prefer_content_runtime_target,
         )
         expected_semantics, observed_semantics = self._failure_semantics(
             failed_run,
@@ -1097,6 +1127,7 @@ class ValidationPlanner:
         file_hints: list[str],
         verification_scope: str,
         prefer_test_runtime_target: bool = False,
+        prefer_content_runtime_target: bool = False,
     ) -> str | None:
         candidates = self._unique_paths([*artifact_paths, *file_hints])
         if verification_scope == "runtime":
@@ -1104,6 +1135,10 @@ class ValidationPlanner:
                 validation = [path for path in candidates if path and self._is_test_path(path)]
                 if validation:
                     return validation[0]
+            if prefer_content_runtime_target:
+                content_candidates = [path for path in candidates if path and not self._is_test_path(path)]
+                if content_candidates:
+                    return content_candidates[0]
             implementation = [
                 path
                 for path in candidates
@@ -1157,7 +1192,7 @@ class ValidationPlanner:
         text = "\n".join(part for part in [failure_summary, excerpt, str(failed_run.summary or "").strip()] if part).lower()
         if missing_features and failed_run.verification_scope == "structural":
             return "structural_missing_feature"
-        if "assertionerror" in text and "!=" in text:
+        if "assertionerror" in text and ("!=" in text or "not found in" in text):
             return "assertion_mismatch"
         if "unrecognized arguments" in text:
             return "runtime_argument_parsing"
@@ -1307,13 +1342,44 @@ class ValidationPlanner:
 
     def _assertion_line_values(self, text: str) -> tuple[str | None, str | None]:
         for raw in str(text or "").splitlines():
-            match = self.ASSERTION_MISMATCH_PATTERN.search(raw.strip())
+            stripped = raw.strip()
+            match = self.ASSERTION_MISMATCH_PATTERN.search(stripped)
+            if match is None:
+                match = self.ASSERTION_CONTAINMENT_PATTERN.search(stripped)
             if match is None:
                 continue
             observed = self._literal_or_text(match.group("observed"))
             expected = self._literal_or_text(match.group("expected"))
             return observed, expected
         return None, None
+
+    def _single_changed_content_assertion_target(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        raw_failure_text: str,
+    ) -> str | None:
+        if failed_run.verification_scope != "runtime":
+            return None
+        if not self.ASSERTION_CONTAINMENT_PATTERN.search(str(raw_failure_text or "")):
+            return None
+        if self._contains_non_assert_runtime_error(raw_failure_text):
+            return None
+        changed_targets = [
+            item.path
+            for item in session.changed_files
+            if item.path and not self._is_test_path(item.path)
+        ]
+        changed_targets = self._unique_paths(changed_targets)
+        if len(changed_targets) == 1:
+            return changed_targets[0]
+        return None
+
+    def _contains_non_assert_runtime_error(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        return any(marker in lowered for marker in self.NON_ASSERT_RUNTIME_ERROR_MARKERS)
 
     def _literal_or_text(self, raw: str | None) -> str | None:
         text = str(raw or "").strip()
@@ -2518,9 +2584,15 @@ class ValidationPlanner:
         failed_run: ValidationRunRecord,
         *,
         prefer_test_runtime_target: bool = False,
+        prefer_content_runtime_target: bool = False,
     ) -> list[str]:
         if failed_run.verification_scope != "runtime" or self._no_tests_executed(failed_run):
             return artifact_paths
+        content_paths = [
+            path
+            for path in artifact_paths
+            if path and not self._is_test_path(path)
+        ]
         implementation_paths = [
             path
             for path in artifact_paths
@@ -2538,6 +2610,9 @@ class ValidationPlanner:
         ]
         if prefer_test_runtime_target:
             ordered = [*validation_paths, *implementation_paths, *documentation_paths]
+            return ordered or artifact_paths
+        if prefer_content_runtime_target:
+            ordered = [*content_paths, *validation_paths]
             return ordered or artifact_paths
         ordered = [*implementation_paths, *documentation_paths, *validation_paths]
         return ordered or artifact_paths
