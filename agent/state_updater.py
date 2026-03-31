@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 import time
 from typing import Any
 
@@ -31,6 +32,7 @@ ANALYSIS_LIKE_INTENTS = {"explain", "inspect", "search", "plan", "validate"}
 ANALYSIS_LIKE_ACTIONS = {"inspect", "search", "explain", "plan", "test"}
 MUTATION_LIKE_INTENTS = {"implement", "repair", "correct"}
 MUTATION_LIKE_ACTIONS = {"create", "modify", "debug"}
+DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt"}
 
 
 class TaskStateUpdater:
@@ -155,13 +157,16 @@ class TaskStateUpdater:
             payload = outcome.value
             try:
                 state = TaskState.model_validate(payload)
-                reconciled = False
-                if not a2_semantic_mode:
-                    reconciled = self._reconcile_with_local_state(state, local_state)
-                if reconciled:
+                reconcile_reason = self._local_reconciliation_reason(state, local_state)
+                if reconcile_reason is not None:
+                    self._reconcile_with_local_state(
+                        state,
+                        local_state,
+                        reason=reconcile_reason,
+                    )
                     self._log(
                         "task_state_semantic_reconciled",
-                        reason="prefer_local_mutation_semantics",
+                        reason=reconcile_reason,
                         model_intent=payload.get("current_user_intent"),
                         model_strategy=payload.get("execution_strategy"),
                         local_intent=local_state.current_user_intent,
@@ -306,13 +311,16 @@ class TaskStateUpdater:
                 )
                 try:
                     state = TaskState.model_validate(payload)
-                    reconciled = False
-                    if not a2_semantic_mode:
-                        reconciled = self._reconcile_with_local_state(state, local_state)
-                    if reconciled:
+                    reconcile_reason = self._local_reconciliation_reason(state, local_state)
+                    if reconcile_reason is not None:
+                        self._reconcile_with_local_state(
+                            state,
+                            local_state,
+                            reason=reconcile_reason,
+                        )
                         self._log(
                             "task_state_semantic_reconciled",
-                            reason="prefer_local_mutation_semantics",
+                            reason=reconcile_reason,
                             model_intent=payload.get("current_user_intent"),
                             model_strategy=payload.get("execution_strategy"),
                             local_intent=local_state.current_user_intent,
@@ -429,21 +437,26 @@ class TaskStateUpdater:
             semantic_resolution="minimal_inference",
         )
 
-    def _reconcile_with_local_state(self, state: TaskState, local_state: TaskState) -> bool:
-        if not self._should_prefer_local_mutation_semantics(state, local_state):
-            return False
-
+    def _reconcile_with_local_state(
+        self,
+        state: TaskState,
+        local_state: TaskState,
+        *,
+        reason: str,
+    ) -> None:
         local_targets = list(local_state.target_artifacts or [])
+        local_target_keys = {self._artifact_identity(artifact) for artifact in local_targets}
         merged_targets = local_targets + [
             artifact
             for artifact in state.target_artifacts
-            if artifact not in local_targets
+            if self._artifact_identity(artifact) not in local_target_keys
         ]
         local_active = list(local_state.active_artifacts or local_targets)
+        local_active_keys = {self._artifact_identity(artifact) for artifact in local_active}
         merged_active = local_active + [
             artifact
             for artifact in state.active_artifacts
-            if artifact not in local_active
+            if self._artifact_identity(artifact) not in local_active_keys
         ]
         local_context = list(local_state.relevant_context or [])
         merged_context = local_context + [
@@ -460,8 +473,11 @@ class TaskStateUpdater:
             item for item in state.execution_outline
             if item not in local_outline
         ]
-        if state.goal_relation in {"validation_request", "clarify", "unknown"}:
+        if state.goal_relation in {"validation_request", "clarify", "unknown"} or reason == "restore_grounded_mutation_scope":
             state.goal_relation = local_state.goal_relation
+        if reason == "restore_grounded_mutation_scope":
+            state.root_goal = local_state.root_goal
+            state.active_goal = local_state.active_goal
         state.current_user_intent = local_state.current_user_intent
         state.execution_strategy = local_state.execution_strategy
         state.next_action = local_state.next_action
@@ -478,7 +494,17 @@ class TaskStateUpdater:
         state.risk_level = local_state.risk_level
         state.ambiguity_level = local_state.ambiguity_level
         state.confidence = max(float(state.confidence or 0.0), float(local_state.confidence or 0.0))
-        return True
+
+    def _local_reconciliation_reason(
+        self,
+        state: TaskState,
+        local_state: TaskState,
+    ) -> str | None:
+        if self._should_prefer_local_mutation_semantics(state, local_state):
+            return "prefer_local_mutation_semantics"
+        if self._should_restore_grounded_mutation_scope(state, local_state):
+            return "restore_grounded_mutation_scope"
+        return None
 
     def _should_prefer_local_mutation_semantics(self, state: TaskState, local_state: TaskState) -> bool:
         if state.needs_clarification or local_state.needs_clarification:
@@ -512,6 +538,119 @@ class TaskStateUpdater:
             for artifact in local_state.target_artifacts
         )
         return has_local_verification or has_validation_artifact
+
+    def _should_restore_grounded_mutation_scope(self, state: TaskState, local_state: TaskState) -> bool:
+        if state.needs_clarification or local_state.needs_clarification:
+            return False
+        if float(local_state.confidence or 0.0) < 0.55:
+            return False
+        if not self._is_mutation_like_state(local_state):
+            return False
+
+        local_targets = list(local_state.target_artifacts or [])
+        if not local_targets:
+            return False
+
+        local_primary_paths = self._technical_primary_paths(local_targets)
+        local_validation_paths = self._validation_target_paths(local_targets)
+        if not local_primary_paths and not local_validation_paths:
+            return False
+
+        state_targets = list(state.target_artifacts or [])
+        state_primary_paths = self._technical_primary_paths(state_targets)
+        state_validation_paths = self._validation_target_paths(state_targets)
+        if not state_targets:
+            return True
+        if local_primary_paths and not state_primary_paths:
+            return True
+        if local_primary_paths and self._documentation_led_scope(state_targets):
+            return True
+        if (
+            local_validation_paths
+            and not state_validation_paths
+            and len(state_primary_paths) < len(local_primary_paths)
+        ):
+            return True
+        return False
+
+    def _is_mutation_like_state(self, state: TaskState) -> bool:
+        strategy = str(state.execution_strategy or "").strip()
+        intent = str(state.current_user_intent or "").strip()
+        action = str(state.next_best_action or state.next_action or "").strip()
+        if strategy in {"feature_implementation", "debug_repair", "rollback_correction", "refactor", "hardening"}:
+            return True
+        if intent in MUTATION_LIKE_INTENTS or intent in {"refactor", "harden"}:
+            return True
+        return action in MUTATION_LIKE_ACTIONS
+
+    def _technical_primary_paths(self, artifacts: list) -> list[str]:
+        paths: list[str] = []
+        for artifact in artifacts:
+            path = self._artifact_path(artifact)
+            if not path:
+                continue
+            role = str(getattr(artifact, "role", "") or "").strip().lower()
+            if role != "primary_target":
+                continue
+            if self._artifact_is_documentation(artifact) or self._artifact_is_validation(artifact):
+                continue
+            if path not in paths:
+                paths.append(path)
+        return paths
+
+    def _validation_target_paths(self, artifacts: list) -> list[str]:
+        paths: list[str] = []
+        for artifact in artifacts:
+            path = self._artifact_path(artifact)
+            if not path:
+                continue
+            if not self._artifact_is_validation(artifact):
+                continue
+            if path not in paths:
+                paths.append(path)
+        return paths
+
+    def _documentation_led_scope(self, artifacts: list) -> bool:
+        if not artifacts:
+            return False
+        primary_artifacts = [
+            artifact
+            for artifact in artifacts
+            if str(getattr(artifact, "role", "") or "").strip().lower() == "primary_target"
+        ]
+        scoped = primary_artifacts or list(artifacts)
+        has_documentation = any(self._artifact_is_documentation(artifact) for artifact in scoped)
+        has_technical_primary = any(
+            not self._artifact_is_documentation(artifact) and not self._artifact_is_validation(artifact)
+            for artifact in scoped
+        )
+        return has_documentation and not has_technical_primary
+
+    def _artifact_path(self, artifact) -> str:
+        return str(getattr(artifact, "path", None) or getattr(artifact, "name", None) or "").strip()
+
+    def _artifact_identity(self, artifact) -> tuple[str, str]:
+        path = str(getattr(artifact, "path", None) or "").strip().lower()
+        name = str(getattr(artifact, "name", None) or "").strip().lower()
+        return path, name
+
+    def _artifact_is_validation(self, artifact) -> bool:
+        role = str(getattr(artifact, "role", "") or "").strip().lower()
+        path = self._artifact_path(artifact).lower()
+        if role == "validation_target":
+            return True
+        if not path:
+            return False
+        return "/tests/" in f"/{path}" or path.startswith("tests/") or Path(path).name.startswith("test_")
+
+    def _artifact_is_documentation(self, artifact) -> bool:
+        role = str(getattr(artifact, "role", "") or "").strip().lower()
+        path = self._artifact_path(artifact)
+        suffix = Path(path).suffix.lower() if path else ""
+        kind = str(getattr(artifact, "kind", "") or "").strip().lower()
+        if role == "supporting_context" and suffix in DOC_SUFFIXES:
+            return True
+        return kind == "doc" or suffix in DOC_SUFFIXES
 
     def _should_short_circuit_with_local_state(
         self,

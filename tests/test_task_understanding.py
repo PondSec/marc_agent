@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1491,7 +1492,7 @@ def test_task_state_a2_preserves_full_retry_mode_for_semantic_recovery(tmp_path)
 
 
 def test_task_state_a2_skips_larger_reserve_model_for_no_start_recovery(tmp_path):
-    config = AppConfig(
+    config = SimpleNamespace(
         workspace_root=str(tmp_path),
         model_name="qwen2.5-coder:7b",
         router_model_name="qwen2.5-coder:7b",
@@ -1985,6 +1986,177 @@ def test_task_state_updater_reconciles_explain_misclassification_for_existing_re
     assert "Apply the requested change" in task_state.output_expectation
     assert "Apply the requested change" in (task_state.verification_target or "")
     assert route.intent == RouteIntent.UPDATE
+
+
+def test_task_state_a2_restores_grounded_code_scope_when_semantic_state_collapses_to_documentation(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["texttools", "tests"],
+        important_files=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        focus_files=["texttools/normalize.py", "normalize_cli.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_normalize.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=["texttools/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small text normalization project with a helper module, CLI wrapper, README, and tests.",
+    )
+    prompt = (
+        "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, "
+        "update README.md if needed, and run python -m unittest tests.test_normalize before finishing."
+    )
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": "Update README.md with information about the new keep_case option.",
+        "active_goal": "Update README.md with information about the new keep_case option.",
+        "goal_relation": "new_task",
+        "output_expectation": "README.md documents the keep_case option accurately.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "README.md mentions the keep_case option.",
+        "target_artifacts": [
+            {"path": "README.md", "name": "README.md", "kind": "doc", "role": "primary_target", "confidence": 0.94},
+        ],
+        "active_artifacts": [
+            {"path": "README.md", "name": "README.md", "kind": "doc", "role": "primary_target", "confidence": 0.94},
+        ],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.86,
+        "next_action": "modify",
+        "next_best_action": "modify",
+        "execution_outline": [
+            "Update README.md with the new option details.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ScriptedLLM(json_payloads=[payload])
+    llm.config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        prompt,
+        snapshot=snapshot,
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts if artifact.path}
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.active_goal != payload["active_goal"]
+    assert task_state.target_artifacts[0].path == "texttools/normalize.py"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "texttools/normalize.py",
+        "normalize_cli.py",
+        "README.md",
+        "tests/test_normalize.py",
+    }
+    assert artifact_roles["README.md"] == "supporting_context"
+    assert artifact_roles["tests/test_normalize.py"] == "validation_target"
+    assert route.intent == RouteIntent.UPDATE
+    assert route.entities.target_name == "texttools/normalize.py"
+
+
+def test_task_state_a2_keeps_documentation_only_scope_when_request_is_explicitly_docs_only(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=3,
+        language_counts={"python": 2, "markdown": 1},
+        top_directories=["texttools", "tests"],
+        important_files=["texttools/normalize.py", "README.md", "tests/test_normalize.py"],
+        focus_files=["README.md"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_normalize.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=["texttools/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small text normalization project with README and tests.",
+    )
+    prompt = "Update README.md only so the keep_case option is documented correctly."
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": prompt,
+        "active_goal": prompt,
+        "goal_relation": "new_task",
+        "output_expectation": "README.md documents the keep_case option accurately.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "README.md documents the keep_case option accurately.",
+        "target_artifacts": [
+            {"path": "README.md", "name": "README.md", "kind": "doc", "role": "primary_target", "confidence": 0.95},
+        ],
+        "active_artifacts": [
+            {"path": "README.md", "name": "README.md", "kind": "doc", "role": "primary_target", "confidence": 0.95},
+        ],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.9,
+        "next_action": "modify",
+        "next_best_action": "modify",
+        "execution_outline": ["Update the requested documentation file."],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ScriptedLLM(json_payloads=[payload])
+    llm.config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        prompt,
+        snapshot=snapshot,
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert [artifact.path for artifact in task_state.target_artifacts] == ["README.md"]
+    assert task_state.active_goal == prompt
 
 
 def test_task_state_avoids_unrelated_test_package_init_when_request_targets_other_init(tmp_path):
