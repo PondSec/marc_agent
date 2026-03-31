@@ -7756,6 +7756,96 @@ def test_planner_no_effective_change_prefers_code_candidate_before_supporting_do
     assert planner._next_update_target(session.router_result, session) == "normalize_cli.py"
 
 
+def test_planner_keeps_remaining_explicit_support_target_instead_of_broadening_after_code_updates(tmp_path):
+    package_dir = tmp_path / "texttools"
+    package_dir.mkdir()
+    (package_dir / "normalize.py").write_text(
+        "def normalize_words(text, *, lowercase=True, keep_case=False):\n    return text.split()\n",
+        encoding="utf-8",
+    )
+    (package_dir / "__init__.py").write_text(
+        "from .normalize import normalize_words\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    return normalize_words('Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# texttools\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text("def test_normalize():\n    assert True\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, "
+            "update README.md if needed, and run python -m unittest tests.test_normalize."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 5,
+                "important_files": [
+                    "texttools/normalize.py",
+                    "normalize_cli.py",
+                    "texttools/__init__.py",
+                    "README.md",
+                    "tests/test_normalize.py",
+                ],
+                "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "repo_summary": "Small text normalization project with helper module, package export, CLI wrapper, README, and tests.",
+            }
+        ),
+        candidate_files=[
+            "texttools/normalize.py",
+            "normalize_cli.py",
+            "texttools/__init__.py",
+            "README.md",
+            "tests/test_normalize.py",
+        ],
+        changed_files=[
+            FileChangeRecord(path="texttools/normalize.py", operation="modify", diff="+ keep_case\n"),
+            FileChangeRecord(path="normalize_cli.py", operation="modify", diff="+ --keep-case\n"),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Implement the keep_case feature."},
+            {"step": 2, "action": "update_artifact", "reason": "Update the related CLI wrapper and docs."},
+            {"step": 3, "action": "run_validation", "reason": "Run the requested unittest module."},
+        ],
+        target_paths=[
+            "texttools/normalize.py",
+            "normalize_cli.py",
+            "README.md",
+            "tests/test_normalize.py",
+        ],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="texttools/normalize.py", name="normalize.py", kind=".py", role="primary_target", confidence=0.99),
+        TaskArtifact(path="normalize_cli.py", name="normalize_cli.py", kind=".py", role="primary_target", confidence=0.98),
+        TaskArtifact(path="README.md", name="README.md", kind=".md", role="supporting_context", confidence=0.9),
+        TaskArtifact(path="tests/test_normalize.py", name="test_normalize.py", kind="test", role="validation_target", confidence=0.9),
+    ]
+
+    assert planner._ordered_remaining_update_targets(session.router_result, session) == ["README.md"]
+    assert planner._next_update_target(session.router_result, session) == "README.md"
+
+
 def test_planner_keeps_review_blocked_pending_target_deferred_during_runtime_repair(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()

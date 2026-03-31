@@ -3661,10 +3661,18 @@ class Planner:
                 explicit_index.get(candidate, 999),
             ),
         )
+        changed_explicit_technical_targets = {
+            candidate
+            for candidate in explicit_targets
+            if candidate in changed_paths
+            and explicit_roles.get(candidate) not in {"supporting_context", "validation_target"}
+        }
         if remaining_explicit and any(
             explicit_roles.get(candidate) not in {"supporting_context", "validation_target"}
             for candidate in remaining_explicit
         ):
+            return remaining_explicit
+        if remaining_explicit and changed_explicit_technical_targets:
             return remaining_explicit
 
         routed_primary_target = self._target_name_path_candidate(route)
