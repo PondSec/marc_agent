@@ -1104,6 +1104,51 @@ def test_task_state_local_short_circuit_infers_readme_for_empty_workspace_create
     assert llm.generate_json_calls == []
 
 
+def test_task_state_local_short_circuit_inferrs_named_package_code_before_docs_in_empty_workspace(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    prompt = (
+        "Create a small Python package named calcstats with library helpers and a CLI entrypoint. "
+        "The CLI should accept integers from the command line and support --sum, --mean, and --median output modes. "
+        "Add a unittest suite in tests/test_stats.py that covers both the library functions and the CLI behavior, "
+        "write a concise README with usage examples, and finish only after python -m unittest tests.test_stats passes."
+    )
+    task_state = updater.update_task_state(prompt, snapshot=empty_snapshot(tmp_path))
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts if artifact.path}
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert [artifact.path for artifact in task_state.target_artifacts[:3]] == [
+        "calcstats/stats.py",
+        "calcstats/__main__.py",
+        "calcstats/__init__.py",
+    ]
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "calcstats/stats.py",
+        "calcstats/__main__.py",
+        "calcstats/__init__.py",
+        "README.md",
+        "tests/test_stats.py",
+    }
+    assert artifact_roles["README.md"] == "supporting_context"
+    assert artifact_roles["tests/test_stats.py"] == "validation_target"
+    assert route.entities.target_name == "calcstats/stats.py"
+    assert route.entities.target_paths[:3] == [
+        "calcstats/stats.py",
+        "calcstats/__main__.py",
+        "calcstats/__init__.py",
+    ]
+    assert llm.generate_json_calls == []
+
+
 def test_task_state_local_short_circuit_preserves_explicit_multi_file_website_targets(tmp_path):
     snapshot = WorkspaceSnapshot(
         root=str(tmp_path),

@@ -3259,6 +3259,52 @@ class Planner:
             candidates.extend(self._snapshot_explicit_target_paths(session))
         return self._unique_paths(candidates)
 
+    def _ordered_create_targets(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> list[str]:
+        explicit = self._explicit_target_paths(route, session)
+        if route.intent != RouteIntent.CREATE or not explicit:
+            return explicit
+
+        task_state = session.task_state
+        artifact_roles: dict[str, str] = {}
+        if task_state is not None:
+            artifact_roles = {
+                path: str(artifact.role or "").strip().lower()
+                for artifact in task_state.target_artifacts
+                for path in [str(artifact.path or "").strip()]
+                if path
+            }
+
+        role_order = {
+            "primary_target": 0,
+            "active_context": 0,
+            "validation_target": 1,
+            "supporting_context": 2,
+        }
+        indexed_positions = {path: index for index, path in enumerate(explicit)}
+
+        def inferred_role(path: str) -> str:
+            explicit_role = artifact_roles.get(path, "")
+            if explicit_role and explicit_role not in {"primary_target", "active_context"}:
+                return explicit_role
+            suffix = Path(path).suffix.lower()
+            if self._path_is_test_like(path):
+                return "validation_target"
+            if suffix in {".md", ".markdown", ".rst", ".txt"}:
+                return "supporting_context"
+            return "primary_target"
+
+        return sorted(
+            explicit,
+            key=lambda path: (
+                role_order.get(inferred_role(path), 3),
+                indexed_positions.get(path, 999),
+            ),
+        )
+
     def _actionable_explicit_target_paths(
         self,
         route: RouterOutput,
@@ -3543,7 +3589,7 @@ class Planner:
     def _has_pending_explicit_create_targets(self, route: RouterOutput, session: SessionState) -> bool:
         if route.intent != RouteIntent.CREATE:
             return False
-        explicit_targets = self._explicit_target_paths(route, session)
+        explicit_targets = self._ordered_create_targets(route, session)
         if len(explicit_targets) <= 1:
             return False
         changed_paths = {item.path for item in session.changed_files}
@@ -3649,7 +3695,7 @@ class Planner:
         if follow_up_override:
             self._log("path_generation_skipped", path=follow_up_override, reason="active_artifact_follow_up")
             return follow_up_override
-        explicit_targets = self._explicit_target_paths(route, session)
+        explicit_targets = self._ordered_create_targets(route, session)
         if explicit_targets:
             changed_paths = {item.path for item in session.changed_files}
             for candidate in explicit_targets:

@@ -147,7 +147,7 @@ def empty_snapshot(tmp_path: Path) -> WorkspaceSnapshot:
 def test_choose_create_path_prefers_index_html_for_empty_workspace_web_requests(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     llm = ScriptedLLM(config=config)
-    planner = Planner(llm, logger=AgentLogger(tmp_path, "planner"))
+    planner = Planner(llm, "", logger=AgentLogger(tmp_path, "planner"))
     session = SessionState(task="build a snake game", workspace_root=str(tmp_path))
     session.workspace_snapshot = empty_snapshot(tmp_path)
     route = RouterOutput.model_validate(
@@ -11965,7 +11965,7 @@ def test_planner_uses_search_terms_for_general_default_filename(tmp_path):
     assert decision.tool_args["path"] == "kanban_board.py"
 
 
-def test_planner_finishes_explicit_create_targets_before_running_validation(tmp_path):
+def test_planner_finishes_productive_create_targets_before_docs_and_validation(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
             route_payload(
@@ -11985,9 +11985,11 @@ def test_planner_finishes_explicit_create_targets_before_running_validation(tmp_
                 target_paths=["wordfreq.py", "README.md", "tests/test_wordfreq.py"],
                 target_name="wordfreq.py",
                 repo_context_needed=False,
-            )
+        )
+            ],
+        text_payloads=[
+            "import unittest\n\n\nclass WordfreqTests(unittest.TestCase):\n    def test_example(self):\n        self.assertEqual('hello'.upper(), 'HELLO')\n"
         ],
-        text_payloads=["# Wordfreq\n\nUsage: python wordfreq.py sample.txt\n"],
     )
     payload = llm.json_payloads[0]
     planner = Planner(llm, "")
@@ -12016,7 +12018,7 @@ def test_planner_finishes_explicit_create_targets_before_running_validation(tmp_
 
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "create_file"
-    assert decision.tool_args["path"] == "README.md"
+    assert decision.tool_args["path"] == "tests/test_wordfreq.py"
 
 
 def test_planner_prefers_lightweight_model_for_remaining_create_targets_after_primary_start_failure(tmp_path):
@@ -12048,7 +12050,7 @@ def test_planner_prefers_lightweight_model_for_remaining_create_targets_after_pr
                 startup_timeout_seconds=110,
             ),
             "print('hello')\n",
-            "# Wordfreq\n",
+            "import unittest\n\n\nclass WordfreqTests(unittest.TestCase):\n    def test_example(self):\n        self.assertEqual('hello'.upper(), 'HELLO')\n",
         ],
         config=AppConfig(
             workspace_root=".",
@@ -12088,7 +12090,7 @@ def test_planner_prefers_lightweight_model_for_remaining_create_targets_after_pr
 
     assert second_decision.action_type == AgentActionType.CALL_TOOL
     assert second_decision.tool_name == "create_file"
-    assert second_decision.tool_args["path"] == "README.md"
+    assert second_decision.tool_args["path"] == "tests/test_wordfreq.py"
     assert llm.generate_calls[2]["kwargs"]["model"] == "qwen2.5-coder:14b"
 
 

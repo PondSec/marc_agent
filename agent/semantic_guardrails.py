@@ -110,6 +110,10 @@ _PATH_RE = re.compile(
 _CONVENTIONAL_ARTIFACT_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\breadme(?:\.md)?\b", flags=re.IGNORECASE), "README.md"),
 )
+_NAMED_CODE_CONTAINER_RE = re.compile(
+    r"\b(?:python\s+)?(?:package|module|library|cli(?:\s+package)?|app|service|tool)\s+(?:named|called)\s+`?(?P<name>[A-Za-z][A-Za-z0-9_-]*)`?",
+    flags=re.IGNORECASE,
+)
 _BACKTICK_SYMBOL_RE = re.compile(r"`(?P<name>[A-Za-z_][A-Za-z0-9_]*)`")
 _CONTEXTUAL_SYMBOL_RE = re.compile(
     r"\b(?:function|method|symbol|helper|class|service|module)\s+(?:named|called)?\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?",
@@ -180,7 +184,15 @@ def build_minimal_task_state(
         )
     anchor_artifacts = context["artifacts"]
     active_artifacts = anchor_artifacts[:6] if signal.use_context else []
-    if signal.intent == "create" and any(str(item.path or "").strip() for item in signal_targets):
+    empty_workspace_targets = _empty_workspace_create_target_artifacts(
+        request,
+        snapshot=snapshot,
+        signal=signal,
+        target_artifacts=signal_targets,
+    )
+    if empty_workspace_targets:
+        target_artifacts = empty_workspace_targets
+    elif signal.intent == "create" and any(str(item.path or "").strip() for item in signal_targets):
         target_artifacts = signal_targets
     else:
         target_artifacts = inferred_snapshot_targets or signal_targets
@@ -1309,6 +1321,35 @@ def _task_artifacts_for_paths(snapshot, selected: list[str]) -> list[TaskArtifac
     return artifacts
 
 
+def _requested_path_artifacts(selected: list[str]) -> list[TaskArtifact]:
+    if not selected:
+        return []
+    has_non_doc_primary = any(
+        not _looks_like_test_artifact(path)
+        and Path(path).suffix.lower() not in {".md", ".markdown", ".rst", ".txt"}
+        for path in selected
+    )
+    artifacts: list[TaskArtifact] = []
+    for index, path in enumerate(selected[:8]):
+        suffix = Path(path).suffix.lower()
+        if _looks_like_test_artifact(path):
+            role = "validation_target"
+        elif has_non_doc_primary and suffix in {".md", ".markdown", ".rst", ".txt"}:
+            role = "supporting_context"
+        else:
+            role = "primary_target"
+        artifacts.append(
+            TaskArtifact(
+                path=path,
+                name=Path(path).name,
+                kind="test" if _looks_like_test_artifact(path) else suffix or "file",
+                role=role,
+                confidence=0.82 if index == 0 else 0.76,
+            )
+        )
+    return artifacts
+
+
 def _explicit_snapshot_request_paths(
     request_lower: str,
     request_space: str,
@@ -1440,6 +1481,113 @@ def _runtime_repair_implementation_paths(snapshot, selected: list[str]) -> list[
         candidate_stem = Path(candidate).stem.lower()
         if any(stem and candidate_stem == stem.lower() for stem in requested_stems):
             ordered.append(candidate)
+    return ordered
+
+
+def _empty_workspace_create_target_artifacts(
+    request: str,
+    *,
+    snapshot,
+    signal: MinimalSemanticSignal,
+    target_artifacts: list[TaskArtifact],
+) -> list[TaskArtifact]:
+    if snapshot is None or getattr(snapshot, "file_count", 0) != 0:
+        return []
+    if signal.intent != "create" or signal.needs_clarification:
+        return []
+
+    explicit_paths = _extract_explicit_paths(request)
+    explicit_primary_paths = [
+        path
+        for path in explicit_paths
+        if not _looks_like_test_artifact(path)
+        and Path(path).suffix.lower() not in {".md", ".markdown", ".rst", ".txt"}
+    ]
+    explicit_support_paths = [
+        path
+        for path in explicit_paths
+        if path not in explicit_primary_paths and Path(path).suffix.lower() in {".md", ".markdown", ".rst", ".txt"}
+    ]
+    explicit_test_paths = [path for path in explicit_paths if _looks_like_test_artifact(path)]
+
+    ordered_paths: list[str] = []
+
+    def add(path: str | None) -> None:
+        normalized = str(path or "").strip()
+        if normalized and normalized not in ordered_paths:
+            ordered_paths.append(normalized)
+
+    for path in explicit_primary_paths:
+        add(path)
+
+    package_name = _named_code_container_name(request)
+    if package_name:
+        for path in _derived_package_create_targets(
+            package_name,
+            request=request,
+            explicit_test_paths=explicit_test_paths,
+        ):
+            add(path)
+
+    if not ordered_paths:
+        for artifact in target_artifacts:
+            candidate = str(artifact.path or artifact.name or "").strip()
+            if not candidate or not Path(candidate).suffix:
+                continue
+            if _looks_like_test_artifact(candidate) or Path(candidate).suffix.lower() in {".md", ".markdown", ".rst", ".txt"}:
+                continue
+            add(candidate)
+
+    for path in explicit_support_paths:
+        add(path)
+    for path in explicit_test_paths:
+        add(path)
+
+    if not ordered_paths:
+        return []
+    return _requested_path_artifacts(ordered_paths)
+
+
+def _named_code_container_name(request: str) -> str | None:
+    match = _NAMED_CODE_CONTAINER_RE.search(str(request or ""))
+    if match is None:
+        return None
+    raw = str(match.group("name") or "").strip().strip("`")
+    if not raw:
+        return None
+    normalized = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_").lower()
+    return normalized or None
+
+
+def _derived_package_create_targets(
+    package_name: str,
+    *,
+    request: str,
+    explicit_test_paths: list[str],
+) -> list[str]:
+    lowered_request = str(request or "").lower()
+    ordered: list[str] = []
+
+    def add(path: str | None) -> None:
+        normalized = str(path or "").strip()
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+
+    for test_path in explicit_test_paths:
+        stem = Path(test_path).stem
+        derived_name: str | None = None
+        if stem.startswith("test_") and len(stem) > 5:
+            derived_name = stem.removeprefix("test_")
+        elif stem.endswith("_test") and len(stem) > 5:
+            derived_name = stem.removesuffix("_test")
+        if not derived_name or derived_name in {"__init__", "__main__", package_name}:
+            continue
+        add(f"{package_name}/{derived_name}.py")
+
+    if _request_targets_package_cli_entrypoint(lowered_request):
+        add(f"{package_name}/__main__.py")
+
+    add(f"{package_name}/__init__.py")
     return ordered
 
 
