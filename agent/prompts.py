@@ -1293,7 +1293,9 @@ def _compact_repair_context(context: ValidationFailureEvidence) -> dict[str, obj
     payload = {
         "command": _trim_text(context.command, 140),
         "verification_scope": context.verification_scope,
+        "bootstrap_status": str(getattr(context, "bootstrap_status", "") or "").strip() or "none",
         "artifact_paths": context.artifact_paths[:4],
+        "root_cause_summary": _trim_text(str(getattr(context, "root_cause_summary", "") or "").strip(), 220),
         "failure_summary": _trim_balanced_text(context.failure_summary or context.summary, 220)
         if prefer_balanced_failure
         else _trim_text(context.failure_summary or context.summary, 180),
@@ -1359,6 +1361,10 @@ def _compact_repair_brief(
         payload["primary_target"] = str(brief.primary_target or "").strip()
     if str(brief.locked_target or "").strip():
         payload["locked_target"] = str(brief.locked_target or "").strip()
+    if str(brief.root_cause_summary or "").strip():
+        payload["root_cause_summary"] = _trim_text(str(brief.root_cause_summary or "").strip(), 180)
+    if str(brief.bootstrap_status or "").strip() and str(brief.bootstrap_status or "").strip() != "none":
+        payload["bootstrap_status"] = str(brief.bootstrap_status or "").strip()
     if brief.expected_semantics:
         payload["expected_semantics"] = [_trim_text(item, 140) for item in brief.expected_semantics[:3]]
     if brief.observed_semantics:
@@ -3468,11 +3474,12 @@ def _repair_rules(repair_strategy: str | None) -> str:
         "- Use the failed validation evidence as a hard constraint for this update.",
         "- Make a concrete mutation that addresses the failed verification scope directly.",
         "- Do not return equivalent content or formatting-only changes.",
+        "- No-op changes are forbidden: do not change only whitespace, comments, metadata, or unrelated regions.",
         f"- If the current evidence is still insufficient to derive a concrete fix, return exactly {REPAIR_BLOCKED_SENTINEL}.",
     ]
     if repair_strategy == "validation_escalated":
         lines.append(
-            "- A previous repair attempt produced no effective change. Tighten the repair and change the file materially."
+            "- A previous repair attempt produced no effective change. The next proposal must change the failing behavior materially, must not be a no-op, and must not repeat the same failure effect."
         )
     return "\n".join(lines)
 

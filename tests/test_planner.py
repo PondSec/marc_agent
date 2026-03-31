@@ -4625,6 +4625,82 @@ def test_planner_rejects_equivalent_repair_after_escalation(tmp_path):
     assert "did not produce a substantive repair change" in session.blockers[-1]
 
 
+def test_assess_effective_mutation_rejects_python_comment_only_change():
+    planner = Planner(ScriptedLLM(), "")
+
+    mutation = planner._assess_effective_mutation(
+        "app/main.py",
+        "def greet(name):\n    return f'Hello, {name}!'\n",
+        "def greet(name):  # greeting helper\n    return f'Hello, {name}!'\n",
+    )
+
+    assert mutation.effective is False
+    assert mutation.reason == "comment-only change"
+    assert mutation.before_hash != mutation.after_hash
+    assert "comment_only" in mutation.change_labels
+
+
+def test_assess_effective_mutation_rejects_metadata_only_change():
+    planner = Planner(ScriptedLLM(), "")
+
+    mutation = planner._assess_effective_mutation(
+        "pyproject.toml",
+        "[project]\nname = 'demo'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+        "[project]\nname = 'demo'\nversion = '0.1.1'\nrequires-python = '>=3.11'\n",
+    )
+
+    assert mutation.effective is False
+    assert mutation.reason == "metadata-only change"
+    assert mutation.before_hash != mutation.after_hash
+    assert "metadata_only" in mutation.change_labels
+
+
+def test_fallback_semantic_change_review_requires_root_cause_productive_change_and_independent_verification(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the CLI bootstrap path.",
+        workspace_root=str(tmp_path),
+        validation_status="passed",
+        edit_generation=1,
+    )
+    session.changed_files.append(FileChangeRecord(path="app/main.py", operation="modify"))
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.test_cli",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+            edit_generation=1,
+        )
+    )
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="app/main.py",
+            validation_command="python -m unittest tests.test_cli",
+            verification_scope="runtime",
+            strategy="validation_targeted",
+            result="mutation_planned",
+            reason="substantive mutation prepared",
+            productive_change=False,
+            root_cause_summary=None,
+            independent_verification=False,
+            behavior_changed=False,
+            failure_signature="runtime:import_failure:abc123",
+            post_validation_failure_signature="runtime:import_failure:abc123",
+        )
+    )
+
+    review = planner._fallback_semantic_change_review(session)
+
+    assert review.requirements_satisfied is False
+    assert "Concrete root cause explanation for the latest repair" in review.missing_requirements
+    assert "Productive code change for the latest repair" in review.missing_requirements
+    assert "Independent verification after the latest repair" in review.missing_requirements
+    assert any("same failure signature" in issue.lower() for issue in review.suspicious_issues)
+
+
 def test_planner_does_not_repeat_identical_validation_without_progress(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

@@ -4,11 +4,13 @@ import ast
 from dataclasses import dataclass, field
 import difflib
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import time
 import tomllib
+import tokenize
 
 from pydantic import ValidationError
 
@@ -146,6 +148,7 @@ class UpdateReviewRetryResult:
     review: ProposedUpdateReview | None = None
     capability_tier: str | None = None
     recovery_strategy: str | None = None
+    effective_repair_strategy: str | None = None
 
 
 @dataclass(slots=True)
@@ -162,12 +165,17 @@ class ContentGenerationResult:
     content: str | None = None
     source: str = "model"
     failure: ContentGenerationFailure | None = None
+    repair_strategy_used: str | None = None
 
 
 @dataclass(slots=True)
 class MutationAssessment:
     effective: bool
     reason: str
+    before_hash: str
+    after_hash: str
+    change_labels: list[str] = field(default_factory=list)
+    changed_line_count: int = 0
 
 
 class Planner:
@@ -353,7 +361,7 @@ class Planner:
             )
             return decision
 
-        if session.validation_status == "failed" and session.validation_runs:
+        if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"} and session.validation_runs:
             repair_decision = self._repair_after_failed_validation(route, session)
             if repair_decision is not None:
                 return repair_decision
@@ -367,7 +375,7 @@ class Planner:
                 )
             if self._requirements_review_missing(session):
                 self._run_semantic_change_review(route, session)
-                if session.validation_status == "failed":
+                if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"}:
                     repair_decision = self._repair_after_failed_validation(route, session)
                     if repair_decision is not None:
                         return repair_decision
@@ -634,6 +642,18 @@ class Planner:
                 de="Ich habe die Aufgabe umgesetzt und validiert.",
                 en="I implemented the task and validated it.",
             )
+        if session.changed_files and session.validation_status == "bootstrap_failed":
+            return self._localized_text(
+                language,
+                de="Ich habe die Aufgabe umgesetzt, aber die Validierung scheitert aktuell noch im Bootstrap- oder Discovery-Pfad.",
+                en="I implemented the task, but validation is currently still failing in the bootstrap or discovery path.",
+            )
+        if session.changed_files and session.validation_status == "bootstrap_reset_required":
+            return self._localized_text(
+                language,
+                de="Ich habe die Aufgabe umgesetzt, aber der Bootstrap-Pfad braucht vor weiteren Retries einen Reset oder menschliche Entscheidung.",
+                en="I implemented the task, but the bootstrap path now needs a reset or human decision before more retries.",
+            )
         if session.changed_files and session.validation_status == "failed":
             return self._localized_text(
                 language,
@@ -702,6 +722,22 @@ class Planner:
                 )
             elif session.validation_status == "passed":
                 lines.append(self._localized_text(language, de="Validierung: bestanden.", en="Validation: passed."))
+            elif session.validation_status == "bootstrap_failed":
+                lines.append(
+                    self._localized_text(
+                        language,
+                        de="Validierung: Bootstrap-/Discovery-Fehler, normaler Repair-Pfad ist noch nicht freigegeben.",
+                        en="Validation: bootstrap/discovery failure; the normal repair path is not cleared yet.",
+                    )
+                )
+            elif session.validation_status == "bootstrap_reset_required":
+                lines.append(
+                    self._localized_text(
+                        language,
+                        de="Validierung: bootstrap_reset_required.",
+                        en="Validation: bootstrap_reset_required.",
+                    )
+                )
             elif session.validation_status == "failed":
                 lines.append(self._localized_text(language, de="Validierung: fehlgeschlagen.", en="Validation: failed."))
             elif session.validation_status == "blocked":
@@ -741,7 +777,7 @@ class Planner:
                     en=f"Blocker: {session.blockers[-1]}.",
                 )
             )
-        elif session.validation_status == "failed" and session.validation_runs:
+        elif session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"} and session.validation_runs:
             lines.append(
                 self._localized_text(
                     language,
@@ -876,16 +912,18 @@ class Planner:
                 final_stop_reason = failure.stop_reason
                 final_failure_class = failure.failure_class
                 final_user_message = failure.user_message
+                effective_strategy = generation.repair_strategy_used or strategy
                 if repair_context is not None:
-                    self._record_repair_attempt(
-                        session,
-                        repair_context,
-                        target=target,
-                        strategy=strategy,
-                        result="generation_failed",
-                        reason=failure.blocker_message,
-                    )
-                if repair_context is not None and strategy != strategies[-1]:
+                    if failure.failure_class != "no_effective_change":
+                        self._record_repair_attempt(
+                            session,
+                            repair_context,
+                            target=target,
+                            strategy=effective_strategy,
+                            result="generation_failed",
+                            reason=failure.blocker_message,
+                        )
+                if repair_context is not None and strategy != strategies[-1] and effective_strategy == strategy:
                     continue
                 deferred_decision = self._continue_after_nonblocking_update_target_failure(
                     route,
@@ -899,6 +937,7 @@ class Planner:
                 break
 
             content = generation.content
+            effective_strategy = generation.repair_strategy_used or strategy
             if repair_context is not None and content.strip() == REPAIR_BLOCKED_SENTINEL:
                 final_failure_reason = (
                     f"The validation-guided repair for {target} could not derive a concrete fix from the current evidence."
@@ -914,7 +953,7 @@ class Planner:
                     session,
                     repair_context,
                     target=target,
-                    strategy=strategy,
+                    strategy=effective_strategy,
                     result="blocked",
                     reason=final_failure_reason,
                 )
@@ -922,16 +961,17 @@ class Planner:
                     continue
                 break
 
-            mutation = self._assess_effective_mutation(current_content, content)
+            mutation = self._assess_effective_mutation(target, current_content, content)
             if mutation.effective:
                 if repair_context is not None:
                     self._record_repair_attempt(
                         session,
                         repair_context,
                         target=target,
-                        strategy=strategy,
+                        strategy=effective_strategy,
                         result="mutation_planned",
                         reason=mutation.reason,
+                        mutation=mutation,
                     )
                 return AgentDecision(
                     thought_summary=f"Update {target} according to the routed goal.",
@@ -953,13 +993,23 @@ class Planner:
                 en="I could not derive a reliable substantive change for the target file.",
             )
             if repair_context is not None:
+                self._log(
+                    "repair_noop_detected",
+                    path=target,
+                    strategy=strategy,
+                    reason=mutation.reason,
+                    before_hash=mutation.before_hash,
+                    after_hash=mutation.after_hash,
+                    change_labels=mutation.change_labels,
+                )
                 self._record_repair_attempt(
                     session,
                     repair_context,
                     target=target,
-                    strategy=strategy,
+                    strategy=effective_strategy,
                     result="no_effective_change",
                     reason=mutation.reason,
+                    mutation=mutation,
                 )
                 if self._should_pivot_after_no_effective_change(session, target, repair_context):
                     alternative_decision = self._alternative_repair_target_decision(
@@ -1424,7 +1474,10 @@ class Planner:
         strategy: str,
         result: str,
         reason: str,
+        mutation: MutationAssessment | None = None,
     ) -> None:
+        root_cause_summary = str(getattr(repair_context, "root_cause_summary", "") or "").strip()
+        productive_change = mutation.effective if mutation is not None else result == "mutation_planned"
         session.repair_history.append(
             RepairAttemptRecord(
                 artifact_path=target,
@@ -1436,6 +1489,11 @@ class Planner:
                 evidence_signature=repair_context.evidence_signature,
                 failure_signature=self._repair_failure_signature(repair_context),
                 region_hint=self._repair_region_hint(repair_context),
+                root_cause_summary=root_cause_summary or None,
+                productive_change=productive_change,
+                before_hash=mutation.before_hash if mutation is not None else None,
+                after_hash=mutation.after_hash if mutation is not None else None,
+                change_labels=list(mutation.change_labels) if mutation is not None else [],
                 iteration=session.iterations,
             )
         )
@@ -1460,6 +1518,145 @@ class Planner:
             return None
         region = str(getattr(brief, "implicated_region_hint", "") or "").strip()
         return region or None
+
+    def _repair_context_root_cause_summary(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str | None:
+        if repair_context is None:
+            return None
+        summary = str(getattr(repair_context, "root_cause_summary", "") or "").strip()
+        if summary:
+            return summary
+        brief = getattr(repair_context, "repair_brief", None)
+        summary = str(getattr(brief, "root_cause_summary", "") or "").strip()
+        return summary or None
+
+    def _repair_context_bootstrap_status(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str:
+        if repair_context is None:
+            return "none"
+        status = str(getattr(repair_context, "bootstrap_status", "") or "").strip()
+        if status in {"bootstrap_failed", "bootstrap_reset_required"}:
+            return status
+        brief = getattr(repair_context, "repair_brief", None)
+        status = str(getattr(brief, "bootstrap_status", "") or "").strip()
+        if status in {"bootstrap_failed", "bootstrap_reset_required"}:
+            return status
+        return "none"
+
+    def _proposed_update_review_text(
+        self,
+        review: ProposedUpdateReview,
+    ) -> str:
+        return " ".join(
+            part.strip()
+            for part in [review.summary, *review.blocking_issues, *review.repair_hints]
+            if str(part or "").strip()
+        ).lower()
+
+    def _review_feedback_is_noop(
+        self,
+        review: ProposedUpdateReview,
+    ) -> bool:
+        text = self._proposed_update_review_text(review)
+        if not text:
+            return False
+        markers = (
+            "no-op",
+            "effectively unchanged",
+            "formal rewrite",
+            "same failing state",
+            "does not make an effective change",
+            "does not make a productive change",
+            "whitespace-only",
+            "comment-only",
+            "metadata-only",
+            "equivalent repair",
+        )
+        return any(marker in text for marker in markers)
+
+    def _review_feedback_noop_reason(
+        self,
+        review: ProposedUpdateReview,
+    ) -> str:
+        text = self._proposed_update_review_text(review)
+        if "file hash unchanged" in text:
+            return "file hash unchanged"
+        if "whitespace-only" in text:
+            return "whitespace-only change"
+        if "comment-only" in text:
+            return "comment-only change"
+        if "metadata-only" in text:
+            return "metadata-only change"
+        if "formal rewrite" in text:
+            return "formal-only rewrite"
+        if "effectively unchanged" in text or "equivalent repair" in text:
+            return "equivalent repair"
+        return "equivalent repair"
+
+    def _review_retry_repair_strategy(
+        self,
+        repair_strategy: str | None,
+        review_feedback: ProposedUpdateReview,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str | None:
+        if repair_context is None:
+            return repair_strategy
+        if self._review_feedback_is_noop(review_feedback):
+            return ESCALATED_REPAIR_STRATEGY
+        return repair_strategy
+
+    def _record_noop_review_attempt(
+        self,
+        session: SessionState,
+        *,
+        target: str,
+        current_content: str | None,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+        strategy: str | None,
+        review: ProposedUpdateReview,
+    ) -> bool:
+        if repair_context is None or current_content is None or not self._review_feedback_is_noop(review):
+            return False
+
+        mutation = self._assess_effective_mutation(target, current_content, proposed_content)
+        if mutation.effective:
+            mutation = MutationAssessment(
+                effective=False,
+                reason=self._review_feedback_noop_reason(review),
+                before_hash=self._content_sha256(current_content),
+                after_hash=self._content_sha256(proposed_content),
+                change_labels=["equivalent_repair"],
+                changed_line_count=self._compact_repair_change_line_count(
+                    current_content=current_content,
+                    proposed_content=proposed_content,
+                ),
+            )
+        effective_strategy = strategy or TARGETED_REPAIR_STRATEGY
+        self._log(
+            "repair_noop_detected",
+            path=target,
+            strategy=effective_strategy,
+            reason=mutation.reason,
+            before_hash=mutation.before_hash,
+            after_hash=mutation.after_hash,
+            change_labels=mutation.change_labels,
+            source="pre_write_review",
+        )
+        self._record_repair_attempt(
+            session,
+            repair_context,
+            target=target,
+            strategy=effective_strategy,
+            result="no_effective_change",
+            reason=mutation.reason,
+            mutation=mutation,
+        )
+        return True
 
     def _repair_brief_primary_target(
         self,
@@ -1507,17 +1704,210 @@ class Planner:
 
     def _assess_effective_mutation(
         self,
+        path: str,
         current_content: str,
         new_content: str,
     ) -> MutationAssessment:
+        before_hash = self._content_sha256(current_content)
+        after_hash = self._content_sha256(new_content)
+        changed_line_count = self._compact_repair_change_line_count(
+            current_content=current_content,
+            proposed_content=new_content,
+        )
+        if before_hash == after_hash:
+            return MutationAssessment(
+                False,
+                "file hash unchanged",
+                before_hash=before_hash,
+                after_hash=after_hash,
+                change_labels=["hash_unchanged"],
+                changed_line_count=changed_line_count,
+            )
         if new_content.strip() == current_content.strip():
-            return MutationAssessment(False, "identical content")
+            return MutationAssessment(
+                False,
+                "identical content",
+                before_hash=before_hash,
+                after_hash=after_hash,
+                change_labels=["equivalent_content"],
+                changed_line_count=changed_line_count,
+            )
         if self._normalized_mutation_content(new_content) == self._normalized_mutation_content(current_content):
-            return MutationAssessment(False, "whitespace-only change")
-        return MutationAssessment(True, "substantive mutation prepared")
+            return MutationAssessment(
+                False,
+                "whitespace-only change",
+                before_hash=before_hash,
+                after_hash=after_hash,
+                change_labels=["whitespace_only"],
+                changed_line_count=changed_line_count,
+            )
+        if self._normalized_comment_stripped_content(path, new_content) == self._normalized_comment_stripped_content(
+            path,
+            current_content,
+        ):
+            return MutationAssessment(
+                False,
+                "comment-only change",
+                before_hash=before_hash,
+                after_hash=after_hash,
+                change_labels=["comment_only"],
+                changed_line_count=changed_line_count,
+            )
+        if self._normalized_metadata_stripped_content(path, new_content) == self._normalized_metadata_stripped_content(
+            path,
+            current_content,
+        ):
+            return MutationAssessment(
+                False,
+                "metadata-only change",
+                before_hash=before_hash,
+                after_hash=after_hash,
+                change_labels=["metadata_only"],
+                changed_line_count=changed_line_count,
+            )
+        return MutationAssessment(
+            True,
+            "substantive mutation prepared",
+            before_hash=before_hash,
+            after_hash=after_hash,
+            change_labels=["productive_change"],
+            changed_line_count=changed_line_count,
+        )
 
     def _normalized_mutation_content(self, content: str) -> str:
         return re.sub(r"\s+", " ", str(content or "").strip())
+
+    def _content_sha256(self, content: str) -> str:
+        return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+
+    def _normalized_comment_stripped_content(self, path: str, content: str) -> str:
+        stripped = self._strip_comments_for_noop_detection(path, content)
+        lines = [str(line or "").strip() for line in str(stripped or "").splitlines() if str(line or "").strip()]
+        return "\n".join(lines)
+
+    def _normalized_metadata_stripped_content(self, path: str, content: str) -> str:
+        text = self._strip_comments_for_noop_detection(path, content)
+        lines: list[str] = []
+        raw_lines = [str(raw or "").rstrip() for raw in str(text or "").splitlines()]
+        front_matter_end = self._front_matter_end_index(path, raw_lines)
+        for index, raw in enumerate(raw_lines, start=1):
+            if front_matter_end is not None and index <= front_matter_end:
+                continue
+            stripped = raw.strip()
+            if not stripped or self._line_is_metadata_only(path, stripped, line_number=index):
+                continue
+            lines.append(stripped)
+        return "\n".join(lines)
+
+    def _strip_comments_for_noop_detection(self, path: str, content: str) -> str:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        text = str(content or "")
+        if suffix in {".py", ".pyi"}:
+            return self._strip_python_comments(text)
+        if suffix in {".html", ".htm", ".xml", ".svg", ".md", ".markdown"}:
+            text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        if suffix in {
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hpp",
+            ".java",
+            ".kt",
+            ".css",
+            ".scss",
+            ".less",
+            ".go",
+            ".rs",
+            ".php",
+        }:
+            text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        line_prefixes = self._comment_prefixes_for_path(path)
+        kept_lines: list[str] = []
+        for raw in text.splitlines():
+            stripped = str(raw or "").strip()
+            if not stripped:
+                continue
+            if any(stripped.startswith(prefix) for prefix in line_prefixes):
+                continue
+            kept_lines.append(str(raw or "").rstrip())
+        return "\n".join(kept_lines)
+
+    def _strip_python_comments(self, content: str) -> str:
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(str(content or "")).readline)
+            kept = [(token.type, token.string) for token in tokens if token.type != tokenize.COMMENT]
+            return tokenize.untokenize(kept)
+        except (SyntaxError, tokenize.TokenError):
+            return str(content or "")
+
+    def _comment_prefixes_for_path(self, path: str) -> tuple[str, ...]:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        if suffix in {".py", ".pyi", ".sh", ".yaml", ".yml", ".toml", ".rb"}:
+            return ("#",)
+        if suffix in {".ini", ".cfg", ".conf", ".properties"}:
+            return ("#", ";", "!")
+        if suffix in {".sql", ".lua"}:
+            return ("--",)
+        if suffix in {
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hpp",
+            ".java",
+            ".kt",
+            ".css",
+            ".scss",
+            ".less",
+            ".go",
+            ".rs",
+            ".php",
+        }:
+            return ("//", "/*", "*", "*/")
+        if suffix in {".html", ".htm", ".xml", ".svg", ".md", ".markdown"}:
+            return ("<!--", "-->")
+        return tuple()
+
+    def _front_matter_end_index(self, path: str, lines: list[str]) -> int | None:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        if suffix not in {".md", ".markdown", ".mdx", ".html", ".htm", ".txt", ".rst"}:
+            return None
+        if not lines or str(lines[0] or "").strip() != "---":
+            return None
+        for index, raw in enumerate(lines[1:12], start=2):
+            if str(raw or "").strip() == "---":
+                return index
+        return None
+
+    def _line_is_metadata_only(self, path: str, stripped_line: str, *, line_number: int) -> bool:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        lowered = str(stripped_line or "").strip().lower()
+        if not lowered:
+            return False
+        if line_number == 1 and lowered.startswith("#!"):
+            return True
+        if line_number <= 2 and "coding:" in lowered:
+            return True
+        if lowered.startswith("<meta ") or lowered.startswith("<meta\t"):
+            return True
+        return bool(
+            re.match(
+                r"^(?:__version__|__author__|__copyright__|version|name|description|author|authors|license|"
+                r"generated(?:_at)?|updated(?:_at)?|last_updated|timestamp|date|created_at|modified_at)\s*[:=]",
+                lowered,
+            )
+        )
 
     def _has_mutation_since_failed_validation(
         self,
@@ -1587,6 +1977,17 @@ class Planner:
 
         repair_context = self.validation_planner.build_failure_evidence(session, failed_run)
         session.active_repair_context = repair_context
+        if session.validation_status == "bootstrap_reset_required":
+            blocker = self._bootstrap_reset_blocker_message(repair_context)
+            if blocker not in session.blockers:
+                session.blockers.append(blocker)
+                session.blockers = session.blockers[-10:]
+            session.last_error = blocker
+            session.stop_reason = "needs_human_or_bootstrap_reset"
+            return self._final_decision(
+                "The current bootstrap failure needs a reset or human intervention before another repair loop.",
+                self._bootstrap_reset_blocked_response(route, session, repair_context),
+            )
 
         repair_route = self._repair_route_after_failed_validation(
             route,
@@ -1683,22 +2084,36 @@ class Planner:
 
         target_name = Path(target).name
         absolute_target = Path(session.workspace_root, target)
+        bootstrap_phase = self._repair_context_bootstrap_status(repair_context) == "bootstrap_failed"
+        root_cause_summary = self._repair_context_root_cause_summary(repair_context)
         if absolute_target.exists() and absolute_target.is_file():
             action_plan = [
                 RouteActionStep(
                     step=1,
                     action=RouteActionName.READ_RELEVANT_FILES,
-                    reason="Inspect the changed artifact again after the failed validation before repairing it.",
+                    reason=(
+                        "Inspect the bootstrap-critical artifact again before repairing the validation startup path."
+                        if bootstrap_phase
+                        else "Inspect the changed artifact again after the failed validation before repairing it."
+                    ),
                 ),
                 RouteActionStep(
                     step=2,
                     action=RouteActionName.UPDATE_ARTIFACT,
-                    reason="Repair the changed artifact using the failed validation evidence.",
+                    reason=(
+                        "Repair the failing bootstrap or discovery path before touching downstream behavior."
+                        if bootstrap_phase
+                        else "Repair the changed artifact using the failed validation evidence."
+                    ),
                 ),
                 RouteActionStep(
                     step=3,
                     action=RouteActionName.RUN_VALIDATION,
-                    reason="Rerun the validation after the repair step.",
+                    reason=(
+                        "Rerun validation to confirm the bootstrap path really changed."
+                        if bootstrap_phase
+                        else "Rerun the validation after the repair step."
+                    ),
                 ),
                 RouteActionStep(
                     step=4,
@@ -1711,12 +2126,20 @@ class Planner:
                 RouteActionStep(
                     step=1,
                     action=RouteActionName.UPDATE_ARTIFACT,
-                    reason="Create or restore the missing artifact implicated by the failed validation.",
+                    reason=(
+                        "Create or restore the missing bootstrap-critical artifact before retrying validation."
+                        if bootstrap_phase
+                        else "Create or restore the missing artifact implicated by the failed validation."
+                    ),
                 ),
                 RouteActionStep(
                     step=2,
                     action=RouteActionName.RUN_VALIDATION,
-                    reason="Rerun the validation after the repair step.",
+                    reason=(
+                        "Rerun validation to confirm the bootstrap path really changed."
+                        if bootstrap_phase
+                        else "Rerun the validation after the repair step."
+                    ),
                 ),
                 RouteActionStep(
                     step=3,
@@ -1731,12 +2154,22 @@ class Planner:
                 *route.entities.constraints,
                 *repair_context.repair_requirements[:4],
                 "Do not return an equivalent file without a substantive fix.",
+                "No-op repairs are forbidden: do not change only whitespace, comments, metadata, or unrelated regions.",
             ]
         )
+        if bootstrap_phase:
+            constraint_lines = self._unique_paths(
+                [
+                    *constraint_lines,
+                    "Bootstrap phase: repair the startup/import/discovery path before changing downstream logic.",
+                    "Do not claim progress unless the failing bootstrap signature changes or validation passes.",
+                ]
+            )
         attribute_lines = self._unique_paths(
             [
                 *route.entities.attributes,
                 f"failed_validation_scope:{failure_scope}",
+                *(["repair_phase:bootstrap"] if bootstrap_phase else []),
                 *(f"missing_feature:{item}" for item in repair_context.missing_features[:4]),
             ]
         )
@@ -1753,8 +2186,13 @@ class Planner:
             update={
                 "intent": next_intent,
                 "requested_outcome": (
-                    f"Repair {target_name} so the failed {failure_scope} validation passes. "
-                    f"Failure summary: {failure_summary} Preserve the original requested outcome."
+                    (
+                        f"Repair the bootstrap path in {target_name} so the failed {failure_scope} validation can start cleanly. "
+                        if bootstrap_phase
+                        else f"Repair {target_name} so the failed {failure_scope} validation passes. "
+                    )
+                    + (f"Root cause: {root_cause_summary} " if root_cause_summary else "")
+                    + f"Failure summary: {failure_summary} Preserve the original requested outcome."
                 ),
                 "entities": route.entities.model_copy(
                     update={
@@ -2505,6 +2943,57 @@ class Planner:
             lines.append("I still lack a substantive, non-equivalent repair that would address this failure safely.")
         return "\n".join(lines)
 
+    def _bootstrap_reset_blocker_message(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str:
+        root_cause = self._repair_context_root_cause_summary(repair_context)
+        summary = str(getattr(repair_context, "failure_summary", "") or "").strip() if repair_context is not None else ""
+        if root_cause and summary and summary != root_cause:
+            return f"Bootstrap reset required: {root_cause} Latest failure evidence: {summary}"
+        if root_cause:
+            return f"Bootstrap reset required: {root_cause}"
+        if summary:
+            return f"Bootstrap reset required: {summary}"
+        return "Bootstrap reset required before another repair loop can continue."
+
+    def _bootstrap_reset_blocked_response(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> str:
+        del route
+        language = self._session_language(session)
+        root_cause = self._repair_context_root_cause_summary(repair_context)
+        summary = str(getattr(repair_context, "failure_summary", "") or "").strip() if repair_context is not None else ""
+        target = self._repair_brief_locked_target(repair_context) or self._repair_brief_primary_target(repair_context)
+        if language == "de":
+            lines = [
+                "Ich stoppe den Repair-Loop, weil der Bootstrap-Pfad trotz wiederholter Versuche dasselbe Fehlerbild liefert.",
+                "Status: bootstrap_reset_required.",
+            ]
+            if target:
+                lines.append(f"Betroffenes Artefakt: {target}.")
+            if root_cause:
+                lines.append(f"Root Cause: {root_cause}")
+            if summary and summary != root_cause:
+                lines.append(f"Letzte Evidenz: {summary}")
+            lines.append("Ein weiterer Retry ohne Reset, neue Evidenz oder menschliche Entscheidung wuerde nur dieselbe Schleife wiederholen.")
+            return "\n".join(lines)
+        lines = [
+            "I am stopping the repair loop because the bootstrap path is still producing the same failure after repeated attempts.",
+            "Status: bootstrap_reset_required.",
+        ]
+        if target:
+            lines.append(f"Affected artifact: {target}.")
+        if root_cause:
+            lines.append(f"Root cause: {root_cause}")
+        if summary and summary != root_cause:
+            lines.append(f"Latest evidence: {summary}")
+        lines.append("Another retry without a reset, new evidence, or human intervention would only repeat the same loop.")
+        return "\n".join(lines)
+
     def _validation_decision(
         self,
         thought_summary: str,
@@ -2947,7 +3436,7 @@ class Planner:
     ) -> ValidationFailureEvidence | None:
         if session.active_repair_context is not None:
             return session.active_repair_context
-        if session.validation_status != "failed" or not session.validation_runs:
+        if session.validation_status not in {"failed", "bootstrap_failed", "bootstrap_reset_required"} or not session.validation_runs:
             return None
         failed_run = self.validation_planner.latest_failed_run(session)
         if failed_run is None:
@@ -3366,6 +3855,15 @@ class Planner:
                         summary=review.summary,
                         blocking_issues=review.blocking_issues[:4],
                     )
+                    self._record_noop_review_attempt(
+                        session,
+                        target=path,
+                        current_content=current_content,
+                        proposed_content=cleaned,
+                        repair_context=repair_context,
+                        strategy=repair_strategy,
+                        review=review,
+                    )
                     review_retry = self._retry_update_after_review_failure(
                         route,
                         session,
@@ -3409,8 +3907,17 @@ class Planner:
                         return ContentGenerationResult(
                             source="failed",
                             failure=failure,
+                            repair_strategy_used=(
+                                review_retry.effective_repair_strategy
+                                or self._review_retry_repair_strategy(
+                                    repair_strategy,
+                                    final_review,
+                                    repair_context,
+                                )
+                            ),
                         )
                     approved_content = review_retry.content
+                    repair_strategy = review_retry.effective_repair_strategy or repair_strategy
                 self._log(
                     "content_generation_finished",
                     path=path,
@@ -3433,7 +3940,10 @@ class Planner:
                         attempts=attempts,
                     ),
                 )
-                return ContentGenerationResult(content=approved_content)
+                return ContentGenerationResult(
+                    content=approved_content,
+                    repair_strategy_used=repair_strategy,
+                )
             attempts[-1] = self._empty_response_attempt(
                 base_attempt=outcome.attempt,
                 context_pressure=context_pressure,
@@ -3481,6 +3991,19 @@ class Planner:
                     summary=review.summary,
                     blocking_issues=review.blocking_issues[:4],
                 )
+                self._record_noop_review_attempt(
+                    session,
+                    target=path,
+                    current_content=current_content,
+                    proposed_content=retry_result.content,
+                    repair_context=repair_context,
+                    strategy=self._review_retry_repair_strategy(
+                        repair_strategy,
+                        review,
+                        repair_context,
+                    ),
+                    review=review,
+                )
                 review_retry = self._retry_update_after_review_failure(
                     route,
                     session,
@@ -3524,8 +4047,17 @@ class Planner:
                     return ContentGenerationResult(
                         source="failed",
                         failure=failure,
+                        repair_strategy_used=(
+                            review_retry.effective_repair_strategy
+                            or self._review_retry_repair_strategy(
+                                repair_strategy,
+                                final_review,
+                                repair_context,
+                            )
+                        ),
                     )
                 approved_content = review_retry.content
+                repair_strategy = review_retry.effective_repair_strategy or repair_strategy
             self._log(
                 "content_generation_finished",
                 path=path,
@@ -3552,6 +4084,7 @@ class Planner:
             return ContentGenerationResult(
                 content=approved_content,
                 source="retry",
+                repair_strategy_used=repair_strategy,
             )
         if self._startup_failure_exhausted(attempts):
             recovery = self._no_start_recovery_content(
@@ -3598,6 +4131,7 @@ class Planner:
                 return ContentGenerationResult(
                     content=fallback,
                     source="template",
+                    repair_strategy_used=repair_strategy,
                 )
         failure = self._build_content_generation_failure(
             route,
@@ -3626,6 +4160,7 @@ class Planner:
         return ContentGenerationResult(
             source="failed",
             failure=failure,
+            repair_strategy_used=repair_strategy,
         )
 
     def _retry_content_generation(
@@ -5890,11 +6425,8 @@ class Planner:
         if repair_context is None:
             return None
 
-        changed_line_count = self._compact_repair_change_line_count(
-            current_content=current_content,
-            proposed_content=proposed_content,
-        )
-        if changed_line_count > 0:
+        mutation = self._assess_effective_mutation(path, current_content, proposed_content)
+        if mutation.effective:
             return None
 
         normalized_path = str(path or "").strip()
@@ -5906,18 +6438,25 @@ class Planner:
                 failure_signature = candidate_signature
 
         signature_suffix = f" for {failure_signature}" if failure_signature else ""
-        blocking_issue = f"The proposed repair does not make an effective change to {normalized_path}{signature_suffix}."
+        blocking_issue = (
+            f"The proposed repair does not make a productive change to {normalized_path}{signature_suffix} "
+            f"({mutation.reason})."
+        )
         locked_target = self._repair_brief_locked_target(repair_context)
         if locked_target:
             blocking_issue += f" The locked repair target is still {locked_target}."
         return ProposedUpdateReview(
             safe_to_write=False,
-            summary="The proposed repair is effectively unchanged, so writing it would only repeat the same failing state.",
+            summary=(
+                "The proposed repair is a no-op or only a formal rewrite, so writing it would only repeat the "
+                "same failing state."
+            ),
             confidence=0.93,
             blocking_issues=[blocking_issue],
             preservation_risks=[],
             repair_hints=[
-                "Change the locked repair target in a way that alters the failing behavior instead of resubmitting the same implementation.",
+                "Change the locked repair target in a way that alters the failing behavior instead of resubmitting an equivalent file.",
+                "Do not change only whitespace, comments, metadata, or unrelated lines; produce a real code-level fix.",
                 "Use the expected-versus-observed repair brief to make a minimal but real semantic change.",
             ],
         )
@@ -6543,6 +7082,11 @@ class Planner:
             num_ctx,
             prompt_variant,
         ) in retry_models:
+            effective_repair_strategy = self._review_retry_repair_strategy(
+                repair_strategy,
+                last_review,
+                repair_context,
+            )
             normalized_model = str(model_name or "").strip()
             variant_key = (normalized_model or "__default__", prompt_variant, strategy)
             if variant_key in seen_retry_variants:
@@ -6555,7 +7099,7 @@ class Planner:
                 path=path,
                 current_content=current_content,
                 repair_context=repair_context,
-                repair_strategy=repair_strategy,
+                repair_strategy=effective_repair_strategy,
                 review_feedback=last_review,
                 mode=prompt_variant,
             )
@@ -6593,6 +7137,7 @@ class Planner:
                 reason="proposed_update_review_rejected",
                 capability_tier=capability_tier,
                 prompt_variant=prompt_variant,
+                repair_strategy=effective_repair_strategy,
                 prompt_chars=len(prompt),
                 prompt_lines=prompt.count("\n") + 1,
                 prompt_sha256=prompt_sha,
@@ -6691,6 +7236,7 @@ class Planner:
                     review=review,
                     capability_tier=capability_tier,
                     recovery_strategy=strategy,
+                    effective_repair_strategy=effective_repair_strategy,
                 )
             self._log(
                 "proposed_update_review_rejected",
@@ -6698,6 +7244,15 @@ class Planner:
                 summary=review.summary,
                 blocking_issues=review.blocking_issues[:4],
                 strategy=strategy,
+            )
+            self._record_noop_review_attempt(
+                session,
+                target=path,
+                current_content=current_content,
+                proposed_content=cleaned,
+                repair_context=repair_context,
+                strategy=effective_repair_strategy,
+                review=review,
             )
             last_review = review
 
@@ -6715,6 +7270,20 @@ class Planner:
         current_content: str | None,
     ) -> ContentGenerationFailure:
         language = self._session_language(session)
+        if current_content is not None and self._review_feedback_is_noop(review):
+            reason = self._review_feedback_noop_reason(review)
+            blocker_message = f"The routed update for {path} did not produce a substantive repair change ({reason})."
+            user_message = self._localized_text(
+                language,
+                de="Ich konnte keine belastbare inhaltliche Aenderung fuer die Zieldatei ableiten.",
+                en="I could not derive a reliable substantive change for the target file.",
+            )
+            return ContentGenerationFailure(
+                stop_reason="no_effective_change",
+                failure_class="no_effective_change",
+                blocker_message=blocker_message,
+                user_message=user_message,
+            )
         target_kind = "update" if current_content is not None else "new file content"
         blocker_message = f"Pre-write review rejected the proposed {target_kind} for {path}: {review.summary}"
         user_message = self._localized_text(
@@ -9147,6 +9716,7 @@ class Planner:
         self._record_semantic_change_review(session, review)
 
     def _record_semantic_change_review(self, session: SessionState, review: SemanticChangeReview) -> None:
+        review = self._enforce_repair_review_gates(session, review)
         command = self.validation_planner.semantic_review_command([item.path for item in session.changed_files])
         excerpt_parts: list[str] = []
         if review.missing_requirements:
@@ -9219,13 +9789,93 @@ class Planner:
             artifacts.append(entry)
         return artifacts
 
+    def _latest_verified_repair_attempt(self, session: SessionState) -> RepairAttemptRecord | None:
+        return next(
+            (
+                attempt
+                for attempt in reversed(session.repair_history)
+                if attempt.result == "mutation_planned"
+            ),
+            None,
+        )
+
+    def _repair_review_gate_failure(self, session: SessionState) -> SemanticChangeReview | None:
+        attempt = self._latest_verified_repair_attempt(session)
+        if attempt is None:
+            return None
+
+        missing_requirements: list[str] = []
+        suspicious_issues: list[str] = []
+        repair_hints: list[str] = []
+        file_hints = [str(attempt.artifact_path or "").strip()] if str(attempt.artifact_path or "").strip() else [
+            item.path for item in session.changed_files[:4]
+        ]
+
+        if not str(attempt.root_cause_summary or "").strip():
+            missing_requirements.append("Concrete root cause explanation for the latest repair")
+            repair_hints.append("Record the concrete failure cause before approving the repair.")
+        if attempt.productive_change is not True:
+            missing_requirements.append("Productive code change for the latest repair")
+            repair_hints.append("Reject whitespace-only, comment-only, metadata-only, or equivalent repairs.")
+        if attempt.independent_verification is not True:
+            missing_requirements.append("Independent verification after the latest repair")
+            repair_hints.append("Rerun an independent validation step after the repair before approving completion.")
+        if (
+            attempt.independent_verification is False
+            and attempt.behavior_changed is False
+            and str(attempt.post_validation_failure_signature or "").strip()
+        ):
+            suspicious_issues.append(
+                "The latest repair reran into the same failure signature without changing the observed behavior."
+            )
+            repair_hints.append("Stop retrying the same path until the bootstrap state is reset or new evidence appears.")
+
+        if not missing_requirements and not suspicious_issues:
+            return None
+
+        return SemanticChangeReview(
+            requirements_satisfied=False,
+            summary=(
+                "Repair review cannot pass yet because the latest repair still lacks a concrete cause, a productive "
+                "change, or an independent verification."
+            ),
+            confidence=0.9,
+            missing_requirements=list(dict.fromkeys(missing_requirements)),
+            suspicious_issues=list(dict.fromkeys(suspicious_issues)),
+            repair_hints=list(dict.fromkeys(repair_hints)),
+            file_hints=file_hints[:4],
+        )
+
+    def _enforce_repair_review_gates(
+        self,
+        session: SessionState,
+        review: SemanticChangeReview,
+    ) -> SemanticChangeReview:
+        gate_failure = self._repair_review_gate_failure(session)
+        if gate_failure is None:
+            return review
+        if review.requirements_satisfied:
+            return gate_failure
+        return review.model_copy(
+            update={
+                "missing_requirements": list(
+                    dict.fromkeys([*review.missing_requirements, *gate_failure.missing_requirements])
+                ),
+                "suspicious_issues": list(
+                    dict.fromkeys([*review.suspicious_issues, *gate_failure.suspicious_issues])
+                ),
+                "repair_hints": list(dict.fromkeys([*review.repair_hints, *gate_failure.repair_hints])),
+                "file_hints": list(dict.fromkeys([*review.file_hints, *gate_failure.file_hints])),
+            }
+        )
+
     def _fallback_semantic_change_review(self, session: SessionState) -> SemanticChangeReview:
         deferred_targets = self._active_deferred_update_targets(session)
         pending_snapshot_targets = self._semantic_review_pending_snapshot_targets(
             session,
             deferred_targets=deferred_targets,
         )
-        if session.validation_status == "failed":
+        if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"}:
             return SemanticChangeReview(
                 requirements_satisfied=False,
                 summary="Existing validation already reports unresolved issues in the changed implementation.",
@@ -9260,12 +9910,13 @@ class Planner:
                 file_hints=[item.path for item in session.changed_files[:4]],
             )
         if session.validation_status == "passed":
-            return SemanticChangeReview(
+            review = SemanticChangeReview(
                 requirements_satisfied=True,
                 summary="Available project-aware validation passed and the fallback review found no additional concrete task-to-code mismatch.",
                 confidence=0.55,
                 file_hints=[item.path for item in session.changed_files[:4]],
             )
+            return self._enforce_repair_review_gates(session, review)
         return SemanticChangeReview(
             requirements_satisfied=False,
             summary="The semantic review fallback could not confirm that the changed artifacts satisfy the requested outcome.",
