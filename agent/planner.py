@@ -3264,7 +3264,7 @@ class Planner:
         route: RouterOutput,
         session: SessionState,
     ) -> list[str]:
-        explicit = self._explicit_target_paths(route, session)
+        explicit = self._actionable_explicit_target_paths(route, session)
         if route.intent != RouteIntent.CREATE or not explicit:
             return explicit
 
