@@ -2675,6 +2675,48 @@ def test_task_state_updater_uses_compact_generation_for_fresh_session(tmp_path):
     assert call["kwargs"]["num_ctx"] == 2048
 
 
+def test_task_state_a2_single_model_semantic_bootstrap_uses_relaxed_startup_budget(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm, timeout=45, num_ctx=4096)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert len(llm.generate_json_calls) >= 3
+    first_call = llm.generate_json_calls[0]["kwargs"]
+    second_call = llm.generate_json_calls[1]["kwargs"]
+    third_call = llm.generate_json_calls[2]["kwargs"]
+
+    assert first_call["model"] == "qwen2.5-coder:7b"
+    assert first_call["timeout"] == 45
+    assert first_call["total_timeout"] == 180
+    assert first_call["num_ctx"] == 2048
+    assert first_call["strict_timeouts"] is False
+
+    assert second_call["timeout"] == 45
+    assert second_call["total_timeout"] == 180
+    assert second_call["num_ctx"] == 4096
+    assert second_call["strict_timeouts"] is False
+
+    assert third_call["timeout"] == 45
+    assert third_call["total_timeout"] == 180
+    assert third_call["num_ctx"] == 2048
+    assert third_call["strict_timeouts"] is False
+
+
 def test_task_state_contract_handles_backend_correction():
     llm = ScriptedLLM(
         [

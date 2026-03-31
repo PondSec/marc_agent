@@ -94,17 +94,25 @@ class TaskStateUpdater:
             )
             self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
             return local_state
+        model_candidates = self._model_candidates()
+        primary_model = model_candidates[0] if model_candidates else None
+        reserve_models = model_candidates[1:]
+        single_model_semantic_bootstrap = strict_semantic_execution and len(model_candidates) <= 1
         prompt = task_state_update_prompt(
             user_input,
             snapshot=snapshot,
             session=session,
             mode=initial_mode,
         )
-        initial_timeout, initial_total_timeout, initial_num_ctx = self._mode_runtime(initial_mode)
+        initial_timeout, initial_total_timeout, initial_num_ctx = self._mode_runtime(
+            initial_mode,
+            single_model_semantic_bootstrap=single_model_semantic_bootstrap,
+        )
+        initial_strict_timeouts = self._strict_timeouts(
+            initial_mode,
+            single_model_semantic_bootstrap=single_model_semantic_bootstrap,
+        )
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
-        model_candidates = self._model_candidates()
-        primary_model = model_candidates[0] if model_candidates else None
-        reserve_models = model_candidates[1:]
         policy = ExecutionRecoveryPolicy(
             task_class="task_state_generation",
             allow_same_backend_retry=True,
@@ -124,7 +132,7 @@ class TaskStateUpdater:
                 retries=0,
                 timeout=initial_timeout,
                 total_timeout=initial_total_timeout,
-                strict_timeouts=initial_mode != "full",
+                strict_timeouts=initial_strict_timeouts,
                 num_ctx=initial_num_ctx,
                 progress_callback=progress,
             ),
@@ -245,7 +253,17 @@ class TaskStateUpdater:
                 session=session,
                 mode=retry_mode,
             )
-            retry_timeout, retry_total_timeout, retry_num_ctx = self._mode_runtime(retry_mode)
+            retry_single_model_bootstrap = (
+                single_model_semantic_bootstrap and decision.candidate.model_identifier == primary_model
+            )
+            retry_timeout, retry_total_timeout, retry_num_ctx = self._mode_runtime(
+                retry_mode,
+                single_model_semantic_bootstrap=retry_single_model_bootstrap,
+            )
+            retry_strict_timeouts = self._strict_timeouts(
+                retry_mode,
+                single_model_semantic_bootstrap=retry_single_model_bootstrap,
+            )
             retry_outcome = invoke_model(
                 lambda progress, prompt_text=retry_prompt, model_name=decision.candidate.model_identifier: self.llm.generate_json(
                     prompt_text,
@@ -254,7 +272,7 @@ class TaskStateUpdater:
                     retries=0,
                     timeout=retry_timeout,
                     total_timeout=retry_total_timeout,
-                    strict_timeouts=retry_mode != "full",
+                    strict_timeouts=retry_strict_timeouts,
                     num_ctx=retry_num_ctx,
                     progress_callback=progress,
                 ),
@@ -573,7 +591,24 @@ class TaskStateUpdater:
         ]
         return self._finalize_state(blocked, semantic_resolution="blocked")
 
-    def _mode_runtime(self, mode: str) -> tuple[int, int, int]:
+    def _mode_runtime(
+        self,
+        mode: str,
+        *,
+        single_model_semantic_bootstrap: bool = False,
+    ) -> tuple[int, int, int]:
+        if single_model_semantic_bootstrap:
+            # On single-model CPU stacks, A2's semantic bootstrap has no faster
+            # reserve path. Give the semantic start enough room to reuse a warm
+            # model instead of falsely classifying a slow first token as
+            # unavailability.
+            if mode == "full":
+                timeout = max(self.timeout, 30)
+                total_timeout = max(timeout * 4, timeout + 135)
+                return timeout, total_timeout, self.num_ctx
+            timeout = max(self.timeout, 30)
+            total_timeout = max(timeout * 4, timeout + 135)
+            return timeout, total_timeout, min(self.num_ctx, 2048)
         if mode == "full":
             timeout = self.timeout
             total_timeout = max(timeout * 2, timeout + 20)
@@ -586,6 +621,18 @@ class TaskStateUpdater:
         total_timeout = max(timeout * 4, timeout + 40)
         num_ctx = min(self.num_ctx, 2048)
         return timeout, total_timeout, num_ctx
+
+    def _strict_timeouts(
+        self,
+        mode: str,
+        *,
+        single_model_semantic_bootstrap: bool = False,
+    ) -> bool:
+        if mode == "full":
+            return False
+        if single_model_semantic_bootstrap:
+            return False
+        return True
 
     def _recovery_prompt_mode(
         self,
