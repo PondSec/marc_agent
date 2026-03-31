@@ -12094,6 +12094,110 @@ def test_planner_prefers_lightweight_model_for_remaining_create_targets_after_pr
     assert llm.generate_calls[2]["kwargs"]["model"] == "qwen2.5-coder:14b"
 
 
+def test_planner_defers_supporting_create_docs_until_first_validation(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Create calcstats/stats.py, calcstats/__main__.py, README.md, and tests/test_stats.py, "
+            "then finish only after python -m unittest tests.test_stats passes."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_stats",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_stats"],
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested starter files."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the generated package."},
+        ],
+        target_paths=["calcstats/stats.py", "calcstats/__main__.py", "README.md", "tests/test_stats.py"],
+        target_name="calcstats/stats.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_stats")
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="calcstats/stats.py", name="calcstats/stats.py", kind="file", role="primary_target", confidence=1.0),
+        TaskArtifact(path="calcstats/__main__.py", name="calcstats/__main__.py", kind="file", role="primary_target", confidence=1.0),
+        TaskArtifact(path="tests/test_stats.py", name="tests/test_stats.py", kind="test", role="validation_target", confidence=1.0),
+        TaskArtifact(path="README.md", name="README.md", kind="doc", role="supporting_context", confidence=1.0),
+    ]
+    session.changed_files = [
+        FileChangeRecord(path="calcstats/stats.py", operation="create"),
+        FileChangeRecord(path="calcstats/__main__.py", operation="create"),
+        FileChangeRecord(path="tests/test_stats.py", operation="create"),
+    ]
+
+    assert planner._active_deferred_create_targets(session.router_result, session) == {"README.md"}
+    assert planner._has_pending_explicit_create_targets(session.router_result, session) is False
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python -m unittest tests.test_stats"
+
+
+def test_planner_reactivates_supporting_create_docs_after_first_passed_validation(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Create calcstats/stats.py, calcstats/__main__.py, README.md, and tests/test_stats.py, "
+            "then finish only after python -m unittest tests.test_stats passes."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_stats",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_stats"],
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested starter files."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the generated package."},
+        ],
+        target_paths=["calcstats/stats.py", "calcstats/__main__.py", "README.md", "tests/test_stats.py"],
+        target_name="calcstats/stats.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_stats")
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="calcstats/stats.py", name="calcstats/stats.py", kind="file", role="primary_target", confidence=1.0),
+        TaskArtifact(path="calcstats/__main__.py", name="calcstats/__main__.py", kind="file", role="primary_target", confidence=1.0),
+        TaskArtifact(path="tests/test_stats.py", name="tests/test_stats.py", kind="test", role="validation_target", confidence=1.0),
+        TaskArtifact(path="README.md", name="README.md", kind="doc", role="supporting_context", confidence=1.0),
+    ]
+    session.changed_files = [
+        FileChangeRecord(path="calcstats/stats.py", operation="create"),
+        FileChangeRecord(path="calcstats/__main__.py", operation="create"),
+        FileChangeRecord(path="tests/test_stats.py", operation="create"),
+    ]
+    session.validation_runs = [
+        ValidationRunRecord(
+            command="python -m unittest tests.test_stats",
+            status="passed",
+            kind="test",
+            verification_scope="runtime",
+        )
+    ]
+    session.validation_status = "passed"
+
+    assert planner._active_deferred_create_targets(session.router_result, session) == set()
+    assert planner._has_pending_explicit_create_targets(session.router_result, session) is True
+    assert planner._choose_create_path(session.router_result, session) == "README.md"
+
+
 def test_generated_content_integrity_review_blocks_placeholder_python_test_without_assertions(tmp_path):
     planner = Planner(ScriptedLLM(), "")
 

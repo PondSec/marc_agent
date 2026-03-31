@@ -3268,6 +3268,33 @@ class Planner:
         if route.intent != RouteIntent.CREATE or not explicit:
             return explicit
 
+        artifact_roles = self._explicit_create_target_roles(route, session, explicit_targets=explicit)
+        role_order = {
+            "primary_target": 0,
+            "active_context": 0,
+            "validation_target": 1,
+            "supporting_context": 2,
+        }
+        indexed_positions = {path: index for index, path in enumerate(explicit)}
+        return sorted(
+            explicit,
+            key=lambda path: (
+                role_order.get(artifact_roles.get(path, "primary_target"), 3),
+                indexed_positions.get(path, 999),
+            ),
+        )
+
+    def _explicit_create_target_roles(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        explicit_targets: list[str] | None = None,
+    ) -> dict[str, str]:
+        explicit = explicit_targets or self._explicit_target_paths(route, session)
+        if route.intent != RouteIntent.CREATE or not explicit:
+            return {}
+
         task_state = session.task_state
         artifact_roles: dict[str, str] = {}
         if task_state is not None:
@@ -3277,14 +3304,6 @@ class Planner:
                 for path in [str(artifact.path or "").strip()]
                 if path
             }
-
-        role_order = {
-            "primary_target": 0,
-            "active_context": 0,
-            "validation_target": 1,
-            "supporting_context": 2,
-        }
-        indexed_positions = {path: index for index, path in enumerate(explicit)}
 
         def inferred_role(path: str) -> str:
             explicit_role = artifact_roles.get(path, "")
@@ -3297,13 +3316,35 @@ class Planner:
                 return "supporting_context"
             return "primary_target"
 
-        return sorted(
-            explicit,
-            key=lambda path: (
-                role_order.get(inferred_role(path), 3),
-                indexed_positions.get(path, 999),
-            ),
-        )
+        return {
+            path: inferred_role(path)
+            for path in explicit
+        }
+
+    def _active_deferred_create_targets(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> set[str]:
+        explicit_targets = self._ordered_create_targets(route, session)
+        if route.intent != RouteIntent.CREATE or not explicit_targets:
+            return set()
+
+        artifact_roles = self._explicit_create_target_roles(route, session, explicit_targets=explicit_targets)
+        supporting_targets = {
+            path
+            for path in explicit_targets
+            if artifact_roles.get(path) == "supporting_context"
+        }
+        if not supporting_targets:
+            return set()
+        if not any(artifact_roles.get(path) != "supporting_context" for path in explicit_targets):
+            return set()
+        if not self.validation_planner.pending_commands(session):
+            return set()
+        if any(run.status == "passed" for run in session.validation_runs):
+            return set()
+        return supporting_targets
 
     def _actionable_explicit_target_paths(
         self,
@@ -3593,7 +3634,11 @@ class Planner:
         if len(explicit_targets) <= 1:
             return False
         changed_paths = {item.path for item in session.changed_files}
-        return any(candidate not in changed_paths for candidate in explicit_targets)
+        deferred_targets = self._active_deferred_create_targets(route, session)
+        return any(
+            candidate not in changed_paths and candidate not in deferred_targets
+            for candidate in explicit_targets
+        )
 
     def _next_unread_candidate(
         self,
@@ -3698,7 +3743,10 @@ class Planner:
         explicit_targets = self._ordered_create_targets(route, session)
         if explicit_targets:
             changed_paths = {item.path for item in session.changed_files}
+            deferred_targets = self._active_deferred_create_targets(route, session)
             for candidate in explicit_targets:
+                if candidate in deferred_targets:
+                    continue
                 if candidate not in changed_paths:
                     return candidate
             return explicit_targets[0]
