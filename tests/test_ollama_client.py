@@ -522,6 +522,67 @@ def test_ollama_client_marks_pre_chunk_startup_timeout_retryable(monkeypatch, tm
     assert error.first_output_received is False
 
 
+def test_ollama_client_preserves_warm_model_after_no_start_timeout(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+    stop_calls: list[str | None] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        del req, timeout
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(client, "_stop_running_model", lambda model_name: stop_calls.append(model_name))
+    monkeypatch.setattr("llm.ollama_client.time.monotonic", FakeMonotonic([0.0, 81.0]))
+
+    with pytest.raises(OllamaGenerationError) as excinfo:
+        client.generate("generate html", timeout=20, total_timeout=120, retries=0)
+
+    error = excinfo.value
+    assert error.reason == "startup_timeout"
+    assert error.no_start_failure is True
+    assert stop_calls == []
+
+
+def test_ollama_client_retries_no_start_without_forcing_cold_restart(monkeypatch, tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        llm_request_retries=1,
+        llm_retry_backoff_ms=0,
+    )
+    client = OllamaClient(config)
+    attempts = {"count": 0}
+    stop_calls: list[str | None] = []
+
+    def fake_urlopen(req: request.Request, timeout):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise TimeoutError("timed out")
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["stream"] is True
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "OK", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"response": "", "done": True}) + "\n").encode("utf-8"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(client, "_stop_running_model", lambda model_name: stop_calls.append(model_name))
+    monkeypatch.setattr("llm.ollama_client.time.monotonic", FakeMonotonic([0.0, 81.0, 82.0, 83.0, 84.0]))
+
+    result = client.generate("generate html", timeout=20, total_timeout=120, retries=1)
+
+    assert result == "OK"
+    assert attempts["count"] == 2
+    assert stop_calls == []
+
+
 def test_ollama_client_expands_large_model_time_budget(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
