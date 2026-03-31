@@ -1361,6 +1361,36 @@ def test_task_state_a2_blocks_mutation_when_semantic_model_is_unavailable(tmp_pa
     assert llm.generate_json_calls
 
 
+def test_task_state_a2_no_start_runs_recovery_before_blocking(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    logger = AgentLogger(tmp_path, "task-state-a2-no-start-recovery")
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm, logger=logger)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    models = [call["kwargs"].get("model") for call in llm.generate_json_calls]
+
+    assert task_state.semantic_resolution == "blocked"
+    assert len(models) > 1
+    assert "qwen2.5-coder:7b" in models
+    log_text = logger.log_path.read_text(encoding="utf-8")
+    assert "task_state_recovery_short_circuit" not in log_text
+
+
 def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 

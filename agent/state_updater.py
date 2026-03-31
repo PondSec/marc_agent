@@ -188,7 +188,12 @@ class TaskStateUpdater:
             error=str(outcome.exception),
             failure=failure.to_dict() if failure is not None else None,
         )
-        if failure is not None and failure.no_start_failure and initial_mode != "full":
+        if (
+            failure is not None
+            and failure.no_start_failure
+            and initial_mode != "full"
+            and not strict_semantic_execution
+        ):
             self._log(
                 "task_state_recovery_short_circuit",
                 strategy="deterministic_fallback",
