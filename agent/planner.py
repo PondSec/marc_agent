@@ -1235,8 +1235,13 @@ class Planner:
             return False
         locked_target = self._repair_brief_locked_target(repair_context)
         primary_target = self._repair_brief_primary_target(repair_context)
-        if text in {locked_target, primary_target} and self._repair_attempt_failure_count(session, repair_context, text) < 2:
-            return False
+        if text in {locked_target, primary_target}:
+            allow_early_direct_script_pivot = (
+                self._is_direct_runtime_entrypoint_script_target(text, repair_context)
+                and self._repair_attempt_failure_count(session, repair_context, text) >= 1
+            )
+            if not allow_early_direct_script_pivot and self._repair_attempt_failure_count(session, repair_context, text) < 2:
+                return False
         if self.validation_planner._is_test_path(text):
             return True
         if Path(text).suffix.lower() in {".md", ".markdown", ".txt", ".rst"}:
@@ -2353,6 +2358,8 @@ class Planner:
         suffix = path.suffix.lower()
         if suffix in {".py", ".pyi"} and self._is_python_runtime_support_module(text, repair_context):
             return True
+        if suffix == ".py" and self._is_direct_runtime_entrypoint_script_target(text, repair_context):
+            return True
         if suffix == ".py":
             return False
         if self._repair_candidate_is_explicitly_referenced(text, repair_context):
@@ -2574,6 +2581,42 @@ class Planner:
         if name == "__init__.py":
             return True
         if name != "__main__.py":
+            return False
+        implementation_peers = self._runtime_implementation_candidates(
+            repair_context,
+            exclude={text},
+        )
+        return bool(implementation_peers)
+
+    def _is_direct_runtime_entrypoint_script_target(
+        self,
+        candidate: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        text = str(candidate or "").strip()
+        if repair_context.verification_scope != "runtime" or not text:
+            return False
+        target = text.replace("\\", "/").lower()
+        failure_text = "\n".join(
+            part
+            for part in [
+                str(repair_context.excerpt or "").strip(),
+                str(repair_context.failure_summary or "").strip(),
+                str(repair_context.summary or "").strip(),
+            ]
+            if part
+        )
+        script_target = self.validation_planner._called_process_python_script_target(failure_text)
+        if not script_target:
+            return False
+        normalized_script = str(script_target or "").strip().replace("\\", "/").lower()
+        if not normalized_script:
+            return False
+        if not (target == normalized_script or normalized_script.endswith(f"/{target}") or target.endswith(f"/{Path(normalized_script).name}")):
+            return False
+        path = Path(text)
+        scriptish_directories = {"script", "scripts", "bin", "tool", "tools"}
+        if not any(part.lower() in scriptish_directories for part in path.parts[:-1]):
             return False
         implementation_peers = self._runtime_implementation_candidates(
             repair_context,

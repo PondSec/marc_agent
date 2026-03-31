@@ -980,9 +980,17 @@ class ValidationPlanner:
             failure_summary=failure_summary,
             missing_features=missing_features,
         )
+        script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
+        normalized_script = self._workspace_relative_path(session, script_target)
+        primary_target = self._prefer_behavioral_runtime_primary_target(
+            artifact_paths=artifact_paths,
+            file_hints=file_hints,
+            verification_scope=failed_run.verification_scope,
+            failure_type=failure_type,
+            primary_target=primary_target,
+            normalized_script_target=normalized_script,
+        )
         if failure_type == "import_failure":
-            script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
-            normalized_script = self._workspace_relative_path(session, script_target)
             if normalized_script:
                 primary_target = normalized_script
         target_line_hint = self._target_traceback_line_hint(
@@ -1076,6 +1084,39 @@ class ValidationPlanner:
             if implementation:
                 return implementation[0]
         return next((path for path in candidates if path), None)
+
+    def _prefer_behavioral_runtime_primary_target(
+        self,
+        *,
+        artifact_paths: list[str],
+        file_hints: list[str],
+        verification_scope: str,
+        failure_type: str,
+        primary_target: str | None,
+        normalized_script_target: str | None,
+    ) -> str | None:
+        if verification_scope != "runtime" or failure_type != "assertion_mismatch":
+            return primary_target
+        script_target = str(normalized_script_target or "").strip()
+        if not script_target:
+            return primary_target
+        current_target = str(primary_target or "").strip()
+        if current_target and current_target != script_target:
+            return primary_target
+        candidates = self._unique_paths([*artifact_paths, *file_hints])
+        implementation = [
+            path
+            for path in candidates
+            if (
+                path
+                and path != script_target
+                and not self._is_test_path(path)
+                and not self._is_documentation_path(path)
+            )
+        ]
+        if implementation:
+            return implementation[0]
+        return primary_target
 
     def _failure_type(
         self,

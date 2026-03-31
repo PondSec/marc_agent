@@ -1114,7 +1114,11 @@ def test_planner_repair_no_effective_change_blocks_model_review(tmp_path):
     )
 
     assert review.safe_to_write is False
-    assert "unchanged" in review.summary.lower() or "effective change" in review.summary.lower()
+    assert (
+        "unchanged" in review.summary.lower()
+        or "effective change" in review.summary.lower()
+        or "no-op" in review.summary.lower()
+    )
     assert llm.generate_json_calls == []
 
 
@@ -7307,6 +7311,55 @@ def test_planner_no_effective_change_keeps_locked_primary_target_before_pivot():
     )
 
     assert planner._should_pivot_after_no_effective_change(session, "greet_cli/__main__.py", repair_context) is True
+
+
+def test_planner_direct_script_wrapper_pivots_after_first_no_effective_change():
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the duplicate-word reporting flow.",
+        workspace_root="/tmp/demo",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_report",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["scripts/build_duplicates.py", "wordaudit/report.py", "tests/test_report.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "AssertionError: Lists differ: ['# skipped', 'alpha', 'beta'] != ['alpha', 'beta']\n"
+            "subprocess.CalledProcessError: "
+            "Command '['/usr/bin/python3', '/tmp/demo/scripts/build_duplicates.py', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+        ),
+        failure_summary="The library behavior is still wrong and the direct script wrapper now exits non-zero.",
+        file_hints=["scripts/build_duplicates.py", "wordaudit/report.py", "tests/test_report.py"],
+        repair_requirements=["Change the library behavior before rechecking the wrapper script."],
+        evidence_signature="sig-runtime-direct-script-wrapper",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:directscriptpivot",
+            primary_target="scripts/build_duplicates.py",
+            locked_target="scripts/build_duplicates.py",
+            expected_semantics=["Validation should produce: ['alpha', 'beta']"],
+            observed_semantics=["Validation currently produces: ['# skipped', 'alpha', 'beta']"],
+            allowed_files=["scripts/build_duplicates.py", "wordaudit/report.py"],
+            forbidden_files=["tests/test_report.py"],
+        ),
+    )
+
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="scripts/build_duplicates.py",
+            validation_command=repair_context.command,
+            verification_scope="runtime",
+            strategy="validation_targeted",
+            result="no_effective_change",
+            reason="identical wrapper rewrite",
+            failure_signature="runtime:assertion_mismatch:directscriptpivot",
+        )
+    )
+
+    assert planner._should_pivot_after_no_effective_change(session, "scripts/build_duplicates.py", repair_context) is True
 
 
 def test_planner_switches_target_immediately_after_identical_repair_generation(tmp_path, monkeypatch):

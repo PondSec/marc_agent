@@ -730,6 +730,69 @@ def test_validation_planner_classifies_direct_script_import_failure_as_bootstrap
     assert evidence.repair_brief.primary_target == "scripts/build_duplicates.py"
 
 
+def test_validation_planner_prefers_library_target_for_behavioral_runtime_failure_before_script_wrapper(tmp_path):
+    planner = ValidationPlanner()
+    package_dir = tmp_path / "wordaudit"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from .report import duplicate_words\n", encoding="utf-8")
+    (package_dir / "report.py").write_text("def duplicate_words(lines):\n    return []\n", encoding="utf-8")
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "build_duplicates.py"
+    script_path.write_text("from wordaudit import duplicate_words\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_report.py"
+    test_path.write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the wordaudit runtime flow.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn="Fix the duplicate-word reporting workflow in the library and script.",
+            root_goal="Repair the wordaudit runtime flow.",
+            active_goal="Repair the runtime flow.",
+            goal_relation="new_task",
+            output_expectation="Working library and script behavior with validation.",
+            verification_target="python -m unittest tests.test_report",
+            next_action="debug",
+            target_artifacts=[
+                {"path": "wordaudit/report.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "scripts/build_duplicates.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_report.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="wordaudit/report.py", operation="modify"))
+    session.changed_files.append(FileChangeRecord(path="scripts/build_duplicates.py", operation="modify"))
+
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_report",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_duplicate_words_ignores_comment_lines (tests.test_report.DuplicateReportTests.test_duplicate_words_ignores_comment_lines)\n"
+            f'  File "{test_path}", line 16, in test_duplicate_words_ignores_comment_lines\n'
+            '    self.assertEqual(duplicate_words(lines), ["alpha", "beta"])\n'
+            "AssertionError: Lists differ: ['# skipped', 'alpha', 'beta'] != ['alpha', 'beta']\n"
+            "subprocess.CalledProcessError: "
+            f"Command '['/usr/bin/python3', '{script_path}', '/tmp/tmpwords.txt']' "
+            "returned non-zero exit status 1.\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.failure_type == "assertion_mismatch"
+    assert evidence.repair_brief.primary_target == "wordaudit/report.py"
+    assert "scripts/build_duplicates.py" in evidence.repair_brief.allowed_files
+
+
 def test_validation_planner_requires_bootstrap_reset_after_two_same_failures_without_behavior_change():
     planner = ValidationPlanner()
     session = SessionState(
