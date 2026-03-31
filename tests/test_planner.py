@@ -12198,6 +12198,50 @@ def test_planner_reactivates_supporting_create_docs_after_first_passed_validatio
     assert planner._choose_create_path(session.router_result, session) == "README.md"
 
 
+def test_planner_preserves_explicit_primary_markdown_create_target_over_validation_file(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Create docs/repo-map.md for this inventory repo, then run "
+            "python -m unittest tests.test_repo_map before finishing."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_repo_map",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_repo_map"],
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested repo map."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the generated document."},
+        ],
+        target_paths=["docs/repo-map.md", "tests/test_repo_map.py"],
+        target_name="docs/repo-map.md",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_repo_map")
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="docs/repo-map.md", name="repo-map.md", kind="doc", role="primary_target", confidence=1.0),
+        TaskArtifact(path="tests/test_repo_map.py", name="tests/test_repo_map.py", kind="test", role="validation_target", confidence=1.0),
+    ]
+
+    assert planner._explicit_create_target_roles(session.router_result, session) == {
+        "docs/repo-map.md": "primary_target",
+        "tests/test_repo_map.py": "validation_target",
+    }
+    assert planner._ordered_create_targets(session.router_result, session) == [
+        "docs/repo-map.md",
+        "tests/test_repo_map.py",
+    ]
+    assert planner._choose_create_path(session.router_result, session) == "docs/repo-map.md"
+
+
 def test_generated_content_integrity_review_blocks_placeholder_python_test_without_assertions(tmp_path):
     planner = Planner(ScriptedLLM(), "")
 

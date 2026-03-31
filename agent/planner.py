@@ -3307,7 +3307,7 @@ class Planner:
 
         def inferred_role(path: str) -> str:
             explicit_role = artifact_roles.get(path, "")
-            if explicit_role and explicit_role not in {"primary_target", "active_context"}:
+            if explicit_role:
                 return explicit_role
             suffix = Path(path).suffix.lower()
             if self._path_is_test_like(path):
