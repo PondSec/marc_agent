@@ -97,7 +97,7 @@ class TaskStateUpdater:
         model_candidates = self._model_candidates()
         primary_model = model_candidates[0] if model_candidates else None
         reserve_models = model_candidates[1:]
-        single_model_semantic_bootstrap = strict_semantic_execution and len(model_candidates) <= 1
+        single_model_semantic_bootstrap = a2_semantic_mode and len(model_candidates) <= 1
         prompt = task_state_update_prompt(
             user_input,
             snapshot=snapshot,

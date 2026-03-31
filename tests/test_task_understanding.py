@@ -2749,6 +2749,34 @@ def test_task_state_a2_single_model_semantic_bootstrap_uses_relaxed_startup_budg
     assert third_call["strict_timeouts"] is False
 
 
+def test_task_state_a2_single_model_analysis_bootstrap_uses_relaxed_startup_budget(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm, timeout=45, num_ctx=4096)
+    session = SessionState(
+        task="Summarize the request flow and key modules for this repo.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    updater.update_task_state(
+        "Summarize the request flow and key modules for this repo.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    first_call = llm.generate_json_calls[0]["kwargs"]
+    assert first_call["model"] == "qwen2.5-coder:7b"
+    assert first_call["timeout"] == 45
+    assert first_call["total_timeout"] == 180
+    assert first_call["num_ctx"] == 2048
+    assert first_call["strict_timeouts"] is False
+
+
 def test_task_state_resumes_after_progress_timeout_before_blocking(tmp_path):
     payload = {
         "latest_user_turn": "Create docs/repo-map.md for this inventory repo.",
