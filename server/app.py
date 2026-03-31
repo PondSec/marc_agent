@@ -6,7 +6,7 @@ import json
 import mimetypes
 import re
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -414,7 +414,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         model_catalog = model_manager.catalog()
         installed_models = model_catalog["installed_models"]
         preferred_model = config.model_name
-        model_candidates = list(config.model_candidates or (preferred_model,))
+        model_candidates = list(_configured_model_candidates(config) or (preferred_model,))
         public_config["preferred_model_name"] = preferred_model
         public_config["router_preferred_model_name"] = config.router_model_name
         public_config["installed_ollama_models"] = installed_models
@@ -1117,7 +1117,7 @@ def _with_available_models(config: AppConfig) -> AppConfig:
     installed_names = [str(item.get("name")) for item in installed_models if item.get("name")]
     if not installed_names:
         router_model_name = config.router_model_name or config.model_name
-        return replace(
+        return _replace_config_compatible(
             config,
             router_model_name=router_model_name,
             model_candidates=tuple(
@@ -1140,7 +1140,7 @@ def _with_available_models(config: AppConfig) -> AppConfig:
         installed_names=installed_names,
         primary_model=primary_model,
     )
-    return replace(
+    return _replace_config_compatible(
         config,
         model_name=primary_model,
         router_model_name=router_model,
@@ -1155,19 +1155,32 @@ def _with_available_models(config: AppConfig) -> AppConfig:
     )
 
 
+def _replace_config_compatible(config: AppConfig, **changes: object) -> AppConfig:
+    if not is_dataclass(config):
+        return config
+    allowed_fields = {field.name for field in fields(config)}
+    compatible_changes = {key: value for key, value in changes.items() if key in allowed_fields}
+    return replace(config, **compatible_changes)
+
+
+def _configured_model_candidates(config: object) -> tuple[str, ...]:
+    raw_candidates = getattr(config, "model_candidates", ()) or ()
+    return tuple(
+        str(raw or "").strip()
+        for raw in raw_candidates
+        if str(raw or "").strip()
+    )
+
+
 def _allowed_model_candidates(
-    config: AppConfig,
+    config: object,
     *,
     primary_model: str,
     router_model: str | None,
     installed_names: list[str] | tuple[str, ...],
 ) -> list[str]:
     installed_lookup = {str(name or "").strip() for name in installed_names if str(name or "").strip()}
-    configured_candidates = [
-        str(raw or "").strip()
-        for raw in (config.model_candidates or ())
-        if str(raw or "").strip()
-    ]
+    configured_candidates = list(_configured_model_candidates(config))
     candidates: list[str] = []
 
     def add(name: str | None, *, require_install: bool = True) -> None:

@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 import zipfile
+from dataclasses import dataclass
 from threading import Event
 from unittest.mock import patch
 
@@ -13,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from agent.models import FileChangeRecord, SessionState, ToolCallRecord
 from config.settings import AppConfig
-from server.app import _with_available_models, create_app
+from server.app import _allowed_model_candidates, _with_available_models, create_app
 
 TEST_ORIGIN = "https://testserver"
 TEST_LOCAL_ORIGIN = "http://127.0.0.1:8000"
@@ -521,6 +522,40 @@ def test_available_models_do_not_expand_semantic_candidates_from_installed_inven
     assert updated.model_name == "qwen2.5-coder:7b"
     assert updated.router_model_name == "qwen2.5-coder:7b"
     assert updated.model_candidates == ("qwen2.5-coder:7b",)
+
+
+def test_allowed_model_candidates_falls_back_when_config_has_no_model_candidates_attr():
+    class LegacyConfig:
+        pass
+
+    candidates = _allowed_model_candidates(
+        LegacyConfig(),
+        primary_model="qwen2.5-coder:7b",
+        router_model="qwen2.5-coder:7b",
+        installed_names=["qwen2.5-coder:7b"],
+    )
+
+    assert candidates == ["qwen2.5-coder:7b"]
+
+
+def test_with_available_models_supports_legacy_config_without_model_candidates():
+    @dataclass(slots=True)
+    class LegacyConfig:
+        ollama_host: str = "http://127.0.0.1:11434"
+        model_name: str = "qwen2.5-coder:7b"
+        router_model_name: str | None = "qwen2.5-coder:7b"
+
+    config = LegacyConfig()
+
+    with patch(
+        "server.app._fetch_installed_ollama_models",
+        return_value=[{"name": "qwen2.5-coder:7b"}],
+    ):
+        updated = _with_available_models(config)
+
+    assert updated.model_name == "qwen2.5-coder:7b"
+    assert updated.router_model_name == "qwen2.5-coder:7b"
+    assert not hasattr(updated, "model_candidates")
 
 
 def test_config_api_reports_allowed_semantic_candidates_not_entire_inventory(tmp_path):
