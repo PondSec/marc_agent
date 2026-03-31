@@ -115,6 +115,7 @@ def task_state_update_prompt(
     *,
     mode: str = "full",
 ) -> str:
+    compact = mode != "full"
     schema_shape = {
         "latest_user_turn": "string",
         "root_goal": "string",
@@ -150,34 +151,90 @@ def task_state_update_prompt(
         "needs_clarification": "boolean (optional, default false)",
         "clarification_questions": "optional list[string]",
     }
-    compact = mode != "full"
+    compact_schema_shape = {
+        "latest_user_turn": "string",
+        "root_goal": "string",
+        "active_goal": "string",
+        "goal_relation": "new_task | continue | refine | correct | report_problem | scope_change | clarify | unknown",
+        "output_expectation": "string",
+        "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null (optional)",
+        "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null (optional)",
+        "verification_target": "string | null (optional)",
+        "target_artifacts": [
+            {
+                "path": "string | null",
+                "name": "string | null",
+                "kind": "file | module | feature | flow | command | test | doc | service | null",
+                "role": "primary_target | validation_target | supporting_context | null",
+                "confidence": 0.0,
+            }
+        ],
+        "constraints": "optional list[string]",
+        "missing_info": "optional list[string]",
+        "ambiguity_level": "low | medium | high",
+        "risk_level": "low | medium | high",
+        "confidence": 0.0,
+        "next_action": "inspect | search | create | modify | debug | test | explain | plan | clarify",
+        "needs_clarification": "boolean (optional, default false)",
+        "clarification_questions": "optional list[string]",
+    }
+    memory_context = _compact_memory_context(session, detail="semantic_start")
+    follow_up_context = _compact_follow_up_context(session)
+    previous_task_state = _compact_task_state(session.task_state if session is not None else None)
+    workspace_detail = "router" if compact else "decision"
+    workspace_context = _compact_workspace_snapshot(snapshot, detail=workspace_detail)
     lines = [
         "Update the central task state for this turn.",
         f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
-        f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
-        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
-        f"Previous task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
-        f"Workspace context: {json.dumps(_compact_workspace_snapshot(snapshot, detail='router' if not compact else 'decision'), ensure_ascii=False)}",
+        f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
         "State update rules:",
-        "- Current turn first: use previous context only when it clearly belongs to the same task and does not conflict.",
-        "- First decide whether this turn continues or changes the active task.",
-        "- current_user_intent should reflect what the user is trying to do at this phase of the task.",
-        "- execution_strategy is secondary semantics: leave it null if the request only supports a generic next action.",
-        "- Extract concrete evidence from diagnostics, terminal errors, changed files, and referenced artifacts.",
-        "- For bugs or regressions, prefer inspect/debug/test before modify.",
-        "- For scope corrections or rollbacks, narrow or revert only the necessary part of the prior work.",
-        "- Update constraints and assumptions explicitly.",
-        "- Keep root_goal stable across refinements unless the user clearly starts a new task.",
-        "- If a compatible active artifact already exists and the user is extending its behavior, prefer modify over create unless the user clearly asks for a distinct new artifact or file surface.",
-        "- next_action and next_best_action should be the single best next move, not a full route tree.",
-        "- Preserve the execution order: inspect current state and active artifacts, gather evidence, act in the smallest sensible step, then verify against verification_target.",
-        "- Ask clarification only if acting now would likely hit the wrong artifact or cause destructive behavior.",
-        "- Be terse: use short phrases instead of full sentences and avoid repeating the user request verbatim across multiple fields.",
-        "- Keep root_goal, active_goal, output_expectation, and verification_target concise, ideally under 18 words each.",
-        "- Omit optional keys when they would only be null, empty, or duplicate another field.",
-        "- Keep lists to at most 3 concise items unless the user explicitly named more artifacts.",
-        f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
     ]
+    if follow_up_context:
+        lines.insert(2, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
+    if memory_context:
+        insert_at = 3 if follow_up_context else 2
+        lines.insert(insert_at, f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}")
+    if previous_task_state:
+        insert_at = 3
+        if follow_up_context:
+            insert_at += 1
+        if memory_context:
+            insert_at += 1
+        lines.insert(insert_at, f"Previous task state: {json.dumps(previous_task_state, ensure_ascii=False)}")
+    if compact:
+        lines.extend(
+            [
+                "- Current turn first: keep prior context only if it clearly belongs to the same task.",
+                "- Decide the single best next move for this turn.",
+                "- Name only the most relevant artifacts, tests, or commands.",
+                "- Ask clarification only if acting now is risky or target selection is unclear.",
+                "- Keep phrases short and omit optional keys when they add no signal.",
+                f"Return JSON only with this structure: {json.dumps(compact_schema_shape, ensure_ascii=False)}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- Current turn first: use previous context only when it clearly belongs to the same task and does not conflict.",
+                "- First decide whether this turn continues or changes the active task.",
+                "- current_user_intent should reflect what the user is trying to do at this phase of the task.",
+                "- execution_strategy is secondary semantics: leave it null if the request only supports a generic next action.",
+                "- Extract concrete evidence from diagnostics, terminal errors, changed files, and referenced artifacts.",
+                "- For bugs or regressions, prefer inspect/debug/test before modify.",
+                "- For scope corrections or rollbacks, narrow or revert only the necessary part of the prior work.",
+                "- Update constraints and assumptions explicitly.",
+                "- Keep root_goal stable across refinements unless the user clearly starts a new task.",
+                "- If a compatible active artifact already exists and the user is extending its behavior, prefer modify over create unless the user clearly asks for a distinct new artifact or file surface.",
+                "- next_action and next_best_action should be the single best next move, not a full route tree.",
+                "- Preserve the execution order: inspect current state and active artifacts, gather evidence, act in the smallest sensible step, then verify against verification_target.",
+                "- Ask clarification only if acting now would likely hit the wrong artifact or cause destructive behavior.",
+                "- Be terse: use short phrases instead of full sentences and avoid repeating the user request verbatim across multiple fields.",
+                "- Keep root_goal, active_goal, output_expectation, and verification_target concise, ideally under 18 words each.",
+                "- Omit optional keys when they would only be null, empty, or duplicate another field.",
+                "- Keep lists to at most 3 concise items unless the user explicitly named more artifacts.",
+                f"Return JSON only with this structure: {json.dumps(schema_shape, ensure_ascii=False)}",
+            ]
+        )
     if not compact:
         lines.insert(2, f"Recent conversation: {_format_objects(_compact_recent_messages(session))}")
         lines.insert(3, f"Recent tool calls: {_format_objects(_compact_recent_calls(session))}")
@@ -197,6 +254,7 @@ def task_understanding_prompt(
     prior_understanding = _compact_task_understanding(
         session.task_understanding if session is not None else None
     )
+    memory_context = _compact_memory_context(session, detail="semantic_start")
     schema_shape = {
         "original_request": "string",
         "interpreted_goal": "string",
@@ -238,7 +296,7 @@ def task_understanding_prompt(
         "Normalize the user's latest request into a task understanding object.",
         f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
-        f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
+        f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}",
         f"Current task state: {json.dumps(_compact_task_state(session.task_state if session is not None else None), ensure_ascii=False)}",
         f"Workspace context: {json.dumps(workspace, ensure_ascii=False)}",
         "Interpretation rules:",
@@ -1077,7 +1135,17 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
     }
 
 
-def _compact_memory_context(session: SessionState | None) -> dict[str, object]:
+def _compact_memory_context(
+    session: SessionState | None,
+    *,
+    detail: str = "standard",
+) -> dict[str, object]:
+    if detail == "semantic_start":
+        return _compact_semantic_start_memory_context(session)
+    return _compact_standard_memory_context(session)
+
+
+def _compact_standard_memory_context(session: SessionState | None) -> dict[str, object]:
     if session is None:
         return {}
     payload: dict[str, object] = {}
@@ -1139,6 +1207,80 @@ def _compact_memory_context(session: SessionState | None) -> dict[str, object]:
         "stale_recall_rate": memory_context.stale_recall_rate,
         "useful_recall_rate": memory_context.useful_recall_rate,
     }
+    return payload
+
+
+def _compact_semantic_start_memory_context(session: SessionState | None) -> dict[str, object]:
+    if session is None:
+        return {}
+    payload: dict[str, object] = {}
+
+    working = _compact_working_memory(session)
+    if working:
+        working_payload = {
+            key: value
+            for key, value in (
+                ("current_goal", working.get("current_goal")),
+                ("primary_target", working.get("primary_target")),
+                ("verification_target", working.get("verification_target")),
+                ("relevant_files", working.get("relevant_files")[:4] if working.get("relevant_files") else []),
+                ("relevant_symbols", working.get("relevant_symbols")[:4] if working.get("relevant_symbols") else []),
+                ("summary", _trim_text(str(working.get("summary") or ""), 180)),
+            )
+            if value not in ("", [], None)
+        }
+        if working_payload:
+            payload["working"] = working_payload
+
+    memory_context = session.memory_context
+    if memory_context is None:
+        return payload
+
+    include_persistent = _should_include_persistent_memory(memory_context)
+    has_repo_map_signal = bool(
+        getattr(memory_context, "repo_map_hints", None)
+        or getattr(memory_context, "suggested_symbols", None)
+        or getattr(memory_context, "suggested_files", None)
+    )
+    if memory_context.recall_brief:
+        payload["recall"] = _trim_text(memory_context.recall_brief, 220)
+    if not include_persistent and not has_repo_map_signal:
+        return payload
+
+    if memory_context.summary and memory_context.summary != "No relevant persistent memory selected.":
+        payload["retrieval_summary"] = _trim_text(memory_context.summary, 260)
+
+    hint_payload: list[dict[str, object]] = []
+    for item in memory_context.selected[:2]:
+        hint: dict[str, object] = {
+            "type": item.memory_type,
+            "title": _trim_text(item.summary.title, 80),
+            "summary": _trim_text(item.summary.summary, 120),
+        }
+        if item.file_paths:
+            hint["file_paths"] = item.file_paths[:3]
+        entry = item.entry
+        if entry is not None:
+            if hasattr(entry, "workflow_hints") and getattr(entry, "workflow_hints", None):
+                hint["workflow_hints"] = [_trim_text(value, 100) for value in list(getattr(entry, "workflow_hints", []))[:1]]
+            if hasattr(entry, "what_worked") and getattr(entry, "what_worked", None):
+                hint["what_worked"] = [_trim_text(value, 100) for value in list(getattr(entry, "what_worked", []))[:1]]
+            if hasattr(entry, "what_failed") and getattr(entry, "what_failed", None):
+                hint["what_failed"] = [_trim_text(value, 100) for value in list(getattr(entry, "what_failed", []))[:1]]
+            if hasattr(entry, "successful_repair_patterns") and getattr(entry, "successful_repair_patterns", None):
+                hint["successful_repair_patterns"] = list(getattr(entry, "successful_repair_patterns", []))[:1]
+            if hasattr(entry, "bad_retry_patterns") and getattr(entry, "bad_retry_patterns", None):
+                hint["bad_retry_patterns"] = list(getattr(entry, "bad_retry_patterns", []))[:1]
+        hint_payload.append(hint)
+    if hint_payload:
+        payload["memory_hints"] = hint_payload
+
+    if memory_context.suggested_files:
+        payload["suggested_files"] = memory_context.suggested_files[:4]
+    if getattr(memory_context, "suggested_symbols", None):
+        payload["suggested_symbols"] = list(memory_context.suggested_symbols[:4])
+    if getattr(memory_context, "repo_map_hints", None):
+        payload["repo_map_hints"] = [_trim_text(item, 120) for item in list(memory_context.repo_map_hints[:3])]
     return payload
 
 
