@@ -2341,19 +2341,54 @@ def _direct_python_script_execution_anchor(
         if len(anchor_lines) >= 4 or index >= 12:
             break
 
+    top_level_imports = _top_level_python_import_lines(current_content, limit=2)
+    import_guidance = ""
+    if top_level_imports:
+        import_guidance = (
+            "\nA change inside main() alone cannot fix a top-level import failure because those imports run "
+            "before main() executes. If this file needs startup/bootstrap help to reach repo-local code, add "
+            "that bootstrap before imports like:\n"
+            + "\n".join(top_level_imports)
+        )
+
     if anchor_lines:
         return (
             f"This file is executed directly as a Python script in the failing command. "
             f"Treat the top-of-file import/bootstrap path as the primary repair surface. "
             f"Keep {path} runnable in that mode and fix any module-level import/bootstrap issue in these current lines:\n"
             + "\n".join(anchor_lines)
+            + import_guidance
         )
 
     return (
         f"This file is executed directly as a Python script in the failing command. "
         f"Treat the top-of-file import/bootstrap path as the primary repair surface. "
         f"Keep {path} runnable in that mode, especially around module-level imports and startup/bootstrap code."
+        + import_guidance
     )
+
+
+def _top_level_python_import_lines(current_content: str, *, limit: int = 2) -> list[str]:
+    import_lines: list[str] = []
+    for index, raw in enumerate(str(current_content or "").splitlines(), start=1):
+        if index > 16:
+            break
+        line = str(raw or "").rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if raw.startswith((" ", "\t")):
+            if import_lines:
+                break
+            continue
+        if stripped.startswith(("import ", "from ")):
+            import_lines.append(f"{index}: {line}")
+            if len(import_lines) >= limit:
+                break
+            continue
+        if import_lines and stripped.startswith(("def ", "class ", "if __name__", "try:", "with ")):
+            break
+    return import_lines
 
 
 def _runtime_failure_invokes_python_script_target(
@@ -2635,6 +2670,13 @@ def _targeted_runtime_prompt_hints(
             hints.append(
                 "When a repo Python file is executed this way, only the script directory is guaranteed on sys.path. If this file imports repo-local modules, add the smallest startup/bootstrap needed near the top so those imports can resolve before they run."
             )
+            if _top_level_python_import_lines(current_content, limit=1):
+                hints.append(
+                    "A change only inside main() or later logic cannot fix an import failure here, because top-level imports execute before main()."
+                )
+                hints.append(
+                    "If this file needs bootstrap help to reach workspace code, place it above the current top-level project import instead of editing only downstream logic."
+                )
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure

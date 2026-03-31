@@ -6991,6 +6991,8 @@ def test_targeted_runtime_prompt_hints_prioritize_bootstrap_for_direct_script_ex
 
     assert any("runs this file directly by script path" in hint for hint in hints)
     assert any("script directory is guaranteed on sys.path" in hint for hint in hints)
+    assert any("cannot fix an import failure here" in hint for hint in hints)
+    assert any("place it above the current top-level project import" in hint for hint in hints)
 
 
 def test_targeted_runtime_failure_focus_keeps_adjacent_code_lines_for_runtime_repairs():
@@ -11323,6 +11325,8 @@ def test_compact_runtime_repair_prompt_anchors_direct_python_script_execution(tm
     assert "Keep scripts/build_duplicates.py runnable in that mode" in prompt
     assert "1: import sys" in prompt
     assert "3: from wordaudit import duplicate_words" in prompt
+    assert "A change inside main() alone cannot fix a top-level import failure" in prompt
+    assert "add that bootstrap before imports like" in prompt
     assert "Change the implicated current lines in scripts/build_duplicates.py:" not in prompt
     assert "The failing command runs this file directly by script path." in prompt
 
