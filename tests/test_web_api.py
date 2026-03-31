@@ -498,6 +498,64 @@ def test_available_models_pick_fast_router_model_when_possible(tmp_path):
 
     assert updated.model_name == "qwen3-coder:30b"
     assert updated.router_model_name == "qwen2.5-coder:14b"
+    assert updated.model_candidates == ("qwen3-coder:30b", "qwen2.5-coder:14b")
+
+
+def test_available_models_do_not_expand_semantic_candidates_from_installed_inventory(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+
+    with patch(
+        "server.app._fetch_installed_ollama_models",
+        return_value=[
+            {"name": "qwen2.5-coder:7b"},
+            {"name": "qwen3:8b"},
+            {"name": "qwen2.5-coder:14b"},
+        ],
+    ):
+        updated = _with_available_models(config)
+
+    assert updated.model_name == "qwen2.5-coder:7b"
+    assert updated.router_model_name == "qwen2.5-coder:7b"
+    assert updated.model_candidates == ("qwen2.5-coder:7b",)
+
+
+def test_config_api_reports_allowed_semantic_candidates_not_entire_inventory(tmp_path):
+    config = build_test_config(
+        tmp_path,
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    config.ensure_state_dirs()
+    catalog = {
+        "installed_models": [
+            {"name": "qwen2.5-coder:7b"},
+            {"name": "qwen3:8b"},
+            {"name": "qwen2.5-coder:14b"},
+        ],
+        "recommended_models": [],
+    }
+
+    with patch(
+        "server.app._fetch_installed_ollama_models",
+        return_value=catalog["installed_models"],
+    ), patch("server.app.ModelManager.catalog", return_value=catalog):
+        app = create_app(config)
+        client = build_test_client(app)
+        response = client.get("/api/config")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["preferred_model_name"] == "qwen2.5-coder:7b"
+    assert payload["model_candidates"] == ["qwen2.5-coder:7b"]
+    assert [item["name"] for item in payload["installed_ollama_models"]] == [
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+        "qwen2.5-coder:14b",
+    ]
 
 
 def test_models_api_and_ensure_endpoint_expose_recommended_download_status(tmp_path):

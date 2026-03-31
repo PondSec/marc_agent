@@ -414,7 +414,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         model_catalog = model_manager.catalog()
         installed_models = model_catalog["installed_models"]
         preferred_model = config.model_name
-        model_candidates = _merge_model_candidates(preferred_model, installed_models)
+        model_candidates = list(config.model_candidates or (preferred_model,))
         public_config["preferred_model_name"] = preferred_model
         public_config["router_preferred_model_name"] = config.router_model_name
         public_config["installed_ollama_models"] = installed_models
@@ -1117,7 +1117,18 @@ def _with_available_models(config: AppConfig) -> AppConfig:
     installed_names = [str(item.get("name")) for item in installed_models if item.get("name")]
     if not installed_names:
         router_model_name = config.router_model_name or config.model_name
-        return replace(config, router_model_name=router_model_name)
+        return replace(
+            config,
+            router_model_name=router_model_name,
+            model_candidates=tuple(
+                _allowed_model_candidates(
+                    config,
+                    primary_model=str(config.model_name or "").strip(),
+                    router_model=router_model_name,
+                    installed_names=(),
+                )
+            ),
+        )
 
     primary_model = _select_primary_model(
         preferred_model=config.model_name,
@@ -1133,16 +1144,52 @@ def _with_available_models(config: AppConfig) -> AppConfig:
         config,
         model_name=primary_model,
         router_model_name=router_model,
+        model_candidates=tuple(
+            _allowed_model_candidates(
+                config,
+                primary_model=primary_model,
+                router_model=router_model,
+                installed_names=installed_names,
+            )
+        ),
     )
 
 
-def _merge_model_candidates(preferred_model: str, installed_models: list[dict]) -> list[str]:
-    candidates = [preferred_model]
-    for item in installed_models:
-        name = item.get("name")
-        if name and name not in candidates:
-            candidates.append(name)
-    return candidates
+def _allowed_model_candidates(
+    config: AppConfig,
+    *,
+    primary_model: str,
+    router_model: str | None,
+    installed_names: list[str] | tuple[str, ...],
+) -> list[str]:
+    installed_lookup = {str(name or "").strip() for name in installed_names if str(name or "").strip()}
+    configured_candidates = [
+        str(raw or "").strip()
+        for raw in (config.model_candidates or ())
+        if str(raw or "").strip()
+    ]
+    candidates: list[str] = []
+
+    def add(name: str | None, *, require_install: bool = True) -> None:
+        text = str(name or "").strip()
+        if not text or text in candidates:
+            return
+        if require_install and installed_lookup and text not in installed_lookup:
+            return
+        candidates.append(text)
+
+    add(primary_model, require_install=False)
+    add(router_model)
+    for candidate in configured_candidates:
+        add(candidate)
+
+    if candidates:
+        return candidates
+    if primary_model:
+        return [primary_model]
+    if router_model:
+        return [router_model]
+    return []
 
 
 def _select_primary_model(
