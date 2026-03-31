@@ -187,6 +187,98 @@ def test_validation_planner_promotes_workspace_traceback_frame_as_runtime_repair
     assert any("greet_cli/__main__.py" in item for item in evidence.repair_requirements)
 
 
+def test_validation_planner_prefers_symbol_resolved_runtime_implementation_over_documentation_noise(tmp_path):
+    planner = ValidationPlanner()
+    for relative_path, content in {
+        "README.md": "# Inventory App\n\nA small service with auth and rate limiting.\n",
+        "docs/repo-map.md": "# Repo Map\n",
+        "tests/test_repo_map.py": (
+            "import unittest\n"
+            "from inventory_app.api import handle_request\n"
+            "from inventory_app.auth import AuthGate\n"
+            "from inventory_app.service import list_inventory\n"
+        ),
+        "inventory_app/api.py": (
+            "from .auth import AuthGate\n"
+            "from .rate_limit import RateLimiter\n"
+            "from .service import list_inventory\n\n"
+            "def handle_request(headers, attempts):\n"
+            "    return {'status': 200, 'items': list_inventory()}\n"
+        ),
+        "inventory_app/auth.py": "class AuthGate:\n    pass\n",
+        "inventory_app/service.py": "def list_inventory():\n    return ['item']\n",
+    }.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    session = SessionState(
+        task="Create docs/repo-map.md for this inventory repo and run python -m unittest tests.test_repo_map.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=6,
+            important_files=[
+                "README.md",
+                "docs/repo-map.md",
+                "inventory_app/api.py",
+                "inventory_app/auth.py",
+                "inventory_app/service.py",
+                "tests/test_repo_map.py",
+            ],
+            focus_files=["docs/repo-map.md", "inventory_app/api.py", "tests/test_repo_map.py"],
+            test_files=["tests/test_repo_map.py"],
+            import_hotspots=["inventory_app/api.py"],
+            symbol_index={
+                "inventory_app/api.py": ["handle_request"],
+                "inventory_app/auth.py": ["AuthGate"],
+                "inventory_app/service.py": ["list_inventory"],
+            },
+        ),
+        task_state=TaskState(
+            latest_user_turn="Create docs/repo-map.md for this inventory repo and run python -m unittest tests.test_repo_map.",
+            root_goal="Create the repo map and verify it.",
+            active_goal="Create docs/repo-map.md and run the targeted unittest.",
+            goal_relation="new_task",
+            output_expectation="A concise repo map in docs/repo-map.md that passes the requested test.",
+            verification_target="python -m unittest tests.test_repo_map",
+            next_action="create",
+            target_artifacts=[
+                {"path": "docs/repo-map.md", "kind": "doc", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_repo_map.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+        changed_files=[FileChangeRecord(path="docs/repo-map.md", operation="create")],
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_repo_map",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{tmp_path / "tests" / "test_repo_map.py"}", line 8, in test_repo_map_exists_and_mentions_key_files\n'
+            "    self.assertIn('README.md', open('README.md').read())\n"
+            "AssertionError: 'README.md' not found in '# Inventory App\\n\\nA small service with auth and rate limiting.\\n'\n"
+            f'  File "{tmp_path / "tests" / "test_repo_map.py"}", line 14, in test_handle_request_authenticates_user\n'
+            "    response = handle_request(request)\n"
+            "TypeError: handle_request() missing 1 required positional argument: 'attempts'\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.artifact_paths[0] == "inventory_app/api.py"
+    assert evidence.file_hints[0] == "inventory_app/api.py"
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "inventory_app/api.py"
+    assert any("inventory_app/api.py" in item for item in evidence.repair_requirements)
+    assert not any(item.startswith("Change README.md") for item in evidence.repair_requirements)
+
+
 def test_validation_planner_collects_bare_workspace_file_references_from_runtime_assertions(tmp_path):
     planner = ValidationPlanner()
     for relative_path in [

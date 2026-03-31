@@ -828,6 +828,26 @@ class ValidationPlanner:
             ]
         )
         diagnostics = self._related_diagnostics(session, failed_run, artifact_paths)
+        runtime_failure_text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                str(failed_run.summary or "").strip(),
+                *(str(item.excerpt or "").strip() for item in diagnostics),
+                *(str(item.summary or "").strip() for item in diagnostics),
+            ]
+            if part
+        )
+        implicated_symbols = (
+            self._implicated_symbols_from_failure_text(runtime_failure_text, runtime_failure_text)
+            if failed_run.verification_scope == "runtime"
+            else []
+        )
+        symbol_resolved_paths = self._symbol_resolved_workspace_paths(
+            session,
+            implicated_symbols,
+        )
+        artifact_paths = self._unique_paths([*artifact_paths, *symbol_resolved_paths])
         failure_scoped_paths = self._failure_scoped_workspace_paths(
             session,
             failed_run,
@@ -849,16 +869,28 @@ class ValidationPlanner:
         )
         expected_features = self._expected_features_from_command(failed_run.command)
         missing_features = self._missing_features_from_failure(failed_run, diagnostics)
-        file_hints = self._unique_paths(
+        runtime_hint_order = (
             [
+                *artifact_paths,
+                *failure_scoped_paths,
+                *symbol_resolved_paths,
+                *traceback_file_hints,
+                *referenced_workspace_paths,
+                *missing_unittest_package_inits,
+                *(path for diagnostic in diagnostics for path in diagnostic.file_hints),
+            ]
+            if failed_run.verification_scope == "runtime"
+            else [
                 *failure_scoped_paths,
                 *artifact_paths,
+                *symbol_resolved_paths,
                 *traceback_file_hints,
                 *referenced_workspace_paths,
                 *missing_unittest_package_inits,
                 *(path for diagnostic in diagnostics for path in diagnostic.file_hints),
             ]
         )
+        file_hints = self._unique_paths(runtime_hint_order)
         line_hints = self._unique_line_hints(
             [
                 *traceback_line_hints,
@@ -870,16 +902,7 @@ class ValidationPlanner:
         )
         summary = str(failed_run.summary or "").strip() or "Validation failed."
         excerpt = self._failure_excerpt(failed_run, diagnostics)
-        raw_failure_text = "\n".join(
-            part
-            for part in [
-                str(failed_run.excerpt or "").strip(),
-                str(failed_run.summary or "").strip(),
-                *(str(item.excerpt or "").strip() for item in diagnostics),
-                *(str(item.summary or "").strip() for item in diagnostics),
-            ]
-            if part
-        )
+        raw_failure_text = runtime_failure_text
         failure_summary = self._failure_summary(
             failed_run,
             diagnostics,
@@ -907,6 +930,7 @@ class ValidationPlanner:
             repair_requirements=repair_requirements,
             missing_features=missing_features,
             prefer_test_runtime_target=prefer_test_runtime_target,
+            implicated_symbols=implicated_symbols,
         )
         evidence_signature = json.dumps(
             {
@@ -960,6 +984,7 @@ class ValidationPlanner:
         repair_requirements: list[str],
         missing_features: list[str],
         prefer_test_runtime_target: bool = False,
+        implicated_symbols: list[str] | None = None,
     ) -> RepairBrief:
         primary_target = self._primary_repair_target(
             artifact_paths=artifact_paths,
@@ -973,7 +998,10 @@ class ValidationPlanner:
             failure_summary=failure_summary,
             missing_features=missing_features,
         )
-        implicated_symbols = self._implicated_symbols_from_failure_text(excerpt, failure_summary)
+        implicated_symbols = list(implicated_symbols or []) or self._implicated_symbols_from_failure_text(
+            excerpt,
+            failure_summary,
+        )
         failure_type = self._failure_type(
             failed_run,
             excerpt=excerpt,
@@ -2496,7 +2524,12 @@ class ValidationPlanner:
         implementation_paths = [
             path
             for path in artifact_paths
-            if path and not self._is_test_path(path)
+            if path and not self._is_test_path(path) and not self._is_documentation_path(path)
+        ]
+        documentation_paths = [
+            path
+            for path in artifact_paths
+            if path and self._is_documentation_path(path)
         ]
         validation_paths = [
             path
@@ -2504,10 +2537,56 @@ class ValidationPlanner:
             if path and self._is_test_path(path)
         ]
         if prefer_test_runtime_target:
-            ordered = [*validation_paths, *implementation_paths]
+            ordered = [*validation_paths, *implementation_paths, *documentation_paths]
             return ordered or artifact_paths
-        ordered = [*implementation_paths, *validation_paths]
+        ordered = [*implementation_paths, *documentation_paths, *validation_paths]
         return ordered or artifact_paths
+
+    def _symbol_resolved_workspace_paths(
+        self,
+        session: SessionState,
+        implicated_symbols: list[str],
+    ) -> list[str]:
+        snapshot = session.workspace_snapshot
+        if snapshot is None:
+            return []
+        symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        if not symbol_index:
+            return []
+        wanted = {
+            str(symbol or "").strip().lower()
+            for symbol in implicated_symbols
+            if str(symbol or "").strip()
+            and not self._is_generic_runtime_failure_symbol(str(symbol or "").strip())
+        }
+        if not wanted:
+            return []
+        hotspots = {str(path or "").strip() for path in getattr(snapshot, "import_hotspots", []) if str(path or "").strip()}
+        services = {str(path or "").strip() for path in getattr(snapshot, "service_files", []) if str(path or "").strip()}
+        entrypoints = {str(path or "").strip() for path in getattr(snapshot, "entrypoints", []) if str(path or "").strip()}
+        candidates: list[str] = []
+        for path, symbols in symbol_index.items():
+            normalized_path = str(path or "").strip()
+            if not normalized_path:
+                continue
+            lowered_symbols = {
+                str(symbol or "").strip().lower()
+                for symbol in list(symbols or [])
+                if str(symbol or "").strip()
+            }
+            if lowered_symbols.intersection(wanted):
+                candidates.append(normalized_path)
+        return sorted(
+            self._unique_paths(candidates),
+            key=lambda path: (
+                1 if self._is_test_path(path) else 0,
+                1 if self._is_documentation_path(path) else 0,
+                0 if path in hotspots else 1,
+                0 if path in services else 1,
+                0 if path in entrypoints else 1,
+                path,
+            ),
+        )[:6]
 
     def _paths_from_validation_command(self, command: str) -> list[str]:
         kind, payload = self._decoded_internal_validation_payload(command)
