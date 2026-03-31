@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from config.settings import AppConfig
-from agent.semantic_runtime import availability_recovery_model, semantic_model_candidates
+from agent.semantic_runtime import availability_recovery_model, rank_semantic_model_candidates, semantic_model_candidates
 
 
 def test_semantic_model_candidates_skip_larger_reserve_model_when_primary_is_already_smaller():
@@ -66,3 +66,10 @@ def test_availability_recovery_model_prefers_near_size_reserve_from_candidate_po
         "qwen2.5-coder:7b",
         ["qwen2.5-coder:14b", "qwen3:8b", "qwen3-coder:30b"],
     ) == "qwen3:8b"
+
+
+def test_rank_semantic_model_candidates_prefers_primary_then_nearby_options():
+    assert rank_semantic_model_candidates(
+        "qwen2.5-coder:7b",
+        ["qwen2.5-coder:7b", "qwen3:14b", "qwen3:8b", "qwen3-coder:30b", "qwen2.5-coder:14b"],
+    )[:3] == ["qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen3:8b"]

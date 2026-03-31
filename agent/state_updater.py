@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 from typing import Any
 
@@ -10,6 +11,7 @@ from agent.semantic_guardrails import build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
     availability_recovery_model,
+    rank_semantic_model_candidates,
     secondary_semantics_limited,
     semantic_model_candidates,
     semantic_resolution_from_attempt,
@@ -192,10 +194,25 @@ class TaskStateUpdater:
             error=str(outcome.exception),
             failure=failure.to_dict() if failure is not None else None,
         )
+        if failure is not None and failure.no_start_failure:
+            refreshed_candidates = self._model_candidates(refresh_live_inventory=True)
+            if refreshed_candidates:
+                model_candidates = refreshed_candidates
+                primary_model = model_candidates[0]
+                reserve_models = model_candidates[1:]
+                if reserve_models and not policy.allow_smaller_faster_model:
+                    policy = replace(policy, allow_smaller_faster_model=True)
         recovery_model = self._recovery_model_for_failure(
             primary_model=primary_model,
             reserve_models=reserve_models,
             failure=failure,
+        )
+        self._log(
+            "task_state_recovery_candidates",
+            model_candidates=model_candidates,
+            primary_model=primary_model,
+            recovery_model=recovery_model,
+            no_start_failure=bool(failure.no_start_failure) if failure is not None else False,
         )
         decisions = policy.plan_recovery(
             failure,
@@ -615,8 +632,44 @@ class TaskStateUpdater:
         state.semantic_inference_mode = "conservative" if semantic_resolution == "minimal_inference" else "full"
         return state
 
-    def _model_candidates(self) -> list[str]:
-        return semantic_model_candidates(self.model_name, getattr(self.llm, "config", None))
+    def _model_candidates(self, *, refresh_live_inventory: bool = False) -> list[str]:
+        config = getattr(self.llm, "config", None)
+        candidates = semantic_model_candidates(self.model_name, config)
+        if not refresh_live_inventory:
+            return candidates
+        live_candidates = self._live_model_candidates()
+        if not live_candidates:
+            return candidates
+        primary_model = (
+            candidates[0]
+            if candidates
+            else str(self.model_name or getattr(config, "model_name", None) or "").strip()
+        )
+        merged_pool: list[str] = []
+        for candidate in [*candidates, *live_candidates]:
+            text = str(candidate or "").strip()
+            if text and text not in merged_pool:
+                merged_pool.append(text)
+        return rank_semantic_model_candidates(primary_model, merged_pool, allow_larger_if_needed=True)
+
+    def _live_model_candidates(self) -> list[str]:
+        list_models = getattr(self.llm, "list_models_safe", None)
+        if not callable(list_models):
+            return []
+        try:
+            raw_models = list_models()
+        except Exception as exc:
+            self._log("task_state_live_model_inventory_failed", error=str(exc))
+            return []
+        candidates: list[str] = []
+        for item in raw_models or []:
+            if isinstance(item, dict):
+                text = str(item.get("name") or item.get("model") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        return candidates
 
     def _backend_identifier(self) -> str:
         return "ollama"

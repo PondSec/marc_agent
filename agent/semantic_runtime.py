@@ -39,6 +39,25 @@ def semantic_model_candidates(preferred_model: str | None, config: object | None
     )
 
 
+def rank_semantic_model_candidates(
+    primary_model: str | None,
+    candidate_pool: Iterable[str] | None,
+    *,
+    allow_larger_if_needed: bool = True,
+) -> list[str]:
+    primary = str(primary_model or "").strip()
+    pool = [str(item or "").strip() for item in candidate_pool or () if str(item or "").strip()]
+    if not primary:
+        if not pool:
+            return []
+        primary = pool[0]
+    return _rank_model_candidates(
+        primary,
+        pool,
+        allow_larger_if_needed=allow_larger_if_needed,
+    )
+
+
 def _configured_model_pool(config: object | None) -> list[str]:
     candidates: list[str] = []
     for raw in (
