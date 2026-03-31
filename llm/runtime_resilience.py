@@ -271,6 +271,16 @@ class ExecutionRecoveryPolicy:
                 and same_backend_retries < self.max_same_backend_retries,
                 reason="startup_retry_not_supported_or_not_transient",
             )
+            _accept(
+                RecoveryCandidate(
+                    "switch_to_faster_model",
+                    "tier_b",
+                    model_identifier=faster_model,
+                    prompt_variant="full",
+                ),
+                condition=self.allow_smaller_faster_model and bool(faster_model),
+                reason="no_faster_model_available",
+            )
             if self.allow_minimal_generation or (
                 self.allow_reduce_request_complexity and failure.context_pressure_likely
             ):
@@ -284,16 +294,6 @@ class ExecutionRecoveryPolicy:
                     condition=True,
                     reason="accepted",
                 )
-            _accept(
-                RecoveryCandidate(
-                    "switch_to_faster_model",
-                    "tier_b",
-                    model_identifier=faster_model,
-                    prompt_variant="full",
-                ),
-                condition=self.allow_smaller_faster_model and bool(faster_model),
-                reason="no_faster_model_available",
-            )
         elif failure.failed_after_progress:
             if self.allow_resume_after_progress and failure.partial_text:
                 _accept(
