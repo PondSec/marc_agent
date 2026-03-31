@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 AGENT_NAME = "M.A.R.C A1"
@@ -88,6 +89,15 @@ def _source_root_for_config_path(config_file: Path | None) -> Path:
     if parent.name == "config":
         return parent.parent
     return parent
+
+
+def _public_base_url_host(public_base_url: str | None) -> str | None:
+    text = str(public_base_url or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    host = (parsed.hostname or "").strip().lower()
+    return host or None
 
 
 def _normalize_access_mode(
@@ -381,11 +391,16 @@ class AppConfig:
             approval_mode=self.approval_mode,
             default=AccessMode.APPROVAL,
         )
+        allowed_hosts = list(self.security_allowed_hosts or ())
+        public_host = _public_base_url_host(self.public_base_url)
+        if public_host and public_host not in allowed_hosts:
+            allowed_hosts.append(public_host)
         return replace(
             self,
             access_mode=mode.value,
             read_only=mode == AccessMode.SAFE,
             approval_mode=mode == AccessMode.APPROVAL,
+            security_allowed_hosts=tuple(allowed_hosts),
         )
 
     @property

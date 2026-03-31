@@ -99,3 +99,13 @@ def test_from_sources_uses_config_path_parent_for_dotenv_lookup(tmp_path, monkey
 
     assert config.workspace_root == "/srv/from-json"
     assert config.security_allowed_hosts == ("agent.pondsec.com", "localhost")
+
+
+def test_normalized_adds_public_base_url_host_to_allowed_hosts():
+    config = AppConfig(
+        workspace_root=".",
+        security_allowed_hosts=("127.0.0.1", "localhost"),
+        public_base_url="https://agent.pondsec.com",
+    ).normalized()
+
+    assert config.security_allowed_hosts == ("127.0.0.1", "localhost", "agent.pondsec.com")
