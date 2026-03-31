@@ -7653,6 +7653,109 @@ def test_nonblocking_update_target_deferral_is_honored_before_any_files_change(t
     assert planner._has_pending_explicit_update_targets(session.router_result, session) is True
 
 
+def test_planner_no_effective_change_prefers_code_candidate_before_supporting_docs(tmp_path, monkeypatch):
+    package_dir = tmp_path / "texttools"
+    package_dir.mkdir()
+    (package_dir / "normalize.py").write_text("def normalize_words(text):\n    return text.split()\n", encoding="utf-8")
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools.normalize import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    return normalize_words('Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# texttools\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text("def test_normalize():\n    assert True\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, "
+            "update README.md if needed, and run python -m unittest tests.test_normalize."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": [
+                    "texttools/normalize.py",
+                    "normalize_cli.py",
+                    "README.md",
+                    "tests/test_normalize.py",
+                ],
+                "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+                "manifests": ["README.md"],
+                "test_files": ["tests/test_normalize.py"],
+                "repo_summary": "Small text normalization project with a helper module, CLI wrapper, README, and tests.",
+            }
+        ),
+        candidate_files=[
+            "tests/test_normalize.py",
+            "texttools/normalize.py",
+            "normalize_cli.py",
+            "README.md",
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Implement the keep_case feature."},
+            {"step": 2, "action": "update_artifact", "reason": "Update the related CLI wrapper and docs."},
+            {"step": 3, "action": "run_validation", "reason": "Run the requested unittest module."},
+        ],
+        target_paths=[
+            "texttools/normalize.py",
+            "README.md",
+            "tests/test_normalize.py",
+        ],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    session.candidate_files = [
+        "tests/test_normalize.py",
+        "texttools/normalize.py",
+        "normalize_cli.py",
+        "README.md",
+    ]
+    session.task_state.target_artifacts = [
+        TaskArtifact(path="texttools/normalize.py", name="normalize_words", kind=".py", role="primary_target", confidence=0.99),
+        TaskArtifact(path="README.md", name="README.md", kind=".md", role="supporting_context", confidence=0.9),
+        TaskArtifact(path="tests/test_normalize.py", name="test_normalize.py", kind="test", role="validation_target", confidence=0.9),
+    ]
+
+    def fake_execute_action_from_plan(_route, _session):
+        return AgentDecision(
+            thought_summary="Continue with the next relevant update target.",
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="read_file",
+            tool_args={"path": planner._next_update_target(_route, _session)},
+            expected_outcome="Inspect the next file that still needs a technical update.",
+            final_response=None,
+        )
+
+    monkeypatch.setattr(planner, "execute_action_from_plan", fake_execute_action_from_plan)
+
+    decision = planner._continue_after_nonblocking_update_target_failure(
+        session.router_result,
+        session,
+        target="texttools/normalize.py",
+        stop_reason="no_effective_change",
+        repair_context=None,
+    )
+
+    assert decision is not None
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "read_file"
+    assert decision.tool_args["path"] == "normalize_cli.py"
+    assert planner._next_update_target(session.router_result, session) == "normalize_cli.py"
+
+
 def test_planner_keeps_review_blocked_pending_target_deferred_during_runtime_repair(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()

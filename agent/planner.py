@@ -3576,6 +3576,144 @@ class Planner:
             for path in explicit
         }
 
+    def _update_candidate_roles(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        candidate_paths: list[str] | None = None,
+    ) -> dict[str, str]:
+        candidates = candidate_paths or self._actionable_explicit_target_paths(route, session)
+        if route.intent != RouteIntent.UPDATE or not candidates:
+            return {}
+
+        task_state = session.task_state
+        artifact_roles: dict[str, str] = {}
+        if task_state is not None:
+            artifact_roles = {
+                path: str(artifact.role or "").strip().lower()
+                for artifact in task_state.target_artifacts
+                for path in [str(artifact.path or "").strip()]
+                if path
+            }
+        routed_primary_target = self._target_name_path_candidate(route)
+        if not routed_primary_target and candidates:
+            routed_primary_target = candidates[0]
+
+        def inferred_role(path: str) -> str:
+            explicit_role = artifact_roles.get(path, "")
+            is_routed_primary_target = path == routed_primary_target
+            if self._path_is_test_like(path) and not is_routed_primary_target:
+                return "validation_target"
+            suffix = Path(path).suffix.lower()
+            if suffix in {".md", ".markdown", ".rst", ".txt"} and not is_routed_primary_target:
+                return "supporting_context"
+            if explicit_role in {
+                "primary_target",
+                "validation_target",
+                "supporting_context",
+                "active_context",
+            }:
+                return explicit_role
+            return "primary_target"
+
+        return {
+            path: inferred_role(path)
+            for path in candidates
+        }
+
+    def _ordered_remaining_update_targets(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        exclude: set[str] | None = None,
+    ) -> list[str]:
+        explicit_targets = self._actionable_explicit_target_paths(route, session)
+        if not explicit_targets:
+            return []
+
+        excluded = {item for item in (exclude or set()) if item}
+        changed_paths = {item.path for item in session.changed_files}
+        deferred_targets = self._active_deferred_update_targets(session)
+        explicit_roles = self._update_candidate_roles(
+            route,
+            session,
+            candidate_paths=explicit_targets,
+        )
+        role_order = {
+            "primary_target": 0,
+            "active_context": 0,
+            "validation_target": 1,
+            "supporting_context": 2,
+        }
+        explicit_index = {path: index for index, path in enumerate(explicit_targets)}
+        remaining_explicit = sorted(
+            [
+                candidate
+                for candidate in explicit_targets
+                if candidate not in changed_paths
+                and candidate not in deferred_targets
+                and candidate not in excluded
+            ],
+            key=lambda candidate: (
+                role_order.get(explicit_roles.get(candidate, "primary_target"), 3),
+                explicit_index.get(candidate, 999),
+            ),
+        )
+        if remaining_explicit and any(
+            explicit_roles.get(candidate) not in {"supporting_context", "validation_target"}
+            for candidate in remaining_explicit
+        ):
+            return remaining_explicit
+
+        routed_primary_target = self._target_name_path_candidate(route)
+        routed_primary_suffix = Path(routed_primary_target).suffix.lower() if routed_primary_target else ""
+        routed_primary_is_documentation = routed_primary_suffix in {".md", ".markdown", ".rst", ".txt"}
+        if routed_primary_is_documentation:
+            return remaining_explicit
+
+        grounded_candidates = self._grounded_update_candidate_paths(session)
+        broader_candidates = [
+            candidate
+            for candidate in grounded_candidates
+            if candidate not in explicit_targets
+            and candidate not in changed_paths
+            and candidate not in deferred_targets
+            and candidate not in excluded
+            and self._current_file_content(session, candidate) is not None
+        ]
+        broader_roles = self._update_candidate_roles(
+            route,
+            session,
+            candidate_paths=broader_candidates,
+        )
+        technical_candidates = [
+            candidate
+            for candidate in broader_candidates
+            if broader_roles.get(candidate) not in {"supporting_context", "validation_target"}
+        ]
+        return [*technical_candidates, *remaining_explicit]
+
+    def _grounded_update_candidate_paths(self, session: SessionState) -> list[str]:
+        candidates: list[str] = []
+        task_state = session.task_state
+        if task_state is not None:
+            candidates.extend(
+                str(getattr(artifact, "path", "") or "").strip()
+                for artifact in task_state.target_artifacts
+                if str(getattr(artifact, "path", "") or "").strip()
+            )
+        candidates.extend(session.candidate_files)
+        if session.follow_up_context is not None:
+            candidates.extend(session.follow_up_context.target_paths)
+            candidates.extend(session.follow_up_context.changed_files)
+            candidates.extend(session.follow_up_context.read_files)
+            for item in session.follow_up_context.diagnostics[-6:]:
+                candidates.extend(item.file_hints)
+        candidates.extend(self._snapshot_match_candidate_paths(session.workspace_snapshot))
+        return self._unique_paths(candidates)
+
     def _active_deferred_create_targets(
         self,
         route: RouterOutput,
@@ -3898,15 +4036,11 @@ class Planner:
                 if self._repair_target_can_be_created(session, pinned_target, repair_context):
                     return pinned_target
 
+        ordered_targets = self._ordered_remaining_update_targets(route, session)
+        if ordered_targets:
+            return ordered_targets[0]
         explicit_targets = self._actionable_explicit_target_paths(route, session)
         if explicit_targets:
-            changed_paths = {item.path for item in session.changed_files}
-            deferred_targets = self._active_deferred_update_targets(session)
-            for candidate in explicit_targets:
-                if candidate in deferred_targets:
-                    continue
-                if candidate not in changed_paths:
-                    return candidate
             return explicit_targets[0]
         return self._primary_target_path(route, session)
 
@@ -5663,16 +5797,11 @@ class Planner:
         if target in deferred_targets:
             return None
 
-        changed_paths = {item.path for item in session.changed_files}
-        explicit_targets = self._actionable_explicit_target_paths(route, session)
-        alternative_targets = [
-            candidate
-            for candidate in explicit_targets
-            if candidate
-            and candidate != target
-            and candidate not in changed_paths
-            and candidate not in deferred_targets
-        ]
+        alternative_targets = self._ordered_remaining_update_targets(
+            route,
+            session,
+            exclude={target},
+        )
         validation_command = self._pick_validation_command(session) if session.changed_files else None
         if not alternative_targets and validation_command is None:
             return None
