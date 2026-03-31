@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from config.settings import AppConfig
 
 
@@ -51,3 +53,49 @@ def test_from_sources_prefers_security_allowed_hosts_and_auto_install_flag(tmp_p
 
     assert config.security_allowed_hosts == ("agent.pondsec.com", "192.168.30.33")
     assert config.auto_install_recommended_models is False
+
+
+def test_from_sources_falls_back_to_app_root_dotenv_when_cwd_has_no_config(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    app_root = tmp_path / "app-root"
+    (app_root / "config").mkdir(parents=True)
+    (app_root / ".env").write_text(
+        "WORKSPACE_ROOT=/srv/workspace\nSECURITY_ALLOWED_HOSTS=agent.pondsec.com,127.0.0.1\nPUBLIC_BASE_URL=https://agent.pondsec.com\n",
+        encoding="utf-8",
+    )
+    (app_root / "config" / "agent.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.chdir(workspace_root)
+    monkeypatch.setattr("config.settings._app_source_root", lambda: app_root)
+    monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SECURITY_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+    config = AppConfig.from_sources()
+
+    assert config.workspace_root == "/srv/workspace"
+    assert config.security_allowed_hosts == ("agent.pondsec.com", "127.0.0.1")
+    assert config.public_base_url == "https://agent.pondsec.com"
+
+
+def test_from_sources_uses_config_path_parent_for_dotenv_lookup(tmp_path, monkeypatch):
+    bundle_root = tmp_path / "bundle"
+    config_dir = bundle_root / "config"
+    config_dir.mkdir(parents=True)
+    config_file = config_dir / "agent.json"
+    config_file.write_text(json.dumps({"workspace_root": "/srv/from-json"}), encoding="utf-8")
+    (bundle_root / ".env").write_text(
+        "SECURITY_ALLOWED_HOSTS=agent.pondsec.com,localhost\n",
+        encoding="utf-8",
+    )
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.delenv("SECURITY_ALLOWED_HOSTS", raising=False)
+
+    config = AppConfig.from_sources(config_path=str(config_file))
+
+    assert config.workspace_root == "/srv/from-json"
+    assert config.security_allowed_hosts == ("agent.pondsec.com", "localhost")

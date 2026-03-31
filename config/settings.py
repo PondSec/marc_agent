@@ -70,6 +70,26 @@ def _load_json_config(path: Path | None) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _app_source_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _default_source_root() -> Path:
+    cwd = Path.cwd()
+    if (cwd / ".env").exists() or (cwd / "config" / "agent.json").exists():
+        return cwd
+    return _app_source_root()
+
+
+def _source_root_for_config_path(config_file: Path | None) -> Path:
+    if config_file is None:
+        return _default_source_root()
+    parent = config_file.parent
+    if parent.name == "config":
+        return parent.parent
+    return parent
+
+
 def _normalize_access_mode(
     value: Any,
     *,
@@ -153,11 +173,11 @@ class AppConfig:
         overrides: dict[str, Any] | None = None,
     ) -> "AppConfig":
         defaults = cls()
-        cwd = Path.cwd()
         config_file = Path(config_path).expanduser().resolve() if config_path else None
-        default_config = cwd / "config" / "agent.json"
+        source_root = _source_root_for_config_path(config_file)
+        default_config = source_root / "config" / "agent.json"
         raw_json = _load_json_config(config_file or default_config)
-        dotenv_values = _load_dotenv(cwd / ".env")
+        dotenv_values = _load_dotenv(source_root / ".env")
         env = os.environ
 
         def pick(name: str, fallback: Any) -> Any:
