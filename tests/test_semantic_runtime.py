@@ -53,9 +53,16 @@ def test_semantic_model_candidates_use_discovered_live_pool_for_same_model_stack
     assert candidates[:3] == ["qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen3-coder:30b"]
 
 
-def test_availability_recovery_model_skips_larger_reserve_candidate():
+def test_availability_recovery_model_skips_oversized_reserve_candidate():
     assert availability_recovery_model("qwen2.5-coder:7b", "qwen2.5-coder:14b") is None
 
 
 def test_availability_recovery_model_keeps_smaller_reserve_candidate():
     assert availability_recovery_model("qwen2.5-coder:14b", "qwen2.5-coder:7b") == "qwen2.5-coder:7b"
+
+
+def test_availability_recovery_model_prefers_near_size_reserve_from_candidate_pool():
+    assert availability_recovery_model(
+        "qwen2.5-coder:7b",
+        ["qwen2.5-coder:14b", "qwen3:8b", "qwen3-coder:30b"],
+    ) == "qwen3:8b"

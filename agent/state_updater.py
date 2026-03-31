@@ -102,11 +102,11 @@ class TaskStateUpdater:
         context_pressure = estimate_context_pressure(prompt_chars=len(prompt))
         model_candidates = self._model_candidates()
         primary_model = model_candidates[0] if model_candidates else None
-        reserve_model = model_candidates[1] if len(model_candidates) > 1 else None
+        reserve_models = model_candidates[1:]
         policy = ExecutionRecoveryPolicy(
             task_class="task_state_generation",
             allow_same_backend_retry=True,
-            allow_smaller_faster_model=bool(reserve_model),
+            allow_smaller_faster_model=bool(reserve_models),
             allow_reduce_request_complexity=True,
             allow_minimal_generation=True,
             allow_deterministic_fallback=not a2_semantic_mode and not strict_semantic_execution,
@@ -194,7 +194,7 @@ class TaskStateUpdater:
         )
         recovery_model = self._recovery_model_for_failure(
             primary_model=primary_model,
-            reserve_model=reserve_model,
+            reserve_models=reserve_models,
             failure=failure,
         )
         decisions = policy.plan_recovery(
@@ -588,14 +588,15 @@ class TaskStateUpdater:
         self,
         *,
         primary_model: str | None,
-        reserve_model: str | None,
+        reserve_models: list[str] | None,
         failure,
     ) -> str | None:
+        candidates = list(reserve_models or [])
         if failure is None:
-            return reserve_model
+            return candidates[0] if candidates else None
         if failure.no_start_failure:
-            return availability_recovery_model(primary_model, reserve_model)
-        return reserve_model
+            return availability_recovery_model(primary_model, candidates)
+        return candidates[0] if candidates else None
 
     def _log(self, event: str, **payload: Any) -> None:
         if self.logger is None:

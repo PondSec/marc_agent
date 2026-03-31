@@ -1563,6 +1563,75 @@ def test_task_state_a2_uses_smaller_reserve_model_when_available_for_no_start(tm
     assert llm.generate_json_calls[2]["kwargs"]["num_ctx"] == updater.num_ctx
 
 
+def test_task_state_a2_prefers_near_size_reserve_model_for_no_start(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+        model_candidates=("qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen3:8b", "qwen3-coder:30b"),
+    )
+    reserve_payload = {
+        "latest_user_turn": "Fix the upload bug in app/upload.py without weakening the tests.",
+        "root_goal": "Fix the upload bug in app/upload.py without weakening the tests.",
+        "active_goal": "Diagnose and fix the upload bug in the current repo.",
+        "goal_relation": "report_problem",
+        "output_expectation": "Diagnose the issue, apply the smallest safe fix, and verify the result.",
+        "current_user_intent": "repair",
+        "execution_strategy": "debug_repair",
+        "open_problem": "Upload bug in app/upload.py.",
+        "verification_target": "Reproduce the bug and rerun the relevant tests.",
+        "target_artifacts": [
+            {"path": "app/upload.py", "name": "upload.py", "kind": ".py", "role": "primary_target", "confidence": 0.92},
+            {"path": "tests/test_auth.py", "name": "test_auth.py", "kind": ".py", "role": "validation_target", "confidence": 0.78},
+        ],
+        "active_artifacts": [
+            {"path": "app/upload.py", "name": "upload.py", "kind": ".py", "role": "primary_target", "confidence": 0.92},
+        ],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "confidence": 0.83,
+        "next_action": "debug",
+        "next_best_action": "debug",
+        "execution_outline": [
+            "Read the strongest target first.",
+            "Reproduce the failure before editing.",
+            "Apply the smallest safe fix and rerun tests.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = SelectiveStartupTimeoutLLM(
+        {"qwen3:8b": reserve_payload},
+        failing_models={"qwen2.5-coder:7b"},
+        config=config,
+    )
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "reserve_model"
+    assert [call["kwargs"].get("model") for call in llm.generate_json_calls[:3]] == [
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+    ]
+
+
 def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 

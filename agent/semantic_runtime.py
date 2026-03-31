@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any, Literal
 
 
@@ -140,21 +141,65 @@ def semantic_resolution_from_attempt(
 
 def availability_recovery_model(
     primary_model: str | None,
-    candidate_model: str | None,
+    candidate_models: str | Iterable[str] | None,
 ) -> str | None:
     primary = str(primary_model or "").strip()
-    candidate = str(candidate_model or "").strip()
-    if not candidate:
+    candidates = _normalized_recovery_candidates(candidate_models, primary)
+    if not candidates:
         return None
     if not primary:
-        return candidate
+        return candidates[0]
     primary_size = _estimated_model_size_billions(primary)
-    candidate_size = _estimated_model_size_billions(candidate)
-    if primary_size is None or candidate_size is None:
-        return candidate
-    if candidate_size <= primary_size:
-        return candidate
-    return None
+    primary_family = _model_family(primary)
+    ranked: list[tuple[tuple[int, int, float, float, int], str]] = []
+    for index, candidate in enumerate(candidates):
+        candidate_size = _estimated_model_size_billions(candidate)
+        candidate_family = _model_family(candidate)
+        family_penalty = 0 if primary_family and candidate_family == primary_family else 1
+        if primary_size is None or candidate_size is None:
+            ranked.append(((2, family_penalty, 0.0, 0.0, index), candidate))
+            continue
+        if candidate_size <= primary_size:
+            ranked.append(
+                (
+                    (
+                        0,
+                        family_penalty,
+                        abs(primary_size - candidate_size),
+                        -candidate_size,
+                        index,
+                    ),
+                    candidate,
+                )
+            )
+            continue
+        growth_ratio = candidate_size / primary_size if primary_size > 0 else float("inf")
+        size_delta = candidate_size - primary_size
+        if growth_ratio <= 1.25 and size_delta <= 2.0:
+            ranked.append(((1, family_penalty, size_delta, candidate_size, index), candidate))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _normalized_recovery_candidates(
+    candidate_models: str | Iterable[str] | None,
+    primary_model: str,
+) -> list[str]:
+    if candidate_models is None:
+        return []
+    if isinstance(candidate_models, str):
+        raw_candidates = [candidate_models]
+    else:
+        raw_candidates = list(candidate_models)
+    normalized: list[str] = []
+    for raw in raw_candidates:
+        text = str(raw or "").strip()
+        if not text or text == primary_model or text in normalized:
+            continue
+        normalized.append(text)
+    return normalized
 
 
 def secondary_semantics_limited(resolution: SemanticResolution) -> bool:
