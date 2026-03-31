@@ -225,6 +225,9 @@ class ValidationPlanner:
         "unboundlocalerror",
         "valueerror",
     )
+    EXCEPTION_EVIDENCE_PATTERN = re.compile(
+        r"\b(?:[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)|SystemExit|CalledProcessError)\b"
+    )
 
     def build_plan(
         self,
@@ -1038,6 +1041,12 @@ class ValidationPlanner:
             failure_summary=failure_summary,
             missing_features=missing_features,
         )
+        if failure_type == "test_discovery_gap":
+            primary_target = self._test_discovery_primary_target(
+                artifact_paths=artifact_paths,
+                file_hints=file_hints,
+                current_primary=primary_target,
+            )
         script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
         normalized_script = self._workspace_relative_path(session, script_target)
         primary_target = self._prefer_behavioral_runtime_primary_target(
@@ -1096,6 +1105,8 @@ class ValidationPlanner:
             primary_target=primary_target,
             locked_target=locked_target,
             candidate_paths=[*artifact_paths, *file_hints],
+            failure_type=failure_type,
+            bootstrap_status=bootstrap_status,
         )
         forbidden_files = self._repair_forbidden_files(
             allowed_files=allowed_files,
@@ -1147,6 +1158,32 @@ class ValidationPlanner:
             if implementation:
                 return implementation[0]
         return next((path for path in candidates if path), None)
+
+    def _test_discovery_primary_target(
+        self,
+        *,
+        artifact_paths: list[str],
+        file_hints: list[str],
+        current_primary: str | None,
+    ) -> str | None:
+        candidates = self._unique_paths([*artifact_paths, *file_hints])
+        existing_test_modules = [
+            path
+            for path in candidates
+            if path
+            and self._is_test_path(path)
+            and not Path(path).name.lower() == "__init__.py"
+        ]
+        if existing_test_modules:
+            return existing_test_modules[0]
+        test_support = [
+            path
+            for path in candidates
+            if path and self._is_test_path(path)
+        ]
+        if test_support:
+            return test_support[0]
+        return str(current_primary or "").strip() or None
 
     def _prefer_behavioral_runtime_primary_target(
         self,
@@ -1802,9 +1839,18 @@ class ValidationPlanner:
         primary_target: str | None,
         locked_target: str | None,
         candidate_paths: list[str],
+        failure_type: str,
+        bootstrap_status: str,
     ) -> list[str]:
         candidates = self._unique_paths(candidate_paths)
         preferred = [str(locked_target or "").strip(), str(primary_target or "").strip()]
+        if failure_type == "test_discovery_gap" or bootstrap_status == "bootstrap_failed":
+            support = [
+                path
+                for path in candidates
+                if path and not self._is_documentation_path(path)
+            ]
+            return self._unique_paths([*preferred, *support])[:4]
         implementation = [
             path
             for path in candidates
@@ -1826,7 +1872,7 @@ class ValidationPlanner:
         candidate_paths: list[str],
         failure_type: str,
     ) -> list[str]:
-        if failure_type == "missing_artifact":
+        if failure_type in {"missing_artifact", "test_discovery_gap"}:
             return []
         allowed = set(allowed_files)
         if not any(path and not self._is_test_path(path) and not self._is_documentation_path(path) for path in allowed):
@@ -1995,7 +2041,37 @@ class ValidationPlanner:
             return True
         if any(marker in lowered for marker in self.FAILURE_EVIDENCE_LINE_MARKERS):
             return True
+        if self.EXCEPTION_EVIDENCE_PATTERN.search(line):
+            return True
         return not any(marker in lowered for marker in self.NON_FAILURE_SUMMARY_LINE_MARKERS) and " fail" in f" {lowered}"
+
+    def _adjacent_assertion_diff_lines(
+        self,
+        lines: list[str],
+        *,
+        start_index: int,
+        limit: int = 4,
+    ) -> list[str]:
+        collected: list[str] = []
+        for raw in lines[start_index + 1 :]:
+            stripped = str(raw or "").strip()
+            if not stripped:
+                break
+            if stripped.startswith(("Traceback", "File ")):
+                break
+            if re.fullmatch(r"[=\-]{5,}", stripped):
+                break
+            if re.search(r"\b(?:FAIL|FAILED|ERROR)\b", stripped):
+                break
+            if stripped.startswith(("-", "+", "?")):
+                collected.append(stripped)
+                if len(collected) >= limit:
+                    break
+                continue
+            if collected:
+                break
+            break
+        return collected
 
     def _traceback_workspace_frames(
         self,
@@ -2799,9 +2875,16 @@ class ValidationPlanner:
             *(str(item.excerpt or "").strip() for item in diagnostics),
             *(str(item.summary or "").strip() for item in diagnostics),
         ]:
-            for line in self._evidence_lines_from_text(text):
-                if self._line_contains_failure_evidence(line) and line not in focused_lines:
+            lines = self._evidence_lines_from_text(text)
+            for index, line in enumerate(lines):
+                if not self._line_contains_failure_evidence(line):
+                    continue
+                if line not in focused_lines:
                     focused_lines.append(line)
+                if "assertionerror" in line.lower():
+                    for diff_line in self._adjacent_assertion_diff_lines(lines, start_index=index):
+                        if diff_line not in focused_lines:
+                            focused_lines.append(diff_line)
         if focused_lines:
             return "\n".join(focused_lines[:8])
         for text in [

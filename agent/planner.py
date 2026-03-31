@@ -912,7 +912,7 @@ class Planner:
                 final_stop_reason = failure.stop_reason
                 final_failure_class = failure.failure_class
                 final_user_message = failure.user_message
-                effective_strategy = generation.repair_strategy_used or strategy
+                effective_strategy = getattr(generation, "repair_strategy_used", None) or strategy
                 if repair_context is not None:
                     if failure.failure_class != "no_effective_change":
                         self._record_repair_attempt(
@@ -937,7 +937,7 @@ class Planner:
                 break
 
             content = generation.content
-            effective_strategy = generation.repair_strategy_used or strategy
+            effective_strategy = getattr(generation, "repair_strategy_used", None) or strategy
             if repair_context is not None and content.strip() == REPAIR_BLOCKED_SENTINEL:
                 final_failure_reason = (
                     f"The validation-guided repair for {target} could not derive a concrete fix from the current evidence."
@@ -2234,6 +2234,35 @@ class Planner:
             repair_context,
             self._unique_paths(candidates),
         )
+        if (
+            repair_context is not None
+            and self._runtime_failure_needs_test_context_first(repair_context)
+        ):
+            read_paths = set(self._read_paths(session))
+            for candidate in ordered_candidates:
+                if not self.validation_planner._is_test_path(candidate):
+                    continue
+                if candidate in read_paths:
+                    continue
+                if not self._is_safe_workspace_target_candidate(session, candidate):
+                    continue
+                absolute = Path(session.workspace_root, candidate)
+                if absolute.exists() and absolute.is_file():
+                    return candidate
+        if (
+            repair_context is not None
+            and self._repair_context_is_bootstrap_test_discovery(repair_context)
+            and any(
+                candidate in set(self._read_paths(session))
+                for candidate in ordered_candidates
+                if candidate and self.validation_planner._is_test_path(candidate)
+            )
+        ):
+            for candidate in ordered_candidates:
+                if not self._is_runtime_support_repair_target(candidate, repair_context):
+                    continue
+                if self._repair_target_can_be_created(session, candidate, repair_context):
+                    return candidate
         for candidate in ordered_candidates:
             if not self._is_safe_workspace_target_candidate(session, candidate):
                 continue
@@ -2247,6 +2276,20 @@ class Planner:
             ):
                 return candidate
         return None
+
+    def _repair_context_is_bootstrap_test_discovery(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None:
+            return False
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return False
+        return (
+            str(getattr(brief, "failure_type", "") or "").strip() == "test_discovery_gap"
+            and str(getattr(brief, "bootstrap_status", "") or "").strip() == "bootstrap_failed"
+        )
 
     def _repair_candidates_with_unattempted_first(
         self,
@@ -2274,6 +2317,44 @@ class Planner:
             attempted = [candidate for candidate in group if candidate in attempted_results]
             return [*unattempted, *attempted]
 
+        recent_support_target: str | None = None
+        if repair_context.verification_scope == "runtime":
+            runtime_support_candidates = [
+                candidate
+                for candidate in candidates
+                if self._is_runtime_support_repair_target(candidate, repair_context)
+            ]
+            if runtime_support_candidates and self._runtime_support_candidates_should_lead(
+                runtime_support_candidates,
+                repair_context,
+            ):
+                locked_target = self._repair_brief_locked_target(repair_context)
+                if locked_target not in runtime_support_candidates:
+                    remaining = [
+                        candidate for candidate in candidates if candidate not in runtime_support_candidates
+                    ]
+                    return [
+                        *_order_by_attempt_status(runtime_support_candidates),
+                        *_order_by_attempt_status(remaining),
+                    ]
+
+            recent_support_target = self._recent_runtime_support_repair_target(
+                session,
+                repair_context,
+            )
+            if (
+                recent_support_target is not None
+                and recent_support_target in candidates
+                and not self._runtime_locked_target_should_yield(
+                    session,
+                    repair_context,
+                    recent_support_target,
+                )
+                and recent_support_target in {*repair_context.artifact_paths, *repair_context.file_hints}
+            ):
+                remaining = [candidate for candidate in candidates if candidate != recent_support_target]
+                return [recent_support_target, *_order_by_attempt_status(remaining)]
+
         locked_target = self._repair_brief_locked_target(repair_context)
         if locked_target and locked_target in candidates:
             if self._runtime_locked_target_should_yield(session, repair_context, locked_target):
@@ -2283,10 +2364,6 @@ class Planner:
             return [locked_target, *_order_by_attempt_status(remaining)]
 
         if repair_context.verification_scope == "runtime":
-            recent_support_target = self._recent_runtime_support_repair_target(
-                session,
-                repair_context,
-            )
             if recent_support_target is not None or attempted_results:
                 support_candidates = [
                     candidate
@@ -2389,21 +2466,7 @@ class Planner:
             self._unique_paths([*repair_context.artifact_paths, *repair_context.file_hints]),
             repair_context,
         )
-        leading_support_candidates = [
-            candidate
-            for candidate in candidates
-            if self._is_runtime_support_repair_target(candidate, repair_context)
-        ]
-        support_should_lead = self._runtime_support_candidates_should_lead(
-            leading_support_candidates,
-            repair_context,
-        )
         sticky_target = self._sticky_runtime_repair_target(session, repair_context)
-        failure_specific_support = [
-            candidate
-            for candidate in leading_support_candidates
-            if candidate and self._repair_candidate_matches_failure_text(candidate, repair_context)
-        ]
         failure_specific_non_test = [
             candidate
             for candidate in candidates
@@ -2443,16 +2506,41 @@ class Planner:
             if self._repair_target_can_be_created(session, candidate, repair_context)
         ]
         existing = self._repair_related_existing_context_paths(session, repair_context)
+        support_candidates = self._unique_paths(
+            [
+                candidate
+                for candidate in [*candidates, *explicitly_referenced_missing, *creatable_missing, *existing]
+                if self._is_runtime_support_repair_target(candidate, repair_context)
+            ]
+        )
+        support_should_lead = self._runtime_support_candidates_should_lead(
+            support_candidates,
+            repair_context,
+        )
+        failure_specific_support = [
+            candidate
+            for candidate in support_candidates
+            if candidate and self._repair_candidate_matches_failure_text(candidate, repair_context)
+        ]
         locked_target = self._repair_brief_locked_target(repair_context)
         primary_target = self._repair_brief_primary_target(repair_context)
         demote_locked = self._runtime_locked_target_should_yield(session, repair_context, locked_target)
+        prioritized_locked_targets = [] if demote_locked else [locked_target, primary_target]
+        if support_should_lead and support_candidates:
+            prioritized_locked_targets = [
+                candidate
+                for candidate in prioritized_locked_targets
+                if candidate not in support_candidates
+            ]
         return self._unique_paths(
             [
-                *([] if demote_locked else [locked_target, primary_target]),
+                *(failure_specific_support if support_should_lead else []),
+                *(support_candidates if support_should_lead else []),
+                *prioritized_locked_targets,
                 sticky_target,
                 *self._memory_guided_candidate_paths(session, failure_only=True),
-                *failure_specific_support,
-                *(leading_support_candidates if support_should_lead else []),
+                *([] if support_should_lead else failure_specific_support),
+                *([] if support_should_lead else support_candidates),
                 *failure_specific_non_test,
                 *explicitly_referenced_missing,
                 *explicitly_referenced_existing,
@@ -2486,6 +2574,8 @@ class Planner:
             for candidate in candidates
             if self.validation_planner._is_test_path(candidate)
         ]
+        if validation_like and self._runtime_failure_needs_test_context_first(repair_context):
+            return [*validation_like, *implementation_like, *support_candidates]
         if support_candidates and self._runtime_support_candidates_should_lead(
             support_candidates,
             repair_context,
@@ -2494,6 +2584,100 @@ class Planner:
         if support_candidates:
             return [*implementation_like, *support_candidates, *validation_like]
         return [*implementation_like, *validation_like]
+
+    def _runtime_failure_needs_test_context_first(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        if repair_context.verification_scope != "runtime":
+            return False
+        brief = getattr(repair_context, "repair_brief", None)
+        if (
+            brief is not None
+            and str(getattr(brief, "failure_type", "") or "").strip() == "test_discovery_gap"
+            and str(getattr(brief, "bootstrap_status", "") or "").strip() == "bootstrap_failed"
+            and any(
+                self.validation_planner._is_test_path(candidate)
+                for candidate in [*repair_context.artifact_paths, *repair_context.file_hints]
+            )
+        ):
+            return True
+        failure_text = "\n".join(
+            part
+            for part in [
+                str(repair_context.excerpt or "").strip(),
+                str(repair_context.failure_summary or "").strip(),
+                str(repair_context.summary or "").strip(),
+            ]
+            if part
+        ).lower()
+        if not failure_text:
+            return False
+        if re.search(r'file ".+?", line \d+', failure_text):
+            return False
+        if re.search(r"[\w./\\-]+\.py:\d+(?::\d+)?", failure_text):
+            return False
+        if any(
+            marker in failure_text
+            for marker in (
+                "assertionerror",
+                "typeerror",
+                "valueerror",
+                "runtimeerror",
+                "nameerror",
+                "attributeerror",
+                "importerror",
+                "modulenotfounderror",
+                "syntaxerror",
+                "indexerror",
+                "keyerror",
+                "filenotfounderror",
+                "calledprocesserror",
+                "systemexit",
+                "traceback",
+                "no such file or directory",
+                " not found in ",
+                " != ",
+                "lists differ",
+            )
+        ):
+            return False
+        region_hint = str(getattr(brief, "implicated_region_hint", "") or "").strip().lower()
+        target_markers: set[str] = set()
+        for candidate in (
+            str(getattr(brief, "locked_target", "") or "").strip(),
+            str(getattr(brief, "primary_target", "") or "").strip(),
+        ):
+            target_markers.update(
+                token
+                for token in self._repair_candidate_reference_tokens(candidate)
+                if token
+            )
+        region_hint_is_generic_target_label = bool(region_hint) and any(
+            marker and marker in region_hint for marker in target_markers
+        )
+        if brief is not None and (
+            brief.expected_semantics
+            or brief.observed_semantics
+            or brief.implicated_symbols
+            or (region_hint and not region_hint_is_generic_target_label)
+        ):
+            return False
+        if not any(
+            self.validation_planner._is_test_path(candidate)
+            for candidate in [*repair_context.artifact_paths, *repair_context.file_hints]
+        ):
+            return False
+        return "fail" in failure_text or any(
+            marker in failure_text
+            for marker in (
+                "no tests ran",
+                "ran 0 tests",
+                "collected 0 items",
+                "test discovery",
+                "loader._failed_test",
+            )
+        )
 
     def _runtime_support_candidates_should_lead(
         self,
@@ -2668,10 +2852,72 @@ class Planner:
             repair_context,
             exclude={target},
         )
+        allowed_files = {
+            str(item or "").strip()
+            for item in getattr(brief, "allowed_files", [])
+            if str(item or "").strip()
+        }
+        if allowed_files:
+            implementation_alternatives = [
+                candidate for candidate in implementation_alternatives if candidate in allowed_files
+            ]
         if not implementation_alternatives:
             return False
         attempted_failures = self._repair_attempt_failure_count(session, repair_context, target)
-        return attempted_failures >= 1 or bool(implementation_alternatives)
+        strongly_implicated_alternatives = [
+            candidate
+            for candidate in implementation_alternatives
+            if (
+                self._repair_candidate_is_strongly_referenced(candidate, repair_context)
+                or self._repair_candidate_matches_failure_text(candidate, repair_context)
+            )
+        ]
+        if attempted_failures >= 1:
+            return True
+        target_markers = {
+            token
+            for token in self._repair_candidate_reference_tokens(target)
+            if token
+        }
+        region_hint = str(getattr(brief, "implicated_region_hint", "") or "").strip().lower()
+        behavioral_focus_points_away_from_support_target = bool(
+            self._is_python_runtime_support_module(target, repair_context)
+            and implementation_alternatives
+            and (
+                any(str(symbol or "").strip() for symbol in getattr(brief, "implicated_symbols", []))
+                or region_hint
+            )
+            and not any(marker and marker in region_hint for marker in target_markers)
+        )
+        if behavioral_focus_points_away_from_support_target:
+            return True
+        if (
+            self._is_python_runtime_support_module(target, repair_context)
+            and implementation_alternatives
+            and any(
+                item.result == "mutation_planned"
+                and str(item.artifact_path or "").strip() == target
+                and str(item.validation_command or "").strip() == str(repair_context.command or "").strip()
+                and str(item.verification_scope or "").strip() == str(repair_context.verification_scope or "").strip()
+                and (
+                    (
+                        self._repair_failure_signature(repair_context)
+                        and str(item.failure_signature or "").strip() == self._repair_failure_signature(repair_context)
+                    )
+                    or (
+                        not self._repair_failure_signature(repair_context)
+                        and str(item.evidence_signature or "").strip() == str(repair_context.evidence_signature or "").strip()
+                    )
+                )
+                for item in session.repair_history
+            )
+        ):
+            return True
+        target_is_directly_implicated = self._repair_candidate_is_explicitly_referenced(
+            target,
+            repair_context,
+        )
+        return bool(strongly_implicated_alternatives) and not target_is_directly_implicated
 
     def _runtime_implementation_candidates(
         self,
@@ -3304,16 +3550,25 @@ class Planner:
                 for path in [str(artifact.path or "").strip()]
                 if path
             }
+        routed_primary_target = self._target_name_path_candidate(route)
+        if not routed_primary_target and explicit:
+            routed_primary_target = explicit[0]
 
         def inferred_role(path: str) -> str:
             explicit_role = artifact_roles.get(path, "")
-            if explicit_role:
-                return explicit_role
-            suffix = Path(path).suffix.lower()
-            if self._path_is_test_like(path):
+            is_routed_primary_target = path == routed_primary_target
+            if self._path_is_test_like(path) and not is_routed_primary_target:
                 return "validation_target"
-            if suffix in {".md", ".markdown", ".rst", ".txt"}:
+            suffix = Path(path).suffix.lower()
+            if suffix in {".md", ".markdown", ".rst", ".txt"} and not is_routed_primary_target:
                 return "supporting_context"
+            if explicit_role in {
+                "primary_target",
+                "validation_target",
+                "supporting_context",
+                "active_context",
+            }:
+                return explicit_role
             return "primary_target"
 
         return {
@@ -3602,6 +3857,47 @@ class Planner:
         }
 
     def _next_update_target(self, route: RouterOutput, session: SessionState) -> str | None:
+        repair_context = self._current_repair_context_hint(session)
+        if route.intent == RouteIntent.UPDATE and repair_context is not None:
+            failed_run = self.validation_planner.latest_failed_run(
+                session,
+                current_generation_only=False,
+                command=repair_context.command,
+            )
+            if failed_run is not None:
+                validation_target = self._repair_target_after_failed_validation(
+                    route,
+                    session,
+                    failed_run,
+                    repair_context,
+                )
+                if (
+                    validation_target
+                    and self._is_safe_workspace_target_candidate(session, validation_target)
+                ):
+                    absolute = Path(session.workspace_root, validation_target)
+                    if absolute.exists() and absolute.is_file():
+                        return validation_target
+                    if self._repair_target_can_be_created(
+                        session,
+                        validation_target,
+                        repair_context,
+                    ):
+                        return validation_target
+            locked_target = self._repair_brief_locked_target(repair_context)
+            primary_target = self._repair_brief_primary_target(repair_context)
+            pinned_target = locked_target or primary_target
+            if (
+                pinned_target
+                and not self._runtime_locked_target_should_yield(session, repair_context, pinned_target)
+                and self._is_safe_workspace_target_candidate(session, pinned_target)
+            ):
+                absolute = Path(session.workspace_root, pinned_target)
+                if absolute.exists() and absolute.is_file():
+                    return pinned_target
+                if self._repair_target_can_be_created(session, pinned_target, repair_context):
+                    return pinned_target
+
         explicit_targets = self._actionable_explicit_target_paths(route, session)
         if explicit_targets:
             changed_paths = {item.path for item in session.changed_files}
@@ -4337,7 +4633,10 @@ class Planner:
             if attempt is None:
                 attempts = [
                     candidate
-                    for candidate in self._content_generation_recovery_attempts(issue)
+                    for candidate in self._content_generation_recovery_attempts(
+                        issue,
+                        history=[*(prior_attempts or []), *retry_attempts],
+                    )
                     if (
                         candidate.strategy,
                         candidate.prompt_kind,
@@ -4586,6 +4885,8 @@ class Planner:
     def _content_generation_recovery_attempts(
         self,
         issue: ExecutionFailure,
+        *,
+        history: list[ExecutionAttemptRecord] | None = None,
     ) -> list[GenerationRecoveryAttempt]:
         policy = ExecutionRecoveryPolicy(
             task_class="content_generation",
@@ -4601,7 +4902,7 @@ class Planner:
             issue,
             primary_model=self._primary_generation_model_name(),
             faster_model=self._lightweight_generation_model_name(),
-            history=[],
+            history=list(history or []),
         )
         attempts: list[GenerationRecoveryAttempt] = []
         for decision in decisions:
@@ -4621,16 +4922,6 @@ class Planner:
                 prompt_kind = "resume"
             elif decision.candidate.prompt_variant in {"compact", "minimal"}:
                 prompt_kind = "compact"
-            if (
-                decision.candidate.strategy == "retry_same_backend"
-                and not issue.first_output_received
-            ):
-                prompt_kind = "compact"
-            if (
-                decision.candidate.strategy == "switch_to_faster_model"
-                and not issue.first_output_received
-            ):
-                prompt_kind = "compact"
             candidate_model_name = decision.candidate.model_identifier
             capability_tier = decision.candidate.capability_tier
             if (
@@ -4638,13 +4929,7 @@ class Planner:
                 and candidate_model_name
                 and candidate_model_name == str(issue.model_identifier or "").strip()
             ):
-                primary_model_name = self._primary_generation_model_name()
-                if primary_model_name and primary_model_name != candidate_model_name:
-                    candidate_model_name = primary_model_name
-                    capability_tier = "tier_a"
-                    prompt_kind = "compact"
-                else:
-                    continue
+                continue
             if (
                 decision.candidate.strategy in {
                     "retry_same_backend",
@@ -4665,6 +4950,33 @@ class Planner:
                     prompt_kind=prompt_kind,
                     model_name=candidate_model_name,
                     capability_tier=capability_tier,
+                )
+            )
+        primary_model = self._primary_generation_model_name()
+        lightweight_model = self._lightweight_generation_model_name()
+        current_model = str(issue.model_identifier or "").strip()
+        if (
+            issue.no_start_failure
+            and primary_model
+            and lightweight_model
+            and current_model == lightweight_model
+            and primary_model != current_model
+            and not any(
+                (attempt.model_name or primary_model) == primary_model
+                for attempt in attempts
+            )
+            and not any(
+                str(item.model_identifier or "").strip() == primary_model
+                and str(item.prompt_variant or "").strip() == "full"
+                for item in list(history or [])
+            )
+        ):
+            attempts.append(
+                GenerationRecoveryAttempt(
+                    strategy="switch_to_primary_model",
+                    prompt_kind="full",
+                    model_name=None,
+                    capability_tier="tier_a",
                 )
             )
         return attempts
@@ -5438,7 +5750,16 @@ class Planner:
         return slug
 
     def _empty_workspace_default_path(self, route: RouterOutput) -> str:
+        default_path = self._default_new_path(route)
         preferred_extension = self._preferred_extension(route)
+        explicit_target = str(route.entities.target_name or "").strip()
+        if preferred_extension == ".html" and (
+            not explicit_target or not self._looks_like_path(explicit_target)
+        ):
+            return "index.html"
+        default_name = Path(default_path).name.lower()
+        if default_name not in {"generated_output", "generated_output.txt", "app.py", "app.js", "app.ts"}:
+            return default_path
         if not str(route.entities.target_name or "").strip() or not self._looks_like_path(str(route.entities.target_name or "").strip()):
             conventional = {
                 ".html": "index.html",
@@ -5448,7 +5769,7 @@ class Planner:
             }.get(preferred_extension)
             if conventional is not None:
                 return conventional
-        return self._default_new_path(route)
+        return default_path
 
     def _path_seed_from_route(self, route: RouterOutput) -> str:
         explicit = str(route.entities.target_name or "").strip()
@@ -5914,10 +6235,20 @@ class Planner:
         current_content: str | None,
         repair_context: ValidationFailureEvidence | None = None,
     ) -> str | None:
-        if repair_context is not None:
-            return None
         lightweight = self._lightweight_generation_model_name()
         if lightweight is None:
+            return None
+        if repair_context is not None:
+            if (
+                current_content is None
+                and self._should_prefer_lightweight_missing_artifact_generation(
+                    route,
+                    session,
+                    path=path,
+                    repair_context=repair_context,
+                )
+            ):
+                return lightweight
             return None
         if current_content is None and self._should_prefer_lightweight_missing_artifact_generation(
             route,
@@ -5934,6 +6265,30 @@ class Planner:
         ):
             return lightweight
         return None
+
+    def _focused_update_scope_supports_small_model(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> bool:
+        target_paths = self._actionable_explicit_target_paths(route, session)
+        if not target_paths or path not in target_paths:
+            return False
+        if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+            return False
+
+        suffix = Path(path).suffix.lower()
+        if suffix in {".html", ".htm", ".css", ".js", ".jsx", ".ts", ".tsx"}:
+            return True
+
+        companion_targets = [candidate for candidate in target_paths if candidate != path]
+        return any(
+            self._path_is_test_like(candidate)
+            or self.validation_planner._is_documentation_path(candidate)
+            for candidate in companion_targets
+        )
 
     def _content_generation_prompt_variant(
         self,
@@ -6022,6 +6377,16 @@ class Planner:
         if target_paths and path not in target_paths:
             return False
         if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+            return False
+        if (
+            not self._path_matches_explicit_request(session, path)
+            and not list(route.entities.constraints or [])
+            and not self._focused_update_scope_supports_small_model(
+                route,
+                session,
+                path=path,
+            )
+        ):
             return False
 
         suffix = Path(path).suffix.lower()
@@ -6163,10 +6528,11 @@ class Planner:
             return False
 
         explicit_targets = self._explicit_target_paths(route, session)
-        if explicit_targets and path not in explicit_targets:
-            return False
-        if len(explicit_targets) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
-            return False
+        if repair_context is None:
+            if explicit_targets and path not in explicit_targets:
+                return False
+            if len(explicit_targets) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
+                return False
 
         prefer_after_runtime_recovery = (
             repair_context is None
@@ -6338,6 +6704,16 @@ class Planner:
             return False
         if len(target_paths) > MAX_LIGHTWEIGHT_UPDATE_TARGETS:
             return False
+        if (
+            not self._path_matches_explicit_request(session, path)
+            and not list(route.entities.constraints or [])
+            and not self._focused_update_scope_supports_small_model(
+                route,
+                session,
+                path=path,
+            )
+        ):
+            return False
 
         suffix = Path(path).suffix.lower()
         if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
@@ -6361,6 +6737,13 @@ class Planner:
                 return False
             if float(task_state.confidence or 0.0) < MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE:
                 return False
+
+        focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        write_requirements = focus.get("current_write_requirements") or []
+        if not isinstance(write_requirements, list) or not write_requirements:
+            return False
+        if len(write_requirements) > 4:
+            return False
 
         return True
 
@@ -6716,9 +7099,9 @@ class Planner:
         if repair_review:
             review_attempts.append((primary_model, "tier_a", "primary_model_review"))
         elif focused_compact_review:
-            review_attempts.append((primary_model, "tier_a", "primary_model_review"))
             if reserve_model is not None:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
+            review_attempts.append((primary_model, "tier_a", "primary_model_review"))
         elif compact_review and reserve_model is not None:
             # On constrained hardware a second full-model review often costs far more
             # latency than the lightweight safety value it adds for small focused edits.
@@ -7427,11 +7810,11 @@ class Planner:
             language,
             de=(
                 f"Ich habe den vorgeschlagenen Inhalt fuer {path} verworfen, "
-                "weil der Vorab-Review einen zu breiten, regressiven oder unvollstaendigen Entwurf erkannt hat. "
+                "weil der KI-Vorab-Review einen zu breiten, regressiven oder unvollstaendigen Entwurf erkannt hat. "
                 "Ich konnte noch keine belastbare engere Fassung ableiten."
             ),
             en=(
-                f"I rejected the proposed content for {path} because the pre-write review flagged it as too broad, regressive, or incomplete. "
+                f"I rejected the proposed content for {path} because the AI review flagged the pre-write draft as too broad, regressive, or incomplete. "
                 "I could not derive a reliable narrower draft yet."
             ),
         )
@@ -8094,7 +8477,10 @@ class Planner:
     ) -> ProposedUpdateReview | None:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return None
-        if self._is_runtime_support_repair_target(path, repair_context):
+        if (
+            self._is_runtime_support_repair_target(path, repair_context)
+            and Path(path).suffix.lower() not in {".py", ".pyi"}
+        ):
             return self._runtime_support_file_relevance_review(
                 path=path,
                 current_content=current_content,

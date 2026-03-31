@@ -562,6 +562,9 @@ def generate_content_prompt(
             f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             f"Related file hints: {related_context}",
         ]
+        diagnostic_context = _diagnostic_context(session)
+        if diagnostic_context:
+            sections.append(f"Diagnostic context: {diagnostic_context}")
         if repair_context is not None:
             sections.extend(
                 [
@@ -723,6 +726,9 @@ def generate_content_retry_prompt(
         ]
         if session is not None:
             sections.append(f"Related file hints: {_related_file_context(session, path)}")
+            diagnostic_context = _diagnostic_context(session)
+            if diagnostic_context:
+                sections.append(f"Diagnostic context: {diagnostic_context}")
         if repair_context is not None:
             sections.extend(
                 [

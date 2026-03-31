@@ -183,6 +183,84 @@ def test_choose_create_path_prefers_index_html_for_empty_workspace_web_requests(
     assert planner._choose_create_path(route, session) == "index.html"
 
 
+def test_next_update_target_stays_on_locked_repair_target_before_other_explicit_targets(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "repo-map.md").write_text("# Repo Map\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Inventory App\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Create docs/repo-map.md and run python -m unittest tests.test_repo_map.",
+        workspace_root=str(tmp_path),
+        changed_files=[FileChangeRecord(path="docs/repo-map.md", operation="create")],
+        validation_status="failed",
+        task_state=TaskState(
+            latest_user_turn="Create docs/repo-map.md and run python -m unittest tests.test_repo_map.",
+            root_goal="Document the inventory repo.",
+            active_goal="Repair docs/repo-map.md after validation failed.",
+            goal_relation="continue",
+            output_expectation="A repo map that passes the targeted unittest.",
+            verification_target="python -m unittest tests.test_repo_map",
+            next_action="update",
+            target_artifacts=[
+                {"path": "docs/repo-map.md", "kind": "doc", "role": "primary_target", "confidence": 1.0},
+                {"path": "tests/test_repo_map.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_repo_map",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["docs/repo-map.md", "README.md", "tests/test_repo_map.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'tests/test_auth.py' not found in docs/repo-map.md output",
+        failure_summary="docs/repo-map.md is still missing required repo-map references.",
+        file_hints=["docs/repo-map.md", "README.md", "tests/test_repo_map.py"],
+        repair_requirements=["Change docs/repo-map.md so the failing validation passes."],
+        evidence_signature="runtime:assertion_mismatch:test",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:test",
+            primary_target="docs/repo-map.md",
+            locked_target="docs/repo-map.md",
+            expected_semantics=["Validation should produce: tests/test_auth.py"],
+            observed_semantics=["Validation currently produces: repo map text without tests/test_auth.py"],
+            allowed_files=["docs/repo-map.md"],
+            forbidden_files=["README.md", "tests/test_repo_map.py"],
+        ),
+    )
+    route = RouterOutput.model_validate(
+        {
+            "user_goal": "Repair the repo map after validation failed.",
+            "intent": "update",
+            "entities": {
+                "target_type": "file",
+                "target_name": "docs/repo-map.md",
+                "target_paths": ["docs/repo-map.md", "README.md"],
+                "attributes": [],
+                "constraints": [],
+            },
+            "requested_outcome": "Repair docs/repo-map.md so the failed validation passes.",
+            "action_plan": [
+                {"step": 1, "action": "update_artifact", "reason": "Repair the failed validation target."}
+            ],
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.9,
+            "safe_to_execute": True,
+            "repo_context_needed": True,
+            "search_terms": ["docs/repo-map.md"],
+            "relevant_extensions": [".md"],
+            "direct_response": None,
+        }
+    )
+
+    assert planner._next_update_target(route, session) == "docs/repo-map.md"
+
+
 def route_payload(
     *,
     intent: str,
@@ -670,7 +748,7 @@ def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path
     prompt = llm.generate_json_calls[0]["args"][0]
 
     assert review.safe_to_write is True
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
     assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
@@ -1164,9 +1242,9 @@ def test_planner_falls_back_locally_after_compact_review_start_failure(tmp_path)
 
     assert review.safe_to_write is True
     assert len(llm.generate_json_calls) == 2
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
-    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen3:8b"
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen3:14b"
     assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is True
 
 
@@ -9205,9 +9283,9 @@ def test_planner_retries_same_implementation_target_after_identical_repair_gener
     decision = planner._draft_update_decision(repair_route, session, "greet_cli/__main__.py")
 
     assert seen_strategies == ["validation_targeted", "validation_escalated"]
-    assert decision.action_type == AgentActionType.CALL_TOOL
-    assert decision.tool_name == "write_file"
-    assert decision.tool_args["path"] == "greet_cli/__main__.py"
+    assert decision.action_type == AgentActionType.FINAL
+    assert session.stop_reason == "no_effective_change"
+    assert "comment-only change" in str(session.last_error or "")
 
 
 def test_planner_switches_to_remaining_repair_target_after_generation_failure(tmp_path):
@@ -12858,10 +12936,10 @@ def test_planner_switches_to_primary_model_when_lightweight_no_start_cannot_go_f
     )
 
     assert attempts
-    assert attempts[0].strategy == "compact_fallback_model"
-    assert attempts[0].model_name == "qwen2.5-coder:14b"
+    assert attempts[0].strategy == "switch_to_primary_model"
+    assert attempts[0].model_name is None
     assert attempts[0].capability_tier == "tier_a"
-    assert attempts[0].prompt_kind == "compact"
+    assert attempts[0].prompt_kind == "full"
 
 
 def test_planner_uses_compact_prompt_for_fallback_model_after_primary_no_start(tmp_path):
@@ -12892,8 +12970,8 @@ def test_planner_uses_compact_prompt_for_fallback_model_after_primary_no_start(t
 
     assert attempts
     assert attempts[0].model_name == "qwen2.5-coder:7b"
-    assert attempts[0].prompt_kind == "compact"
-    assert attempts[0].strategy == "compact_fallback_model"
+    assert attempts[0].prompt_kind == "full"
+    assert attempts[0].strategy == "fallback_model"
 
 
 def test_planner_uses_compact_same_model_retry_after_retryable_no_start(tmp_path):
@@ -12924,7 +13002,7 @@ def test_planner_uses_compact_same_model_retry_after_retryable_no_start(tmp_path
 
     assert attempts
     assert attempts[0].strategy == "retry_same_model"
-    assert attempts[0].prompt_kind == "compact"
+    assert attempts[0].prompt_kind == "full"
     assert attempts[0].model_name is None
 
 
@@ -12992,7 +13070,7 @@ def test_planner_recovers_from_retryable_no_start_with_same_model_retry(tmp_path
     assert llm.generate_calls[1]["kwargs"]["model"] is None
     assert llm.generate_calls[1]["kwargs"]["timeout"] >= 60
     assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 210
-    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
 
 
 def test_planner_extends_compact_primary_generation_budget_for_repairs(tmp_path):
