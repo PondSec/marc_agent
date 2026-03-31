@@ -58,6 +58,7 @@ class TaskStateUpdater:
         payload: dict[str, Any] | None = None
         initial_mode = self._initial_prompt_mode(session)
         local_state = self._fallback_state(user_input, snapshot=snapshot, session=session)
+        strict_semantic_execution = self._requires_semantic_model_execution(session, local_state)
         if self._should_short_circuit_with_local_state(
             initial_mode=initial_mode,
             session=session,
@@ -106,7 +107,7 @@ class TaskStateUpdater:
             allow_smaller_faster_model=bool(reserve_model),
             allow_reduce_request_complexity=True,
             allow_minimal_generation=True,
-            allow_deterministic_fallback=True,
+            allow_deterministic_fallback=not strict_semantic_execution,
             max_same_backend_retries=1,
             max_total_attempts=4,
         )
@@ -314,6 +315,29 @@ class TaskStateUpdater:
             )
 
         self._log("task_state_fallback", error=str(outcome.exception), payload=payload or {})
+        if strict_semantic_execution:
+            state = self._blocked_state_for_missing_semantics(user_input, local_state)
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="blocked",
+                        capability_tier="tier_e",
+                        recovery_strategy="semantic_model_required",
+                        degraded=False,
+                        honest_blocked=True,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="A2 refused to execute a mutation task from deterministic fallback without semantic model understanding.",
+                        attempts=attempts,
+                    ),
+                    semantic_resolution="blocked",
+                ),
+            )
+            self._log("task_state_updated", task_state=state.model_dump(), source="semantic_blocked")
+            return state
         state = self._fallback_state(user_input, snapshot=snapshot, session=session)
         self._append_runtime_execution(
             session,
@@ -451,6 +475,8 @@ class TaskStateUpdater:
         session,
         state: TaskState,
     ) -> bool:
+        if self._requires_semantic_model_execution(session, state):
+            return False
         if initial_mode != "compact":
             return False
         config = getattr(self.llm, "config", None)
@@ -463,6 +489,66 @@ class TaskStateUpdater:
         if state.needs_clarification or state.ambiguity_level == "high":
             return False
         return float(state.confidence or 0.0) >= 0.65
+
+    def _agent_profile(self, session) -> str:
+        if session is None:
+            return ""
+        runtime_options = getattr(session, "runtime_options", {}) or {}
+        raw = str(runtime_options.get("agent_profile") or "").strip().lower()
+        if raw in {"a1", "a2"}:
+            return raw
+        return ""
+
+    def _requires_semantic_model_execution(self, session, state: TaskState) -> bool:
+        if self._agent_profile(session) != "a2":
+            return False
+        if state.needs_clarification:
+            return False
+        strategy = str(state.execution_strategy or "").strip()
+        intent = str(state.current_user_intent or "").strip()
+        action = str(state.next_best_action or state.next_action or "").strip()
+        if strategy in {"feature_implementation", "debug_repair", "refactor", "hardening", "rollback_correction"}:
+            return True
+        if intent in MUTATION_LIKE_INTENTS:
+            return True
+        return action in MUTATION_LIKE_ACTIONS
+
+    def _blocked_state_for_missing_semantics(self, user_input: str, state: TaskState) -> TaskState:
+        blocked = state.model_copy(deep=True)
+        blocked.latest_user_turn = str(user_input or "").strip() or blocked.latest_user_turn
+        blocked.root_goal = blocked.latest_user_turn or blocked.root_goal
+        blocked.active_goal = "Wait for semantic model understanding before mutating the repository."
+        blocked.goal_relation = "clarify"
+        blocked.output_expectation = "Do not change repository files until semantic task understanding is available."
+        blocked.current_user_intent = None
+        blocked.execution_strategy = None
+        blocked.open_problem = None
+        blocked.verification_target = None
+        blocked.target_artifacts = []
+        blocked.active_artifacts = []
+        blocked.evidence = []
+        blocked.supplied_evidence = []
+        blocked.relevant_context = []
+        blocked.constraints = []
+        blocked.assumptions = [
+            "A2 requires semantic model understanding for create, update, and debug execution instead of deterministic lexical fallback."
+        ]
+        blocked.missing_info = [
+            "Semantic model understanding is currently unavailable for this mutation task."
+        ]
+        blocked.ambiguity_level = "high"
+        blocked.risk_level = "high"
+        blocked.confidence = min(float(blocked.confidence or 0.0), 0.2)
+        blocked.next_action = "clarify"
+        blocked.next_best_action = "clarify"
+        blocked.execution_outline = [
+            "Retry semantic task understanding before executing repository changes."
+        ]
+        blocked.needs_clarification = True
+        blocked.clarification_questions = [
+            "Der semantische Modellpfad ist gerade nicht verfuegbar. Starte den Lauf erneut, sobald das Modell wieder sauber antwortet."
+        ]
+        return self._finalize_state(blocked, semantic_resolution="blocked")
 
     def _mode_runtime(self, mode: str) -> tuple[int, int, int]:
         if mode == "full":

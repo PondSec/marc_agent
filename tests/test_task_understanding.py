@@ -1268,6 +1268,99 @@ def test_task_state_local_short_circuit_prioritizes_debug_for_bugfix_prompts_wit
     assert llm.generate_json_calls == []
 
 
+def test_task_state_a2_shared_model_stack_requires_semantic_model_for_mutation_tasks(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "latest_user_turn": "Fix the upload bug in app/upload.py without weakening the tests.",
+                "root_goal": "Fix the upload bug in app/upload.py without weakening the tests.",
+                "active_goal": "Diagnose and fix the upload bug in the current repo.",
+                "goal_relation": "report_problem",
+                "output_expectation": "Diagnose the issue, apply the smallest safe fix, and verify the result.",
+                "current_user_intent": "repair",
+                "execution_strategy": "debug_repair",
+                "open_problem": "Upload bug in app/upload.py.",
+                "verification_target": "Reproduce the bug and rerun the relevant tests.",
+                "target_artifacts": [
+                    {"path": "app/upload.py", "name": "upload.py", "kind": ".py", "role": "primary_target", "confidence": 0.92},
+                    {"path": "tests/test_auth.py", "name": "test_auth.py", "kind": ".py", "role": "validation_target", "confidence": 0.78},
+                ],
+                "active_artifacts": [
+                    {"path": "app/upload.py", "name": "upload.py", "kind": ".py", "role": "primary_target", "confidence": 0.92},
+                ],
+                "evidence": [],
+                "supplied_evidence": [],
+                "relevant_context": [],
+                "constraints": [],
+                "assumptions": [],
+                "missing_info": [],
+                "ambiguity_level": "low",
+                "risk_level": "medium",
+                "confidence": 0.83,
+                "next_action": "debug",
+                "next_best_action": "debug",
+                "execution_outline": [
+                    "Read the strongest target first.",
+                    "Reproduce the failure before editing.",
+                    "Apply the smallest safe fix and rerun tests.",
+                ],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.execution_strategy == "debug_repair"
+    assert task_state.target_artifacts[0].path == "app/upload.py"
+    assert llm.generate_json_calls
+
+
+def test_task_state_a2_blocks_mutation_when_semantic_model_is_unavailable(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "blocked"
+    assert task_state.needs_clarification is True
+    assert task_state.next_action == "clarify"
+    assert task_state.target_artifacts == []
+    assert llm.generate_json_calls
+
+
 def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 

@@ -88,7 +88,7 @@ class AgentCore:
         session.access_mode = self.config.access_mode
         self.memory = self._build_memory_store(session)
         session.project_id = session.project_id or getattr(self.memory, "project_id", None)
-        session.runtime_options = self._runtime_options()
+        session.runtime_options = self._runtime_options(session)
         session.touch()
 
         logger = AgentLogger(self.config.log_dir_path, session.id, verbose=self.config.verbose)
@@ -878,8 +878,8 @@ class AgentCore:
             return "max_tool_calls_reached"
         return "loop_stopped"
 
-    def _runtime_options(self) -> dict[str, object]:
-        return {
+    def _runtime_options(self, session: SessionState | None = None) -> dict[str, object]:
+        options = {
             "access_mode": self.config.access_mode,
             "dry_run": self.config.dry_run,
             "read_only": self.config.read_only,
@@ -889,6 +889,12 @@ class AgentCore:
             "helper_dir": str(self.config.helper_dir_path),
             "report_dir": str(self.config.report_dir_path),
         }
+        existing = dict(getattr(session, "runtime_options", {}) or {})
+        for key in ("agent_profile", "execution_profile"):
+            value = existing.get(key)
+            if value:
+                options[key] = value
+        return options
 
     def _debug_repair_incomplete(self, session: SessionState) -> bool:
         if session.task_state is None or session.task_state.execution_strategy != "debug_repair":
