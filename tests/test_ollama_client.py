@@ -522,7 +522,7 @@ def test_ollama_client_marks_pre_chunk_startup_timeout_retryable(monkeypatch, tm
     assert error.first_output_received is False
 
 
-def test_ollama_client_stops_hung_model_after_no_start_timeout(monkeypatch, tmp_path):
+def test_ollama_client_leaves_model_warm_after_no_start_timeout(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
         model_name="qwen2.5-coder:7b",
@@ -545,10 +545,10 @@ def test_ollama_client_stops_hung_model_after_no_start_timeout(monkeypatch, tmp_
     error = excinfo.value
     assert error.reason == "startup_timeout"
     assert error.no_start_failure is True
-    assert stop_calls == ["qwen2.5-coder:7b"]
+    assert stop_calls == []
 
 
-def test_ollama_client_clears_hung_model_before_retrying_no_start(monkeypatch, tmp_path):
+def test_ollama_client_preserves_model_warmth_before_retrying_no_start(monkeypatch, tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
         model_name="qwen2.5-coder:7b",
@@ -580,7 +580,7 @@ def test_ollama_client_clears_hung_model_before_retrying_no_start(monkeypatch, t
 
     assert result == "OK"
     assert attempts["count"] == 2
-    assert stop_calls == ["qwen2.5-coder:7b"]
+    assert stop_calls == []
 
 
 def test_ollama_client_expands_large_model_time_budget(monkeypatch, tmp_path):
