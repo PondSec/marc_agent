@@ -224,6 +224,7 @@ class TaskStateUpdater:
             retry_mode = self._recovery_prompt_mode(
                 initial_mode=initial_mode,
                 candidate_prompt_variant=decision.candidate.prompt_variant,
+                preserve_full_retry=strict_semantic_execution,
             )
             retry_prompt = task_state_update_prompt(
                 user_input,
@@ -574,9 +575,12 @@ class TaskStateUpdater:
         *,
         initial_mode: str,
         candidate_prompt_variant: str,
+        preserve_full_retry: bool = False,
     ) -> str:
         if candidate_prompt_variant != "full":
             return "compact"
+        if preserve_full_retry:
+            return "full"
         if initial_mode != "full":
             return "compact"
         return "full"

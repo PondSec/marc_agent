@@ -1391,6 +1391,37 @@ def test_task_state_a2_no_start_runs_recovery_before_blocking(tmp_path):
     assert "task_state_recovery_short_circuit" not in log_text
 
 
+def test_task_state_a2_preserves_full_retry_mode_for_semantic_recovery(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = StartupTimeoutLLM(config=config)
+    updater = TaskStateUpdater(llm)
+    session = SessionState(
+        task="Fix the upload bug in app/upload.py without weakening the tests.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    updater.update_task_state(
+        "Fix the upload bug in app/upload.py without weakening the tests.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert len(llm.generate_json_calls) >= 2
+    first_call = llm.generate_json_calls[0]["kwargs"]
+    assert first_call["timeout"] == 18
+    assert first_call["num_ctx"] == 2048
+    assert any(
+        call["kwargs"]["timeout"] == updater.timeout
+        and call["kwargs"]["num_ctx"] == updater.num_ctx
+        for call in llm.generate_json_calls[1:]
+    )
+
+
 def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 
