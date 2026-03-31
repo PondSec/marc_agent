@@ -114,6 +114,7 @@ def task_state_update_prompt(
     session: SessionState | None = None,
     *,
     mode: str = "full",
+    resume_partial: str | None = None,
 ) -> str:
     compact = mode != "full"
     schema_shape = {
@@ -183,6 +184,23 @@ def task_state_update_prompt(
     previous_task_state = _compact_task_state(session.task_state if session is not None else None)
     workspace_detail = "router" if compact else "decision"
     workspace_context = _compact_workspace_snapshot(snapshot, detail=workspace_detail)
+    if mode == "resume" and str(resume_partial or "").strip():
+        return "\n".join(
+            [
+                "Finish the partially emitted task-state JSON object for this turn.",
+                "Return valid JSON only.",
+                "Preserve already-correct fields from the partial object, repair broken structure, and complete any missing required fields.",
+                "Do not restart analysis from scratch unless the partial object is clearly contradictory.",
+                f"Latest user request: {_trim_text(task, 500)}",
+                f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
+                f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}",
+                f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}",
+                f"Previous task state: {json.dumps(previous_task_state, ensure_ascii=False)}",
+                f"Partial JSON from the timed-out attempt: {_trim_text(str(resume_partial), 1400)}",
+                "Keep phrases short and omit optional keys when they add no signal.",
+                f"Return JSON only with this structure: {json.dumps(compact_schema_shape, ensure_ascii=False)}",
+            ]
+        )
     lines = [
         "Update the central task state for this turn.",
         f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",

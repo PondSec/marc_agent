@@ -86,6 +86,38 @@ class StartupTimeoutLLM(ScriptedLLM):
         )
 
 
+class ProgressTimeoutThenSuccessLLM(ScriptedLLM):
+    def __init__(self, payload: dict, *, config=None):
+        super().__init__(json_payloads=[payload])
+        self.config = config
+        self._raised = False
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if not self._raised:
+            self._raised = True
+            raise OllamaGenerationError(
+                "timed out waiting for model completion after 72.1 seconds",
+                reason="total_timeout",
+                retryable=True,
+                model_name=str(kwargs.get("model") or "") or None,
+                startup_timeout_seconds=72,
+                inactivity_timeout_seconds=18,
+                total_timeout_seconds=72,
+                partial_text=(
+                    '{\n'
+                    '  "latest_user_turn": "Create docs/repo-map.md",\n'
+                    '  "root_goal": "Create repo map docs",\n'
+                    '  "active_goal": "Create docs/repo-map.md",\n'
+                    '  "goal_relation": "new_task"'
+                ),
+                first_output_received=True,
+                characters=240,
+                activity_count=40,
+            )
+        return super().generate_json(*args, **kwargs)
+
+
 class SelectiveStartupTimeoutLLM(ScriptedLLM):
     def __init__(
         self,
@@ -2715,6 +2747,63 @@ def test_task_state_a2_single_model_semantic_bootstrap_uses_relaxed_startup_budg
     assert third_call["total_timeout"] == 180
     assert third_call["num_ctx"] == 2048
     assert third_call["strict_timeouts"] is False
+
+
+def test_task_state_resumes_after_progress_timeout_before_blocking(tmp_path):
+    payload = {
+        "latest_user_turn": "Create docs/repo-map.md for this inventory repo.",
+        "root_goal": "Create repo map docs",
+        "active_goal": "Create docs/repo-map.md",
+        "goal_relation": "new_task",
+        "output_expectation": "A concise repo map in docs/repo-map.md.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "Run python -m unittest tests.test_repo_map.",
+        "target_artifacts": [
+            {
+                "path": "docs/repo-map.md",
+                "name": "repo-map.md",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.9,
+            }
+        ],
+        "constraints": ["Work only inside the current repo."],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "confidence": 0.82,
+        "next_action": "create",
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ProgressTimeoutThenSuccessLLM(payload, config=config)
+    updater = TaskStateUpdater(llm, timeout=45, num_ctx=4096)
+    session = SessionState(
+        task="Create docs/repo-map.md for this inventory repo.",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = updater.update_task_state(
+        "Create docs/repo-map.md for this inventory repo.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.next_action == "create"
+    assert len(llm.generate_json_calls) >= 2
+    resume_call = llm.generate_json_calls[-1]
+    assert resume_call["kwargs"]["total_timeout"] == 180
+    assert resume_call["kwargs"]["strict_timeouts"] is False
+    assert resume_call["kwargs"]["num_ctx"] == 2048
+    assert "Partial JSON from the timed-out attempt" in resume_call["args"][0]
+    assert '"goal_relation": "new_task"' in resume_call["args"][0]
 
 
 def test_task_state_contract_handles_backend_correction():

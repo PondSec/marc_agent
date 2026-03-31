@@ -116,6 +116,7 @@ class TaskStateUpdater:
         policy = ExecutionRecoveryPolicy(
             task_class="task_state_generation",
             allow_same_backend_retry=True,
+            allow_resume_after_progress=True,
             allow_smaller_faster_model=bool(reserve_models),
             allow_reduce_request_complexity=True,
             allow_minimal_generation=True,
@@ -252,6 +253,11 @@ class TaskStateUpdater:
                 snapshot=snapshot,
                 session=session,
                 mode=retry_mode,
+                resume_partial=(
+                    failure.partial_text
+                    if decision.candidate.strategy == "resume_after_progress" and failure is not None
+                    else None
+                ),
             )
             retry_single_model_bootstrap = (
                 single_model_semantic_bootstrap and decision.candidate.model_identifier == primary_model
@@ -609,6 +615,10 @@ class TaskStateUpdater:
             timeout = max(self.timeout, 30)
             total_timeout = max(timeout * 4, timeout + 135)
             return timeout, total_timeout, min(self.num_ctx, 2048)
+        if mode == "resume":
+            timeout = max(self.timeout, 24)
+            total_timeout = max(timeout * 4, timeout + 90)
+            return timeout, total_timeout, min(self.num_ctx, 2048)
         if mode == "full":
             timeout = self.timeout
             total_timeout = max(timeout * 2, timeout + 20)
@@ -628,7 +638,7 @@ class TaskStateUpdater:
         *,
         single_model_semantic_bootstrap: bool = False,
     ) -> bool:
-        if mode == "full":
+        if mode in {"full", "resume"}:
             return False
         if single_model_semantic_bootstrap:
             return False
