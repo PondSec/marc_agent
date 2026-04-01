@@ -11229,6 +11229,8 @@ def test_repair_no_effective_change_review_adds_semantic_delta_literal_hint(tmp_
 
     assert review is not None
     assert any("never handles the observed-only literal '!'" in hint for hint in review.repair_hints)
+    assert any("Rewrite at least one implicated output line in texttools/normalize.py" in hint for hint in review.repair_hints)
+    assert any("2:     return ' '.join(text.replace(',', ' ').split()).lower()" in hint for hint in review.repair_hints)
 
 
 def test_review_generated_update_blocks_when_model_backed_review_times_out(tmp_path, monkeypatch):
@@ -12710,6 +12712,8 @@ def test_planner_review_retry_keeps_same_model_and_escalates_follow_up_to_full_f
     assert llm.generate_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
     assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is False
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
+    assert llm.generate_calls[1]["kwargs"]["timeout"] >= 75
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 330
     assert "references sys.argv without importing sys." in llm.generate_calls[1]["args"][0]
     assert "add import sys before using it" in llm.generate_calls[1]["args"][0]
 

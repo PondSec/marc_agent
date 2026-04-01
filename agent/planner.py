@@ -28,6 +28,8 @@ from agent.models import (
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
+    _line_focused_excerpt,
+    _repair_target_line_hints,
     _repair_semantic_delta_lines,
     choose_path_prompt,
     final_response_prompt,
@@ -7201,6 +7203,18 @@ class Planner:
     ) -> list[str]:
         hints: list[str] = []
         seen: set[str] = set()
+        focused_line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        focused_line_excerpt = _line_focused_excerpt(
+            current_content,
+            line_hints=focused_line_hints,
+            limit=220,
+            before_radius=0,
+            after_radius=0,
+        )
         for delta in _repair_semantic_delta_lines(repair_context, limit=2):
             text = str(delta or "").strip()
             if not text:
@@ -7223,6 +7237,14 @@ class Planner:
             elif remove_match is not None:
                 observed = str(remove_match.group("observed") or "").strip()
                 if observed:
+                    if focused_line_excerpt:
+                        hint = (
+                            f"Rewrite at least one implicated output line in {path}; leaving this excerpt unchanged "
+                            f"will preserve the failing behavior:\n{focused_line_excerpt}"
+                        )
+                        if hint not in seen:
+                            seen.add(hint)
+                            hints.append(hint)
                     if observed not in str(current_content or ""):
                         hint = (
                             f"The current implementation in {path} never handles the observed-only literal {observed!r} "
@@ -7245,6 +7267,12 @@ class Planner:
                 seen.add(hint)
                 hints.append(hint)
         return hints[:2]
+
+    def _repair_followup_retry_budget(self) -> tuple[int, int]:
+        reserve_model = self._lightweight_generation_model_name()
+        if reserve_model is None:
+            return max(self._llm_timeout(75), 75), max(self._llm_timeout(330), 330)
+        return max(self._llm_timeout(60), 60), max(self._llm_timeout(240), 240)
 
     def _review_generated_update(
         self,
@@ -7780,6 +7808,7 @@ class Planner:
                     )
                 )
         elif prefer_primary_repair_retry:
+            followup_timeout_seconds, followup_total_timeout_seconds = self._repair_followup_retry_budget()
             retry_models.append(
                 (
                     primary_model,
@@ -7796,8 +7825,8 @@ class Planner:
                     primary_model,
                     "tier_a",
                     "review_guided_retry_followup",
-                    max(self._llm_timeout(60), 60),
-                    max(self._llm_timeout(240), 240),
+                    followup_timeout_seconds,
+                    followup_total_timeout_seconds,
                     min(self._llm_num_ctx(4096), 4096),
                     "full",
                 )
