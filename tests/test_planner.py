@@ -12170,7 +12170,7 @@ def test_review_guided_retry_prefers_primary_model_for_validation_repairs(tmp_pa
     assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
 
 
-def test_planner_review_retry_keeps_same_model_for_compact_and_full_follow_up_attempts(tmp_path, monkeypatch):
+def test_planner_review_retry_keeps_same_model_and_escalates_follow_up_to_full_for_validation_repairs(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[
             "def main():\n    return 'compact'\n",
@@ -12253,9 +12253,11 @@ def test_planner_review_retry_keeps_same_model_for_compact_and_full_follow_up_at
     assert len(llm.generate_calls) == 2
     assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
     assert llm.generate_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
     assert "The proposal leaves the implicated identifier lines unchanged." in llm.generate_calls[0]["args"][0]
     assert llm.generate_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
     assert "references sys.argv without importing sys." in llm.generate_calls[1]["args"][0]
     assert "add import sys before using it" in llm.generate_calls[1]["args"][0]
 
@@ -12455,6 +12457,39 @@ def test_review_guided_retry_prompt_surfaces_minimal_semantic_delta(tmp_path, mo
         "Apply this exact semantic delta in the behavior produced by this file: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
         in prompt
     )
+
+
+def test_review_feedback_marks_semantic_stalls_as_noop_for_repair_escalation(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+
+    unchanged_lines_review = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="Lines unchanged.",
+        confidence=0.8,
+        blocking_issues=["The proposal leaves the implicated identifier lines unchanged."],
+        preservation_risks=[],
+        repair_hints=["Change the implicated callable."],
+    )
+    observed_mismatch_review = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposal still leaves the title punctuation mismatch in place.",
+        confidence=0.89,
+        blocking_issues=[
+            "The proposal still preserves the observed punctuation mismatch in the titled greeting output."
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the output construction in the locked target so the observed-only punctuation disappears."],
+    )
+
+    assert planner._review_feedback_is_noop(unchanged_lines_review) is True
+    assert planner._review_feedback_is_noop(observed_mismatch_review) is True
 
 
 def test_review_guided_retry_prompt_surfaces_undefined_runtime_symbol_guidance(tmp_path, monkeypatch):

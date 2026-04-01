@@ -1580,6 +1580,11 @@ class Planner:
             "comment-only",
             "metadata-only",
             "equivalent repair",
+            "leaves the implicated",
+            "still leaves the implicated",
+            "preserves the observed",
+            "still preserves the observed",
+            "leaves the observed",
         )
         return any(marker in text for marker in markers)
 
@@ -7717,9 +7722,9 @@ class Planner:
                     "tier_a",
                     "review_guided_retry_followup",
                     max(self._llm_timeout(60), 60),
-                    max(self._llm_timeout(210), 210),
-                    min(self._llm_num_ctx(2048), 2048),
-                    "compact",
+                    max(self._llm_timeout(240), 240),
+                    min(self._llm_num_ctx(4096), 4096),
+                    "full",
                 )
             )
         elif prefer_lightweight_retry and reserve_model is not None:
