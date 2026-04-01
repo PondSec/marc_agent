@@ -306,11 +306,32 @@ def test_ollama_client_scales_small_model_startup_budget_with_long_recovery_time
 def test_ollama_client_stops_streaming_json_once_object_is_complete(monkeypatch, tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     client = OllamaClient(config)
-    response = FakeReadlineStreamingResponse(
+
+    class ClosableBlockingJsonResponse(FakeReadlineStreamingResponse):
+        def __init__(self, events):
+            super().__init__(events)
+            self.closed = False
+
+        def readline(self):
+            self.read_calls += 1
+            if self.closed:
+                return b""
+            if self.events:
+                event = self.events.pop(0)
+                if isinstance(event, Exception):
+                    raise event
+                return event
+            while not self.closed:
+                time.sleep(0.01)
+            return b""
+
+        def close(self):
+            self.closed = True
+
+    response = ClosableBlockingJsonResponse(
         [
             (json.dumps({"response": "{\"ok\":", "done": False}) + "\n").encode("utf-8"),
             (json.dumps({"response": " true}", "done": False}) + "\n").encode("utf-8"),
-            (json.dumps({"response": "   ", "done": False}) + "\n").encode("utf-8"),
         ]
     )
 
@@ -324,7 +345,26 @@ def test_ollama_client_stops_streaming_json_once_object_is_complete(monkeypatch,
     payload = client.generate_json("route this", retries=0)
 
     assert payload == {"ok": True}
-    assert response.read_calls == 2
+    assert response.closed is True
+
+
+def test_ollama_client_caps_json_generation_budget(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    client = OllamaClient(config)
+
+    def fake_urlopen(req: request.Request, timeout):
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["format"] == "json"
+        assert payload["options"]["num_predict"] == client.JSON_NUM_PREDICT_LIMIT
+        return FakeReadlineStreamingResponse(
+            [(json.dumps({"response": "{\"ok\": true}", "done": True}) + "\n").encode("utf-8")]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    payload = client.generate_json("route this", retries=0)
+
+    assert payload == {"ok": True}
 
 
 def test_ollama_client_raises_structured_inactivity_timeout_with_partial_progress(monkeypatch, tmp_path):

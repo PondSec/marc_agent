@@ -82,6 +82,8 @@ class OllamaGenerationError(OllamaClientError):
 
 
 class OllamaClient:
+    JSON_NUM_PREDICT_LIMIT = 768
+
     def __init__(self, config: AppConfig):
         self.config = config
 
@@ -186,6 +188,10 @@ class OllamaClient:
             payload["system"] = system
         if expect_json:
             payload["format"] = "json"
+            # Structured semantic calls should stay compact and finish. Without a
+            # bounded generation budget, small local models can drift into long
+            # invalid JSON streams that never close the object cleanly.
+            payload["options"]["num_predict"] = self.JSON_NUM_PREDICT_LIMIT
 
         target = self.config.ollama_host.rstrip("/") + "/api/generate"
         body = json.dumps(payload).encode("utf-8")
