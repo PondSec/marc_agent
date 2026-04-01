@@ -2043,6 +2043,12 @@ class ValidationPlanner:
         lines = [str(line or "").strip() for line in str(text or "").splitlines()]
         return [line for line in lines if line]
 
+    def _text_contains_failure_evidence(self, text: str) -> bool:
+        for line in self._evidence_lines_from_text(text):
+            if self._line_contains_failure_evidence(line):
+                return True
+        return False
+
     def _line_contains_failure_evidence(self, line: str) -> bool:
         lowered = str(line or "").strip().lower()
         if not lowered:
@@ -2651,6 +2657,9 @@ class ValidationPlanner:
         related: list[DiagnosticRecord] = []
         normalized_command = self.command_identity(failed_run.command)
         artifact_set = set(artifact_paths)
+        current_failure_has_specific_evidence = self._text_contains_failure_evidence(
+            str(failed_run.excerpt or "").strip()
+        )
         for diagnostic in reversed(session.diagnostics):
             diagnostic_command = self.command_identity(diagnostic.command or "")
             if diagnostic_command and diagnostic_command == normalized_command:
@@ -2658,6 +2667,47 @@ class ValidationPlanner:
                 continue
             if artifact_set and artifact_set.intersection(diagnostic.file_hints):
                 related.append(diagnostic)
+        if not related:
+            return []
+
+        current_iteration = int(failed_run.iteration or 0)
+        if current_iteration > 0:
+            same_iteration = [
+                diagnostic
+                for diagnostic in related
+                if int(getattr(diagnostic, "iteration", 0) or 0) == current_iteration
+            ]
+            if same_iteration:
+                related = same_iteration
+            elif current_failure_has_specific_evidence:
+                return []
+            else:
+                older_relevant = [
+                    diagnostic
+                    for diagnostic in related
+                    if 0 < int(getattr(diagnostic, "iteration", 0) or 0) <= current_iteration
+                ]
+                if older_relevant:
+                    latest_iteration = max(int(diagnostic.iteration or 0) for diagnostic in older_relevant)
+                    related = [
+                        diagnostic
+                        for diagnostic in older_relevant
+                        if int(diagnostic.iteration or 0) == latest_iteration
+                    ]
+        else:
+            iterated = [
+                diagnostic
+                for diagnostic in related
+                if int(getattr(diagnostic, "iteration", 0) or 0) > 0
+            ]
+            if iterated:
+                latest_iteration = max(int(diagnostic.iteration or 0) for diagnostic in iterated)
+                related = [
+                    diagnostic
+                    for diagnostic in iterated
+                    if int(diagnostic.iteration or 0) == latest_iteration
+                ]
+
         return list(reversed(related[-4:]))
 
     def _artifact_paths_for_failed_run(
@@ -2692,7 +2742,8 @@ class ValidationPlanner:
             )
             paths.extend(self._missing_unittest_package_inits(session, failed_run, paths))
         paths.extend(self._paths_from_validation_command(failed_run.command))
-        if session.active_repair_context is not None:
+        fresh_paths = self._unique_paths(paths)
+        if not fresh_paths and session.active_repair_context is not None:
             paths.extend(session.active_repair_context.artifact_paths)
         paths.extend(item.path for item in session.changed_files)
         return self._unique_paths(paths)

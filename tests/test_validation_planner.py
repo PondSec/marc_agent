@@ -10,6 +10,7 @@ from agent.models import (
     RepairAttemptRecord,
     SessionState,
     ValidationCommand,
+    ValidationFailureEvidence,
     ValidationRunRecord,
     WorkspaceSnapshot,
 )
@@ -1867,6 +1868,112 @@ def test_validation_planner_uses_structural_diagnostic_file_mentions_as_primary_
     assert evidence.missing_features == ["contact-form"]
     assert evidence.failure_summary == "contact.html is missing validation-required features: contact-form."
     assert any("contact.html" in item for item in evidence.repair_requirements)
+
+
+def test_validation_planner_prefers_current_failure_iteration_over_stale_import_history(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text, lowercase=True):\n"
+        "    return text.lower().split() if lowercase else text.split()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    return normalize_words('Hello world')\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text("pass\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("Usage\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Add a keep_case option and repair the failing normalize runtime path.",
+        workspace_root=str(tmp_path),
+        validation_status="failed",
+        edit_generation=1,
+        task_state=TaskState(
+            latest_user_turn="Add keep_case support to the text normalization workflow.",
+            root_goal="Extend the normalization workflow safely.",
+            active_goal="Implement keep_case support in the provider and CLI.",
+            goal_relation="continue",
+            output_expectation="Updated module, CLI, and docs with passing tests.",
+            verification_target="python -m unittest tests.test_normalize",
+            next_action="modify",
+            target_artifacts=[
+                {"path": "texttools/normalize.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "normalize_cli.py", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                {"path": "README.md", "kind": "file", "role": "documentation", "confidence": 0.5},
+                {"path": "tests/test_normalize.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="modify"),
+            FileChangeRecord(path="normalize_cli.py", operation="modify"),
+            FileChangeRecord(path="README.md", operation="modify"),
+            FileChangeRecord(path="texttools/__init__.py", operation="modify"),
+        ]
+    )
+    session.diagnostics.append(
+        DiagnosticRecord(
+            source="run_tests",
+            category="command_failure",
+            summary="ImportError: cannot import name 'normalize_words_keep_case' from 'texttools'",
+            tool_name="run_tests",
+            command="python -m unittest tests.test_normalize",
+            file_hints=["texttools/__init__.py"],
+            excerpt="ImportError: cannot import name 'normalize_words_keep_case' from 'texttools'",
+            iteration=8,
+        )
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/__init__.py", "texttools/normalize.py", "normalize_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="ImportError: cannot import name 'normalize_words_keep_case' from 'texttools'",
+        failure_summary="texttools/__init__.py fails because the active runtime path cannot import normalize_words_keep_case.",
+        file_hints=["texttools/__init__.py"],
+        line_hints=[],
+        action_hints=[],
+        repair_requirements=[],
+        evidence_signature="stale-import-history",
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        iteration=11,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            f'  File "{tests_dir / "test_normalize.py"}", line 8, in test_keep_case\n'
+            "    normalize_words('Hello world', keep_case=True)\n"
+            f'  File "{pkg / "normalize.py"}", line 1, in normalize_words\n'
+            "    return text.lower().split() if lowercase else text.split()\n"
+            "TypeError: normalize_words() got an unexpected keyword argument 'keep_case'\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.failure_type == "runtime_failure"
+    assert evidence.artifact_paths[0] == "texttools/normalize.py"
+    assert evidence.repair_brief.primary_target == "texttools/normalize.py"
+    assert evidence.repair_brief.locked_target == "texttools/normalize.py"
+    assert "TypeError" in str(evidence.failure_summary)
+    assert "ImportError" not in str(evidence.failure_summary)
+    assert "ImportError" not in str(evidence.excerpt or "")
 
 
 def test_validation_planner_prioritizes_test_artifacts_for_no_test_execution_failures():
