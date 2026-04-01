@@ -2751,6 +2751,11 @@ def _repair_target_line_hints(
             hints.append(line)
     if hints:
         return hints
+    semantic_hints = _semantic_output_anchor_line_hints(
+        current_content,
+        repair_context=repair_context,
+        limit=4,
+    )
     supporting_hints = _supporting_file_line_hints(
         current_content,
         repair_context=repair_context,
@@ -2758,12 +2763,72 @@ def _repair_target_line_hints(
         limit=4,
         allow_target_token_fallback=False,
     )
-    if supporting_hints:
-        return supporting_hints
-    return _semantic_output_anchor_line_hints(
+    if _prefer_semantic_anchor_hints(
         current_content,
         repair_context=repair_context,
-        limit=4,
+        semantic_hints=semantic_hints,
+        supporting_hints=supporting_hints,
+    ):
+        return _merge_repair_line_hints(semantic_hints, supporting_hints, limit=4)
+    if supporting_hints:
+        return _merge_repair_line_hints(supporting_hints, semantic_hints, limit=4)
+    return semantic_hints
+
+
+def _merge_repair_line_hints(*groups: list[int], limit: int = 4) -> list[int]:
+    merged: list[int] = []
+    for group in groups:
+        for line in group:
+            if line <= 0 or line in merged:
+                continue
+            merged.append(line)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _prefer_semantic_anchor_hints(
+    current_content: str,
+    *,
+    repair_context: ValidationFailureEvidence,
+    semantic_hints: list[int],
+    supporting_hints: list[int],
+) -> bool:
+    if not semantic_hints:
+        return False
+    if not supporting_hints:
+        return True
+    if repair_context.verification_scope != "runtime":
+        return False
+    semantic_score = _repair_line_hint_group_score(
+        current_content,
+        repair_context=repair_context,
+        line_hints=semantic_hints,
+    )
+    supporting_score = _repair_line_hint_group_score(
+        current_content,
+        repair_context=repair_context,
+        line_hints=supporting_hints,
+    )
+    return semantic_score > supporting_score
+
+
+def _repair_line_hint_group_score(
+    current_content: str,
+    *,
+    repair_context: ValidationFailureEvidence,
+    line_hints: list[int],
+) -> int:
+    lines = [str(line or "").rstrip() for line in str(current_content or "").splitlines()]
+    if not lines or not line_hints:
+        return 0
+    return max(
+        (
+            _semantic_anchor_line_score(lines[line - 1], repair_context=repair_context)
+            for line in line_hints
+            if 1 <= line <= len(lines)
+        ),
+        default=0,
     )
 
 
@@ -2795,37 +2860,101 @@ def _semantic_output_anchor_line_hints(
 
     scored: list[tuple[int, int]] = []
     for index, line in enumerate(lines, start=1):
-        lowered = line.lower()
-        if not lowered.strip():
+        score = _semantic_anchor_line_score(
+            line,
+            repair_context=repair_context,
+            symbol_tokens=symbol_tokens,
+        )
+        if score <= 0:
             continue
-        score = 0
-        if re.search(r"""(^|\W)f["']""", line):
-            score += 5
-        if ".format(" in lowered:
-            score += 4
-        if re.search(r"\b(print|return)\b", lowered) or any(
-            marker in lowered for marker in (".write(", ".append(", "textcontent", "innerhtml", "innertext")
-        ):
-            score += 3
-        if "=" in line:
-            score += 1
-        if any(token and token in lowered for token in symbol_tokens):
-            score += 2
-        if score > 0:
-            scored.append((score, index))
+        scored.append((score, index))
 
     if not scored:
         return []
 
-    best_line = max(scored, key=lambda item: (item[0], -item[1]))[1]
     hints: list[int] = []
-    previous_index = best_line - 1
-    if previous_index >= 1:
-        previous_line = lines[previous_index - 1].strip().lower()
-        if previous_line.startswith(("if ", "elif ", "else", "for ", "while ", "with ", "case ")):
-            hints.append(previous_index)
-    hints.append(best_line)
+    for _, best_line in sorted(scored, key=lambda item: (-item[0], item[1])):
+        previous_index = best_line - 1
+        if previous_index >= 1:
+            previous_line = lines[previous_index - 1].strip().lower()
+            if previous_line.startswith(("if ", "elif ", "else", "for ", "while ", "with ", "case ")):
+                hints.append(previous_index)
+                if len(hints) >= limit:
+                    break
+        hints.append(best_line)
+        hints = _merge_repair_line_hints(hints, limit=limit)
+        if len(hints) >= limit:
+            break
     return hints[:limit]
+
+
+def _semantic_anchor_line_score(
+    line: str,
+    *,
+    repair_context: ValidationFailureEvidence,
+    symbol_tokens: set[str] | None = None,
+) -> int:
+    text = str(line or "").rstrip()
+    lowered = text.lower()
+    stripped = lowered.strip()
+    if not stripped:
+        return 0
+
+    score = 0
+    if re.search(r"""(^|\W)f["']""", text):
+        score += 5
+    if ".format(" in lowered:
+        score += 4
+    if re.search(r"\b(print|return|yield)\b", lowered) or any(
+        marker in lowered for marker in (".write(", ".append(", "textcontent", "innerhtml", "innertext")
+    ):
+        score += 3
+    if any(
+        marker in lowered
+        for marker in (
+            ".replace(",
+            ".split(",
+            ".join(",
+            ".strip(",
+            ".lower(",
+            ".upper(",
+            ".title(",
+            ".capitalize(",
+            ".translate(",
+            "re.sub(",
+            "regex.sub(",
+        )
+    ):
+        score += 5
+    if "=" in text and "==" not in text and "!=" not in text:
+        score += 1
+    if re.search(r"""['"][^'"]+['"]""", text):
+        score += 2
+    if symbol_tokens and any(token and token in lowered for token in symbol_tokens):
+        score += 2
+
+    delta_literals = _repair_semantic_delta_literals(repair_context)
+    if delta_literals and any(literal.lower() in lowered for literal in delta_literals):
+        score += 3
+
+    if re.fullmatch(r"return\s+[A-Za-z_][A-Za-z0-9_]*\([^)]*\)", stripped):
+        score -= 3
+
+    return score
+
+
+def _repair_semantic_delta_literals(repair_context: ValidationFailureEvidence, *, limit: int = 6) -> list[str]:
+    literals: list[str] = []
+    for delta in _repair_semantic_delta_lines(repair_context, limit=2):
+        for match in re.findall(r"'([^']+)'|\"([^\"]+)\"", str(delta or "")):
+            literal = next((item for item in match if item), "")
+            normalized = str(literal or "").strip()
+            if not normalized or normalized in literals:
+                continue
+            literals.append(normalized)
+            if len(literals) >= limit:
+                return literals
+    return literals
 
 
 def _targeted_runtime_prompt_hints(

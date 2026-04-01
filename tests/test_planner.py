@@ -29,6 +29,7 @@ from agent.planner import (
 )
 from agent.prompts import (
     _artifact_scoped_focus,
+    _repair_target_line_hints,
     _repair_required_literal_anchors,
     _targeted_runtime_failure_focus_lines,
     _targeted_runtime_prompt_hints,
@@ -6675,6 +6676,76 @@ def test_compact_repair_prompt_surfaces_minimal_semantic_delta_for_behavior_mism
         "Apply this exact semantic delta in the behavior produced by this file: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
         in prompt
     )
+
+
+def test_runtime_repair_prefers_behavioral_local_anchor_over_wrapper_line_for_semantic_delta(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    current_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    if keep_case:\n"
+        "        return ' '.join(text.replace(',', ' ').split())\n"
+        "    else:\n"
+        "        return ' '.join(text.replace(',', ' ').split()).lower()\n\n"
+        "def normalize_words_keep_case(text: str) -> str:\n"
+        "    return normalize_words(text, keep_case=True)\n"
+    )
+    (pkg / "normalize.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "from texttools.normalize import normalize_words, normalize_words_keep_case\n"
+        "from normalize_cli import main\n",
+        encoding="utf-8",
+    )
+
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "tests/test_normalize.py", "normalize_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "AssertionError: 'Hello WORLD!' != 'Hello WORLD'\n"
+            "- Hello WORLD!\n"
+            "+ Hello WORLD\n"
+        ),
+        failure_summary="texttools/normalize.py still produces the wrong behavior: expected Hello WORLD but observed Hello WORLD!.",
+        file_hints=["texttools/normalize.py", "tests/test_normalize.py", "normalize_cli.py"],
+        line_hints=[9, 12, 15],
+        repair_requirements=[],
+        evidence_signature="sig-normalize-semantic-anchor",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:normalize1234",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=[
+                "test_cli_supports_keep_case_flag",
+                "test_default_normalization_lowercases_words",
+                "test_keep_case_variant_preserves_original_case",
+                "assertEqual",
+                "normalize_words_keep_case",
+            ],
+            implicated_region_hint="",
+            repair_constraints=[],
+            recent_failed_attempts=[],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py", "texttools/__init__.py"],
+            forbidden_files=["tests/test_normalize.py", "README.md"],
+        ),
+    )
+
+    hints = _repair_target_line_hints(
+        path="texttools/normalize.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert 3 in hints
+    assert 5 in hints
+    assert hints.index(3) < hints.index(8) if 8 in hints else True
 
 
 def test_compact_repair_prompt_focuses_supporting_test_lines_around_runtime_hints(tmp_path):
