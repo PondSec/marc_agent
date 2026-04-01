@@ -1305,18 +1305,13 @@ class ValidationPlanner:
         missing_features: list[str],
     ) -> tuple[list[str], list[str]]:
         text = "\n".join(part for part in [excerpt, failure_summary, str(failed_run.summary or "").strip()] if part)
-        diff_observed, diff_expected = self._assertion_diff_values(text)
-        parsed_observed, parsed_expected = self._assertion_line_values(text)
         expected: list[str] = []
         observed: list[str] = []
-        if diff_expected is not None:
-            expected.append(f"Validation should produce: {self._semantic_display_value(diff_expected)}")
-        elif parsed_expected is not None:
-            expected.append(f"Validation should produce: {self._semantic_display_value(parsed_expected)}")
-        if diff_observed is not None:
-            observed.append(f"Validation currently produces: {self._semantic_display_value(diff_observed)}")
-        elif parsed_observed is not None:
-            observed.append(f"Validation currently produces: {self._semantic_display_value(parsed_observed)}")
+        for assertion_observed, assertion_expected in self._assertion_semantic_pairs(text)[:3]:
+            if assertion_expected is not None:
+                expected.append(f"Validation should produce: {self._semantic_display_value(assertion_expected)}")
+            if assertion_observed is not None:
+                observed.append(f"Validation currently produces: {self._semantic_display_value(assertion_observed)}")
         lowered = text.lower()
         if not expected and missing_features:
             expected.append("Required validation features must be present: " + ", ".join(missing_features[:3]))
@@ -1346,25 +1341,46 @@ class ValidationPlanner:
             observed.append(observed_text)
         return self._unique_strings(expected), self._unique_strings(observed)
 
-    def _assertion_diff_values(self, text: str) -> tuple[str | None, str | None]:
+    def _assertion_semantic_pairs(self, text: str) -> list[tuple[str | None, str | None]]:
         lines = [str(raw or "").rstrip() for raw in str(text or "").splitlines()]
         if not lines:
-            return None, None
+            return []
 
+        pairs: list[tuple[str | None, str | None]] = []
         for index, raw in enumerate(lines):
             stripped = raw.strip()
-            if "AssertionError:" not in stripped or "!=" not in stripped:
+            if not stripped.startswith("AssertionError:"):
                 continue
             diff_lines = self._adjacent_assertion_diff_lines(lines, start_index=index)
             observed = self._first_semantic_diff_value(diff_lines, prefix="-")
             expected = self._first_semantic_diff_value(diff_lines, prefix="+")
-            if observed or expected:
-                return observed, expected
+            line_observed, line_expected = self._assertion_line_pair(stripped)
+            if observed is None:
+                observed = line_observed
+            if expected is None:
+                expected = line_expected
+            if observed is None and expected is None:
+                continue
+            pairs.append((observed, expected))
 
-        return (
-            self._first_semantic_diff_value(lines, prefix="-"),
-            self._first_semantic_diff_value(lines, prefix="+"),
-        )
+        if pairs:
+            return self._unique_semantic_pairs(pairs)
+
+        fallback_pairs: list[tuple[str | None, str | None]] = []
+        parsed_observed, parsed_expected = self._assertion_line_pair(str(text or ""))
+        if parsed_observed is not None or parsed_expected is not None:
+            fallback_pairs.append((parsed_observed, parsed_expected))
+        diff_observed = self._first_semantic_diff_value(lines, prefix="-")
+        diff_expected = self._first_semantic_diff_value(lines, prefix="+")
+        if diff_observed is not None or diff_expected is not None:
+            fallback_pairs.append((diff_observed, diff_expected))
+        return self._unique_semantic_pairs(fallback_pairs)
+
+    def _assertion_diff_values(self, text: str) -> tuple[str | None, str | None]:
+        pairs = self._assertion_semantic_pairs(text)
+        if pairs:
+            return pairs[0]
+        return None, None
 
     def _adjacent_assertion_diff_lines(
         self,
@@ -1432,16 +1448,23 @@ class ValidationPlanner:
 
     def _assertion_line_values(self, text: str) -> tuple[str | None, str | None]:
         for raw in str(text or "").splitlines():
-            stripped = raw.strip()
-            match = self.ASSERTION_MISMATCH_PATTERN.search(stripped)
-            if match is None:
-                match = self.ASSERTION_CONTAINMENT_PATTERN.search(stripped)
-            if match is None:
-                continue
-            observed = self._literal_or_text(match.group("observed"))
-            expected = self._literal_or_text(match.group("expected"))
-            return observed, expected
+            observed, expected = self._assertion_line_pair(raw)
+            if observed is not None or expected is not None:
+                return observed, expected
         return None, None
+
+    def _assertion_line_pair(self, text: str) -> tuple[str | None, str | None]:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return None, None
+        match = self.ASSERTION_MISMATCH_PATTERN.search(stripped)
+        if match is None:
+            match = self.ASSERTION_CONTAINMENT_PATTERN.search(stripped)
+        if match is None:
+            return None, None
+        observed = self._literal_or_text(match.group("observed"))
+        expected = self._literal_or_text(match.group("expected"))
+        return observed, expected
 
     def _semantic_display_value(self, value: str | None) -> str | None:
         if value is None:
@@ -1875,6 +1898,12 @@ class ValidationPlanner:
         if failure_type == "structural_missing_feature" and missing_features:
             return f"{target} is missing validation-required behavior or structure: {', '.join(missing_features[:3])}."
         if failure_type == "assertion_mismatch" and expected_semantics and observed_semantics:
+            if len(expected_semantics) > 1 and len(observed_semantics) > 1:
+                return (
+                    f"{target} still produces the wrong behavior across multiple validation assertions: "
+                    f"{expected_semantics[0]} but {observed_semantics[0]}; "
+                    f"{expected_semantics[1]} but {observed_semantics[1]}."
+                )
             return f"{target} still produces the wrong behavior: expected {expected_semantics[0]} but observed {observed_semantics[0]}."
         if failure_type == "runtime_argument_parsing":
             return f"{target} rejects the exercised runtime invocation instead of accepting the intended arguments."
@@ -3170,7 +3199,7 @@ class ValidationPlanner:
                         if diff_line not in focused_lines:
                             focused_lines.append(diff_line)
         if focused_lines:
-            return "\n".join(focused_lines[:8])
+            return "\n".join(self._preserve_assertion_context_at_excerpt_boundary(focused_lines, max_lines=8))
         for text in [
             str(failed_run.excerpt or "").strip(),
             *(str(item.excerpt or "").strip() for item in diagnostics),
@@ -3195,11 +3224,50 @@ class ValidationPlanner:
             return f"Validation-required features are missing: {feature_text}."
         excerpt = self._failure_excerpt(failed_run, diagnostics)
         if excerpt:
-            return excerpt[:240]
+            return self._trim_failure_summary_text(excerpt, max_chars=240)
         summary = str(failed_run.summary or "").strip()
         if summary:
             return summary[:240]
         return "Validation failed without a readable summary."
+
+    def _preserve_assertion_context_at_excerpt_boundary(
+        self,
+        lines: list[str],
+        *,
+        max_lines: int,
+    ) -> list[str]:
+        clipped = [str(line or "").rstrip() for line in lines[:max_lines]]
+        while len(clipped) < len(lines):
+            last_line = str(clipped[-1] or "").strip() if clipped else ""
+            next_line = str(lines[len(clipped)] or "").strip()
+            if not last_line or not next_line:
+                break
+            if last_line.startswith("AssertionError:") and next_line.startswith(("-", "+", "?")):
+                clipped.append(str(lines[len(clipped)] or "").rstrip())
+                continue
+            if last_line.startswith(("-", "+", "?")) and next_line.startswith(("+", "?")):
+                clipped.append(str(lines[len(clipped)] or "").rstrip())
+                continue
+            break
+        return clipped
+
+    def _trim_failure_summary_text(self, text: str, *, max_chars: int) -> str:
+        lines = [str(line or "").rstrip() for line in str(text or "").splitlines() if str(line or "").strip()]
+        if not lines:
+            return ""
+        selected: list[str] = []
+        used = 0
+        for line in lines:
+            projected = used + len(line) + (1 if selected else 0)
+            if selected and projected > max_chars:
+                break
+            if not selected and len(line) > max_chars:
+                return line[:max_chars]
+            selected.append(line)
+            used = projected
+        if selected:
+            return "\n".join(selected)
+        return str(text or "").strip()[:max_chars]
 
     def _repair_requirements(
         self,
@@ -3363,6 +3431,21 @@ class ValidationPlanner:
             if not text or text in unique:
                 continue
             unique.append(text)
+        return unique
+
+    def _unique_semantic_pairs(
+        self,
+        values: list[tuple[str | None, str | None]],
+    ) -> list[tuple[str | None, str | None]]:
+        unique: list[tuple[str | None, str | None]] = []
+        for observed, expected in values:
+            pair = (
+                str(observed).strip() if observed is not None else None,
+                str(expected).strip() if expected is not None else None,
+            )
+            if pair == (None, None) or pair in unique:
+                continue
+            unique.append(pair)
         return unique
 
     def _unique_line_hints(self, values: list[int]) -> list[int]:

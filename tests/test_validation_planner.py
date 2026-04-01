@@ -679,6 +679,75 @@ def test_validation_planner_builds_repair_brief_with_semantics_and_stable_signat
     assert evidence_a.repair_brief.failure_signature == evidence_b.repair_brief.failure_signature
 
 
+def test_validation_planner_keeps_multiple_assertion_semantic_pairs_in_repair_brief(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text):\n    return text\n\n"
+        "def normalize_words_keep_case(text):\n    return text\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_normalize.py"
+    test_path.write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Repair the normalize keep-case workflow.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="modify"),
+            FileChangeRecord(path="normalize_cli.py", operation="modify"),
+            FileChangeRecord(path="texttools/__init__.py", operation="modify"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 2.",
+        excerpt=(
+            "FAIL: test_cli_supports_keep_case_flag (tests.test_normalize.NormalizeTests.test_cli_supports_keep_case_flag)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 20, in test_cli_supports_keep_case_flag\n'
+            "    self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n"
+            "AssertionError: 'Hello WORLD!' != 'Hello WORLD'\n"
+            "- Hello WORLD!\n"
+            "+ Hello WORLD\n\n"
+            "FAIL: test_normalize_words_still_lowercases_by_default (tests.test_normalize.NormalizeTests.test_normalize_words_still_lowercases_by_default)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 24, in test_normalize_words_still_lowercases_by_default\n'
+            "    self.assertEqual(normalize_words('Hello WORLD!'), 'hello world')\n"
+            "AssertionError: 'hello world!' != 'hello world'\n"
+            "- hello world!\n"
+            "+ hello world\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.expected_semantics == [
+        "Validation should produce: Hello WORLD",
+        "Validation should produce: hello world",
+    ]
+    assert evidence.repair_brief.observed_semantics == [
+        "Validation currently produces: Hello WORLD!",
+        "Validation currently produces: hello world!",
+    ]
+    assert "multiple validation assertions" in evidence.repair_brief.root_cause_summary
+
+
 def test_validation_planner_repair_brief_tracks_recent_failed_attempts_for_same_signature(tmp_path):
     planner = ValidationPlanner()
     pkg = tmp_path / "greet_cli"
