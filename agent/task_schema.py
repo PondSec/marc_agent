@@ -129,12 +129,32 @@ class TaskUnderstanding(StrictModel):
             item.step = index
         self.execution_plan = ordered_steps
 
+        if self._should_clear_inconsistent_clarification():
+            self.needs_clarification = False
+            self.clarification_questions = []
+        elif self.needs_clarification:
+            if self.recommended_mode != "clarify":
+                self.recommended_mode = "clarify"
+            if self.confidence > 0.85:
+                self.confidence = 0.85
+
         if self.needs_clarification and not self.clarification_questions:
             raise ValueError("clarification_questions must be present when needs_clarification is true")
-        if self.needs_clarification and self.confidence > 0.85:
-            raise ValueError("high confidence tasks should not request clarification")
         if not self.original_request:
             raise ValueError("original_request is required")
         if not self.interpreted_goal:
             raise ValueError("interpreted_goal is required")
         return self
+
+    def _should_clear_inconsistent_clarification(self) -> bool:
+        if not self.needs_clarification:
+            return False
+        if self.recommended_mode == "clarify":
+            return False
+        if self.ambiguity_level != "low":
+            return False
+        if self.risk_level == "high":
+            return False
+        if float(self.confidence or 0.0) < 0.8:
+            return False
+        return bool(self.target_artifacts or self.execution_plan or self.constraints)

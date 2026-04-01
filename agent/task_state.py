@@ -490,6 +490,10 @@ class TaskState(StrictModel):
         self.execution_outline = _compact_strings(self.execution_outline, limit=6)
         self.clarification_questions = _compact_strings(self.clarification_questions, limit=3)
         self.next_best_action = self.next_best_action or self.next_action
+        if self._should_clear_inconsistent_clarification():
+            self.needs_clarification = False
+            self.clarification_questions = []
+            self.missing_info = []
         if self._should_prefer_feature_bootstrap():
             self.current_user_intent = "implement"
             self.execution_strategy = "feature_implementation"
@@ -537,6 +541,21 @@ class TaskState(StrictModel):
         if not self.output_expectation:
             raise ValueError("output_expectation is required")
         return self
+
+    def _should_clear_inconsistent_clarification(self) -> bool:
+        if not self.needs_clarification:
+            return False
+        if (self.next_best_action or self.next_action) == "clarify":
+            return False
+        if self.ambiguity_level != "low":
+            return False
+        if self.risk_level == "high":
+            return False
+        if float(self.confidence or 0.0) < 0.8:
+            return False
+        if not (self.active_artifacts or self.target_artifacts or self.verification_target):
+            return False
+        return True
 
     def _should_prefer_feature_bootstrap(self) -> bool:
         evidence_kinds = {item.kind for item in self.evidence}

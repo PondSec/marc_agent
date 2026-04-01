@@ -1906,6 +1906,83 @@ def test_task_state_updater_keeps_empty_workspace_create_requests_out_of_debug_f
     assert route.action_plan[0].action.value == "create_artifact"
 
 
+def test_task_state_updater_clears_spurious_clarification_from_confident_executable_payload(tmp_path):
+    payload = {
+        "latest_user_turn": "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, and run python -m unittest tests.test_normalize before finishing.",
+        "root_goal": "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, and run python -m unittest tests.test_normalize before finishing.",
+        "active_goal": "Implement the keep_case option in texttools/normalize.py and its support in normalize_cli.py.",
+        "goal_relation": "continue",
+        "output_expectation": "Updated code with the new keep_case option and updated CLI support.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "tests.test_normalize",
+        "target_artifacts": [
+            {"path": "texttools/normalize.py", "name": "normalize_words", "kind": "function", "role": "primary_target", "confidence": 1.0},
+            {"path": "normalize_cli.py", "name": "main", "kind": "function", "role": "supporting_context", "confidence": 1.0},
+        ],
+        "active_artifacts": [
+            {"path": "texttools/normalize.py", "name": "normalize_words", "kind": "function", "role": "primary_target", "confidence": 1.0},
+            {"path": "normalize_cli.py", "name": "main", "kind": "function", "role": "supporting_context", "confidence": 1.0},
+        ],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": ["specific implementation details for the keep_case option"],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.9,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": [],
+        "needs_clarification": True,
+        "clarification_questions": [
+            "What should the behavior of the keep_case option be? Should it preserve original case or convert to lowercase?"
+        ],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+    understanding = task_state.to_task_understanding()
+
+    assert task_state.needs_clarification is False
+    assert task_state.clarification_questions == []
+    assert task_state.missing_info == []
+    assert understanding.needs_clarification is False
+    assert route.needs_clarification is False
+
+
+def test_task_understanding_clears_spurious_clarification_for_confident_executable_result():
+    understanding = TaskUnderstanding.model_validate(
+        understanding_payload(
+            "Add a keep_case option to texttools/normalize.py and normalize_cli.py.",
+            interpreted_goal="Implement keep_case support in the normalization library and CLI.",
+            intent_category="build",
+            recommended_mode="create",
+            confidence=0.9,
+            target_artifacts=[
+                {
+                    "path": "texttools/normalize.py",
+                    "name": "normalize_words",
+                    "kind": "function",
+                    "role": "primary_target",
+                    "confidence": 1.0,
+                }
+            ],
+            needs_clarification=True,
+            clarification_questions=["Should keep_case preserve original case or convert to lowercase?"],
+        )
+    )
+
+    assert understanding.needs_clarification is False
+    assert understanding.clarification_questions == []
+    assert understanding.recommended_mode == "create"
+
+
 def test_task_state_updater_reconciles_explain_misclassification_for_existing_repo_feature_request(tmp_path):
     snapshot = WorkspaceSnapshot(
         root=str(tmp_path),
