@@ -3199,19 +3199,39 @@ def _artifact_scoped_focus(
         general_constraints.append(constraint)
 
     for requirement_sentence in _derived_requirement_sentences(route, session):
-        current_score = _scope_relevance_score(requirement_sentence, current_markers)
-        other_score = _scope_relevance_score(requirement_sentence, other_markers)
-        if current_score > 0 and current_score >= other_score:
+        sentence_current_score = _scope_relevance_score(requirement_sentence, current_markers)
+        sentence_other_score = _scope_relevance_score(requirement_sentence, other_markers)
+        sentence_explicit_target_hits = 0
+        for explicit_target in explicit_targets:
+            if _explicit_target_reference_hit(requirement_sentence, explicit_target):
+                sentence_explicit_target_hits += 1
+        if sentence_explicit_target_hits <= 1:
+            if sentence_current_score > 0 and sentence_current_score >= sentence_other_score:
+                for requirement in _split_requirement_clauses(requirement_sentence):
+                    if requirement not in current_requirements:
+                        current_requirements.append(requirement)
+                continue
+            if sentence_other_score > sentence_current_score:
+                for requirement in _split_requirement_clauses(requirement_sentence):
+                    if requirement not in other_requirements:
+                        other_requirements.append(requirement)
+                continue
             for requirement in _split_requirement_clauses(requirement_sentence):
+                if requirement not in general_constraints:
+                    general_constraints.append(requirement)
+            continue
+        clauses = _split_requirement_clauses(requirement_sentence)
+        for requirement in clauses:
+            current_score = _scope_relevance_score(requirement, current_markers)
+            other_score = _scope_relevance_score(requirement, other_markers)
+            if current_score > 0 and current_score >= other_score:
                 if requirement not in current_requirements:
                     current_requirements.append(requirement)
-            continue
-        if other_score > current_score:
-            for requirement in _split_requirement_clauses(requirement_sentence):
+                continue
+            if other_score > current_score:
                 if requirement not in other_requirements:
                     other_requirements.append(requirement)
-            continue
-        for requirement in _split_requirement_clauses(requirement_sentence):
+                continue
             if requirement not in general_constraints:
                 general_constraints.append(requirement)
 
@@ -3260,6 +3280,10 @@ def _artifact_scoped_focus(
             )
             if fallback:
                 current_requirements.append(fallback)
+
+    current_requirements = _dedupe_requirement_items(current_requirements)
+    other_requirements = _dedupe_requirement_items(other_requirements)
+    general_constraints = _dedupe_requirement_items(general_constraints)
 
     return {
         "target_path": path,
@@ -4220,6 +4244,53 @@ def _scope_relevance_score(text: str, markers: set[str]) -> int:
         if candidate in normalized:
             score += 3 if "/" in candidate or "." in candidate else 1
     return score
+
+
+def _explicit_target_reference_hit(text: str, explicit_target: str) -> bool:
+    normalized_text = str(text or "").strip().lower()
+    normalized_target = str(explicit_target or "").strip().replace("\\", "/").lower()
+    if not normalized_text or not normalized_target:
+        return False
+    candidates = [normalized_target]
+    basename = Path(normalized_target).name.lower()
+    if basename and basename not in candidates:
+        candidates.append(basename)
+    stem = Path(normalized_target).stem.lower()
+    if stem and len(stem) >= 4 and stem not in candidates:
+        candidates.append(stem)
+    return any(candidate in normalized_text for candidate in candidates if candidate)
+
+
+def _dedupe_requirement_items(items: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen_keys: set[str] = set()
+    for item in items:
+        cleaned = str(item or "").strip()
+        if not cleaned:
+            continue
+        key = _requirement_dedupe_key(cleaned)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(cleaned)
+    return deduped
+
+
+def _requirement_dedupe_key(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"[^a-z0-9_./-]+", " ", normalized)
+    tokens: list[str] = []
+    for raw in normalized.split():
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        if token.isalpha() and len(token) > 4:
+            if token.endswith("s") and not token.endswith("ss") and len(token) >= 6:
+                token = token[:-1]
+        tokens.append(token)
+    return " ".join(tokens)
 
 
 def _repair_rules(repair_strategy: str | None) -> str:

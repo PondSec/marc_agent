@@ -3169,6 +3169,85 @@ def test_artifact_scoped_focus_adds_test_contract_requirement_for_python_module(
     assert any("normalize_words_keep_case" in item for item in focus["current_write_requirements"])
 
 
+def test_artifact_scoped_focus_keeps_file_local_clause_for_multi_target_request(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    normalize_current = "def normalize_words(text):\n    return text.lower()\n"
+    (pkg / "normalize.py").write_text(normalize_current, encoding="utf-8")
+    (pkg / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    (tmp_path / "normalize_cli.py").write_text("from texttools import normalize_words\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, "
+            "update README.md if needed, and run python -m unittest tests.test_normalize before finishing."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the keep-case feature."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "texttools/normalize.py",
+        current_content=normalize_current,
+    )
+
+    assert "Add a keep_case option to texttools/normalize.py" in focus["current_write_requirements"]
+    assert "support it in normalize_cli.py" in focus["other_pending_requirements"]
+    assert "update README.md if needed" in focus["other_pending_requirements"]
+
+
+def test_proposed_update_review_prompt_surfaces_file_local_clause_for_multi_target_request(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    normalize_current = "def normalize_words(text):\n    return text.lower()\n"
+    (pkg / "normalize.py").write_text(normalize_current, encoding="utf-8")
+    (pkg / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    (tmp_path / "normalize_cli.py").write_text("from texttools import normalize_words\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, "
+            "update README.md if needed, and run python -m unittest tests.test_normalize before finishing."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the keep-case feature."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        supporting_artifact_context="tests/test_normalize.py expects keep_case support.",
+        current_excerpt=normalize_current,
+        proposed_excerpt=(
+            "def normalize_words(text, *, keep_case=False):\n"
+            "    return text if keep_case else text.lower()\n"
+        ),
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert '"current_write_requirements": ["Add a keep_case option to texttools/normalize.py"' in prompt
+
+
 def test_generate_content_prompt_adds_test_contract_requirement_for_cli_entrypoint(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
