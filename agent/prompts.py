@@ -562,6 +562,9 @@ def generate_content_prompt(
             f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             f"Related file hints: {related_context}",
         ]
+        file_requirement_summary = _file_local_requirement_summary(file_focus)
+        if file_requirement_summary:
+            sections.append(file_requirement_summary)
         diagnostic_context = _diagnostic_context(session)
         if diagnostic_context:
             sections.append(f"Diagnostic context: {diagnostic_context}")
@@ -609,6 +612,7 @@ def generate_content_prompt(
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     sections = [
         "Produce the full file content for the requested task.",
         f"Latest user request: {_trim_text(session.task, 700)}",
@@ -618,13 +622,16 @@ def generate_content_prompt(
         f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Target path: {path}",
         f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
-        f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
+        f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
         f"Workspace context: {json.dumps(_compact_workspace_snapshot(session.workspace_snapshot, detail='decision'), ensure_ascii=False)}",
         f"Inspected context: {_inspected_context(session)}",
         f"Diagnostic context: {_diagnostic_context(session)}",
         f"Follow-up context: {json.dumps(_compact_follow_up_context(session), ensure_ascii=False)}",
         _single_file_boundary_instruction(path, route.entities.target_paths),
     ]
+    file_requirement_summary = _file_local_requirement_summary(file_focus)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
     if repair_context is not None:
         sections.extend(
             [
@@ -1727,6 +1734,17 @@ def _compact_generation_focus(
         "constraints": (task_state.constraints[:4] if task_state is not None else []) or route.entities.constraints[:4],
         "related_targets": related_targets,
     }
+
+
+def _file_local_requirement_summary(file_focus: dict[str, object], *, limit: int = 3) -> str:
+    items = [
+        _trim_text(str(item or "").strip(), 180)
+        for item in file_focus.get("current_write_requirements", [])[:limit]
+        if str(item or "").strip()
+    ]
+    if not items:
+        return ""
+    return "File-local requirements: " + "; ".join(items)
 
 
 def _compact_repair_file_focus(
@@ -3066,6 +3084,14 @@ def _artifact_scoped_focus(
         if candidate not in current_requirements:
             current_requirements.append(candidate)
 
+    for candidate in _cross_file_consistency_requirements(
+        session,
+        path=path,
+        current_content=current_content,
+    ):
+        if candidate not in current_requirements:
+            current_requirements.append(candidate)
+
     if not current_requirements:
         if len(explicit_targets) <= 1 or current_artifact_role == "primary_target" or is_explicit_target:
             fallback = _trim_text(
@@ -3088,6 +3114,116 @@ def _artifact_scoped_focus(
         "other_pending_requirements": other_requirements[:4],
         "general_constraints": general_constraints[:4],
     }
+
+
+def _cross_file_consistency_requirements(
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None,
+) -> list[str]:
+    snapshot = session.workspace_snapshot if session is not None else None
+    normalized_path = str(path or "").strip().replace("\\", "/")
+    if snapshot is None or not normalized_path.endswith(".py"):
+        return []
+    source = str(current_content or "")
+    if not source.strip():
+        return []
+    symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+    if not symbol_index:
+        return []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    requirements: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported_symbols = [
+            str(alias.name or "").strip()
+            for alias in node.names
+            if str(alias.name or "").strip() and alias.name != "*"
+        ]
+        if not imported_symbols:
+            continue
+        provider_candidates = _resolve_import_from_provider_paths(
+            normalized_path,
+            module=str(node.module or "").strip(),
+            level=int(getattr(node, "level", 0) or 0),
+            snapshot=snapshot,
+        )
+        for provider_path in provider_candidates:
+            available_symbols = [
+                str(symbol or "").strip()
+                for symbol in list(symbol_index.get(provider_path, []) or [])
+                if str(symbol or "").strip()
+            ]
+            if not available_symbols:
+                continue
+            available_set = {symbol.lower() for symbol in available_symbols}
+            missing_symbols = [
+                symbol
+                for symbol in imported_symbols
+                if symbol.lower() not in available_set
+            ]
+            if not missing_symbols:
+                continue
+            symbol_preview = ", ".join(available_symbols[:4])
+            missing_preview = ", ".join(missing_symbols[:3])
+            requirement = (
+                f"Keep {normalized_path} consistent with {provider_path}: this file imports "
+                f"{missing_preview}, but the known symbols in {provider_path} are {symbol_preview}. "
+                "Reconcile that broken import or export path in this file with the smallest coherent change."
+            )
+            trimmed = _trim_text(requirement, 220)
+            if trimmed not in requirements:
+                requirements.append(trimmed)
+    return requirements[:4]
+
+
+def _resolve_import_from_provider_paths(
+    current_path: str,
+    *,
+    module: str,
+    level: int,
+    snapshot: WorkspaceSnapshot,
+) -> list[str]:
+    known_paths = {
+        str(item or "").strip().replace("\\", "/")
+        for item in [
+            *list(getattr(snapshot, "important_files", []) or []),
+            *list(getattr(snapshot, "focus_files", []) or []),
+            *list(getattr(snapshot, "test_files", []) or []),
+            *(getattr(snapshot, "symbol_index", {}) or {}).keys(),
+        ]
+        if str(item or "").strip()
+    }
+    if not known_paths:
+        return []
+
+    module_parts = [part for part in str(module or "").split(".") if part]
+    current_parent_parts = list(Path(current_path).parent.parts)
+    candidate_modules: list[list[str]] = []
+    if level > 0:
+        ascend = max(level - 1, 0)
+        if ascend <= len(current_parent_parts):
+            base_parts = current_parent_parts[: len(current_parent_parts) - ascend]
+            candidate_modules.append([*base_parts, *module_parts])
+    elif module_parts:
+        candidate_modules.append(module_parts)
+
+    resolved: list[str] = []
+    for parts in candidate_modules:
+        if not parts:
+            continue
+        module_path = "/".join(parts)
+        for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
+            normalized_candidate = candidate.replace("\\", "/")
+            if normalized_candidate in known_paths and normalized_candidate not in resolved:
+                resolved.append(normalized_candidate)
+    return resolved[:4]
 
 
 def _explicit_generation_constraints(
