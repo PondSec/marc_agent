@@ -2234,6 +2234,14 @@ class Planner:
             repair_context,
             self._unique_paths(candidates),
         )
+        if repair_context is not None:
+            non_documentation_candidates = [
+                candidate
+                for candidate in ordered_candidates
+                if not self.validation_planner._is_documentation_path(candidate)
+            ]
+            if non_documentation_candidates:
+                ordered_candidates = non_documentation_candidates
         if (
             repair_context is not None
             and self._runtime_failure_needs_test_context_first(repair_context)
@@ -2559,6 +2567,11 @@ class Planner:
     ) -> list[str]:
         if repair_context.verification_scope != "runtime":
             return candidates
+        documentation_like = [
+            candidate
+            for candidate in candidates
+            if self.validation_planner._is_documentation_path(candidate)
+        ]
         support_candidates = [
             candidate
             for candidate in candidates
@@ -2567,7 +2580,11 @@ class Planner:
         implementation_like = [
             candidate
             for candidate in candidates
-            if candidate not in support_candidates and not self.validation_planner._is_test_path(candidate)
+            if (
+                candidate not in support_candidates
+                and candidate not in documentation_like
+                and not self.validation_planner._is_test_path(candidate)
+            )
         ]
         validation_like = [
             candidate
@@ -2575,15 +2592,15 @@ class Planner:
             if self.validation_planner._is_test_path(candidate)
         ]
         if validation_like and self._runtime_failure_needs_test_context_first(repair_context):
-            return [*validation_like, *implementation_like, *support_candidates]
+            return [*validation_like, *implementation_like, *support_candidates, *documentation_like]
         if support_candidates and self._runtime_support_candidates_should_lead(
             support_candidates,
             repair_context,
         ):
-            return [*support_candidates, *implementation_like, *validation_like]
+            return [*support_candidates, *implementation_like, *validation_like, *documentation_like]
         if support_candidates:
-            return [*implementation_like, *support_candidates, *validation_like]
-        return [*implementation_like, *validation_like]
+            return [*implementation_like, *support_candidates, *validation_like, *documentation_like]
+        return [*implementation_like, *validation_like, *documentation_like]
 
     def _runtime_failure_needs_test_context_first(
         self,

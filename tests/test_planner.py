@@ -12471,6 +12471,161 @@ def test_compact_runtime_repair_prompt_anchors_direct_python_script_execution(tm
     assert "The failing command runs this file directly by script path." in prompt
 
 
+def test_prioritize_runtime_target_categories_demotes_documentation_for_runtime_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_report",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["scripts/build_duplicates.py", "README.md", "tests/test_report.py"],
+        summary="Validation command exited with 1.",
+        excerpt="CalledProcessError: scripts/build_duplicates.py exited with status 1.",
+        failure_summary="The runtime script still exits non-zero.",
+        file_hints=["scripts/build_duplicates.py", "README.md", "tests/test_report.py"],
+        repair_requirements=[
+            "Change scripts/build_duplicates.py so the failing runtime or test path can complete successfully."
+        ],
+        evidence_signature="sig-runtime-doc-demotion",
+    )
+
+    ordered = planner._prioritize_runtime_target_categories(
+        ["README.md", "scripts/build_duplicates.py", "tests/test_report.py"],
+        repair_context,
+    )
+
+    assert ordered[:2] == ["scripts/build_duplicates.py", "tests/test_report.py"]
+    assert ordered[-1] == "README.md"
+
+
+def test_runtime_repair_target_after_failed_validation_skips_documentation_after_technical_noops(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words\n",
+        encoding="utf-8",
+    )
+    normalize_path = pkg / "normalize.py"
+    normalize_path.write_text(
+        "def normalize_words(text, *, keep_case=False):\n"
+        "    return text.split()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# texttools\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_normalize.py"
+    test_path.write_text(
+        "from texttools import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Add keep_case support and finish the failing runtime repair.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": [
+                    "texttools/normalize.py",
+                    "texttools/__init__.py",
+                    "normalize_cli.py",
+                    "README.md",
+                    "tests/test_normalize.py",
+                ],
+                "focus_files": [
+                    "texttools/normalize.py",
+                    "texttools/__init__.py",
+                    "normalize_cli.py",
+                    "tests/test_normalize.py",
+                ],
+                "test_files": ["tests/test_normalize.py"],
+                "likely_commands": ["python -m unittest tests.test_normalize"],
+            }
+        ),
+        validation_status="failed",
+        edit_generation=2,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_normalize",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_normalize"],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the keep-case implementation."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_normalize and finish only when it passes.",
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="write"),
+            FileChangeRecord(path="texttools/__init__.py", operation="write"),
+            FileChangeRecord(path="normalize_cli.py", operation="write"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=2,
+        iteration=12,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "ImportError: Failed to import test module: test_normalize\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 1, in <module>\n'
+            "    from texttools import normalize_words, normalize_words_keep_case\n"
+            "ImportError: cannot import name 'normalize_words_keep_case' "
+            f"from 'texttools.normalize' ({normalize_path})\n"
+            "FAILED (errors=1)\n"
+        ),
+    )
+    session.validation_runs.append(failed_run)
+    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
+    assert repair_context is not None
+    session.active_repair_context = repair_context
+    for path in ("texttools/normalize.py", "texttools/__init__.py", "normalize_cli.py"):
+        session.repair_history.append(
+            RepairAttemptRecord(
+                artifact_path=path,
+                validation_command=repair_context.command,
+                verification_scope=repair_context.verification_scope,
+                strategy="validation_targeted",
+                result="no_effective_change",
+                reason="file hash unchanged",
+                evidence_signature=repair_context.evidence_signature,
+                failure_signature=getattr(repair_context.repair_brief, "failure_signature", None),
+                iteration=12,
+            )
+        )
+
+    next_target = planner._repair_target_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    assert next_target == "texttools/normalize.py"
+
+
 def test_review_guided_retry_can_escalate_to_full_for_broad_updates(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[
