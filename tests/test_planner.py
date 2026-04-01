@@ -11039,7 +11039,7 @@ def test_review_generated_update_blocks_when_model_backed_review_times_out(tmp_p
     assert any("deterministic fallback checks alone" in issue for issue in review.blocking_issues)
 
 
-def test_primary_compact_repair_review_uses_relaxed_runtime_budget(tmp_path, monkeypatch):
+def test_primary_compact_repair_review_uses_compact_repair_runtime_budget(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         json_payloads=[
             {
@@ -11122,7 +11122,7 @@ def test_primary_compact_repair_review_uses_relaxed_runtime_budget(tmp_path, mon
     assert kwargs["model"] == "qwen2.5-coder:7b"
     assert kwargs["num_ctx"] == 2048
     assert kwargs["timeout"] == 60
-    assert kwargs["total_timeout"] == 180
+    assert kwargs["total_timeout"] == 210
     assert kwargs["strict_timeouts"] is False
 
 

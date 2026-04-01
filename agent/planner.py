@@ -7351,8 +7351,14 @@ class Planner:
                 # treating the review like a short strict-timeout hop when it is the same
                 # model that just needed a longer warm start for generation.
                 if capability_tier == "tier_a":
-                    timeout = max(self._llm_timeout(60), 60)
-                    total_timeout = max(self._llm_timeout(180), 180)
+                    if repair_review:
+                        timeout, total_timeout = self._content_generation_time_budget(
+                            prompt_variant="compact",
+                            repair_context=session.active_repair_context,
+                        )
+                    else:
+                        timeout = max(self._llm_timeout(60), 60)
+                        total_timeout = max(self._llm_timeout(180), 180)
                 else:
                     timeout = max(self._llm_timeout(25), 25)
                     total_timeout = max(timeout + 20, 45)
