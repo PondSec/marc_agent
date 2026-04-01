@@ -983,6 +983,27 @@ def test_validation_planner_prefers_library_target_for_behavioral_runtime_failur
         task="Repair the wordaudit runtime flow.",
         workspace_root=str(tmp_path),
         edit_generation=1,
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=4,
+            language_counts={"python": 4},
+            top_directories=["wordaudit", "scripts", "tests"],
+            important_files=["wordaudit/report.py", "scripts/build_duplicates.py", "tests/test_report.py"],
+            focus_files=["wordaudit/report.py", "scripts/build_duplicates.py"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=["tests/test_report.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["scripts/build_duplicates.py"],
+            repo_map=[],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small library plus script wrapper for duplicate-word reporting.",
+        ),
         task_state=TaskState(
             latest_user_turn="Fix the duplicate-word reporting workflow in the library and script.",
             root_goal="Repair the wordaudit runtime flow.",
@@ -1025,6 +1046,104 @@ def test_validation_planner_prefers_library_target_for_behavioral_runtime_failur
     assert evidence.repair_brief.failure_type == "assertion_mismatch"
     assert evidence.repair_brief.primary_target == "wordaudit/report.py"
     assert "scripts/build_duplicates.py" in evidence.repair_brief.allowed_files
+
+
+def test_validation_planner_prefers_entrypoint_target_for_assertion_only_runtime_output_failures(tmp_path):
+    planner = ValidationPlanner()
+    package_dir = tmp_path / "texttools"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    (package_dir / "normalize.py").write_text(
+        "def normalize_words(text, lowercase=True, keep_case=False):\n"
+        "    return text.split() if keep_case else text.lower().split()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    return normalize_words('Hello WORLD', keep_case=True)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# texttools\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_normalize.py"
+    test_path.write_text("pass\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Add a keep_case option and repair the failing normalize runtime path.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=5,
+            language_counts={"python": 4, "markdown": 1},
+            top_directories=["texttools", "tests"],
+            important_files=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+            focus_files=["texttools/normalize.py", "normalize_cli.py"],
+            file_briefs={},
+            manifests=["README.md"],
+            configs=[],
+            test_files=["tests/test_normalize.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["normalize_cli.py"],
+            repo_map=[],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small text normalization project with helper module, CLI wrapper, README, and tests.",
+        ),
+        task_state=TaskState(
+            latest_user_turn="Add keep_case support to the text normalization workflow.",
+            root_goal="Extend the normalization workflow safely.",
+            active_goal="Implement keep_case support in the provider and CLI.",
+            goal_relation="continue",
+            output_expectation="Updated module, CLI, and docs with passing tests.",
+            verification_target="python -m unittest tests.test_normalize",
+            next_action="modify",
+            target_artifacts=[
+                {"path": "texttools/normalize.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+                {"path": "normalize_cli.py", "kind": "file", "role": "primary_target", "confidence": 0.98},
+                {"path": "README.md", "kind": "file", "role": "supporting_context", "confidence": 0.5},
+                {"path": "tests/test_normalize.py", "kind": "test", "role": "validation_target", "confidence": 1.0},
+            ],
+        ),
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="modify"),
+            FileChangeRecord(path="normalize_cli.py", operation="modify"),
+            FileChangeRecord(path="texttools/__init__.py", operation="modify"),
+        ]
+    )
+
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_cli_supports_keep_case_flag (tests.test_normalize.NormalizeTests.test_cli_supports_keep_case_flag)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 20, in test_cli_supports_keep_case_flag\n'
+            "    self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n"
+            "AssertionError: '' != 'Hello WORLD'\n"
+            "+ Hello WORLD\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.artifact_paths[0] == "normalize_cli.py"
+    assert evidence.repair_brief.primary_target == "normalize_cli.py"
+    assert evidence.repair_brief.locked_target == "normalize_cli.py"
+    assert evidence.repair_brief.observed_semantics == ["Validation currently produces: ''"]
+    assert evidence.repair_requirements[0].startswith("Change normalize_cli.py")
 
 
 def test_validation_planner_requires_bootstrap_reset_after_two_same_failures_without_behavior_change():

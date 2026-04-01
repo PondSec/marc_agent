@@ -865,6 +865,12 @@ class ValidationPlanner:
             failed_run,
             runtime_failure_text,
         )
+        entrypoint_assertion_target = self._entrypoint_assertion_runtime_target(
+            session,
+            failed_run,
+            traceback_frames=traceback_frames,
+            candidate_paths=artifact_paths,
+        )
         implicated_symbols = (
             self._implicated_symbols_from_failure_text(runtime_failure_text, runtime_failure_text)
             if failed_run.verification_scope == "runtime"
@@ -875,7 +881,9 @@ class ValidationPlanner:
             session,
             implicated_symbols,
         )
-        artifact_paths = self._unique_paths([content_assertion_target, *artifact_paths, *symbol_resolved_paths])
+        artifact_paths = self._unique_paths(
+            [content_assertion_target, entrypoint_assertion_target, *artifact_paths, *symbol_resolved_paths]
+        )
         failure_scoped_paths = self._failure_scoped_workspace_paths(
             session,
             failed_run,
@@ -891,7 +899,7 @@ class ValidationPlanner:
             prefer_test_runtime_target=prefer_test_runtime_target,
             prefer_content_runtime_target=content_assertion_target is not None,
         )
-        artifact_paths = self._unique_paths([content_assertion_target, *artifact_paths])
+        artifact_paths = self._unique_paths([content_assertion_target, entrypoint_assertion_target, *artifact_paths])
         missing_unittest_package_inits = self._missing_unittest_package_inits(
             session,
             failed_run,
@@ -1263,14 +1271,14 @@ class ValidationPlanner:
         parsed_observed, parsed_expected = self._assertion_line_values(text)
         expected: list[str] = []
         observed: list[str] = []
-        if diff_expected:
-            expected.append(f"Validation should produce: {diff_expected}")
-        elif parsed_expected:
-            expected.append(f"Validation should produce: {parsed_expected}")
-        if diff_observed:
-            observed.append(f"Validation currently produces: {diff_observed}")
-        elif parsed_observed:
-            observed.append(f"Validation currently produces: {parsed_observed}")
+        if diff_expected is not None:
+            expected.append(f"Validation should produce: {self._semantic_display_value(diff_expected)}")
+        elif parsed_expected is not None:
+            expected.append(f"Validation should produce: {self._semantic_display_value(parsed_expected)}")
+        if diff_observed is not None:
+            observed.append(f"Validation currently produces: {self._semantic_display_value(diff_observed)}")
+        elif parsed_observed is not None:
+            observed.append(f"Validation currently produces: {self._semantic_display_value(parsed_observed)}")
         lowered = text.lower()
         if not expected and missing_features:
             expected.append("Required validation features must be present: " + ", ".join(missing_features[:3]))
@@ -1397,6 +1405,11 @@ class ValidationPlanner:
             return observed, expected
         return None, None
 
+    def _semantic_display_value(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return "''" if value == "" else value
+
     def _single_changed_content_assertion_target(
         self,
         session: SessionState,
@@ -1424,6 +1437,95 @@ class ValidationPlanner:
         if not lowered:
             return False
         return any(marker in lowered for marker in self.NON_ASSERT_RUNTIME_ERROR_MARKERS)
+
+    def _entrypoint_assertion_runtime_target(
+        self,
+        session: SessionState,
+        failed_run: ValidationRunRecord,
+        *,
+        traceback_frames: list[tuple[str, int]] | None = None,
+        candidate_paths: list[str],
+    ) -> str | None:
+        if failed_run.verification_scope != "runtime" or self._no_tests_executed(failed_run):
+            return None
+        failure_text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        )
+        lowered = failure_text.lower()
+        if "assertionerror" not in lowered or ("!=" not in failure_text and "not found in" not in lowered):
+            return None
+        frames = traceback_frames if traceback_frames is not None else self._traceback_workspace_frames(session, failed_run)
+        if any(path and not self._is_test_path(path) for path, _line in frames):
+            return None
+
+        snapshot = session.workspace_snapshot
+        entrypoints = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "entrypoints", [])
+            if str(path or "").strip()
+        }
+        services = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "service_files", [])
+            if str(path or "").strip()
+        }
+        if not entrypoints and not services:
+            return None
+
+        task_primary_targets = {
+            str(getattr(artifact, "path", "") or "").strip()
+            for artifact in getattr(session.task_state, "target_artifacts", []) or []
+            if str(getattr(artifact, "path", "") or "").strip()
+            and str(getattr(artifact, "role", "") or "").strip() == "primary_target"
+        }
+        changed_targets = {
+            str(item.path or "").strip()
+            for item in session.changed_files
+            if str(item.path or "").strip()
+        }
+        implementation_candidates = [
+            path
+            for path in self._unique_paths(candidate_paths)
+            if path
+            and not self._is_test_path(path)
+            and not self._is_documentation_path(path)
+            and Path(path).name.lower() != "__init__.py"
+        ]
+        if len(implementation_candidates) < 2:
+            return None
+
+        def score(path: str) -> tuple[int, int, int, int]:
+            return (
+                1 if path in entrypoints else 0,
+                1 if path in services else 0,
+                1 if path in task_primary_targets else 0,
+                1 if path in changed_targets else 0,
+            )
+
+        current = implementation_candidates[0]
+        scored_candidates = sorted(
+            implementation_candidates,
+            key=lambda path: (
+                -score(path)[0],
+                -score(path)[1],
+                -score(path)[2],
+                -score(path)[3],
+                path,
+            ),
+        )
+        best = scored_candidates[0]
+        current_score = score(current)
+        best_score = score(best)
+        if best == current or best_score <= current_score:
+            return None
+        if len(scored_candidates) > 1 and score(scored_candidates[1]) == best_score:
+            return None
+        return best
 
     def _literal_or_text(self, raw: str | None) -> str | None:
         text = str(raw or "").strip()
