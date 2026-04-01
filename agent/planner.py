@@ -7125,7 +7125,7 @@ class Planner:
         }
         if len(unresolved_competing_scope) > 1:
             return False
-        if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 2:
+        if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
             return False
 
         changed_line_count = self._compact_repair_change_line_count(
