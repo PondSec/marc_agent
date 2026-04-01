@@ -1259,6 +1259,18 @@ def _compact_semantic_start_memory_context(session: SessionState | None) -> dict
     memory_context = session.memory_context
     if memory_context is None:
         return payload
+    request = getattr(memory_context, "request", None)
+    project_only_bootstrap = (
+        session.task_state is None
+        and session.task_understanding is None
+        and session.router_result is None
+        and session.active_repair_context is None
+        and not session.plan
+        and not session.tool_calls
+        and not session.changed_files
+        and not session.diagnostics
+        and list(getattr(request, "include_types", []) or []) == ["project"]
+    )
 
     include_persistent = _should_include_persistent_memory(memory_context)
     has_repo_map_signal = bool(
@@ -1266,7 +1278,7 @@ def _compact_semantic_start_memory_context(session: SessionState | None) -> dict
         or getattr(memory_context, "suggested_symbols", None)
         or getattr(memory_context, "suggested_files", None)
     )
-    if memory_context.recall_brief:
+    if memory_context.recall_brief and not project_only_bootstrap:
         payload["recall"] = _trim_text(memory_context.recall_brief, 220)
     if not include_persistent and not has_repo_map_signal:
         return payload
@@ -1274,8 +1286,12 @@ def _compact_semantic_start_memory_context(session: SessionState | None) -> dict
     if memory_context.summary and memory_context.summary != "No relevant persistent memory selected.":
         payload["retrieval_summary"] = _trim_text(memory_context.summary, 260)
 
+    selected_items = list(memory_context.selected)
+    if project_only_bootstrap:
+        selected_items = [item for item in selected_items if item.memory_type == "project"]
+
     hint_payload: list[dict[str, object]] = []
-    for item in memory_context.selected[:2]:
+    for item in selected_items[:2]:
         hint: dict[str, object] = {
             "type": item.memory_type,
             "title": _trim_text(item.summary.title, 80),
@@ -1287,13 +1303,13 @@ def _compact_semantic_start_memory_context(session: SessionState | None) -> dict
         if entry is not None:
             if hasattr(entry, "workflow_hints") and getattr(entry, "workflow_hints", None):
                 hint["workflow_hints"] = [_trim_text(value, 100) for value in list(getattr(entry, "workflow_hints", []))[:1]]
-            if hasattr(entry, "what_worked") and getattr(entry, "what_worked", None):
+            if not project_only_bootstrap and hasattr(entry, "what_worked") and getattr(entry, "what_worked", None):
                 hint["what_worked"] = [_trim_text(value, 100) for value in list(getattr(entry, "what_worked", []))[:1]]
-            if hasattr(entry, "what_failed") and getattr(entry, "what_failed", None):
+            if not project_only_bootstrap and hasattr(entry, "what_failed") and getattr(entry, "what_failed", None):
                 hint["what_failed"] = [_trim_text(value, 100) for value in list(getattr(entry, "what_failed", []))[:1]]
-            if hasattr(entry, "successful_repair_patterns") and getattr(entry, "successful_repair_patterns", None):
+            if not project_only_bootstrap and hasattr(entry, "successful_repair_patterns") and getattr(entry, "successful_repair_patterns", None):
                 hint["successful_repair_patterns"] = list(getattr(entry, "successful_repair_patterns", []))[:1]
-            if hasattr(entry, "bad_retry_patterns") and getattr(entry, "bad_retry_patterns", None):
+            if not project_only_bootstrap and hasattr(entry, "bad_retry_patterns") and getattr(entry, "bad_retry_patterns", None):
                 hint["bad_retry_patterns"] = list(getattr(entry, "bad_retry_patterns", []))[:1]
         hint_payload.append(hint)
     if hint_payload:

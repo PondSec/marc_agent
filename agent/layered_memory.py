@@ -310,8 +310,11 @@ class AgentMemoryStore(RepoMemoryStore):
     def build_retrieval_request(self, task: str, session: SessionState) -> RetrievalRequest:
         working = session.working_memory or self.build_working_memory(session)
         use_case = self._infer_use_case(task, session)
+        fresh_task_bootstrap = self._is_fresh_task_bootstrap(session)
         include_types = ["episodic", "project", "failure", "conversation"]
-        if use_case == "repair_assistance":
+        if fresh_task_bootstrap and use_case != "user_recall":
+            include_types = ["project"]
+        elif use_case == "repair_assistance":
             include_types = ["failure", "episodic", "project", "conversation"]
         elif use_case == "project_context":
             include_types = ["project", "episodic", "failure", "conversation"]
@@ -338,9 +341,9 @@ class AgentMemoryStore(RepoMemoryStore):
             current_subtask=working.current_subtask if working is not None else None,
             changed_files=[item.path for item in session.changed_files[-6:]],
             include_types=include_types,
-            max_hits=6,
-            max_per_type=2,
-            summary_budget_chars=900,
+            max_hits=4 if fresh_task_bootstrap else 6,
+            max_per_type=1 if fresh_task_bootstrap else 2,
+            summary_budget_chars=520 if fresh_task_bootstrap else 900,
             allow_cross_project=use_case in {"similar_task_lookup", "user_recall"},
         )
 
@@ -1307,6 +1310,42 @@ class AgentMemoryStore(RepoMemoryStore):
         if any(token in lowered for token in ("architecture", "repo", "projekt", "module", "subsystem")):
             return "project_context"
         return "similar_task_lookup"
+
+    def _is_fresh_task_bootstrap(self, session: SessionState) -> bool:
+        if session.active_repair_context is not None:
+            return False
+        if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"}:
+            return False
+        if session.task_state is not None or session.task_understanding is not None or session.router_result is not None:
+            return False
+        if session.plan:
+            return False
+        if session.tool_calls or session.changed_files or session.diagnostics or session.validation_runs:
+            return False
+        if session.repair_history or session.executed_commands or session.notes:
+            return False
+        follow_up = session.follow_up_context
+        if follow_up is None:
+            return True
+        return not any(
+            [
+                str(follow_up.previous_task or "").strip(),
+                str(follow_up.previous_root_goal or "").strip(),
+                str(follow_up.previous_active_goal or "").strip(),
+                str(follow_up.previous_requested_outcome or "").strip(),
+                str(follow_up.previous_interpreted_goal or "").strip(),
+                str(follow_up.last_error or "").strip(),
+                follow_up.previous_constraints,
+                follow_up.previous_assumptions,
+                follow_up.target_paths,
+                follow_up.changed_files,
+                follow_up.read_files,
+                follow_up.recent_commands,
+                follow_up.notes,
+                follow_up.diagnostics,
+                follow_up.validation_runs,
+            ]
+        )
 
     def _query_terms(self, request: RetrievalRequest) -> set[str]:
         return set(

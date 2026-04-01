@@ -17,7 +17,7 @@ from agent.models import (
     ValidationFailureEvidence,
 )
 from agent.planner import ESCALATED_REPAIR_STRATEGY, Planner, TARGETED_REPAIR_STRATEGY
-from agent.prompts import generate_content_prompt
+from agent.prompts import generate_content_prompt, task_state_update_prompt
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
 from config.settings import AppConfig
@@ -103,6 +103,17 @@ def build_session(store: AgentMemoryStore, task: str = "Harden the auth flow") -
     )
     session.task_state = build_task_state(task)
     session.router_result = build_route()
+    session.workspace_snapshot = store.build_snapshot(task)
+    return session
+
+
+def build_fresh_start_session(store: AgentMemoryStore, task: str = "Harden the auth flow") -> SessionState:
+    session = SessionState(
+        task=task,
+        workspace_root=str(store.workspace.root),
+        project_id=store.project_id,
+        candidate_files=["app/auth.py", "tests/test_main.py"],
+    )
     session.workspace_snapshot = store.build_snapshot(task)
     return session
 
@@ -286,6 +297,49 @@ def test_new_session_does_not_inherit_transient_working_ballast(tmp_path):
     assert fresh.working_memory.recent_attempts == []
     assert fresh.working_memory.recent_failures == []
     assert all(item.memory_type != "working" for item in fresh.memory_context.selected)
+
+
+def test_fresh_semantic_start_limits_persistent_retrieval_to_project_memory(tmp_path):
+    store = build_store(tmp_path)
+    seeded = build_session(store, "Fix auth bug")
+    store.refresh_session_memory(seeded.task, seeded)
+    store.persist_session_memory(seeded)
+    store.upsert_entry(
+        make_conversation_entry(
+            store,
+            session_id="recall-chat",
+            summary="Last time we only needed to rerun the validation command.",
+        )
+    )
+
+    fresh = build_fresh_start_session(store, "Add audit logging to the auth flow")
+    store.refresh_session_memory(fresh.task, fresh)
+
+    assert fresh.memory_context is not None
+    assert fresh.memory_context.request.include_types == ["project"]
+    assert all(item.memory_type == "project" for item in fresh.memory_context.selected)
+
+
+def test_fresh_semantic_start_prompt_excludes_prior_conversation_recall(tmp_path):
+    store = build_store(tmp_path)
+    seeded = build_session(store, "Fix auth bug")
+    store.refresh_session_memory(seeded.task, seeded)
+    store.persist_session_memory(seeded)
+    store.upsert_entry(
+        make_conversation_entry(
+            store,
+            session_id="recall-chat",
+            summary="Last time we only needed to rerun the validation command.",
+        )
+    )
+
+    fresh = build_fresh_start_session(store, "Add audit logging to the auth flow")
+    store.refresh_session_memory(fresh.task, fresh)
+    prompt = task_state_update_prompt(fresh.task, snapshot=fresh.workspace_snapshot, session=fresh, mode="compact")
+
+    assert "Memory context:" in prompt
+    assert "Last time we only needed to rerun the validation command." not in prompt
+    assert '"repo_map_hints"' in prompt or '"suggested_files"' in prompt
 
 
 def test_episodic_memory_recalls_similar_prior_case(tmp_path):
