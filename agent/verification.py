@@ -40,6 +40,10 @@ class ValidationPlanner:
     BARE_WORKSPACE_REFERENCE_PATTERN = re.compile(
         r"(?<![\w./-])(?P<path>(?:(?:[\w.-]+/)+[\w.-]+|[\w.-]+)\.[A-Za-z0-9_-]+)(?![\w./-])"
     )
+    IMPORT_ERROR_SYMBOL_PATTERN = re.compile(
+        r"ImportError:\s+cannot import name ['\"](?P<symbol>[A-Za-z_][A-Za-z0-9_]*)['\"]\s+from\s+['\"](?P<module>[A-Za-z_][A-Za-z0-9_.]*)['\"](?:\s+\((?P<path>[^)]+)\))?",
+        re.IGNORECASE,
+    )
     EXPLICIT_VALIDATION_COMMAND_SPECS = (
         {
             "kind": "test",
@@ -978,6 +982,26 @@ class ValidationPlanner:
             prefer_content_runtime_target=content_assertion_target is not None,
             implicated_symbols=implicated_symbols,
         )
+        brief_primary_target = str(getattr(repair_brief, "primary_target", "") or "").strip()
+        if brief_primary_target and brief_primary_target != (artifact_paths[0] if artifact_paths else ""):
+            repair_requirements = self._repair_requirements(
+                failed_run,
+                diagnostics,
+                artifact_paths=artifact_paths,
+                expected_features=expected_features,
+                missing_features=missing_features,
+                missing_unittest_package_inits=missing_unittest_package_inits,
+                primary_target_override=brief_primary_target,
+            )
+            repair_brief = repair_brief.model_copy(
+                update={
+                    "repair_constraints": [
+                        str(item or "").strip()
+                        for item in repair_requirements[:4]
+                        if str(item or "").strip()
+                    ]
+                }
+            )
         evidence_signature = json.dumps(
             {
                 "command": self.command_identity(failed_run.command),
@@ -1046,10 +1070,14 @@ class ValidationPlanner:
             failure_summary=failure_summary,
             missing_features=missing_features,
         )
+        raw_failure = raw_failure_text or "\n".join(part for part in [excerpt, summary] if part)
+        import_symbol, _import_module, import_provider_path = self._missing_import_symbol_details(raw_failure)
         implicated_symbols = list(implicated_symbols or []) or self._implicated_symbols_from_failure_text(
             excerpt,
             failure_summary,
         )
+        if import_symbol and import_symbol not in implicated_symbols:
+            implicated_symbols.insert(0, import_symbol)
         failure_type = self._failure_type(
             failed_run,
             excerpt=excerpt,
@@ -1064,6 +1092,7 @@ class ValidationPlanner:
             )
         script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
         normalized_script = self._workspace_relative_path(session, script_target)
+        normalized_import_provider = self._workspace_relative_path(session, import_provider_path)
         primary_target = self._prefer_behavioral_runtime_primary_target(
             artifact_paths=artifact_paths,
             file_hints=file_hints,
@@ -1075,14 +1104,23 @@ class ValidationPlanner:
         if failure_type == "import_failure":
             if normalized_script:
                 primary_target = normalized_script
+            provider_target = self._prefer_import_failure_provider_target(
+                artifact_paths=artifact_paths,
+                file_hints=file_hints,
+                current_primary=primary_target,
+                normalized_provider_target=normalized_import_provider,
+            )
+            if provider_target:
+                primary_target = provider_target
         target_line_hint = self._target_traceback_line_hint(
             primary_target,
-            text=raw_failure_text or "\n".join(part for part in [excerpt, summary] if part),
+            text=raw_failure,
         )
         implicated_region_hint = self._implicated_region_hint(
             primary_target,
             target_line_hint=target_line_hint,
             implicated_symbols=implicated_symbols,
+            failure_type=failure_type,
         )
         failure_signature = self._failure_signature(
             failed_run,
@@ -1567,6 +1605,11 @@ class ValidationPlanner:
     def _implicated_symbols_from_failure_text(self, excerpt: str, failure_summary: str) -> list[str]:
         symbols: list[str] = []
         text = "\n".join(part for part in [excerpt, failure_summary] if part)
+        import_symbol, import_module, _import_path = self._missing_import_symbol_details(text)
+        if import_symbol:
+            symbols.append(import_symbol)
+        if import_module and import_module not in symbols:
+            symbols.append(import_module)
         undefined_symbol, _usage_line = self._undefined_runtime_symbol_details(text)
         if undefined_symbol:
             symbols.append(undefined_symbol)
@@ -1589,6 +1632,15 @@ class ValidationPlanner:
             if name not in symbols:
                 symbols.append(name)
         return symbols
+
+    def _missing_import_symbol_details(self, text: str) -> tuple[str | None, str | None, str | None]:
+        match = self.IMPORT_ERROR_SYMBOL_PATTERN.search(str(text or ""))
+        if match is None:
+            return None, None, None
+        symbol = str(match.group("symbol") or "").strip() or None
+        module = str(match.group("module") or "").strip() or None
+        path = str(match.group("path") or "").strip() or None
+        return symbol, module, path
 
     def _missing_module_name(self, text: str) -> str | None:
         for pattern in (
@@ -1669,15 +1721,45 @@ class ValidationPlanner:
         *,
         target_line_hint: int | None,
         implicated_symbols: list[str],
+        failure_type: str,
     ) -> str | None:
         target = str(primary_target or "").strip()
         if not target:
             return None
         if target_line_hint is not None and target_line_hint > 0:
             return f"{target}:line {target_line_hint}"
+        if failure_type == "import_failure" and implicated_symbols:
+            return f"{target}:symbol {implicated_symbols[0]}"
         if self._is_test_path(target) and implicated_symbols:
             return f"{target}:symbol {implicated_symbols[0]}"
         return target
+
+    def _prefer_import_failure_provider_target(
+        self,
+        *,
+        artifact_paths: list[str],
+        file_hints: list[str],
+        current_primary: str | None,
+        normalized_provider_target: str | None,
+    ) -> str | None:
+        provider_target = str(normalized_provider_target or "").strip()
+        if not provider_target or self._is_test_path(provider_target) or self._is_documentation_path(provider_target):
+            return str(current_primary or "").strip() or None
+        candidates = self._unique_paths([*artifact_paths, *file_hints])
+        if provider_target in candidates:
+            return provider_target
+        if any(provider_target.endswith(f"/{candidate}") for candidate in candidates if candidate):
+            matched = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate and provider_target.endswith(f"/{candidate}")
+                ),
+                None,
+            )
+            if matched:
+                return matched
+        return provider_target or str(current_primary or "").strip() or None
 
     def _target_traceback_line_hint(
         self,
@@ -3122,10 +3204,13 @@ class ValidationPlanner:
         expected_features: list[str],
         missing_features: list[str],
         missing_unittest_package_inits: list[str] | None = None,
+        primary_target_override: str | None = None,
     ) -> list[str]:
         requirements: list[str] = []
         scope = failed_run.verification_scope
-        primary_target = artifact_paths[0] if artifact_paths else "the implicated artifact"
+        primary_target = str(primary_target_override or "").strip() or (
+            artifact_paths[0] if artifact_paths else "the implicated artifact"
+        )
         missing_unittest_package_inits = missing_unittest_package_inits or []
         if scope == "structural":
             if missing_features:
