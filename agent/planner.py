@@ -2846,8 +2846,6 @@ class Planner:
         brief = getattr(repair_context, "repair_brief", None)
         if brief is not None and (brief.expected_semantics or brief.observed_semantics):
             behavioral_failure = True
-        if not behavioral_failure:
-            return False
         implementation_alternatives = self._runtime_implementation_candidates(
             repair_context,
             exclude={target},
@@ -2863,6 +2861,23 @@ class Planner:
             ]
         if not implementation_alternatives:
             return False
+        target_markers = {
+            token
+            for token in self._repair_candidate_reference_tokens(target)
+            if token
+        }
+        region_hint = str(getattr(brief, "implicated_region_hint", "") or "").strip().lower()
+        evidence_points_away_from_support_target = bool(
+            self._is_python_runtime_support_module(target, repair_context)
+            and implementation_alternatives
+            and (
+                any(str(symbol or "").strip() for symbol in getattr(brief, "implicated_symbols", []))
+                or region_hint
+            )
+            and not any(marker and marker in region_hint for marker in target_markers)
+        )
+        if not behavioral_failure and not evidence_points_away_from_support_target:
+            return False
         attempted_failures = self._repair_attempt_failure_count(session, repair_context, target)
         strongly_implicated_alternatives = [
             candidate
@@ -2874,22 +2889,7 @@ class Planner:
         ]
         if attempted_failures >= 1:
             return True
-        target_markers = {
-            token
-            for token in self._repair_candidate_reference_tokens(target)
-            if token
-        }
-        region_hint = str(getattr(brief, "implicated_region_hint", "") or "").strip().lower()
-        behavioral_focus_points_away_from_support_target = bool(
-            self._is_python_runtime_support_module(target, repair_context)
-            and implementation_alternatives
-            and (
-                any(str(symbol or "").strip() for symbol in getattr(brief, "implicated_symbols", []))
-                or region_hint
-            )
-            and not any(marker and marker in region_hint for marker in target_markers)
-        )
-        if behavioral_focus_points_away_from_support_target:
+        if evidence_points_away_from_support_target:
             return True
         if (
             self._is_python_runtime_support_module(target, repair_context)
@@ -2937,6 +2937,7 @@ class Planner:
             if candidate
             and candidate not in skipped
             and not self.validation_planner._is_test_path(candidate)
+            and not self.validation_planner._is_documentation_path(candidate)
             and not self._is_runtime_support_repair_target(candidate, repair_context)
         ]
 

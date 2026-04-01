@@ -2023,8 +2023,14 @@ class ValidationPlanner:
                 candidate = str(attempt.artifact_path or "").strip()
                 if not candidate or candidate not in allowed_candidates:
                     continue
-                if str(attempt.failure_signature or "").strip() == failure_signature:
-                    return candidate
+                if str(attempt.failure_signature or "").strip() != failure_signature:
+                    continue
+                # Only preserve a prior lock when this signature already produced a
+                # substantive mutation. No-op retries should not overwrite the
+                # stronger current primary target inferred from fresh evidence.
+                if attempt.result != "mutation_planned":
+                    continue
+                return candidate
         return str(primary_target or "").strip() or None
 
     def _repair_allowed_files(

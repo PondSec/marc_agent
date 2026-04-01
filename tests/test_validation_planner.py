@@ -1036,6 +1036,91 @@ def test_validation_planner_prefers_import_provider_target_after_export_patch(tm
     assert evidence.repair_requirements[0].startswith("Change texttools/normalize.py")
 
 
+def test_validation_planner_noop_support_retry_does_not_relock_import_provider_failure(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    init_path = pkg / "__init__.py"
+    normalize_path = pkg / "normalize.py"
+    init_path.write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    normalize_path.write_text(
+        "def normalize_words(text, *, keep_case=False):\n"
+        "    return text.split()\n",
+        encoding="utf-8",
+    )
+    cli_path = tmp_path / "normalize_cli.py"
+    cli_path.write_text("from texttools import normalize_words\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# texttools\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_normalize.py"
+    test_path.write_text(
+        "from normalize_cli import main\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Repair the normalize keep-case runtime flow after the export patch.",
+        workspace_root=str(tmp_path),
+        edit_generation=2,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="modify"),
+            FileChangeRecord(path="normalize_cli.py", operation="modify"),
+            FileChangeRecord(path="README.md", operation="modify"),
+            FileChangeRecord(path="texttools/__init__.py", operation="modify"),
+        ]
+    )
+
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=2,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "ImportError: Failed to import test module: test_normalize\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 2, in <module>\n'
+            "    from texttools import normalize_words, normalize_words_keep_case\n"
+            f'  File "{cli_path}", line 1, in <module>\n'
+            "    from texttools import normalize_words\n"
+            "ImportError: cannot import name 'normalize_words_keep_case' "
+            f"from 'texttools.normalize' ({normalize_path})\n"
+            "FAILED (errors=1)\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+    assert evidence.repair_brief is not None
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="texttools/__init__.py",
+            validation_command=failed_run.command,
+            verification_scope="runtime",
+            strategy="validation_escalated",
+            result="no_effective_change",
+            reason="file hash unchanged",
+            failure_signature=evidence.repair_brief.failure_signature,
+        )
+    )
+
+    updated = planner.build_failure_evidence(session, failed_run)
+
+    assert updated.repair_brief is not None
+    assert updated.repair_brief.primary_target == "texttools/normalize.py"
+    assert updated.repair_brief.locked_target == "texttools/normalize.py"
+    assert updated.repair_brief.recent_failed_attempts
+    assert updated.repair_brief.recent_failed_attempts[0].target == "texttools/__init__.py"
+    assert updated.repair_brief.recent_failed_attempts[0].result == "no_effective_change"
+
+
 def test_validation_planner_prefers_library_target_for_behavioral_runtime_failure_before_script_wrapper(tmp_path):
     planner = ValidationPlanner()
     package_dir = tmp_path / "wordaudit"
