@@ -11121,8 +11121,8 @@ def test_primary_compact_repair_review_uses_relaxed_runtime_budget(tmp_path, mon
     kwargs = llm.generate_json_calls[0]["kwargs"]
     assert kwargs["model"] == "qwen2.5-coder:7b"
     assert kwargs["num_ctx"] == 2048
-    assert kwargs["timeout"] == 45
-    assert kwargs["total_timeout"] == 90
+    assert kwargs["timeout"] == 60
+    assert kwargs["total_timeout"] == 180
     assert kwargs["strict_timeouts"] is False
 
 
