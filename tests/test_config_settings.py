@@ -109,3 +109,32 @@ def test_normalized_adds_public_base_url_host_to_allowed_hosts():
     ).normalized()
 
     assert config.security_allowed_hosts == ("127.0.0.1", "localhost", "agent.pondsec.com")
+
+
+def test_from_sources_prefers_workspace_env_for_runtime_settings(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / ".env").write_text(
+        "PUBLIC_BASE_URL=https://agent.pondsec.com\nSECURITY_ALLOWED_HOSTS=agent.pondsec.com,localhost\nAUTH_SECRET_KEY=workspace-secret\n",
+        encoding="utf-8",
+    )
+    app_root = tmp_path / "app-root"
+    (app_root / "config").mkdir(parents=True)
+    (app_root / ".env").write_text(
+        "PUBLIC_BASE_URL=https://wrong.example.com\nSECURITY_ALLOWED_HOSTS=wrong.example.com\nAUTH_SECRET_KEY=app-secret\n",
+        encoding="utf-8",
+    )
+    (app_root / "config" / "agent.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("config.settings._app_source_root", lambda: app_root)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("SECURITY_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("AUTH_SECRET_KEY", raising=False)
+
+    config = AppConfig.from_sources(workspace_override=str(workspace_root))
+
+    assert config.workspace_root == str(workspace_root.resolve())
+    assert config.public_base_url == "https://agent.pondsec.com"
+    assert config.auth_secret_key == "workspace-secret"
+    assert config.security_allowed_hosts == ("agent.pondsec.com", "localhost")

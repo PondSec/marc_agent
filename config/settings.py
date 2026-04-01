@@ -91,6 +91,13 @@ def _source_root_for_config_path(config_file: Path | None) -> Path:
     return parent
 
 
+def _workspace_env_path(workspace_override: str | None, raw_json: dict[str, Any]) -> Path | None:
+    workspace_root = str(workspace_override or raw_json.get("workspace_root") or raw_json.get("WORKSPACE_ROOT") or "").strip()
+    if not workspace_root:
+        return None
+    return Path(workspace_root).expanduser().resolve() / ".env"
+
+
 def _public_base_url_host(public_base_url: str | None) -> str | None:
     text = str(public_base_url or "").strip()
     if not text:
@@ -188,11 +195,15 @@ class AppConfig:
         default_config = source_root / "config" / "agent.json"
         raw_json = _load_json_config(config_file or default_config)
         dotenv_values = _load_dotenv(source_root / ".env")
+        workspace_env_path = _workspace_env_path(workspace_override, raw_json)
+        workspace_dotenv_values = _load_dotenv(workspace_env_path) if workspace_env_path is not None else {}
         env = os.environ
 
         def pick(name: str, fallback: Any) -> Any:
             if name in env:
                 return env[name]
+            if name in workspace_dotenv_values:
+                return workspace_dotenv_values[name]
             if name in dotenv_values:
                 return dotenv_values[name]
             return raw_json.get(name.lower(), raw_json.get(name, fallback))
