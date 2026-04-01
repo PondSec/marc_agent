@@ -3241,6 +3241,234 @@ def test_generate_content_prompt_adds_test_contract_requirement_for_cli_entrypoi
     assert "'Hello WORLD'" in prompt
 
 
+def test_compact_repair_retry_prompt_surfaces_file_local_requirements(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    normalize_current = (
+        "def normalize_words(text: str) -> str:\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n\n"
+        "def normalize_words_keep_case(text: str) -> str:\n"
+        "    return ' '.join(text.replace(',', ' ').split())\n"
+    )
+    (pkg / "normalize.py").write_text(normalize_current, encoding="utf-8")
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = bool(argv and '--keep-case' in argv)\n"
+        "    return normalize_words_keep_case('Hello, WORLD!') if keep_case else normalize_words('Hello, WORLD!')\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import unittest\n\n"
+        "from normalize_cli import main\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "class TestNormalize(unittest.TestCase):\n"
+        "    def test_default_normalization_lowercases_words(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!'), 'hello world')\n\n"
+        "    def test_keep_case_variant_preserves_original_case(self):\n"
+        "        self.assertEqual(normalize_words_keep_case('Hello, WORLD!'), 'Hello WORLD')\n\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        self.assertEqual(main(['--keep-case']), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+            "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "symbol_index": {
+                "texttools/normalize.py": ["normalize_words", "normalize_words_keep_case"],
+                "normalize_cli.py": ["main"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Add keep_case support and repair the failing normalization behavior.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        file_hints=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        repair_requirements=["Change texttools/normalize.py so the keep-case output drops the observed-only punctuation."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:retry-file-local",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words_keep_case"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Stay on the locked normalization target and remove the observed-only punctuation."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposal still preserves the observed punctuation mismatch in the keep-case path.",
+        confidence=0.9,
+        blocking_issues=["The proposal still preserves the observed punctuation mismatch in the keep-case path."],
+        preservation_risks=[],
+        repair_hints=["Keep normalize_words_keep_case aligned with the tested keep-case contract."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=normalize_current,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Repair-scoped requirements:" in prompt
+    assert "normalize_words_keep_case" in prompt
+    assert "tests/test_normalize.py" in prompt
+
+
+def test_full_repair_retry_prompt_surfaces_file_local_requirements(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    normalize_current = (
+        "def normalize_words(text: str) -> str:\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n\n"
+        "def normalize_words_keep_case(text: str) -> str:\n"
+        "    return ' '.join(text.replace(',', ' ').split())\n"
+    )
+    (pkg / "normalize.py").write_text(normalize_current, encoding="utf-8")
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = bool(argv and '--keep-case' in argv)\n"
+        "    return normalize_words_keep_case('Hello, WORLD!') if keep_case else normalize_words('Hello, WORLD!')\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import unittest\n\n"
+        "from normalize_cli import main\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "class TestNormalize(unittest.TestCase):\n"
+        "    def test_keep_case_variant_preserves_original_case(self):\n"
+        "        self.assertEqual(normalize_words_keep_case('Hello, WORLD!'), 'Hello WORLD')\n\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        self.assertEqual(main(['--keep-case']), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+            "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "symbol_index": {
+                "texttools/normalize.py": ["normalize_words", "normalize_words_keep_case"],
+                "normalize_cli.py": ["main"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Repair the keep_case behavior without drifting away from the tested contract.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        file_hints=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        repair_requirements=["Change texttools/normalize.py so the keep-case output drops the observed-only punctuation."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:retry-file-local-full",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words_keep_case"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Stay on the locked normalization target and remove the observed-only punctuation."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposal still preserves the observed punctuation mismatch in the keep-case path.",
+        confidence=0.9,
+        blocking_issues=["The proposal still preserves the observed punctuation mismatch in the keep-case path."],
+        preservation_risks=[],
+        repair_hints=["Keep normalize_words_keep_case aligned with the tested keep-case contract."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=normalize_current,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "File-local requirements:" in prompt
+    assert "normalize_words_keep_case" in prompt
+    assert "tests/test_normalize.py" in prompt
+
+
 def test_planner_does_not_reject_entrypoint_update_for_helper_signature_literal_scoped_elsewhere(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()

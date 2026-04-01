@@ -720,6 +720,7 @@ def generate_content_retry_prompt(
                 repair_strategy=repair_strategy,
                 review_feedback=review_feedback,
             )
+        file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
         sections = [
             "Produce the full file content for exactly one file.",
             f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
@@ -728,9 +729,12 @@ def generate_content_retry_prompt(
             f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
             f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
             f"Task focus: {json.dumps(task_focus, ensure_ascii=False)}",
-            f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
+            f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             _single_file_boundary_instruction(path, route.entities.target_paths),
         ]
+        file_requirement_summary = _file_local_requirement_summary(file_focus)
+        if file_requirement_summary:
+            sections.append(file_requirement_summary)
         if session is not None:
             sections.append(f"Related file hints: {_related_file_context(session, path)}")
             diagnostic_context = _diagnostic_context(session)
@@ -764,6 +768,7 @@ def generate_content_retry_prompt(
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     sections = [
         "Produce the full file content for exactly one file.",
         f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 700)}",
@@ -774,10 +779,13 @@ def generate_content_retry_prompt(
         f"Task understanding: {json.dumps(_compact_task_understanding(session.task_understanding if session is not None else None), ensure_ascii=False)}",
         f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
         f"Target path: {path}",
-        f"File-scoped focus: {json.dumps(_artifact_scoped_focus(route, session, path, current_content=current_content), ensure_ascii=False)}",
+        f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
         f"Search hints: {_format_list(route.search_terms[:6])}",
         _single_file_boundary_instruction(path, route.entities.target_paths),
     ]
+    file_requirement_summary = _file_local_requirement_summary(file_focus)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
     if session is not None:
         sections.extend(
             [
@@ -1978,6 +1986,8 @@ def _compact_repair_retry_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview,
 ) -> str:
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+    compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
     related_context = _repair_related_file_context(
         session,
@@ -2014,6 +2024,15 @@ def _compact_repair_retry_prompt(
         "Keep the update narrow and preserve unrelated existing behavior.",
     ]
     repair_brief = targeted_context.get("repair_brief") or {}
+    if compact_focus.get("current_write_requirements"):
+        sections.append(
+            "Repair-scoped requirements: "
+            + "; ".join(
+                _trim_text(str(item or "").strip(), 140)
+                for item in compact_focus.get("current_write_requirements", [])[:3]
+                if str(item or "").strip()
+            )
+        )
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         sections.append(
             "Primary repair target: "
