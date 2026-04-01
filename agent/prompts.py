@@ -3092,6 +3092,14 @@ def _artifact_scoped_focus(
         if candidate not in current_requirements:
             current_requirements.append(candidate)
 
+    for candidate in _test_contract_requirements(
+        session,
+        path=path,
+        current_content=current_content,
+    ):
+        if candidate not in current_requirements:
+            current_requirements.append(candidate)
+
     if not current_requirements:
         if len(explicit_targets) <= 1 or current_artifact_role == "primary_target" or is_explicit_target:
             fallback = _trim_text(
@@ -3181,6 +3189,286 @@ def _cross_file_consistency_requirements(
             if trimmed not in requirements:
                 requirements.append(trimmed)
     return requirements[:4]
+
+
+def _test_contract_requirements(
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None,
+) -> list[str]:
+    snapshot = session.workspace_snapshot if session is not None else None
+    normalized_path = str(path or "").strip().replace("\\", "/")
+    source = str(current_content or "")
+    if snapshot is None or not normalized_path.endswith(".py") or not source.strip():
+        return []
+
+    current_symbols = _python_source_symbols(source)
+    symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+    for symbol in list(symbol_index.get(normalized_path, []) or []):
+        normalized_symbol = str(symbol or "").strip()
+        if normalized_symbol and normalized_symbol not in current_symbols:
+            current_symbols.append(normalized_symbol)
+
+    requirements: list[str] = []
+    for test_path in _candidate_test_contract_paths(session):
+        test_text = _workspace_file_excerpt(session, test_path)
+        if not test_text:
+            continue
+        for requirement in _python_test_contract_requirements(
+            session,
+            snapshot=snapshot,
+            target_path=normalized_path,
+            current_symbols=current_symbols,
+            test_path=test_path,
+            test_text=test_text,
+        ):
+            if requirement not in requirements:
+                requirements.append(requirement)
+    return requirements[:4]
+
+
+def _candidate_test_contract_paths(session: SessionState | None) -> list[str]:
+    if session is None:
+        return []
+    snapshot = session.workspace_snapshot
+    candidate_paths: list[str] = []
+    if snapshot is not None:
+        for path in list(getattr(snapshot, "test_files", []) or []):
+            normalized = str(path or "").strip().replace("\\", "/")
+            if normalized and normalized not in candidate_paths:
+                candidate_paths.append(normalized)
+    for item in session.tool_calls:
+        if item.tool_name not in {"read_file", "write_file", "create_file", "replace_file", "patch_file"}:
+            continue
+        path = str(item.tool_args.get("path") or "").strip().replace("\\", "/")
+        if _related_context_is_test_like(path) and path not in candidate_paths:
+            candidate_paths.append(path)
+    return candidate_paths[:6]
+
+
+def _python_source_symbols(source: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    symbols: list[str] = []
+
+    def add(candidate: str) -> None:
+        normalized = str(candidate or "").strip()
+        if normalized and normalized not in symbols:
+            symbols.append(normalized)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            add(node.name)
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    add(target.id)
+    return symbols[:24]
+
+
+def _python_test_contract_requirements(
+    session: SessionState,
+    *,
+    snapshot: WorkspaceSnapshot,
+    target_path: str,
+    current_symbols: list[str],
+    test_path: str,
+    test_text: str,
+) -> list[str]:
+    try:
+        tree = ast.parse(test_text)
+    except SyntaxError:
+        return []
+
+    current_symbol_set = {symbol.lower() for symbol in current_symbols}
+    imported_target_symbols: list[str] = []
+    requirements: list[str] = []
+    parent_map: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported_symbols = [
+            str(alias.name or "").strip()
+            for alias in node.names
+            if str(alias.name or "").strip() and alias.name != "*"
+        ]
+        if not imported_symbols:
+            continue
+        provider_candidates = _resolve_import_from_provider_paths(
+            test_path,
+            module=str(node.module or "").strip(),
+            level=int(getattr(node, "level", 0) or 0),
+            snapshot=snapshot,
+        )
+        relevant_provider = any(
+            _python_provider_references_target(
+                session,
+                snapshot=snapshot,
+                provider_path=provider_path,
+                target_path=target_path,
+            )
+            for provider_path in provider_candidates
+        )
+        if not relevant_provider:
+            continue
+        for symbol in imported_symbols:
+            if symbol not in imported_target_symbols:
+                imported_target_symbols.append(symbol)
+        missing_symbols = [
+            symbol
+            for symbol in imported_symbols
+            if symbol.lower() not in current_symbol_set
+        ]
+        if missing_symbols:
+            preview = ", ".join(missing_symbols[:3])
+            requirement = _trim_text(
+                (
+                    f"Keep {target_path} compatible with {test_path}: tests import {preview}. "
+                    "Provide that symbol or keep the dependent export path coherent with the smallest safe change."
+                ),
+                220,
+            )
+            if requirement not in requirements:
+                requirements.append(requirement)
+
+    relevant_callables = {symbol.lower() for symbol in imported_target_symbols}
+    relevant_callables.update(current_symbol_set)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callable_name = _python_call_name(node.func)
+        if not callable_name or callable_name.lower() not in relevant_callables:
+            continue
+        contract = _python_test_call_contract(node, parent_map)
+        if not contract:
+            continue
+        requirement = _trim_text(
+            f"Keep {target_path} compatible with {test_path}: {contract}.",
+            220,
+        )
+        if requirement not in requirements:
+            requirements.append(requirement)
+    return requirements[:4]
+
+
+def _python_provider_references_target(
+    session: SessionState,
+    *,
+    snapshot: WorkspaceSnapshot,
+    provider_path: str,
+    target_path: str,
+    visited: set[str] | None = None,
+    depth: int = 0,
+) -> bool:
+    normalized_provider = str(provider_path or "").strip().replace("\\", "/")
+    normalized_target = str(target_path or "").strip().replace("\\", "/")
+    if not normalized_provider or not normalized_target:
+        return False
+    if normalized_provider == normalized_target:
+        return True
+    if depth >= 2:
+        return False
+    visited_paths = visited or set()
+    if normalized_provider in visited_paths:
+        return False
+    visited_paths = {*visited_paths, normalized_provider}
+
+    source = _workspace_file_excerpt(session, normalized_provider)
+    if not source:
+        file_briefs = getattr(snapshot, "file_briefs", {}) or {}
+        source = str(file_briefs.get(normalized_provider) or "")
+    if not source or not normalized_provider.endswith(".py"):
+        return False
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        candidates = _resolve_import_from_provider_paths(
+            normalized_provider,
+            module=str(node.module or "").strip(),
+            level=int(getattr(node, "level", 0) or 0),
+            snapshot=snapshot,
+        )
+        for candidate in candidates:
+            if candidate == normalized_target:
+                return True
+            if _python_provider_references_target(
+                session,
+                snapshot=snapshot,
+                provider_path=candidate,
+                target_path=normalized_target,
+                visited=visited_paths,
+                depth=depth + 1,
+            ):
+                return True
+    return False
+
+
+def _python_call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return str(node.id or "").strip()
+    if isinstance(node, ast.Attribute):
+        return str(node.attr or "").strip()
+    return ""
+
+
+def _python_test_call_contract(
+    node: ast.Call,
+    parent_map: dict[ast.AST, ast.AST],
+) -> str:
+    rendered_call = _python_render_expression(node)
+    if not rendered_call:
+        return ""
+
+    parent = parent_map.get(node)
+    if isinstance(parent, ast.Call):
+        parent_name = _python_call_name(parent.func).lower()
+        if parent_name in {"assertequal", "assertsequenceequal", "assertlistequal"} and parent.args:
+            if parent.args[0] is node and len(parent.args) >= 2:
+                expected = _python_render_expression(parent.args[1])
+                if expected:
+                    return f"{rendered_call} should evaluate to {expected}"
+        if parent_name in {"asserttrue", "assertfalse"} and parent.args and parent.args[0] is node:
+            if parent_name == "asserttrue":
+                return f"{rendered_call} should remain truthy"
+            return f"{rendered_call} should remain falsy"
+
+    if isinstance(parent, ast.Compare) and parent.left is node and parent.comparators:
+        expected = _python_render_expression(parent.comparators[0])
+        if expected:
+            return f"{rendered_call} should evaluate to {expected}"
+
+    if isinstance(parent, ast.Assert):
+        return f"preserve compatibility with {rendered_call}"
+    return ""
+
+
+def _python_render_expression(node: ast.AST | None) -> str:
+    if node is None:
+        return ""
+    try:
+        rendered = ast.unparse(node)
+    except Exception:
+        return ""
+    normalized = " ".join(str(rendered or "").split()).strip()
+    if not normalized or len(normalized) > 120:
+        return ""
+    return normalized
 
 
 def _resolve_import_from_provider_paths(

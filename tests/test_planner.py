@@ -3116,6 +3116,130 @@ def test_generate_content_prompt_surfaces_cross_file_import_consistency_requirem
     assert "texttools/normalize.py" in prompt
 
 
+def test_artifact_scoped_focus_adds_test_contract_requirement_for_python_module(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    normalize_current = "def normalize_words(text, *, keep_case=False):\n    return text.lower()\n"
+    (pkg / "normalize.py").write_text(normalize_current, encoding="utf-8")
+    (pkg / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import unittest\n\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "class TestNormalize(unittest.TestCase):\n"
+        "    def test_keep_case_variant_preserves_original_case(self):\n"
+        "        self.assertEqual(normalize_words_keep_case('Hello, WORLD!'), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["texttools/normalize.py", "texttools/__init__.py", "tests/test_normalize.py"],
+            "focus_files": ["texttools/normalize.py", "texttools/__init__.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "symbol_index": {
+                "texttools/normalize.py": ["normalize_words"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Add keep_case support to texttools/normalize.py and make the unittest pass.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the keep-case feature."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "texttools/normalize.py",
+        current_content=normalize_current,
+    )
+
+    assert any("tests/test_normalize.py" in item for item in focus["current_write_requirements"])
+    assert any("normalize_words_keep_case" in item for item in focus["current_write_requirements"])
+
+
+def test_generate_content_prompt_adds_test_contract_requirement_for_cli_entrypoint(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text, *, keep_case=False):\n    return text.lower()\n"
+        "def normalize_words_keep_case(text):\n    return text\n",
+        encoding="utf-8",
+    )
+    cli_current = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    return normalize_words('Hello, WORLD!')\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(cli_current, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import unittest\n\n"
+        "from normalize_cli import main\n\n"
+        "class TestNormalize(unittest.TestCase):\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        self.assertEqual(main(['--keep-case']), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+            "focus_files": ["normalize_cli.py", "texttools/normalize.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "symbol_index": {
+                "normalize_cli.py": ["main"],
+                "texttools/normalize.py": ["normalize_words", "normalize_words_keep_case"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Add keep_case support and update the CLI so the targeted unittest passes.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the keep-case feature."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=cli_current,
+    )
+
+    assert "File-local requirements:" in prompt
+    assert "main(['--keep-case'])" in prompt
+    assert "'Hello WORLD'" in prompt
+
+
 def test_planner_does_not_reject_entrypoint_update_for_helper_signature_literal_scoped_elsewhere(tmp_path):
     pkg = tmp_path / "greet_cli"
     pkg.mkdir()
