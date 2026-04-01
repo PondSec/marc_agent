@@ -5121,6 +5121,37 @@ class Planner:
                     capability_tier="tier_a",
                 )
             )
+        if (
+            issue.no_start_failure
+            and issue.context_pressure_likely
+            and (not lightweight_model or lightweight_model == primary_model)
+        ):
+            compact_same_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "compact"
+                    and (attempt.model_name is None or attempt.model_name == primary_model)
+                ),
+                None,
+            )
+            full_same_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "retry_same_model"
+                    and (attempt.model_name is None or attempt.model_name == primary_model)
+                ),
+                None,
+            )
+            if compact_same_model is not None and full_same_model is not None:
+                reordered: list[GenerationRecoveryAttempt] = [compact_same_model]
+                for attempt in attempts:
+                    if attempt is compact_same_model:
+                        continue
+                    reordered.append(attempt)
+                attempts = reordered
         return attempts
 
     def _content_generation_prompt_for_attempt(
