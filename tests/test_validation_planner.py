@@ -908,6 +908,61 @@ def test_validation_planner_classifies_direct_script_import_failure_as_bootstrap
     assert evidence.repair_brief.primary_target == "scripts/build_duplicates.py"
 
 
+def test_validation_planner_prefers_non_test_target_for_unittest_import_wrapper_failures(tmp_path):
+    planner = ValidationPlanner()
+    package_dir = tmp_path / "texttools"
+    package_dir.mkdir()
+    init_path = package_dir / "__init__.py"
+    init_path.write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    normalize_path = package_dir / "normalize.py"
+    normalize_path.write_text(
+        "def normalize_words(text, *, lowercase=True):\n"
+        "    return text.split()\n",
+        encoding="utf-8",
+    )
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    test_path = test_dir / "test_normalize.py"
+    test_path.write_text(
+        "from texttools import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Repair the normalize keep-case runtime flow.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+    )
+    session.changed_files.append(FileChangeRecord(path="texttools/normalize.py", operation="modify"))
+
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "ImportError: Failed to import test module: test_normalize\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 1, in <module>\n'
+            "    from texttools import normalize_words, normalize_words_keep_case\n"
+            "ImportError: cannot import name 'normalize_words_keep_case' "
+            f"from 'texttools' ({init_path})\n"
+            "FAILED (errors=1)\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.bootstrap_status == "bootstrap_failed"
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "texttools/__init__.py"
+    assert evidence.repair_brief.locked_target == "texttools/__init__.py"
+    assert evidence.repair_requirements[0].startswith("Change texttools/__init__.py")
+    assert "tests/test_normalize.py" not in evidence.repair_requirements[0]
+
+
 def test_validation_planner_prefers_library_target_for_behavioral_runtime_failure_before_script_wrapper(tmp_path):
     planner = ValidationPlanner()
     package_dir = tmp_path / "wordaudit"

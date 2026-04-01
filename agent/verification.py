@@ -927,6 +927,13 @@ class ValidationPlanner:
                 *(line for diagnostic in diagnostics for line in diagnostic.line_hints),
             ]
         )
+        import_wrapper_target = self._unittest_import_wrapper_non_test_target(
+            failed_run,
+            candidate_paths=[*referenced_workspace_paths, *artifact_paths, *file_hints],
+        )
+        if import_wrapper_target:
+            artifact_paths = self._unique_paths([import_wrapper_target, *artifact_paths])
+            file_hints = self._unique_paths([import_wrapper_target, *file_hints])
         action_hints = self._unique_strings(
             [hint for diagnostic in diagnostics for hint in diagnostic.action_hints]
         )
@@ -1636,6 +1643,9 @@ class ValidationPlanner:
             return "bootstrap_failed"
         if failure_type != "import_failure":
             return "none"
+        lowered_failure = str(raw_failure_text or "").strip().lower()
+        if "failed to import test module" in lowered_failure or "loader._failed_test" in lowered_failure:
+            return "bootstrap_failed"
 
         script_target = self._python_script_target_from_failure(failed_run, raw_failure_text)
         if script_target:
@@ -2157,7 +2167,40 @@ class ValidationPlanner:
             ]
             if part
         ).lower()
+        if self._unittest_import_wrapper_non_test_target(
+            failed_run,
+            candidate_paths=self._referenced_workspace_paths(session, failed_run),
+        ):
+            return False
         return any(marker in failure_text for marker in self.TEST_HARNESS_RUNTIME_ERROR_MARKERS)
+
+    def _unittest_import_wrapper_non_test_target(
+        self,
+        failed_run: ValidationRunRecord,
+        *,
+        candidate_paths: list[str],
+    ) -> str | None:
+        if failed_run.verification_scope != "runtime":
+            return None
+        failure_text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        ).lower()
+        if not failure_text:
+            return None
+        if "failed to import test module" not in failure_text and "loader._failed_test" not in failure_text:
+            return None
+        for candidate in self._unique_paths(candidate_paths):
+            if not candidate:
+                continue
+            if self._is_test_path(candidate) or self._is_documentation_path(candidate):
+                continue
+            return candidate
+        return None
 
     def can_repeat_command(
         self,
