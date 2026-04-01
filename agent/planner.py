@@ -7040,6 +7040,7 @@ class Planner:
         normalized_path = str(path or "").strip()
         if not normalized_path:
             return False
+        target_is_explicitly_allowed = bool(allowed_files and normalized_path in allowed_files)
         suffix = Path(normalized_path).suffix.lower()
         if suffix not in LIGHTWEIGHT_UPDATE_SUFFIXES:
             return False
@@ -7047,9 +7048,9 @@ class Planner:
             return False
         if current_content.count("\n") + 1 > MAX_LIGHTWEIGHT_UPDATE_LINES:
             return False
-        if locked_target and locked_target != normalized_path:
+        if locked_target and locked_target != normalized_path and not target_is_explicitly_allowed:
             return False
-        if primary_target and primary_target != normalized_path:
+        if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
             return False
         if allowed_files and normalized_path not in allowed_files:
             return False
@@ -7357,6 +7358,11 @@ class Planner:
             path=path,
             current_content=current_content,
             proposed_content=proposed_content,
+            model_backed_review_failed=True,
+            review_failure_reason=(
+                str(attempts[-1].failure.reason if attempts and attempts[-1].failure is not None else "").strip()
+                or "model_review_unavailable"
+            ),
         )
         self._append_runtime_execution(
             session,
@@ -8000,6 +8006,8 @@ class Planner:
         path: str,
         current_content: str,
         proposed_content: str,
+        model_backed_review_failed: bool = False,
+        review_failure_reason: str | None = None,
     ) -> ProposedUpdateReview:
         repair_context = session.active_repair_context
         review = self._validation_repair_relevance_review(
@@ -8053,6 +8061,43 @@ class Planner:
                 ],
                 repair_hints=[
                     "Produce a smaller focused update that preserves unrelated existing behavior.",
+                ],
+            )
+        if (
+            model_backed_review_failed
+            and repair_context is not None
+            and not self._should_skip_model_backed_repair_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                reserve_model=None,
+            )
+        ):
+            locked_target = self._repair_brief_locked_target(repair_context) if repair_context is not None else ""
+            target_hint = locked_target or str(path or "").strip()
+            failure_detail = str(review_failure_reason or "").strip()
+            blocking_issue = (
+                f"The model-backed pre-write review for {path} did not complete cleanly, so the update "
+                "cannot be written on deterministic fallback checks alone."
+            )
+            if failure_detail:
+                blocking_issue += f" Last review error: {failure_detail}."
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary=(
+                    "The model-backed pre-write review was unavailable after an attempted review, and the "
+                    "local fallback cannot independently prove this update is safe."
+                ),
+                confidence=0.78,
+                blocking_issues=[blocking_issue],
+                preservation_risks=[
+                    "Writing an unreviewed patch here could repeat the same failing behavior or introduce a new drift.",
+                ],
+                repair_hints=[
+                    f"Retry with a smaller, better-anchored change that stays on {target_hint}.",
+                    "If the same review path keeps timing out, block the write instead of applying the patch unchecked.",
                 ],
             )
         return ProposedUpdateReview(

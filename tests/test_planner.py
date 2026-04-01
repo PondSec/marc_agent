@@ -10028,6 +10028,166 @@ def test_fallback_proposed_update_review_reuses_runtime_symbol_review_after_mode
     assert "undefined runtime symbol" in review.summary.lower()
 
 
+def test_should_skip_model_backed_repair_review_allows_explicit_allowed_scope_when_brief_target_lags(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Repair normalize_cli.py", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the CLI wrapper."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '' != 'Hello WORLD'",
+        failure_summary="The CLI entrypoint still returns an empty result instead of preserving case.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        line_hints=[9],
+        action_hints=[],
+        repair_requirements=["Change normalize_cli.py so the failing runtime path produces the expected output."],
+        evidence_signature="sig-normalize-keep-case",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:normalize-keep-case",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: ''"],
+            implicated_symbols=["main", "normalize_words_keep_case"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the repair on the CLI path that produces the observed output."],
+            recent_failed_attempts=[],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    return normalize_words('Hello, WORLD!')\n"
+    )
+    proposed_content = (
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = bool(argv and '--keep-case' in argv)\n"
+        "    return normalize_words_keep_case('Hello, WORLD!') if keep_case else normalize_words('Hello, WORLD!')\n"
+    )
+
+    assert (
+        planner._should_skip_model_backed_repair_review(
+            session.router_result,
+            session,
+            path="normalize_cli.py",
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=None,
+        )
+        is True
+    )
+
+
+def test_review_generated_update_blocks_when_model_backed_review_times_out(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair normalize_cli.py so keep-case output is correct.",
+        workspace_root=str(tmp_path),
+        validation_status="failed",
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the CLI wrapper."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '' != 'Hello WORLD'",
+        failure_summary="The CLI entrypoint still returns an empty result instead of preserving case.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        line_hints=[9],
+        action_hints=[],
+        repair_requirements=["Change normalize_cli.py so the failing runtime path produces the expected output."],
+        evidence_signature="sig-normalize-review-timeout",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:normalize-review-timeout",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: ''"],
+            implicated_symbols=["main", "normalize_words_keep_case"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the repair on normalize_cli.py."],
+            recent_failed_attempts=[],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    def fail_review(*_args, **_kwargs):
+        raise OllamaGenerationError(
+            "timed out waiting for the model to start streaming after 45.0 seconds",
+            reason="startup_timeout",
+            retryable=False,
+            model_name="qwen2.5-coder:7b",
+            startup_timeout_seconds=45,
+            total_timeout_seconds=45,
+        )
+
+    monkeypatch.setattr(planner, "_should_skip_model_backed_repair_review", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(llm, "generate_json", fail_review)
+
+    review = planner._review_generated_update(
+        route=session.router_result,
+        session=session,
+        path="normalize_cli.py",
+        current_content=(
+            "from texttools import normalize_words\n\n"
+            "def main(argv=None):\n"
+            "    return normalize_words('Hello, WORLD!')\n"
+        ),
+        proposed_content=(
+            "from texttools import normalize_words, normalize_words_keep_case\n\n"
+            "def main(argv=None):\n"
+            "    keep_case = bool(argv and '--keep-case' in argv)\n"
+            "    return normalize_words_keep_case('Hello, WORLD!') if keep_case else normalize_words('Hello, WORLD!')\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "attempted review" in review.summary.lower()
+    assert any("deterministic fallback checks alone" in issue for issue in review.blocking_issues)
+
+
 def test_validation_repair_relevance_review_allows_python_body_change_with_same_function_signature(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(
