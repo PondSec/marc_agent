@@ -7346,13 +7346,22 @@ class Planner:
             )
             prompt = compact_prompt if use_compact_prompt else full_prompt
             if use_compact_prompt:
-                timeout = max(self._llm_timeout(25), 25)
-                total_timeout = max(timeout + 20, 45)
+                # Primary-model compact reviews still pay the full local startup cost on
+                # constrained single-model hardware. Keep the prompt compact, but avoid
+                # treating the review like a short strict-timeout hop when it is the same
+                # model that just needed a longer warm start for generation.
+                if capability_tier == "tier_a":
+                    timeout = max(self._llm_timeout(45), 45)
+                    total_timeout = max(self._llm_timeout(90), 90)
+                else:
+                    timeout = max(self._llm_timeout(25), 25)
+                    total_timeout = max(timeout + 20, 45)
             else:
                 timeout = max(self._llm_timeout(18), 18)
                 total_timeout = max(timeout + 12, timeout * 2)
             num_ctx = min(self._llm_num_ctx(2048), 2048) if use_compact_prompt else min(self._llm_num_ctx(6144), 6144)
             prompt_variant = "compact" if use_compact_prompt else "full"
+            strict_timeouts = use_compact_prompt and capability_tier != "tier_a"
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,
@@ -7361,7 +7370,7 @@ class Planner:
                     retries=0,
                     timeout=timeout,
                     total_timeout=total_timeout,
-                    strict_timeouts=use_compact_prompt,
+                    strict_timeouts=strict_timeouts,
                     num_ctx=num_ctx,
                     progress_callback=progress,
                 ),

@@ -11039,6 +11039,93 @@ def test_review_generated_update_blocks_when_model_backed_review_times_out(tmp_p
     assert any("deterministic fallback checks alone" in issue for issue in review.blocking_issues)
 
 
+def test_primary_compact_repair_review_uses_relaxed_runtime_budget(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The focused repair changes the implicated runtime path and stays scoped.",
+                "confidence": 0.91,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Fix the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    session = SessionState(
+        task="Repair the runtime output without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case path still preserves punctuation that the expected output removes.",
+        repair_requirements=["Change normalize_cli.py so the runtime output drops the trailing punctuation."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:review-runtime-budget",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the repair on normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+    monkeypatch.setattr(planner, "_should_skip_model_backed_repair_review", lambda *_args, **_kwargs: False)
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=(
+            "from texttools import normalize_words, normalize_words_keep_case\n\n"
+            "def main(argv=None):\n"
+            "    keep_case = bool(argv and '--keep-case' in argv)\n"
+            "    return normalize_words_keep_case('Hello, WORLD!') if keep_case else normalize_words('Hello, WORLD!')\n"
+        ),
+        proposed_content=(
+            "from texttools import normalize_words, normalize_words_keep_case\n\n"
+            "def main(argv=None):\n"
+            "    keep_case = bool(argv and '--keep-case' in argv)\n"
+            "    source = 'Hello, WORLD!'\n"
+            "    return normalize_words_keep_case(source).replace('!', '') if keep_case else normalize_words(source)\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    kwargs = llm.generate_json_calls[0]["kwargs"]
+    assert kwargs["model"] == "qwen2.5-coder:7b"
+    assert kwargs["num_ctx"] == 2048
+    assert kwargs["timeout"] == 45
+    assert kwargs["total_timeout"] == 90
+    assert kwargs["strict_timeouts"] is False
+
+
 def test_validation_repair_relevance_review_allows_python_body_change_with_same_function_signature(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(
