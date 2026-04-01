@@ -7056,7 +7056,20 @@ class Planner:
             return False
         if normalized_path in forbidden_files:
             return False
-        if len(allowed_files) > 2:
+        changed_paths = {
+            str(getattr(item, "path", "") or "").strip()
+            for item in getattr(session, "changed_files", []) or []
+            if str(getattr(item, "path", "") or "").strip()
+        }
+        unresolved_competing_scope = {
+            candidate
+            for candidate in allowed_files
+            if candidate != normalized_path
+            and candidate not in changed_paths
+            and not self.validation_planner._is_test_path(candidate)
+            and not self.validation_planner._is_documentation_path(candidate)
+        }
+        if len(unresolved_competing_scope) > 1:
             return False
         if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 2:
             return False

@@ -10101,6 +10101,97 @@ def test_should_skip_model_backed_repair_review_allows_explicit_allowed_scope_wh
     )
 
 
+def test_should_skip_model_backed_repair_review_ignores_changed_and_test_evidence_scope(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the texttools package export after a failing runtime validation.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the locked package export."}],
+        target_paths=["texttools/__init__.py"],
+        target_name="texttools/__init__.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.changed_files = [
+        FileChangeRecord(path="texttools/normalize.py", operation="update"),
+        FileChangeRecord(path="normalize_cli.py", operation="update"),
+    ]
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=[
+            "texttools/__init__.py",
+            "texttools/normalize.py",
+            "normalize_cli.py",
+            "tests/test_normalize.py",
+        ],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "ImportError: cannot import name 'normalize_words_keep_case' from 'texttools' "
+            "(/workspace/texttools/__init__.py)"
+        ),
+        failure_summary="The package export for keep-case normalization is still missing.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=[
+            "texttools/__init__.py",
+            "texttools/normalize.py",
+            "normalize_cli.py",
+            "tests/test_normalize.py",
+        ],
+        line_hints=[1],
+        action_hints=[],
+        repair_requirements=["Change texttools/__init__.py so the missing import path becomes available."],
+        evidence_signature="sig-texttools-export-runtime",
+        repair_brief=RepairBrief(
+            failure_type="import_failure",
+            failure_signature="runtime:import_failure:texttools-export",
+            primary_target="texttools/__init__.py",
+            locked_target="texttools/__init__.py",
+            expected_semantics=[],
+            observed_semantics=[],
+            implicated_symbols=["normalize_words_keep_case"],
+            implicated_region_hint="texttools/__init__.py",
+            repair_constraints=["Stay on the locked package export target."],
+            recent_failed_attempts=[],
+            allowed_files=[
+                "texttools/__init__.py",
+                "texttools/normalize.py",
+                "normalize_cli.py",
+                "tests/test_normalize.py",
+            ],
+            forbidden_files=["README.md"],
+        ),
+    )
+
+    current_content = "from .normalize import normalize_words\n"
+    proposed_content = (
+        "from .normalize import normalize_words, normalize_words_keep_case\n"
+    )
+
+    assert (
+        planner._should_skip_model_backed_repair_review(
+            session.router_result,
+            session,
+            path="texttools/__init__.py",
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=None,
+        )
+        is True
+    )
+
+
 def test_review_generated_update_blocks_when_model_backed_review_times_out(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         config=AppConfig(
