@@ -28,6 +28,7 @@ from agent.models import (
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
+    _repair_semantic_delta_lines,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
@@ -7180,11 +7181,70 @@ class Planner:
             blocking_issues=[blocking_issue],
             preservation_risks=[],
             repair_hints=[
+                *self._semantic_delta_noop_repair_hints(
+                    path=path,
+                    current_content=current_content,
+                    repair_context=repair_context,
+                ),
                 "Change the locked repair target in a way that alters the failing behavior instead of resubmitting an equivalent file.",
                 "Do not change only whitespace, comments, metadata, or unrelated lines; produce a real code-level fix.",
                 "Use the expected-versus-observed repair brief to make a minimal but real semantic change.",
             ],
         )
+
+    def _semantic_delta_noop_repair_hints(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> list[str]:
+        hints: list[str] = []
+        seen: set[str] = set()
+        for delta in _repair_semantic_delta_lines(repair_context, limit=2):
+            text = str(delta or "").strip()
+            if not text:
+                continue
+            replace_match = re.search(
+                r"Replace observed-only text ['\"](?P<observed>.+?)['\"] with expected text ['\"](?P<expected>.+?)['\"]",
+                text,
+            )
+            remove_match = re.search(r"Remove observed-only text ['\"](?P<observed>.+?)['\"]", text)
+            insert_match = re.search(r"Insert expected-only text ['\"](?P<expected>.+?)['\"]", text)
+            hint: str | None = None
+            if replace_match is not None:
+                observed = str(replace_match.group("observed") or "").strip()
+                expected = str(replace_match.group("expected") or "").strip()
+                if observed and expected:
+                    hint = (
+                        f"The current implementation in {path} must stop returning {observed!r} at the mismatching "
+                        f"output position and instead produce {expected!r} there."
+                    )
+            elif remove_match is not None:
+                observed = str(remove_match.group("observed") or "").strip()
+                if observed:
+                    if observed not in str(current_content or ""):
+                        hint = (
+                            f"The current implementation in {path} never handles the observed-only literal {observed!r} "
+                            "explicitly. Change the output construction or normalization so that literal no longer "
+                            "survives in the returned value."
+                        )
+                    else:
+                        hint = (
+                            f"Change the output construction in {path} so the observed-only literal {observed!r} "
+                            "disappears from the returned value."
+                        )
+            elif insert_match is not None:
+                expected = str(insert_match.group("expected") or "").strip()
+                if expected:
+                    hint = (
+                        f"The current implementation in {path} still omits the expected literal {expected!r}. "
+                        "Change the produced result so that literal appears at the mismatching output position."
+                    )
+            if hint and hint not in seen:
+                seen.add(hint)
+                hints.append(hint)
+        return hints[:2]
 
     def _review_generated_update(
         self,

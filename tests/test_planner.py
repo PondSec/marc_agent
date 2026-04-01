@@ -11180,6 +11180,57 @@ def test_should_skip_model_backed_repair_review_disables_skip_after_first_failed
     )
 
 
+def test_repair_no_effective_change_review_adds_semantic_delta_literal_hint(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    current_content = (
+        "def normalize_words(text: str) -> str:\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n\n"
+        "def normalize_words_keep_case(text: str) -> str:\n"
+        "    return ' '.join(text.replace(',', ' ').split())\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        file_hints=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        repair_requirements=["Change texttools/normalize.py so the keep-case output drops the observed-only punctuation."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:normalize-noop-review",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words_keep_case"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Stay on the locked normalization target and remove the observed-only punctuation."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    review = planner._repair_no_effective_change_review(
+        path="texttools/normalize.py",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert any("never handles the observed-only literal '!'" in hint for hint in review.repair_hints)
+
+
 def test_review_generated_update_blocks_when_model_backed_review_times_out(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         config=AppConfig(
