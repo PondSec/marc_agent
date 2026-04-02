@@ -7960,6 +7960,13 @@ class Planner:
     ) -> ProposedUpdateReview | None:
         if Path(path).suffix.lower() not in {".py", ".pyi"}:
             return None
+        if not self._path_exposes_direct_main_contract_target(
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+        ):
+            return None
         if repair_context is not None and repair_context.verification_scope != "runtime":
             return None
 
@@ -7969,13 +7976,6 @@ class Planner:
                 repair_context,
             )
         else:
-            if not self._path_exposes_direct_main_contract_target(
-                session,
-                path=path,
-                current_content=current_content,
-                proposed_content=proposed_content,
-            ):
-                return None
             option_tokens, positional_tokens = self._session_direct_main_option_contract_details(
                 session,
             )

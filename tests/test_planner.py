@@ -13464,6 +13464,120 @@ def test_pre_write_update_review_allows_initial_direct_main_contract_fix_when_pa
     assert review.safe_to_write is True
 
 
+def test_pre_write_update_review_does_not_apply_direct_main_option_guard_to_library_repair_targets(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    current_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    if keep_case:\n"
+        "        return ' '.join(text.replace(',', ' ').split())\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n"
+    )
+    proposed_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    cleaned = text.replace(',', ' ').replace('!', ' ')\n"
+        "    parts = cleaned.split()\n"
+        "    if keep_case:\n"
+        "        return ' '.join(parts)\n"
+        "    return ' '.join(parts).lower()\n"
+    )
+    (pkg / "normalize.py").write_text(current_content, encoding="utf-8")
+    (pkg / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    if argv and '--keep-case' in argv:\n"
+        "        return normalize_words('Hello, WORLD!', keep_case=True)\n"
+        "    return normalize_words('Hello, WORLD!')\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import unittest\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        self.assertEqual(main(['--keep-case']), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep_case behavior without drifting away from the tested contract.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="texttools/normalize.py still preserves punctuation that the runtime path should drop.",
+        file_hints=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        repair_requirements=["Change texttools/normalize.py so the keep-case output drops punctuation."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:library-direct-main-scope",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Keep the repair on texttools/normalize.py."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays on the library target and repairs the evidenced punctuation bug.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+
+
 def test_pre_write_update_review_rejects_direct_main_option_fix_with_inexact_token_spellings(
     tmp_path,
 ):
