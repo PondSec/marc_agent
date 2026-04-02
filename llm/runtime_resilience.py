@@ -26,6 +26,7 @@ Degraded execution rules:
 from dataclasses import asdict, dataclass
 import json
 import time
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Literal
 
 
@@ -182,6 +183,65 @@ class InvocationOutcome:
     attempt: ExecutionAttemptRecord
     value: Any | None = None
     exception: Exception | None = None
+
+
+class InvocationLifecycleTimeoutError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        elapsed: float,
+        idle_for: float,
+        characters: int = 0,
+        activity_count: int = 0,
+        partial_text: str = "",
+        retryable: bool = True,
+        model_name: str | None = None,
+        backend_identifier: str | None = None,
+        startup_timeout_seconds: int | None = None,
+        inactivity_timeout_seconds: int | None = None,
+        total_timeout_seconds: int | None = None,
+        first_output_received: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = str(reason or "runtime_error")
+        self.elapsed = float(elapsed)
+        self.idle_for = float(idle_for)
+        self.characters = max(int(characters), 0)
+        self.activity_count = max(int(activity_count), 0)
+        self.partial_text = str(partial_text or "")
+        self.retryable = bool(retryable)
+        self.model_name = str(model_name or "").strip() or None
+        self.backend_identifier = str(backend_identifier or "").strip() or None
+        self.startup_timeout_seconds = (
+            max(int(startup_timeout_seconds), 1)
+            if startup_timeout_seconds is not None
+            else None
+        )
+        self.inactivity_timeout_seconds = (
+            max(int(inactivity_timeout_seconds), 1)
+            if inactivity_timeout_seconds is not None
+            else None
+        )
+        self.total_timeout_seconds = (
+            max(int(total_timeout_seconds), 1)
+            if total_timeout_seconds is not None
+            else None
+        )
+        self.first_output_received = (
+            bool(first_output_received)
+            if first_output_received is not None
+            else bool(self.partial_text) or self.characters > 0
+        )
+
+    @property
+    def timed_out(self) -> bool:
+        return self.reason in {"startup_timeout", "inactivity_timeout", "total_timeout"}
+
+    @property
+    def progress_seen(self) -> bool:
+        return bool(self.partial_text) or self.characters > 0 or self.activity_count > 0
 
 
 @dataclass(slots=True)
@@ -421,65 +481,77 @@ class ExecutionAttemptStateMachine:
         self.record = record
         self._event_callback = event_callback
         self._started_at = time.monotonic()
+        self._lock = Lock()
         self._last_heartbeat_at = 0.0
         self._last_chunk_at = 0.0
+        self._last_event_at = self._started_at
         self._last_status_key: tuple[str, str] | None = None
+        self._terminal = False
         self.record.state = "launching"
 
     def progress_callback(self, payload: dict[str, Any]) -> None:
-        kind = str(payload.get("type") or "").strip()
-        if kind == "status":
-            stage = str(payload.get("stage") or "").strip()
-            if stage == "request_started":
-                self.record.state = "launching"
-            elif stage in {"waiting_for_first_chunk", "startup_timeout_warning"}:
-                self.record.state = "waiting_for_first_output"
-            self._sync_timeouts(payload)
-            status_key = (kind, stage)
-            if status_key == self._last_status_key:
+        with self._lock:
+            if self._terminal:
                 return
-            self._last_status_key = status_key
-        elif kind == "heartbeat":
-            if self.record.first_output_received or self.record.had_progress:
-                self.record.state = "stalled_after_progress"
-            else:
-                self.record.state = "waiting_for_first_output"
             now = time.monotonic()
-            if now - self._last_heartbeat_at < 8.0:
-                return
-            self._last_heartbeat_at = now
-        elif kind == "chunk":
-            self.record.state = "streaming"
-            self.record.first_output_received = True
-            self.record.had_progress = True
-            self.record.output_characters = max(
-                self.record.output_characters,
-                _coerce_int(payload.get("characters")) or self.record.output_characters,
-            )
-            now = time.monotonic()
-            if now - self._last_chunk_at < 2.0:
-                return
-            self._last_chunk_at = now
-        enriched = {
-            **payload,
-            "attempt": self.record.attempt_number,
-            "attempt_state": self.record.state,
-            "capability_tier": self.record.capability_tier,
-            "recovery_strategy": self.record.recovery_strategy,
-            "prompt_variant": self.record.prompt_variant,
-            "model": payload.get("model", self.record.model_identifier),
-            "backend": payload.get("backend", self.record.backend_identifier),
-            "task_class": self.record.task_class,
-        }
+            self._last_event_at = now
+            kind = str(payload.get("type") or "").strip()
+            if kind == "status":
+                stage = str(payload.get("stage") or "").strip()
+                if stage == "request_started":
+                    self.record.state = "launching"
+                elif stage in {"waiting_for_first_chunk", "startup_timeout_warning"}:
+                    self.record.state = "waiting_for_first_output"
+                self._sync_timeouts(payload)
+                status_key = (kind, stage)
+                if status_key == self._last_status_key:
+                    return
+                self._last_status_key = status_key
+            elif kind == "heartbeat":
+                if self.record.first_output_received or self.record.had_progress:
+                    self.record.state = "stalled_after_progress"
+                else:
+                    self.record.state = "waiting_for_first_output"
+                if now - self._last_heartbeat_at < 8.0:
+                    return
+                self._last_heartbeat_at = now
+                self.record.activity_count = max(self.record.activity_count + 1, 1)
+            elif kind == "chunk":
+                self.record.state = "streaming"
+                self.record.first_output_received = True
+                self.record.had_progress = True
+                self.record.output_characters = max(
+                    self.record.output_characters,
+                    _coerce_int(payload.get("characters")) or self.record.output_characters,
+                )
+                self.record.activity_count = max(self.record.activity_count + 1, 1)
+                if now - self._last_chunk_at < 2.0:
+                    return
+                self._last_chunk_at = now
+            enriched = {
+                **payload,
+                "attempt": self.record.attempt_number,
+                "attempt_state": self.record.state,
+                "capability_tier": self.record.capability_tier,
+                "recovery_strategy": self.record.recovery_strategy,
+                "prompt_variant": self.record.prompt_variant,
+                "model": payload.get("model", self.record.model_identifier),
+                "backend": payload.get("backend", self.record.backend_identifier),
+                "task_class": self.record.task_class,
+            }
         self._emit(enriched)
 
     def complete(self, value: Any) -> ExecutionAttemptRecord:
-        self.record.state = "completed"
-        self.record.elapsed_seconds = round(time.monotonic() - self._started_at, 1)
-        self.record.output_characters = max(
-            self.record.output_characters,
-            measure_output_characters(value),
-        )
+        with self._lock:
+            if self._terminal:
+                return self.record
+            self._terminal = True
+            self.record.state = "completed"
+            self.record.elapsed_seconds = round(time.monotonic() - self._started_at, 1)
+            self.record.output_characters = max(
+                self.record.output_characters,
+                measure_output_characters(value),
+            )
         return self.record
 
     def fail(
@@ -488,20 +560,89 @@ class ExecutionAttemptStateMachine:
         *,
         context_pressure_estimate: ContextPressureEstimate | None = None,
     ) -> ExecutionAttemptRecord:
-        failure = classify_execution_failure(
-            exc,
-            attempt=self.record,
-            context_pressure_estimate=context_pressure_estimate,
-            elapsed_seconds=round(time.monotonic() - self._started_at, 1),
-        )
-        self.record.failure = failure
-        self.record.state = failure.state
-        self.record.elapsed_seconds = failure.elapsed_seconds
-        self.record.had_progress = failure.had_progress
-        self.record.first_output_received = failure.first_output_received
-        self.record.output_characters = max(self.record.output_characters, failure.characters)
-        self.record.activity_count = max(self.record.activity_count, failure.activity_count)
+        with self._lock:
+            if self._terminal:
+                return self.record
+            self._terminal = True
+            failure = classify_execution_failure(
+                exc,
+                attempt=self.record,
+                context_pressure_estimate=context_pressure_estimate,
+                elapsed_seconds=round(time.monotonic() - self._started_at, 1),
+            )
+            self.record.failure = failure
+            self.record.state = failure.state
+            self.record.elapsed_seconds = failure.elapsed_seconds
+            self.record.had_progress = failure.had_progress
+            self.record.first_output_received = failure.first_output_received
+            self.record.output_characters = max(self.record.output_characters, failure.characters)
+            self.record.activity_count = max(self.record.activity_count, failure.activity_count)
         return self.record
+
+    def lifecycle_timeout_error(self, *, now: float | None = None) -> InvocationLifecycleTimeoutError | None:
+        with self._lock:
+            if self._terminal:
+                return None
+            current = time.monotonic() if now is None else float(now)
+            elapsed = max(current - self._started_at, 0.0)
+            idle_for = max(current - self._last_event_at, 0.0)
+            startup_timeout = self.record.startup_timeout_seconds
+            inactivity_timeout = self.record.inactivity_timeout_seconds
+            total_timeout = self.record.total_timeout_seconds
+            if (
+                not self.record.first_output_received
+                and startup_timeout is not None
+                and elapsed >= float(startup_timeout)
+            ):
+                return InvocationLifecycleTimeoutError(
+                    f"invoke_model watchdog timed out waiting for first output after {elapsed:.1f} seconds",
+                    reason="startup_timeout",
+                    elapsed=round(elapsed, 1),
+                    idle_for=round(idle_for, 1),
+                    characters=self.record.output_characters,
+                    activity_count=self.record.activity_count,
+                    model_name=self.record.model_identifier,
+                    backend_identifier=self.record.backend_identifier,
+                    startup_timeout_seconds=startup_timeout,
+                    inactivity_timeout_seconds=inactivity_timeout,
+                    total_timeout_seconds=total_timeout,
+                    first_output_received=False,
+                )
+            if (
+                (self.record.first_output_received or self.record.had_progress)
+                and inactivity_timeout is not None
+                and idle_for >= float(inactivity_timeout)
+            ):
+                return InvocationLifecycleTimeoutError(
+                    f"invoke_model watchdog timed out waiting for progress after {idle_for:.1f} seconds",
+                    reason="inactivity_timeout",
+                    elapsed=round(elapsed, 1),
+                    idle_for=round(idle_for, 1),
+                    characters=self.record.output_characters,
+                    activity_count=self.record.activity_count,
+                    model_name=self.record.model_identifier,
+                    backend_identifier=self.record.backend_identifier,
+                    startup_timeout_seconds=startup_timeout,
+                    inactivity_timeout_seconds=inactivity_timeout,
+                    total_timeout_seconds=total_timeout,
+                    first_output_received=self.record.first_output_received,
+                )
+            if total_timeout is not None and elapsed >= float(total_timeout):
+                return InvocationLifecycleTimeoutError(
+                    f"invoke_model watchdog timed out waiting for completion after {elapsed:.1f} seconds",
+                    reason="total_timeout" if (self.record.first_output_received or self.record.had_progress) else "startup_timeout",
+                    elapsed=round(elapsed, 1),
+                    idle_for=round(idle_for, 1),
+                    characters=self.record.output_characters,
+                    activity_count=self.record.activity_count,
+                    model_name=self.record.model_identifier,
+                    backend_identifier=self.record.backend_identifier,
+                    startup_timeout_seconds=startup_timeout,
+                    inactivity_timeout_seconds=inactivity_timeout,
+                    total_timeout_seconds=total_timeout,
+                    first_output_received=self.record.first_output_received,
+                )
+        return None
 
     def _sync_timeouts(self, payload: dict[str, Any]) -> None:
         if self.record.startup_timeout_seconds is None:
@@ -548,13 +689,48 @@ def invoke_model(
         total_timeout_seconds=total_timeout_seconds,
     )
     machine = ExecutionAttemptStateMachine(record, event_callback=event_callback)
-    try:
-        value = invoke(machine.progress_callback)
-    except Exception as exc:  # noqa: BLE001
+    result: dict[str, Any] = {}
+    done = Event()
+
+    def _worker() -> None:
+        try:
+            result["value"] = invoke(machine.progress_callback)
+        except Exception as exc:  # noqa: BLE001
+            result["exception"] = exc
+        finally:
+            done.set()
+
+    worker = Thread(target=_worker, daemon=True)
+    worker.start()
+    poll_interval_seconds = _watchdog_poll_interval_seconds(record)
+    while not done.is_set():
+        timeout_exc = machine.lifecycle_timeout_error()
+        if timeout_exc is not None and not done.is_set():
+            machine.fail(timeout_exc, context_pressure_estimate=context_pressure_estimate)
+            return InvocationOutcome(attempt=record, value=None, exception=timeout_exc)
+        time.sleep(poll_interval_seconds)
+    exc = result.get("exception")
+    if isinstance(exc, Exception):
         machine.fail(exc, context_pressure_estimate=context_pressure_estimate)
         return InvocationOutcome(attempt=record, value=None, exception=exc)
+    value = result.get("value")
     machine.complete(value)
     return InvocationOutcome(attempt=record, value=value, exception=None)
+
+
+def _watchdog_poll_interval_seconds(record: ExecutionAttemptRecord) -> float:
+    timeouts = [
+        float(value)
+        for value in (
+            record.startup_timeout_seconds,
+            record.inactivity_timeout_seconds,
+            record.total_timeout_seconds,
+        )
+        if value is not None and float(value) > 0.0
+    ]
+    if not timeouts:
+        return 0.1
+    return max(0.05, min(min(timeouts) / 10.0, 1.0))
 
 
 def classify_execution_failure(

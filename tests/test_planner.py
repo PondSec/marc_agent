@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
+import llm.runtime_resilience as runtime_resilience
 import pytest
 
 from agent.models import (
@@ -15523,6 +15525,109 @@ def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, m
     assert all(call["kwargs"]["num_ctx"] == 2048 for call in llm.generate_calls)
     assert "The retry still leaves argv handling incomplete." in llm.generate_calls[1]["args"][0]
     assert "Handle argv=None inside main() instead of hard-coding a fixed return value." in llm.generate_calls[1]["args"][0]
+
+
+def test_review_guided_retry_followup_hang_returns_terminal_timeout(tmp_path, monkeypatch):
+    class FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+            self.lock = threading.Lock()
+
+        def monotonic(self) -> float:
+            with self.lock:
+                return self.value
+
+        def sleep(self, seconds: float) -> None:
+            with self.lock:
+                self.value += max(float(seconds), 0.0)
+
+    class BlockingSecondRetryLLM(ScriptedLLM):
+        def __init__(self, *, config: AppConfig) -> None:
+            super().__init__(config=config)
+            self._blocker = threading.Event()
+
+        def generate(self, *args, **kwargs):
+            self.generate_calls.append({"args": args, "kwargs": kwargs})
+            callback = kwargs.get("progress_callback")
+            if len(self.generate_calls) == 1:
+                return "def main():\n    return 'draft'\n"
+            if callback is not None:
+                callback(
+                    {
+                        "type": "status",
+                        "stage": "request_started",
+                        "model": kwargs.get("model") or "qwen2.5-coder:7b",
+                        "startup_timeout": kwargs.get("timeout"),
+                        "inactivity_timeout": kwargs.get("timeout"),
+                        "total_timeout": kwargs.get("total_timeout"),
+                    }
+                )
+            self._blocker.wait(timeout=60)
+            return "def main(argv=None):\n    return argv or []\n"
+
+    llm = BlockingSecondRetryLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Update app.py so main accepts optional argv while keeping the edit focused.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refine the focused update."}],
+        target_paths=["app.py"],
+        target_name="app.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    reviews = iter(
+        [
+            ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The retry still leaves argv handling incomplete.",
+                confidence=0.9,
+                blocking_issues=["The proposal still ignores the optional argv path."],
+                preservation_risks=[],
+                repair_hints=["Handle argv=None inside main() instead of hard-coding a fixed return value."],
+            ),
+        ]
+    )
+    monkeypatch.setattr(planner, "_pre_write_update_review", lambda *_args, **_kwargs: next(reviews))
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_resilience.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime_resilience.time, "sleep", clock.sleep)
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.py",
+        current_content="def main():\n    return []\n",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal replaces the focused update with a stub.",
+            confidence=0.82,
+            blocking_issues=["Keep the change focused on argv handling."],
+            preservation_risks=[],
+            repair_hints=["Revise only the main() logic that needs argv support."],
+        ),
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content is None
+    assert len(llm.generate_calls) == 2
+    assert len(result.attempts) == 2
+    assert result.attempts[-1].state == "failed_startup"
+    assert result.attempts[-1].failure is not None
+    assert result.attempts[-1].failure.failure_class == "startup_timeout"
+    assert result.review is not None
+    assert result.review.safe_to_write is False
 
 
 def test_review_guided_retry_prompt_surfaces_minimal_semantic_delta(tmp_path, monkeypatch):
