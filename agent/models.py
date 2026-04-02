@@ -477,6 +477,7 @@ class ToolExecutionMeta(StrictModel):
     mutating: bool = False
     destructive: bool = False
     concurrency_safe: bool = False
+    verification_tool: bool = False
     execution_mode: ToolExecutionMode = "exclusive"
 
 

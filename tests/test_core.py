@@ -8,6 +8,8 @@ from agent.models import (
     RepairAttemptRecord,
     RepairBrief,
     SessionState,
+    ToolCallRecord,
+    ToolExecutionMeta,
     ToolRunResult,
     ValidationCommand,
     ValidationFailureEvidence,
@@ -259,6 +261,31 @@ def test_core_marks_model_start_failure_without_changes_as_partial(tmp_path):
     status = core._resolve_final_status(session, final_action=True)
 
     assert status == "partial"
+
+
+def test_core_uses_tool_metadata_for_phase_detection(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Mutate a generated artifact",
+        workspace_root=str(tmp_path),
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="custom_mutator",
+            success=True,
+            summary="Updated generated artifact.",
+            tool_meta=ToolExecutionMeta(
+                category="write",
+                mutating=True,
+                execution_mode="mutating",
+            ),
+        )
+    )
+
+    assert core._determine_phase(session) == "editing"
 
 
 def test_core_append_note_uses_concise_tool_summary_for_file_update(tmp_path):

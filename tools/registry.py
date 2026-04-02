@@ -37,6 +37,7 @@ class ToolSpec:
     category: str = "general"
     mutating: bool = False
     destructive: bool = False
+    verification_tool: bool = False
 
     def is_read_only(self) -> bool:
         return not self.mutating and self.category in READ_ONLY_CATEGORIES
@@ -60,6 +61,7 @@ class ToolSpec:
             "mutating": self.mutating,
             "destructive": self.destructive,
             "concurrency_safe": self.is_concurrency_safe(),
+            "verification_tool": self.verification_tool,
             "execution_mode": self.execution_mode(),
         }
 
@@ -217,6 +219,7 @@ def build_default_registry(
             input_model=RunShellArgs,
             handler=shell.run_shell,
             category="execute",
+            verification_tool=True,
         )
     )
     registry.register(
@@ -226,6 +229,7 @@ def build_default_registry(
             input_model=RunTestsArgs,
             handler=shell.run_tests,
             category="verify",
+            verification_tool=True,
         )
     )
     registry.register(

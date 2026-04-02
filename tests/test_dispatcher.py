@@ -70,3 +70,16 @@ def test_dispatcher_marks_mutating_tools_as_exclusive(tmp_path):
     assert result.tool_meta.read_only is False
     assert result.tool_meta.concurrency_safe is False
     assert result.tool_meta.execution_mode == "mutating"
+
+
+def test_dispatcher_marks_validation_tools_in_runtime_metadata(tmp_path):
+    dispatcher = build_dispatcher(tmp_path)
+
+    result = dispatcher.dispatch(
+        "run_tests",
+        {"command": "python -m pytest -q", "cwd": ".", "timeout": 5},
+        iteration=1,
+    )
+
+    assert result.tool_meta is not None
+    assert result.tool_meta.verification_tool is True

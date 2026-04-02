@@ -15,6 +15,7 @@ from agent.models import (
     PlanItem,
     SessionState,
     ToolCallRecord,
+    ToolExecutionMeta,
     ValidationCommand,
     ValidationRunRecord,
     WorkspaceSnapshot,
@@ -477,7 +478,7 @@ class AgentCore:
         }
         if tool_name in labels:
             return labels[tool_name]
-        if tool_name in READ_LIKE_TOOLS:
+        if self._tool_is_read_like(tool_name):
             return f"Read via {tool_name}"
         return self._trim_note_text(f"{tool_name}: {str(data.get('message') or '')}".strip(" :"), 100) or tool_name
 
@@ -590,7 +591,10 @@ class AgentCore:
             return "repairing"
         if session.changed_files and self.validation_planner.pending_commands(session):
             return "verifying"
-        if session.tool_calls and session.tool_calls[-1].tool_name in WRITE_TOOLS:
+        if session.tool_calls and self._tool_is_mutating(
+            session.tool_calls[-1].tool_name,
+            session.tool_calls[-1].tool_meta,
+        ):
             return "editing"
         if session.plan and any(item.status == "in_progress" for item in session.plan):
             return "exploring"
@@ -662,7 +666,7 @@ class AgentCore:
     ) -> bool:
         if decision.action_type != AgentActionType.CALL_TOOL:
             return False
-        if str(decision.tool_name or "").strip() not in WRITE_TOOLS:
+        if not self._tool_is_mutating(str(decision.tool_name or "").strip()):
             return False
         repair_context = session.active_repair_context
         if repair_context is None:
@@ -736,7 +740,7 @@ class AgentCore:
                 [*result.data.get("files", [])[:20], *session.candidate_files]
             )[:24]
 
-        if decision.tool_name in WRITE_TOOLS and result.success:
+        if result.success and self._tool_is_mutating(decision.tool_name, result.tool_meta):
             if session.validation_status in {"failed", "bootstrap_failed"}:
                 session.repair_attempts += 1
             session.edit_generation += 1
@@ -750,7 +754,7 @@ class AgentCore:
             session.workspace_snapshot = self.memory.build_snapshot(task)
             self._refresh_session_context(task, session)
 
-        if decision.tool_name in VERIFY_TOOLS:
+        if self._tool_is_verification(decision.tool_name, result.tool_meta):
             run = self._record_validation_run(session, decision, result)
             failure_evidence = None
             if run.status in {"failed", "timeout"}:
@@ -1142,6 +1146,33 @@ class AgentCore:
 
     def _has_degraded_semantic_execution(self, session: SessionState) -> bool:
         return self._semantic_resolution(session) != "full_model"
+
+    def _tool_is_mutating(
+        self,
+        tool_name: str | None,
+        tool_meta: ToolExecutionMeta | None = None,
+    ) -> bool:
+        if tool_meta is not None:
+            return tool_meta.mutating or tool_meta.destructive
+        return str(tool_name or "").strip() in WRITE_TOOLS
+
+    def _tool_is_read_like(
+        self,
+        tool_name: str | None,
+        tool_meta: ToolExecutionMeta | None = None,
+    ) -> bool:
+        if tool_meta is not None:
+            return tool_meta.read_only
+        return str(tool_name or "").strip() in READ_LIKE_TOOLS
+
+    def _tool_is_verification(
+        self,
+        tool_name: str | None,
+        tool_meta: ToolExecutionMeta | None = None,
+    ) -> bool:
+        if tool_meta is not None:
+            return tool_meta.verification_tool
+        return str(tool_name or "").strip() in VERIFY_TOOLS
 
     def _unique(self, values: Iterable[str]) -> list[str]:
         seen: set[str] = set()
