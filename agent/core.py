@@ -10,6 +10,7 @@ from agent.memory import RepoMemoryStore
 from agent.models import (
     DiagnosticRecord,
     FileChangeRecord,
+    RepairAttemptRecord,
     PlanItem,
     SessionState,
     ToolCallRecord,
@@ -528,6 +529,8 @@ class AgentCore:
             session.repair_attempts >= self.config.max_repair_attempts
             and session.validation_status in {"failed", "bootstrap_failed"}
         ):
+            if self._should_allow_progressive_repair_write(session, decision):
+                return decision
             if session.validation_status == "bootstrap_failed":
                 session.validation_status = "bootstrap_reset_required"
                 session.stop_reason = "needs_human_or_bootstrap_reset"
@@ -556,6 +559,53 @@ class AgentCore:
                 )
             session.stop_reason = "validation_command_missing"
         return decision
+
+    def _should_allow_progressive_repair_write(
+        self,
+        session: SessionState,
+        decision: AgentDecision,
+    ) -> bool:
+        if decision.action_type != AgentActionType.CALL_TOOL:
+            return False
+        if str(decision.tool_name or "").strip() not in WRITE_TOOLS:
+            return False
+        repair_context = session.active_repair_context
+        if repair_context is None:
+            return False
+        latest_attempt = self._latest_verified_failed_repair_attempt(session)
+        if latest_attempt is None or latest_attempt.behavior_changed is not True:
+            return False
+        target = str(decision.tool_args.get("path") or "").strip()
+        if not target:
+            return False
+        brief = repair_context.repair_brief
+        if brief is None:
+            return target == str(latest_attempt.artifact_path or "").strip()
+        allowed_files = {
+            str(item or "").strip()
+            for item in brief.allowed_files
+            if str(item or "").strip()
+        }
+        locked_target = str(brief.locked_target or brief.primary_target or "").strip()
+        if allowed_files and target not in allowed_files:
+            return False
+        if locked_target and target != locked_target and allowed_files and target not in allowed_files:
+            return False
+        latest_target = str(latest_attempt.artifact_path or "").strip()
+        return not latest_target or target == latest_target or target == locked_target or target in allowed_files
+
+    def _latest_verified_failed_repair_attempt(
+        self,
+        session: SessionState,
+    ) -> RepairAttemptRecord | None:
+        return next(
+            (
+                attempt
+                for attempt in reversed(session.repair_history)
+                if attempt.result == "mutation_planned" and attempt.independent_verification is False
+            ),
+            None,
+        )
 
     def _validation_decision(
         self,

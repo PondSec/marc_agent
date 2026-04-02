@@ -3,10 +3,18 @@ from __future__ import annotations
 from agent.core import AgentCore
 from agent.layered_memory import AgentMemoryStore
 from agent.memory import RepoMemoryStore
-from agent.models import FileChangeRecord, SessionState, ValidationCommand, ValidationRunRecord
+from agent.models import (
+    FileChangeRecord,
+    RepairAttemptRecord,
+    RepairBrief,
+    SessionState,
+    ValidationCommand,
+    ValidationFailureEvidence,
+    ValidationRunRecord,
+)
 from agent.task_state import TaskState
 from config.settings import AppConfig
-from llm.schemas import RouteActionName, RouteIntent, RouterOutput
+from llm.schemas import AgentActionType, AgentDecision, RouteActionName, RouteIntent, RouterOutput
 
 
 def test_core_marks_unvalidated_changed_files_as_partial(tmp_path):
@@ -104,6 +112,115 @@ def test_core_marks_generation_failure_without_changes_as_partial(tmp_path):
     status = core._resolve_final_status(session, final_action=True)
 
     assert status == "partial"
+
+
+def test_core_allows_progressive_repair_write_after_limit_when_behavior_improved(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    config.max_repair_attempts = 3
+    core = AgentCore(config)
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        validation_status="failed",
+        repair_attempts=3,
+        active_repair_context=ValidationFailureEvidence(
+            command="python -m unittest tests.test_normalize",
+            verification_scope="runtime",
+            status="failed",
+            artifact_paths=["normalize_cli.py"],
+            summary="CLI stdout contract still fails.",
+            failure_summary="Expected Hello WORLD.",
+            evidence_signature="sig-2",
+            repair_brief=RepairBrief(
+                failure_signature="runtime:assertion_mismatch:new",
+                primary_target="normalize_cli.py",
+                locked_target="normalize_cli.py",
+                allowed_files=["normalize_cli.py"],
+            ),
+        ),
+    )
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="normalize_cli.py",
+            validation_command="python -m unittest tests.test_normalize",
+            verification_scope="runtime",
+            strategy="targeted_repair",
+            result="mutation_planned",
+            reason="stdout path repaired",
+            evidence_signature="sig-1",
+            failure_signature="runtime:assertion_mismatch:old",
+            independent_verification=False,
+            behavior_changed=True,
+        )
+    )
+    decision = AgentDecision(
+        thought_summary="Repair normalize_cli.py from the latest failed runtime evidence.",
+        action_type=AgentActionType.CALL_TOOL,
+        tool_name="write_file",
+        tool_args={"path": "normalize_cli.py", "content": "print('Hello WORLD')\n"},
+        expected_outcome="Apply the targeted repair.",
+    )
+
+    enforced = core._enforce_iteration_rules(session, decision)
+
+    assert enforced == decision
+    assert session.stop_reason is None
+    assert session.validation_status == "failed"
+
+
+def test_core_stops_after_repair_limit_when_latest_failed_repair_did_not_change_behavior(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    config.max_repair_attempts = 3
+    core = AgentCore(config)
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        validation_status="failed",
+        repair_attempts=3,
+        active_repair_context=ValidationFailureEvidence(
+            command="python -m unittest tests.test_normalize",
+            verification_scope="runtime",
+            status="failed",
+            artifact_paths=["normalize_cli.py"],
+            summary="CLI stdout contract still fails.",
+            failure_summary="Expected Hello WORLD.",
+            evidence_signature="sig-3",
+            repair_brief=RepairBrief(
+                failure_signature="runtime:assertion_mismatch:same",
+                primary_target="normalize_cli.py",
+                locked_target="normalize_cli.py",
+                allowed_files=["normalize_cli.py"],
+            ),
+        ),
+    )
+    session.repair_history.append(
+        RepairAttemptRecord(
+            artifact_path="normalize_cli.py",
+            validation_command="python -m unittest tests.test_normalize",
+            verification_scope="runtime",
+            strategy="targeted_repair",
+            result="mutation_planned",
+            reason="stdout path repaired",
+            evidence_signature="sig-2",
+            failure_signature="runtime:assertion_mismatch:same",
+            independent_verification=False,
+            behavior_changed=False,
+        )
+    )
+    decision = AgentDecision(
+        thought_summary="Repair normalize_cli.py from the latest failed runtime evidence.",
+        action_type=AgentActionType.CALL_TOOL,
+        tool_name="write_file",
+        tool_args={"path": "normalize_cli.py", "content": "print('Hello WORLD')\n"},
+        expected_outcome="Apply the targeted repair.",
+    )
+
+    enforced = core._enforce_iteration_rules(session, decision)
+
+    assert enforced.action_type == AgentActionType.FINAL
+    assert session.stop_reason == "max_repair_attempts_reached"
 
 
 def test_core_uses_bootstrap_reset_stop_reason_and_partial_status(tmp_path):
