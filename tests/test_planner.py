@@ -12791,10 +12791,28 @@ def test_planner_review_retry_keeps_same_model_and_escalates_follow_up_to_full_f
     assert llm.generate_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
     assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is False
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
-    assert llm.generate_calls[1]["kwargs"]["timeout"] >= 75
-    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 330
+    assert llm.generate_calls[1]["kwargs"]["timeout"] >= 90
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 420
     assert "references sys.argv without importing sys." in llm.generate_calls[1]["args"][0]
     assert "add import sys before using it" in llm.generate_calls[1]["args"][0]
+
+
+def test_planner_repair_followup_retry_budget_expands_for_single_model_runtime(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:7b",
+                router_model_name="qwen2.5-coder:7b",
+            )
+        ),
+        "",
+    )
+
+    timeout_seconds, total_timeout_seconds = planner._repair_followup_retry_budget()
+
+    assert timeout_seconds == 90
+    assert total_timeout_seconds == 420
 
 
 def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, monkeypatch):

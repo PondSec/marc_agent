@@ -7271,7 +7271,11 @@ class Planner:
     def _repair_followup_retry_budget(self) -> tuple[int, int]:
         reserve_model = self._lightweight_generation_model_name()
         if reserve_model is None:
-            return max(self._llm_timeout(75), 75), max(self._llm_timeout(330), 330)
+            # On single-model 7B deployments the decisive follow-up repair hop has no
+            # real model switch available. Give that last same-model escalation enough
+            # warm-start and completion budget to be meaningfully different from the
+            # initial compact retry instead of timing out during startup again.
+            return max(self._llm_timeout(90), 90), max(self._llm_timeout(420), 420)
         return max(self._llm_timeout(60), 60), max(self._llm_timeout(240), 240)
 
     def _review_generated_update(
