@@ -6618,9 +6618,7 @@ class Planner:
         path: str,
         current_content: str | None,
     ) -> bool:
-        if current_content is None:
-            return False
-        if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG}:
+        if not self._supports_update_style_existing_artifact(route, current_content=current_content):
             return False
         if route.needs_clarification or not route.safe_to_execute:
             return False
@@ -6937,6 +6935,16 @@ class Planner:
             return False
         return True
 
+    def _supports_update_style_existing_artifact(
+        self,
+        route: RouterOutput,
+        *,
+        current_content: str | None,
+    ) -> bool:
+        if current_content is None:
+            return False
+        return route.intent in {RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.CREATE}
+
     def _should_prefer_lightweight_update_generation(
         self,
         route: RouterOutput,
@@ -6946,9 +6954,13 @@ class Planner:
         current_content: str | None,
     ) -> bool:
         lightweight = self._lightweight_generation_model_name()
-        if lightweight is None or current_content is None:
+        if lightweight is None:
             return False
-        if route.intent != RouteIntent.UPDATE or route.needs_clarification or not route.safe_to_execute:
+        if (
+            not self._supports_update_style_existing_artifact(route, current_content=current_content)
+            or route.needs_clarification
+            or not route.safe_to_execute
+        ):
             return False
 
         target_paths = self._actionable_explicit_target_paths(route, session)
@@ -7007,9 +7019,7 @@ class Planner:
         path: str,
         current_content: str | None,
     ) -> bool:
-        if current_content is None:
-            return False
-        if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG}:
+        if not self._supports_update_style_existing_artifact(route, current_content=current_content):
             return False
         if route.needs_clarification or not route.safe_to_execute:
             return False

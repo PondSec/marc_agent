@@ -1821,6 +1821,173 @@ def test_planner_uses_compact_primary_prompt_for_low_risk_multi_file_create_when
     assert "Validated route:" not in llm.generate_calls[0]["args"][0]
 
 
+def test_planner_uses_compact_primary_prompt_for_existing_file_when_route_is_create(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    target = pkg / "normalize.py"
+    original = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    words = text.replace(',', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return ' '.join(words)\n"
+        "    return ' '.join(word.lower() for word in words)\n"
+    )
+    updated = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    words = [word.strip('!?') for word in text.replace(',', ' ').split()]\n"
+        "    if keep_case:\n"
+        "        return ' '.join(words)\n"
+        "    return ' '.join(word.lower() for word in words)\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        text_payloads=[updated],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Ergaenze die keep-case-Funktionalitaet in texttools/normalize.py und normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "update_artifact",
+                "reason": "Extend the existing normalization module and companion CLI behavior.",
+            }
+        ],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.risk_level = "low"
+    session.task_state.confidence = 0.9
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=original,
+    )
+
+    assert result.content.strip() == updated.strip()
+    assert llm.generate_calls[0]["kwargs"]["model"] is None
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert "Validated route:" not in llm.generate_calls[0]["args"][0]
+
+
+def test_planner_prefers_lightweight_model_for_existing_file_when_route_is_create(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    target = pkg / "normalize.py"
+    original = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    words = text.replace(',', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return ' '.join(words)\n"
+        "    return ' '.join(word.lower() for word in words)\n"
+    )
+    updated = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    words = [word.strip('!?') for word in text.replace(',', ' ').split()]\n"
+        "    if keep_case:\n"
+        "        return ' '.join(words)\n"
+        "    return ' '.join(word.lower() for word in words)\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        text_payloads=[updated],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3-coder:30b",
+            router_model_name="qwen2.5-coder:14b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Ergaenze die keep-case-Funktionalitaet in texttools/normalize.py und normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "update_artifact",
+                "reason": "Extend the existing normalization module and companion CLI behavior.",
+            }
+        ],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.risk_level = "low"
+    session.task_state.confidence = 0.9
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=original,
+    )
+
+    assert result.content.strip() == updated.strip()
+    assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
+
+
+def test_planner_keeps_compact_review_for_existing_file_when_route_is_create(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    current_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    words = text.replace(',', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return ' '.join(words)\n"
+        "    return ' '.join(word.lower() for word in words)\n"
+    )
+    (pkg / "normalize.py").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Ergaenze die keep-case-Funktionalitaet in texttools/normalize.py und normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "update_artifact",
+                "reason": "Extend the existing normalization module and companion CLI behavior.",
+            }
+        ],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.risk_level = "low"
+    session.task_state.confidence = 0.9
+
+    assert planner._should_keep_update_review_compact(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=current_content,
+    )
+
+
 def test_planner_keeps_primary_model_for_small_create_when_semantics_are_limited(tmp_path):
     llm = ScriptedLLM(
         text_payloads=[
