@@ -7884,6 +7884,14 @@ class Planner:
                 proposed_content=proposed_content,
             )
         if review is None:
+            review = self._direct_main_option_contract_review(
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
             review = self._validation_repair_relevance_review(
                 path=path,
                 current_content=current_content,
@@ -7939,6 +7947,121 @@ class Planner:
                 ],
             )
         return review
+
+    def _direct_main_option_contract_review(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        option_tokens = self._direct_main_option_contract_tokens(session, repair_context)
+        if not option_tokens:
+            return None
+
+        current_contract_lines = self._runtime_argv_contract_lines(current_content)
+        proposed_contract_lines = self._runtime_argv_contract_lines(proposed_content)
+        if not current_contract_lines or current_contract_lines != proposed_contract_lines:
+            return None
+
+        lowered_current = str(current_content or "").lower()
+        if any(token.lower() in lowered_current for token in option_tokens):
+            return None
+
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        option_preview = ", ".join(option_tokens[:3])
+        evidence_hint = f" near {' | '.join(target_evidence[:2])}" if target_evidence else ""
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair still ignores the direct main([...]) option contract exercised by the failed runtime path."
+            ),
+            confidence=0.9,
+            blocking_issues=[
+                (
+                    f"The failing runtime path passes option tokens like {option_preview} into main([...]), "
+                    f"but the proposal leaves the argv-handling lines in {path} unchanged{evidence_hint}."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                f"Change the argv-handling lines in {path} so the direct main([...]) invocation recognizes option tokens like {option_preview} before formatting stdout.",
+                "Do not stop at output-only formatting changes if the provided runtime option tokens are still ignored.",
+                *self._runtime_target_repair_hints(path, repair_context, evidence_lines=target_evidence),
+            ],
+        )
+
+    def _direct_main_option_contract_tokens(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        *,
+        limit: int = 4,
+    ) -> list[str]:
+        if repair_context.verification_scope != "runtime":
+            return []
+
+        candidate_paths = self._unique_paths(
+            [
+                *[
+                    str(candidate or "").strip()
+                    for candidate in getattr(repair_context, "file_hints", []) or []
+                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+                ],
+                *(
+                    list(getattr(session.workspace_snapshot, "test_files", []) or [])
+                    if session.workspace_snapshot is not None
+                    else []
+                ),
+            ]
+        )
+        if not candidate_paths:
+            return []
+
+        tokens: list[str] = []
+        for candidate in candidate_paths[:4]:
+            excerpt = self._current_or_last_read_excerpt(session, path=candidate)
+            if "main([" not in excerpt:
+                continue
+            for match in re.finditer(r"\bmain\(\s*(\[[^\]]*\])\s*\)", excerpt):
+                raw_argv = str(match.group(1) or "").strip()
+                if not raw_argv:
+                    continue
+                try:
+                    values = ast.literal_eval(raw_argv)
+                except (SyntaxError, ValueError):
+                    continue
+                if not isinstance(values, (list, tuple)):
+                    continue
+                for value in values:
+                    token = str(value or "").strip()
+                    if not token.startswith("-") or token in tokens:
+                        continue
+                    tokens.append(token)
+                    if len(tokens) >= limit:
+                        return tokens[:limit]
+        return tokens[:limit]
+
+    def _runtime_argv_contract_lines(
+        self,
+        content: str,
+    ) -> tuple[str, ...]:
+        lines: list[str] = []
+        for raw_line in str(content or "").splitlines():
+            stripped = raw_line.strip()
+            lowered = stripped.lower()
+            if not stripped:
+                continue
+            if "argv" in lowered or "parse_args(" in lowered:
+                lines.append(stripped)
+        return tuple(lines[:8])
 
     def _repair_target_scope_review(
         self,
