@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Callable, Iterable
 
 from agent.diagnostics import FailureAnalyzer
@@ -47,6 +48,7 @@ WRITE_TOOLS = {
 }
 VERIFY_TOOLS = {"run_tests", "run_shell"}
 SEMANTIC_RUNTIME_OPERATIONS = {"router_generation", "task_state_generation", "task_understanding"}
+READ_LIKE_TOOLS = {"inspect_workspace", "list_files", "search_in_files", "read_file", "show_diff", "git_status", "git_diff", "git_log"}
 
 
 class AgentCore:
@@ -409,11 +411,103 @@ class AgentCore:
     def _append_note(self, session: SessionState, result) -> None:
         if result.data.get("snapshot"):
             session.workspace_snapshot = WorkspaceSnapshot.model_validate(result.data["snapshot"])
-        note = f"{result.tool_name}: {result.message}"
+        note = self._tool_note_summary(result)
         if result.data.get("exit_code") is not None:
             note += f" (exit={result.data['exit_code']})"
+        if session.notes and session.notes[-1] == note:
+            return
+        if note in session.notes:
+            session.notes.remove(note)
         session.notes.append(note)
         session.notes = session.notes[-40:]
+
+    def _tool_note_summary(self, result) -> str:
+        tool_name = str(result.tool_name or "").strip()
+        data = getattr(result, "data", {}) or {}
+        changed_files = list(getattr(result, "changed_files", []) or [])
+        path = self._tool_note_path(data, changed_files)
+        command = self._tool_note_command(data)
+        label = self._tool_note_label(tool_name, path=path, command=command, data=data)
+        if result.success:
+            return label
+        message = str(getattr(result, "message", "") or "").strip()
+        if not message:
+            return f"{label} failed"
+        return f"{label} failed: {self._trim_note_text(message, 140)}"
+
+    def _tool_note_label(
+        self,
+        tool_name: str,
+        *,
+        path: str | None,
+        command: str | None,
+        data: dict[str, object],
+    ) -> str:
+        target = self._trim_note_text(path or "", 72) if path else None
+        command_label = self._trim_note_text(command or "", 72) if command else None
+        branch = str(
+            data.get("branch")
+            or data.get("branch_name")
+            or data.get("name")
+            or ""
+        ).strip()
+        labels = {
+            "inspect_workspace": "Inspected workspace",
+            "list_files": f"Listed files in {target}" if target else "Listed files",
+            "search_in_files": f"Searched {target}" if target else "Searched files",
+            "read_file": f"Read {target}" if target else "Read file",
+            "show_diff": f"Read diff for {target}" if target else "Read diff",
+            "write_file": f"Updated {target}" if target else "Updated file",
+            "append_file": f"Appended to {target}" if target else "Appended file",
+            "create_file": f"Created {target}" if target else "Created file",
+            "delete_file": f"Deleted {target}" if target else "Deleted file",
+            "replace_in_file": f"Updated {target}" if target else "Updated file",
+            "patch_file": f"Patched {target}" if target else "Patched file",
+            "run_tests": f"Ran {command_label}" if command_label else "Ran validation",
+            "run_shell": f"Executed {command_label}" if command_label else "Executed shell command",
+            "git_status": "Read git status",
+            "git_diff": "Read git diff",
+            "git_log": "Read git history",
+            "git_create_branch": (
+                f"Created branch {self._trim_note_text(branch, 60)}"
+                if branch
+                else "Created branch"
+            ),
+        }
+        if tool_name in labels:
+            return labels[tool_name]
+        if tool_name in READ_LIKE_TOOLS:
+            return f"Read via {tool_name}"
+        return self._trim_note_text(f"{tool_name}: {str(data.get('message') or '')}".strip(" :"), 100) or tool_name
+
+    def _tool_note_path(self, data: dict[str, object], changed_files: list[FileChangeRecord]) -> str | None:
+        if changed_files:
+            candidate = str(getattr(changed_files[0], "path", "") or "").strip()
+            if candidate:
+                return candidate
+        for key in ("path", "file_path", "target", "root", "directory"):
+            candidate = str(data.get(key) or "").strip()
+            if candidate:
+                return candidate
+        return None
+
+    def _tool_note_command(self, data: dict[str, object]) -> str | None:
+        for key in ("command", "cmd"):
+            candidate = str(data.get(key) or "").strip()
+            if candidate:
+                return candidate
+        return None
+
+    def _trim_note_text(self, text: str, limit: int) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+        if len(normalized) <= limit:
+            return normalized
+        target = Path(normalized).name.strip()
+        if target and len(target) <= limit:
+            return target
+        return normalized[: limit - 1].rstrip() + "…"
 
     def _add_diagnostics(self, session: SessionState, result) -> None:
         diagnostics = self.failure_analyzer.analyze(result, iteration=session.iterations)

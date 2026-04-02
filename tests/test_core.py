@@ -8,6 +8,7 @@ from agent.models import (
     RepairAttemptRecord,
     RepairBrief,
     SessionState,
+    ToolRunResult,
     ValidationCommand,
     ValidationFailureEvidence,
     ValidationRunRecord,
@@ -258,6 +259,49 @@ def test_core_marks_model_start_failure_without_changes_as_partial(tmp_path):
     status = core._resolve_final_status(session, final_action=True)
 
     assert status == "partial"
+
+
+def test_core_append_note_uses_concise_tool_summary_for_file_update(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Update normalize_cli.py",
+        workspace_root=str(tmp_path),
+    )
+    result = ToolRunResult(
+        tool_name="write_file",
+        success=True,
+        message="Wrote normalize_cli.py.",
+        data={"path": "normalize_cli.py"},
+        changed_files=[FileChangeRecord(path="normalize_cli.py", operation="write")],
+    )
+
+    core._append_note(session, result)
+
+    assert session.notes == ["Updated normalize_cli.py"]
+
+
+def test_core_append_note_keeps_failure_reason_for_failed_tool_runs(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Run tests",
+        workspace_root=str(tmp_path),
+    )
+    result = ToolRunResult(
+        tool_name="run_tests",
+        success=False,
+        message="Validation command exited with 1.",
+        data={"command": "python -m unittest tests.test_stats", "exit_code": 1},
+    )
+
+    core._append_note(session, result)
+
+    assert session.notes == [
+        "Ran python -m unittest tests.test_stats failed: Validation command exited with 1. (exit=1)"
+    ]
 
 
 def test_core_marks_uncertain_degraded_semantic_fallback_as_partial_not_analysis_complete(tmp_path):
