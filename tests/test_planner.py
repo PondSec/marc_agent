@@ -9407,7 +9407,7 @@ def test_planner_runtime_repair_pivots_to_inferred_main_entrypoint_after_library
                     {"step": 1, "action": "update_artifact", "reason": "Repair the keep-case implementation."},
                     {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
                 ],
-                target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+                target_paths=["texttools/normalize.py", "tests/test_normalize.py"],
                 target_name="texttools/normalize.py",
             )
         ],
@@ -9473,6 +9473,7 @@ def test_planner_runtime_repair_pivots_to_inferred_main_entrypoint_after_library
     )
 
     assert "normalize_cli.py" in snapshot.entrypoints
+    assert "normalize_cli.py" in repair_context.artifact_paths
     assert repair_context.repair_brief.primary_target == "normalize_cli.py"
     assert repair_context.repair_brief.locked_target == "normalize_cli.py"
     assert next_target == "normalize_cli.py"

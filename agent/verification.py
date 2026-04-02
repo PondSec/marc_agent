@@ -2936,6 +2936,7 @@ class ValidationPlanner:
     ) -> list[str]:
         paths: list[str] = []
         task_state = session.task_state
+        snapshot = session.workspace_snapshot
         no_tests_executed = self._no_tests_executed(failed_run)
         if failed_run.verification_scope == "runtime" and task_state is not None and not no_tests_executed:
             paths.extend(
@@ -2943,6 +2944,8 @@ class ValidationPlanner:
                 for artifact in task_state.target_artifacts
                 if artifact.path and artifact.role != "supporting_context"
             )
+            if snapshot is not None:
+                paths.extend(snapshot.entrypoints[:4])
         if no_tests_executed:
             if task_state is not None:
                 paths.extend(
