@@ -2177,6 +2177,21 @@ def _focused_full_repair_update_prompt(
         review_feedback=review_feedback,
     )
     working_memory = _compact_working_memory(session)
+    noop_followup = _review_feedback_indicates_noop_repair(review_feedback)
+    concrete_examples = _repair_behavior_examples(repair_context)
+    implicated_line_excerpt = ""
+    if noop_followup:
+        implicated_line_excerpt = _line_focused_excerpt(
+            current_content,
+            line_hints=_repair_target_line_hints(
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            ),
+            limit=220,
+            before_radius=0,
+            after_radius=0,
+        )
 
     sections = [
         "Produce the full file content for exactly one file.",
@@ -2266,6 +2281,11 @@ def _focused_full_repair_update_prompt(
             "Minimal semantic delta: "
             + " | ".join(_trim_text(item, 180) for item in semantic_deltas[:2])
         )
+    if concrete_examples:
+        sections.append(
+            "Concrete behavior examples: "
+            + " | ".join(_trim_text(item, 180) for item in concrete_examples[:2])
+        )
     failure_focus = [
         _trim_text(str(item or "").strip(), 180)
         for item in targeted_context.get("failure_focus", [])
@@ -2286,7 +2306,7 @@ def _focused_full_repair_update_prompt(
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
     diagnostic_context = _diagnostic_context(session)
-    if diagnostic_context:
+    if diagnostic_context and not noop_followup:
         sections.append(f"Diagnostic context: {diagnostic_context}")
     if repair_brief.get("repair_constraints"):
         sections.append(
@@ -2323,6 +2343,17 @@ def _focused_full_repair_update_prompt(
                 for item in repair_brief.get("recent_failed_attempts", [])[:3]
             )
         )
+    if noop_followup:
+        sections.extend(
+            [
+                "Repeated no-op detected: the previous proposal preserved the same file hash for the active failure.",
+                "This follow-up must rewrite the implicated behavior in the locked target instead of re-emitting an equivalent file.",
+            ]
+        )
+        if implicated_line_excerpt:
+            sections.append(
+                "Implicated current lines that must change:\n" + implicated_line_excerpt
+            )
     if runtime_hints:
         sections.append(
             "Targeted runtime hints: "
@@ -2339,11 +2370,18 @@ def _focused_full_repair_update_prompt(
             + " ".join(_trim_text(item, 220) for item in fixture_hints[:4])
         )
     if review_feedback is not None:
+        if not noop_followup:
+            sections.append(
+                f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}"
+            )
         sections.extend(
             [
-                f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
                 _direct_review_corrections(review_feedback),
-                "Use that feedback to make a smaller, safer update while preserving unrelated existing behavior.",
+                (
+                    "Use that feedback to make a smaller, safer update while preserving unrelated existing behavior."
+                    if not noop_followup
+                    else "Use that feedback to make a concrete code-level mutation in the locked target. If the current evidence is still insufficient to derive a real fix, return exactly __REPAIR_BLOCKED__."
+                ),
             ]
         )
     if mutation_anchors:
@@ -2358,6 +2396,60 @@ def _focused_full_repair_update_prompt(
         ]
     )
     return "\n\n".join(sections)
+
+
+def _review_feedback_indicates_noop_repair(review: ProposedUpdateReview | None) -> bool:
+    if review is None:
+        return False
+    combined = " ".join(
+        str(item or "").strip()
+        for item in [review.summary, *review.blocking_issues, *review.repair_hints]
+        if str(item or "").strip()
+    ).lower()
+    if not combined:
+        return False
+    return any(
+        marker in combined
+        for marker in (
+            "no-op",
+            "file hash unchanged",
+            "no effective change",
+            "equivalent file",
+            "equivalent content",
+            "same failing state",
+            "implicated lines unchanged",
+        )
+    )
+
+
+def _repair_behavior_examples(
+    repair_context: ValidationFailureEvidence,
+    *,
+    limit: int = 2,
+) -> list[str]:
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is None:
+        return []
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in getattr(brief, "expected_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in getattr(brief, "observed_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    examples: list[str] = []
+    for observed_value, expected_value in zip(observed_items, expected_items):
+        observed = str(observed_value or "").strip()
+        expected = str(expected_value or "").strip()
+        if not observed or not expected or observed == expected:
+            continue
+        examples.append(f"{observed!r} -> {expected!r}")
+        if len(examples) >= limit:
+            break
+    return examples
 
 
 def _mandatory_mutation_rules(anchors: list[str]) -> str:
