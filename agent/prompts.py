@@ -768,6 +768,17 @@ def generate_content_retry_prompt(
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
+    if current_content is not None and repair_context is not None and session is not None:
+        return _focused_full_repair_update_prompt(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
+            review_feedback=review_feedback,
+        )
+
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     sections = [
         "Produce the full file content for exactly one file.",
@@ -2121,6 +2132,225 @@ def _compact_repair_retry_prompt(
     sections.extend(
         [
             _direct_review_corrections(review_feedback),
+            "Current file content:",
+            current_content,
+            "Update this file to satisfy the request. Return the full updated file content only.",
+            "Do not add markdown fences or explanations.",
+        ]
+    )
+    return "\n\n".join(sections)
+
+
+def _focused_full_repair_update_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    current_content: str,
+    repair_context: ValidationFailureEvidence,
+    repair_strategy: str | None,
+    review_feedback: ProposedUpdateReview | None,
+) -> str:
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+    compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
+    targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
+    repair_brief = targeted_context.get("repair_brief") or {}
+    support_excerpt_limit = 500 if repair_context.verification_scope == "runtime" else 220
+    support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
+    related_context = _repair_related_file_context(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        excerpt_limit=support_excerpt_limit,
+        max_files=support_max_files,
+    )
+    runtime_hints = _targeted_runtime_prompt_hints(
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+        targeted_context=targeted_context,
+    )
+    mutation_anchors = _mandatory_mutation_anchors(
+        path=path,
+        current_content=current_content,
+        repair_context=repair_context,
+        review_feedback=review_feedback,
+    )
+    working_memory = _compact_working_memory(session)
+
+    sections = [
+        "Produce the full file content for exactly one file.",
+        f"Target path: {path}",
+        f"Latest user request: {_trim_text(session.task, 260)}",
+        f"Requested outcome: {_trim_text(route.requested_outcome, 220)}",
+        (
+            "Repair objective: make the failed "
+            f"{repair_context.verification_scope} validation pass while preserving the original requested behavior."
+        ),
+        _single_file_boundary_instruction(path, route.entities.target_paths),
+        (
+            "Validation-guided repair context: "
+            + " ".join(
+                part
+                for part in [
+                    f"command={_trim_text(repair_context.command, 120)}" if str(repair_context.command or "").strip() else "",
+                    f"scope={repair_context.verification_scope}",
+                    f"summary={_trim_text(repair_context.failure_summary or repair_context.summary, 220)}",
+                ]
+                if part
+            )
+        ),
+        _repair_rules(repair_strategy),
+        "Keep the update narrow and preserve unrelated existing behavior, imports, and interfaces.",
+    ]
+    relevant_working_memory = {
+        key: value
+        for key, value in (
+            ("current_goal", working_memory.get("current_goal")),
+            ("current_subtask", working_memory.get("current_subtask")),
+            ("primary_target", working_memory.get("primary_target")),
+            ("verification_target", working_memory.get("verification_target")),
+            ("relevant_files", working_memory.get("relevant_files", [])[:4] if working_memory.get("relevant_files") else []),
+            ("relevant_symbols", working_memory.get("relevant_symbols", [])[:4] if working_memory.get("relevant_symbols") else []),
+            ("summary", _trim_text(str(working_memory.get("summary") or ""), 180)),
+        )
+        if value not in ("", [], None)
+    }
+    if not relevant_working_memory and session.task_state is not None:
+        fallback_targets = [
+            item.path
+            for item in [*session.task_state.active_artifacts[:4], *session.task_state.target_artifacts[:4]]
+            if str(getattr(item, "path", "") or "").strip()
+        ]
+        relevant_working_memory = {
+            key: value
+            for key, value in (
+                ("current_goal", _trim_text(session.task_state.active_goal, 180)),
+                ("verification_target", _trim_text(session.task_state.verification_target or "", 180)),
+                ("relevant_files", fallback_targets[:4]),
+                (
+                    "summary",
+                    _trim_text(
+                        session.task_state.open_problem
+                        or session.task_state.output_expectation
+                        or session.task_state.root_goal,
+                        180,
+                    ),
+                ),
+            )
+            if value not in ("", [], None)
+        }
+    if relevant_working_memory:
+        sections.append(f"Working memory: {json.dumps(relevant_working_memory, ensure_ascii=False)}")
+    file_requirement_summary = _file_local_requirement_summary(compact_focus)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
+    if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
+        sections.append(
+            "Primary repair target: "
+            + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
+        )
+    if repair_brief.get("expected_semantics"):
+        sections.append(
+            "Expected semantics: "
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
+        )
+    if repair_brief.get("observed_semantics"):
+        sections.append(
+            "Observed semantics: "
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
+        )
+    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    if semantic_deltas:
+        sections.append(
+            "Minimal semantic delta: "
+            + " | ".join(_trim_text(item, 180) for item in semantic_deltas[:2])
+        )
+    failure_focus = [
+        _trim_text(str(item or "").strip(), 180)
+        for item in targeted_context.get("failure_focus", [])
+        if str(item or "").strip()
+    ]
+    if failure_focus:
+        sections.append("Failure focus: " + " | ".join(failure_focus[:4]))
+    if repair_brief.get("implicated_region_hint") or repair_brief.get("implicated_symbols"):
+        region_parts: list[str] = []
+        if repair_brief.get("implicated_region_hint"):
+            region_parts.append(f"region={repair_brief['implicated_region_hint']}")
+        if repair_brief.get("implicated_symbols"):
+            region_parts.append(
+                "symbols=" + ", ".join(_trim_text(str(item or "").strip(), 40) for item in repair_brief.get("implicated_symbols", [])[:4])
+            )
+        if region_parts:
+            sections.append("Repair focus: " + " ".join(region_parts))
+    if related_context != "none":
+        sections.append(f"Supporting file hints: {related_context}")
+    diagnostic_context = _diagnostic_context(session)
+    if diagnostic_context:
+        sections.append(f"Diagnostic context: {diagnostic_context}")
+    if repair_brief.get("repair_constraints"):
+        sections.append(
+            "Repair constraints: "
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("repair_constraints", [])[:3])
+        )
+    if repair_brief.get("allowed_files"):
+        sections.append(
+            "Allowed repair files: "
+            + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("allowed_files", [])[:4])
+        )
+    if repair_brief.get("forbidden_files"):
+        sections.append(
+            "Avoid drifting into other files without strong new evidence: "
+            + ", ".join(_trim_text(str(item or "").strip(), 80) for item in repair_brief.get("forbidden_files", [])[:4])
+        )
+    if repair_brief.get("recent_failed_attempts"):
+        sections.append(
+            "Recent failed repair attempts: "
+            + " | ".join(
+                _trim_text(
+                    " ".join(
+                        part
+                        for part in [
+                            str(item.get("target") or "").strip(),
+                            str(item.get("strategy") or "").strip(),
+                            str(item.get("result") or "").strip(),
+                            str(item.get("reason") or "").strip(),
+                        ]
+                        if part
+                    ),
+                    180,
+                )
+                for item in repair_brief.get("recent_failed_attempts", [])[:3]
+            )
+        )
+    if runtime_hints:
+        sections.append(
+            "Targeted runtime hints: "
+            + " ".join(_trim_text(item, 220) for item in runtime_hints[:6])
+        )
+    fixture_hints = _runtime_support_file_prompt_hints(
+        path=path,
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+    if fixture_hints:
+        sections.append(
+            "Runtime support file hints: "
+            + " ".join(_trim_text(item, 220) for item in fixture_hints[:4])
+        )
+    if review_feedback is not None:
+        sections.extend(
+            [
+                f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+                _direct_review_corrections(review_feedback),
+                "Use that feedback to make a smaller, safer update while preserving unrelated existing behavior.",
+            ]
+        )
+    if mutation_anchors:
+        sections.append(_mandatory_mutation_rules(mutation_anchors))
+    sections.extend(
+        [
+            _update_rules(),
             "Current file content:",
             current_content,
             "Update this file to satisfy the request. Return the full updated file content only.",
