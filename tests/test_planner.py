@@ -9479,6 +9479,150 @@ def test_planner_runtime_repair_pivots_to_inferred_main_entrypoint_after_library
     assert next_target == "normalize_cli.py"
 
 
+def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_contract(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text: str, keep_case: bool = False) -> list:\n"
+        "    parts = text.replace(',', ' ').replace('!', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return parts\n"
+        "    return [part.lower() for part in parts]\n\n"
+        "def normalize_words_keep_case(text: str) -> list:\n"
+        "    return normalize_words(text, keep_case=True)\n",
+        encoding="utf-8",
+    )
+    current_cli = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False  # Default behavior is to convert to lowercase\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_normalize.py"
+    test_path.write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_normalize_words_lowercases_by_default(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!'), ['hello', 'world'])\n\n"
+        "    def test_normalize_words_can_keep_case(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!', keep_case=True), ['Hello', 'WORLD'])\n\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+            "focus_files": ["normalize_cli.py", "texttools/normalize.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "symbol_index": {
+                "normalize_cli.py": ["main"],
+                "texttools/normalize.py": ["normalize_words", "normalize_words_keep_case"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Repair the normalize keep-case runtime flow after the library fix.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_normalize and fix the keep-case runtime flow.",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_cli_supports_keep_case_flag (tests.test_normalize.NormalizeTests.test_cli_supports_keep_case_flag)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 19, in test_cli_supports_keep_case_flag\n'
+            "    self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n"
+            "AssertionError: '' != 'Hello WORLD'\n"
+            "+ Hello WORLD\n"
+        ),
+        failure_summary="normalize_cli.py still produces the wrong behavior: expected Validation should produce: Hello WORLD but observed Validation currently produces: ''.",
+        file_hints=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        line_hints=[19],
+        repair_requirements=["Change normalize_cli.py so the failing runtime path produces the expected output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:normalize-cli-stdout-contract",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: ''"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the repair on normalize_cli.py."],
+            allowed_files=["normalize_cli.py", "texttools/normalize.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+        confidence=0.93,
+        blocking_issues=[
+            "The proposed repair does not make a productive change to normalize_cli.py for runtime:assertion_mismatch:normalize-cli-stdout-contract (file hash unchanged)."
+        ],
+        preservation_risks=[],
+        repair_hints=[
+            "Change the locked repair target so the failing stdout behavior changes materially.",
+        ],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_cli,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "main(['--keep-case', 'Hello', 'WORLD'])" in prompt
+    assert "output.getvalue().strip()" in prompt
+    assert "The failing test checks stdout for this path." in prompt
+    assert "The test calls main([...]) directly." in prompt
+    assert "do not hardcode the expected literal" in prompt
+
+
 def test_planner_current_repair_context_pivots_back_to_provider_after_support_noop(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()

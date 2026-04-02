@@ -3364,6 +3364,37 @@ def _targeted_runtime_prompt_hints(
                 hints.append(
                     "If this file needs bootstrap help to reach workspace code, place it above the current top-level project import instead of editing only downstream logic."
                 )
+    stdout_capture_contract = any(
+        marker in lowered_support or marker in lowered_failure
+        for marker in (
+            "redirect_stdout(",
+            "getvalue().strip(",
+            "stdout.getvalue(",
+            "mock_stdout.getvalue(",
+            "patch('sys.stdout'",
+            'patch("sys.stdout"',
+            "new_callable=stringio",
+            "capsys.readouterr(",
+            "capfd.readouterr(",
+        )
+    )
+    if stdout_capture_contract:
+        hints.append(
+            "The failing test checks stdout for this path. Make the repaired path emit the expected text to stdout instead of only returning a value."
+        )
+        if "print(" not in lowered_current and ".write(" not in lowered_current:
+            hints.append(
+                "If this path currently only returns a value, add the smallest stdout emission needed for the CLI contract while preserving unrelated helper behavior."
+            )
+    if re.search(r"(?:__main__\.)?main\(\s*\[", supporting_context):
+        hints.append(
+            "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
+        )
+    repair_brief = targeted_context.get("repair_brief") or {}
+    if repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics"):
+        hints.append(
+            "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source unless the current implementation already derives it directly."
+        )
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure
@@ -4939,10 +4970,18 @@ def _repair_related_file_context(
         ):
             continue
         normalized_excerpt = str(excerpt or "").strip()
-        focused_line_hints = _supporting_file_line_hints(
-            excerpt,
+        frame_line_hints = _repair_failure_frame_line_hints(
+            path,
             repair_context=repair_context,
-            target_path=target_path,
+        )
+        focused_line_hints = _merge_repair_line_hints(
+            frame_line_hints,
+            _supporting_file_line_hints(
+                excerpt,
+                repair_context=repair_context,
+                target_path=target_path,
+            ),
+            limit=6,
         )
         if focused_line_hints:
             focused_excerpt = _line_focused_excerpt(
@@ -5061,19 +5100,20 @@ def _line_focused_excerpt(
         return ""
     leading_radius = max(0, radius if before_radius is None else before_radius)
     trailing_radius = max(0, radius if after_radius is None else after_radius)
-    hinted_lines = sorted(
-        {
-            hint
-            for raw in line_hints
-            for hint in [int(raw)]
-            if hint >= 1 and hint <= len(lines)
-        }
-    )
+    hinted_lines: list[int] = []
+    for raw in line_hints:
+        try:
+            hint = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if hint < 1 or hint > len(lines) or hint in hinted_lines:
+            continue
+        hinted_lines.append(hint)
     if not hinted_lines:
         return _trim_balanced_text(normalized, limit)
 
     selected_indexes: set[int] = set()
-    for hint in hinted_lines[:4]:
+    for hint in hinted_lines[:6]:
         start = max(hint - 1 - leading_radius, 0)
         end = min(hint + trailing_radius, len(lines))
         selected_indexes.update(range(start, end))
@@ -5314,6 +5354,46 @@ def _path_was_created(session: SessionState, path: str) -> bool:
         if str(item.tool_args.get("path") or "").strip() == target:
             return True
     return False
+
+
+def _repair_failure_frame_line_hints(
+    path: str,
+    *,
+    repair_context: ValidationFailureEvidence,
+    limit: int = 4,
+) -> list[int]:
+    target = str(path or "").strip().replace("\\", "/")
+    if not target:
+        return []
+    frame_text = "\n".join(
+        part
+        for part in [
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ]
+        if part
+    )
+    if not frame_text:
+        return []
+    hints: list[int] = []
+    for match in re.finditer(r'File "(?P<path>[^"]+)", line (?P<line>\d+)(?:, in [^\n]+)?', frame_text):
+        raw_path = str(match.group("path") or "").strip().replace("\\", "/")
+        if not raw_path:
+            continue
+        normalized_path = raw_path.removeprefix("./")
+        if not _artifact_matches_path(target, normalized_path, normalized_path):
+            continue
+        try:
+            line = int(match.group("line") or 0)
+        except ValueError:
+            line = 0
+        if line <= 0 or line in hints:
+            continue
+        hints.append(line)
+        if len(hints) >= limit:
+            break
+    return hints
 
 
 def _normalized_focus_text(text: str) -> str:
