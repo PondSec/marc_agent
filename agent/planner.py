@@ -3533,7 +3533,10 @@ class Planner:
         if session.workspace_snapshot is not None:
             candidates.extend(session.workspace_snapshot.focus_files)
             candidates.extend(session.workspace_snapshot.important_files[:12])
-        return self._unique_paths(candidates)
+        return self._prioritize_request_entrypoint_targets(
+            session,
+            self._unique_paths(candidates),
+        )
 
     def _read_candidates(
         self,
@@ -3578,7 +3581,10 @@ class Planner:
             candidates.append(target_name_path)
         if session is not None:
             candidates.extend(self._snapshot_explicit_target_paths(session))
-        return self._unique_paths(candidates)
+        unique = self._unique_paths(candidates)
+        if session is None:
+            return unique
+        return self._prioritize_request_entrypoint_targets(session, unique)
 
     def _ordered_create_targets(
         self,
@@ -4011,6 +4017,66 @@ class Planner:
                 continue
             sanitized = re.sub(re.escape(normalized), " ", sanitized, flags=re.IGNORECASE)
         return sanitized.lower()
+
+    def _request_targets_cli_entrypoint(self, request_lower: str) -> bool:
+        lowered = str(request_lower or "").lower()
+        if "python -m" in lowered or "python3 -m" in lowered:
+            return True
+        if "command line" in lowered or "kommandozeile" in lowered:
+            return True
+        if "argparse" in lowered:
+            return True
+        normalized = f" {re.sub(r'[^0-9a-zäöüß]+', ' ', lowered).strip()} "
+        if " cli " in normalized:
+            return True
+        return bool(re.search(r"(^|[^0-9a-z])--[a-z0-9][\w-]*", lowered))
+
+    def _prioritize_request_entrypoint_targets(
+        self,
+        session: SessionState,
+        candidates: list[str],
+    ) -> list[str]:
+        if len(candidates) <= 1:
+            return candidates
+        snapshot = session.workspace_snapshot
+        if snapshot is None:
+            return candidates
+        request_lower = self._request_text_for_explicit_target_matching(session)
+        if not self._request_targets_cli_entrypoint(request_lower):
+            return candidates
+
+        entrypoints = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "entrypoints", []) or []
+            if str(path or "").strip()
+        }
+        if not entrypoints:
+            return candidates
+
+        prioritized_entrypoints = [
+            path
+            for path in candidates
+            if path in entrypoints
+        ]
+        if not prioritized_entrypoints:
+            return candidates
+
+        def priority(path: str) -> tuple[int, int]:
+            basename = Path(path).name.lower()
+            is_entrypoint = path in entrypoints
+            return (
+                0 if is_entrypoint and basename == "__main__.py" else 1 if is_entrypoint else 2,
+                0 if self._path_matches_explicit_request(session, path) else 1,
+            )
+
+        indexed_positions = {path: index for index, path in enumerate(candidates)}
+        return sorted(
+            candidates,
+            key=lambda path: (
+                *priority(path),
+                indexed_positions.get(path, 999),
+            ),
+        )
 
     def _target_name_path_candidate(self, route: RouterOutput) -> str | None:
         target_name = str(route.entities.target_name or "").strip()

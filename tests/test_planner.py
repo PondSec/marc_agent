@@ -1946,6 +1946,154 @@ def test_planner_prefers_lightweight_model_for_existing_file_when_route_is_creat
     assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
 
 
+def test_planner_prefers_cli_entrypoint_for_cli_focused_update_targets(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text: str, keep_case: bool = False) -> list:\n"
+        "    parts = text.replace(',', ' ').replace('!', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return parts\n"
+        "    return [part.lower() for part in parts]\n\n"
+        "def normalize_words_keep_case(text: str) -> list:\n"
+        "    return normalize_words(text, keep_case=True)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    assert main(['--keep-case']) == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+            "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "likely_commands": ["python -m unittest tests.test_normalize"],
+        }
+    )
+    session = SessionState(
+        task=(
+            "Aktiviere die vorhandene keep-case-Unterstuetzung auch in der CLI "
+            "und validiere am Ende mit python -m unittest tests.test_normalize."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Finish the CLI-facing keep-case behavior."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+
+    assert "normalize_cli.py" in session.workspace_snapshot.entrypoints
+    assert planner._actionable_explicit_target_paths(session.router_result, session)[0] == "normalize_cli.py"
+    assert planner._next_update_target(session.router_result, session) == "normalize_cli.py"
+
+
+def test_planner_keeps_library_target_when_request_does_not_target_cli_entrypoint(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text: str, keep_case: bool = False) -> list:\n"
+        "    parts = text.replace(',', ' ').replace('!', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return parts\n"
+        "    return [part.lower() for part in parts]\n\n"
+        "def normalize_words_keep_case(text: str) -> list:\n"
+        "    return normalize_words(text, keep_case=True)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    assert main(['--keep-case']) == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+            "focus_files": ["texttools/normalize.py", "normalize_cli.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "likely_commands": ["python -m unittest tests.test_normalize"],
+        }
+    )
+    session = SessionState(
+        task=(
+            "Bereinige die keep-case-Normalisierung in texttools/normalize.py "
+            "und validiere am Ende mit python -m unittest tests.test_normalize."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the keep-case normalization logic."},
+            {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+        ],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+
+    assert "normalize_cli.py" in session.workspace_snapshot.entrypoints
+    assert planner._actionable_explicit_target_paths(session.router_result, session)[0] == "texttools/normalize.py"
+    assert planner._next_update_target(session.router_result, session) == "texttools/normalize.py"
+
+
 def test_planner_keeps_compact_review_for_existing_file_when_route_is_create(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
