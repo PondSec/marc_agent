@@ -146,7 +146,7 @@ def test_web_root_serves_gui(tmp_path):
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "M.A.R.C A1" in response.text
+    assert "M.A.R.C A2" in response.text
 
 
 def test_workspaces_api_does_not_auto_add_base_workspace(tmp_path):

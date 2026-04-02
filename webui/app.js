@@ -2,6 +2,24 @@ const STORAGE_KEY = "marc_a1.workspace_ui.v3";
 const CHAT_SCROLL_BOTTOM_THRESHOLD = 24;
 const COMMIT_AND_PUSH_PROMPT =
   "Bitte pruefe den aktuellen Git-Status in diesem Workspace, erstelle einen kleinen sinnvollen Commit mit einer kurzen passenden Message und pushe den aktuellen Branch zu origin. Wenn es nichts zu committen gibt oder der Push scheitert, erklaere kurz den Grund im Chat.";
+const APP_BRAND_NAME = "M.A.R.C A2";
+const APP_BRAND_PLAIN = "MARC A2";
+const REFERENCE_WELCOME_ART = [
+  "                                                          ",
+  "     *                                       █████▓▓░     ",
+  "                                 *         ███▓░     ░░   ",
+  "            ░░░░░░                        ███▓░           ",
+  "    ░░░   ░░░░░░░░░░                      ███▓░           ",
+  "   ░░░░░░░░░░░░░░░░░    *                ██▓░░      ▓   ",
+  "                                             ░▓▓███▓▓░    ",
+  " *                                 ░░░░                   ",
+  "                                 ░░░░░░░░                 ",
+  "                               ░░░░░░░░░░░░░░░░           ",
+  "      █████████                                        * ",
+  "      ██▄█████▄██                        *                ",
+  "      █████████     *                                   ",
+  ".......█ █   █ █..........................................",
+];
 let sessionRefreshHandle = null;
 let modelRefreshHandle = null;
 let authTickerHandle = null;
@@ -1703,7 +1721,7 @@ function renderSetupShell() {
           <div class="brand-panel auth-brand-panel">
             <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
             <div class="brand-copy">
-              <p class="brand-title">M.A.R.C A1</p>
+              <p class="brand-title">${APP_BRAND_NAME}</p>
               <p class="brand-subtitle">Gefuehrter Setup-Assistent fuer die lokale Agent-Runtime</p>
             </div>
           </div>
@@ -2043,7 +2061,7 @@ function renderAuthShell() {
           <div class="brand-panel auth-brand-panel">
             <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
             <div class="brand-copy">
-              <p class="brand-title">M.A.R.C A1</p>
+              <p class="brand-title">${APP_BRAND_NAME}</p>
               <p class="brand-subtitle">Gesicherte Operator-Konsole fuer lokale Agent-Laufzeiten</p>
             </div>
           </div>
@@ -2183,7 +2201,7 @@ function renderSidebar() {
         <div class="sidebar-brand-row">
           <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
           <div class="brand-copy">
-            <p class="brand-title">M.A.R.C A1</p>
+            <p class="brand-title">${APP_BRAND_NAME}</p>
             <p class="brand-subtitle">${escapeHtml(activeRuns ? `${activeRuns} aktive Laeufe` : "Lokale Agentenarbeit")}</p>
           </div>
         </div>
@@ -2718,6 +2736,192 @@ function buildWorkspaceShellView(sourceState = state) {
   };
 }
 
+function buildReferenceHeroView(sourceState = state) {
+  const shell = buildWorkspaceShellView(sourceState);
+  const { workspace, session } = shell;
+  const validation = session ? buildValidationSnapshot(session) : null;
+  const workspaceSessions = workspace ? sessionsForWorkspaceFrom(sourceState, workspace.id) : [];
+  const activeRuns = Array.isArray(sourceState.sessions)
+    ? sourceState.sessions.filter((item) => isSessionRunning(item)).length
+    : 0;
+  const recentSessions = workspaceSessions.slice(0, 3).map((item) => ({
+    text: shorten(item.title || item.last_message_preview || item.task || "Neuer Thread", 56),
+    meta: `${sessionBadgeText(item)} · ${formatSessionTimestamp(item.updated_at)}`,
+  }));
+  const currentStep = currentThoughtFrom(sourceState);
+  const welcomeCopy = session
+    ? "Transcript, Tool-Aktivitaet und Laufzustand bleiben in einer einzigen konzentrierten REPL-Sicht gebuendelt."
+    : workspace
+      ? "Die Workspace-Shell orientiert sich jetzt direkt an der Referenz-REPL: erst Kontext und Status, dann der Verlauf, dann der Prompt."
+      : "Verbinde ein Projekt und arbeite dann in derselben transcript-zentrierten Shell weiter, statt in einer losen Dashboard-Ansicht.";
+  const feeds = [
+    {
+      title: "Workspace",
+      lines: workspace
+        ? [
+            { text: workspace.name, meta: shortenPath(workspace.path, 72) },
+            {
+              text: countLabel(workspaceSessions.length, "1 Thread", `${workspaceSessions.length} Threads`),
+              meta: activeRuns ? `${activeRuns} aktive Laeufe` : "Keine aktiven Laeufe",
+            },
+          ]
+        : [{ text: "Noch kein Projekt verbunden", meta: "Lege links einen lokalen Workspace an." }],
+      footer: workspace ? "Lokaler Kontext verbunden" : "Projekt anlegen, um zu starten",
+    },
+    {
+      title: session ? "Current session" : "Start prompt",
+      lines: session
+        ? [
+            { text: shell.title, meta: labelForPhase(session.current_phase) },
+            { text: labelForAccessMode(session.access_mode), meta: sessionStatusTone(session) === "running" ? "Agent arbeitet" : shell.statusText },
+            {
+              text: countLabel(session.changed_files?.length || 0, "1 Datei geaendert", `${session.changed_files?.length || 0} Dateien geaendert`),
+              meta: validation ? validation.statusLabel : "Noch keine Checks",
+            },
+          ]
+        : [
+            { text: workspace ? composerPlaceholder(workspace) : "Verbinde zuerst ein lokales Projekt", meta: composerHint(workspace) },
+            { text: "Ctrl+Enter sendet direkt", meta: "Zugriff, Modell und Profil bleiben im Footer sichtbar" },
+          ],
+      footer: currentStep || "Bereit fuer den naechsten Auftrag",
+    },
+    {
+      title: "Recent activity",
+      lines: recentSessions.length
+        ? recentSessions
+        : [
+            {
+              text: workspace ? "Noch kein Verlauf in diesem Workspace" : "Noch keine Sessions",
+              meta: workspace ? "Starte den ersten Thread, um hier Aktivitaet zu sehen." : "Nach dem ersten Lauf erscheint hier der Verlauf.",
+            },
+          ],
+      footer: validation
+        ? `Checks: ${validation.statusLabel}`
+        : activeRuns
+          ? `${activeRuns} aktive Laeufe`
+          : "Leerlauf",
+    },
+  ];
+
+  return {
+    shell,
+    compact: Boolean(session),
+    brand: APP_BRAND_NAME,
+    plainBrand: APP_BRAND_PLAIN,
+    welcomeTitle: session ? shell.title : `Welcome to ${APP_BRAND_PLAIN}`,
+    welcomeCopy,
+    promptHint: composerHint(workspace),
+    modelLabel: sourceState.composer.modelName || sourceState.config?.model_name || "Standard",
+    locationLabel: workspace?.path ? shortenPath(workspace.path, 84) : "Kein lokaler Workspace verbunden",
+    statusText: shell.statusText,
+    statusTone: shell.statusTone,
+    currentStep: currentStep || "Bereit",
+    feeds,
+    runtimeStatusItems: shell.runtimeStatusItems,
+  };
+}
+
+function renderReferenceHero() {
+  const hero = buildReferenceHeroView();
+  if (hero.compact) {
+    return `
+      <section class="reference-hero reference-hero-compact">
+        <div class="reference-hero-compact-head">
+          <div class="reference-hero-compact-brand">
+            <div class="reference-hero-mark" aria-hidden="true">${icon("spark")}</div>
+            <div class="reference-hero-compact-copy">
+              <strong>${escapeHtml(hero.brand)}</strong>
+              <span>${escapeHtml(hero.modelLabel)} · ${escapeHtml(hero.locationLabel)}</span>
+            </div>
+          </div>
+          <span class="reference-hero-state tone-${escapeHtml(hero.statusTone)}">${escapeHtml(hero.statusText)}</span>
+        </div>
+        <div class="reference-hero-compact-body">
+          <div class="reference-hero-compact-titleblock">
+            <span class="reference-kicker">Current session</span>
+            <h2>${escapeHtml(hero.welcomeTitle)}</h2>
+            <p>${escapeHtml(hero.welcomeCopy)}</p>
+          </div>
+          ${renderReferenceStatusLine(hero.runtimeStatusItems, hero.currentStep)}
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="reference-hero reference-hero-full">
+      <div class="reference-hero-grid">
+        <div class="reference-hero-primary">
+          <div class="reference-hero-heading">
+            <span class="reference-kicker">Welcome</span>
+            <h2>${escapeHtml(hero.welcomeTitle)}</h2>
+            <p>${escapeHtml(hero.welcomeCopy)}</p>
+          </div>
+          <pre class="reference-welcome-art" aria-hidden="true">${escapeHtml(REFERENCE_WELCOME_ART.join("\n"))}</pre>
+          <div class="reference-hero-meta">
+            <span class="reference-meta-pill">${escapeHtml(hero.brand)}</span>
+            <span class="reference-meta-pill">${escapeHtml(hero.modelLabel)}</span>
+            <span class="reference-meta-pill">${escapeHtml(hero.locationLabel)}</span>
+          </div>
+        </div>
+        <div class="reference-feed-column">
+          ${hero.feeds.map(renderReferenceFeedCard).join("")}
+        </div>
+      </div>
+      ${renderReferenceStatusLine(hero.runtimeStatusItems, hero.currentStep)}
+    </section>
+  `;
+}
+
+function renderReferenceFeedCard(feed) {
+  const lines = Array.isArray(feed?.lines) ? feed.lines : [];
+  return `
+    <section class="reference-feed-card">
+      <div class="reference-feed-head">
+        <h3>${escapeHtml(feed?.title || "Feed")}</h3>
+      </div>
+      <div class="reference-feed-body">
+        ${
+          lines.length
+            ? lines.map(renderReferenceFeedLine).join("")
+            : `<p class="reference-feed-empty">Noch keine Daten verfuegbar.</p>`
+        }
+      </div>
+      ${feed?.footer ? `<div class="reference-feed-footer">${escapeHtml(feed.footer)}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderReferenceFeedLine(line) {
+  return `
+    <div class="reference-feed-line">
+      <strong>${escapeHtml(line?.text || "")}</strong>
+      ${line?.meta ? `<span>${escapeHtml(line.meta)}</span>` : ""}
+    </div>
+  `;
+}
+
+function renderReferenceStatusLine(items, currentStep = "") {
+  const segments = Array.isArray(items)
+    ? items.map(
+        (item) => `
+          <span class="reference-status-segment tone-${escapeHtml(item.tone || "muted")}">
+            <span class="reference-status-label">${escapeHtml(item.label)}</span>
+            <strong>${escapeHtml(item.value)}</strong>
+          </span>
+        `,
+      )
+    : [];
+  if (currentStep) {
+    segments.push(
+      `<span class="reference-status-segment tone-running"><span class="reference-status-label">Now</span><strong>${escapeHtml(
+        currentStep,
+      )}</strong></span>`,
+    );
+  }
+  return `<div class="reference-status-line">${segments.join("")}</div>`;
+}
+
 function renderRuntimeStatusStrip(items) {
   if (!Array.isArray(items) || !items.length) {
     return "";
@@ -2744,16 +2948,18 @@ function renderTopBar() {
   const { workspace, session } = shell;
 
   return `
-    <header class="thread-topbar">
-      <div class="thread-topbar-inner">
-        <div class="thread-topbar-copy">
-          <h1 class="thread-topbar-title">${escapeHtml(shell.title)}</h1>
-          <p class="thread-topbar-subtitle">${escapeHtml(shell.subtitle)}</p>
+    <header class="reference-toolbar">
+      <div class="reference-toolbar-inner">
+        <div class="reference-toolbar-copy">
+          <strong class="reference-toolbar-title">${escapeHtml(APP_BRAND_NAME)}</strong>
+          <span class="reference-toolbar-subtitle">${escapeHtml(
+            workspace ? `${workspace.name} · ${shortenPath(workspace.path, 56)}` : "Kein Projekt verbunden",
+          )}</span>
         </div>
-        <div class="thread-toolbar">
-          <span class="thread-toolbar-status tone-${escapeHtml(shell.statusTone)}">${escapeHtml(shell.statusText)}</span>
+        <div class="reference-toolbar-actions">
+          <span class="reference-toolbar-status tone-${escapeHtml(shell.statusTone)}">${escapeHtml(shell.statusText)}</span>
           <button
-            class="icon-button top-bar-icon"
+            class="icon-button reference-toolbar-icon"
             type="button"
             data-action="open-workspace-preview"
             data-workspace-id="${escapeHtml(workspace?.id || "")}"
@@ -2768,7 +2974,7 @@ function renderTopBar() {
             ${icon("play")}
           </button>
           <button
-            class="button-secondary"
+            class="button-ghost reference-toolbar-button"
             type="button"
             data-action="download-session-handoff"
             data-session-id="${escapeHtml(session?.id || "")}"
@@ -2779,10 +2985,10 @@ function renderTopBar() {
             )}"
             ${shell.canDownloadHandoff ? "" : "disabled"}
           >
-            Aenderungen laden
+            Handoff
           </button>
           <button
-            class="button-secondary"
+            class="button-ghost reference-toolbar-button"
             type="button"
             data-action="${workspace ? "new-chat" : "open-workspace-modal"}"
             ${workspace ? `data-workspace-id="${escapeHtml(workspace.id)}"` : ""}
@@ -2790,7 +2996,7 @@ function renderTopBar() {
             Neuer Thread
           </button>
           <button
-            class="icon-button top-bar-icon"
+            class="icon-button reference-toolbar-icon"
             type="button"
             data-action="download-workspace-export"
             data-workspace-id="${escapeHtml(workspace?.id || "")}"
@@ -2805,7 +3011,7 @@ function renderTopBar() {
             ${icon("download")}
           </button>
           <button
-            class="icon-button top-bar-icon"
+            class="icon-button reference-toolbar-icon"
             type="button"
             data-action="commit-push"
             aria-label="Commit und Push an den Agenten senden"
@@ -2819,7 +3025,7 @@ function renderTopBar() {
             ${icon("git-push")}
           </button>
           <button
-            class="icon-button top-bar-icon"
+            class="icon-button reference-toolbar-icon"
             type="button"
             data-action="delete-session"
             data-session-id="${escapeHtml(session?.id || "")}"
@@ -2834,7 +3040,7 @@ function renderTopBar() {
             ${icon("trash")}
           </button>
           <button
-            class="icon-button top-bar-icon"
+            class="icon-button reference-toolbar-icon"
             type="button"
             data-action="open-settings-page"
             aria-label="Einstellungen"
@@ -2844,7 +3050,6 @@ function renderTopBar() {
           </button>
         </div>
       </div>
-      ${renderRuntimeStatusStrip(shell.runtimeStatusItems)}
     </header>
   `;
 }
@@ -2860,25 +3065,26 @@ function renderChatContainer() {
 }
 
 function renderChatStateMessages() {
+  const hero = renderReferenceHero();
   if (state.ui.booting) {
-    return renderStageState(
+    return `${hero}${renderStageState(
       "Oberflaeche wird vorbereitet",
       "Projekte, Threads und Laufzeitstatus werden geladen.",
-    );
+    )}`;
   }
 
   if (state.ui.sessionLoading) {
-    return renderStageState(
+    return `${hero}${renderStageState(
       "Thread wird geladen",
       "Konversation, Arbeitsdetails und Validierung werden zusammengestellt.",
-    );
+    )}`;
   }
 
   if (!state.activeSession) {
-    return renderEmptyThreadState();
+    return `${hero}${renderEmptyThreadState()}`;
   }
 
-  return renderThreadView(state.activeSession);
+  return `${hero}${renderThreadView(state.activeSession)}`;
 }
 
 function renderStageState(title, copy, actions = "") {
@@ -3008,15 +3214,15 @@ function renderConversationPanel(session) {
     .join(" | ");
   return `
     <section class="thread-canvas">
-      <div class="thread-context">
-        <div class="thread-context-copy">
-          <span class="thread-context-project">${escapeHtml(workspace?.name || "Projekt")}</span>
-          <h2 class="thread-context-title">${escapeHtml(title)}</h2>
-          <p class="thread-context-summary">${escapeHtml(overview.summary)}</p>
+      <div class="reference-transcript-head">
+        <div class="reference-transcript-copy">
+          <span class="reference-kicker">Transcript</span>
+          <h2>${escapeHtml(title)}</h2>
+          <p>${escapeHtml(overview.summary)}</p>
         </div>
-        ${contextMeta ? `<p class="thread-context-meta">${escapeHtml(contextMeta)}</p>` : ""}
+        ${contextMeta ? `<p class="reference-transcript-meta">${escapeHtml(contextMeta)}</p>` : ""}
       </div>
-      <div class="thread-feed">
+      <div class="thread-feed reference-thread-feed">
         ${timeline.length ? timeline.map((entry) => renderTimelineEntry(entry, session)).join("") : `<div class="inline-note">Noch keine Nachrichten in diesem Thread.</div>`}
         ${isSessionRunning(session) ? renderRunningMessage(session) : ""}
       </div>
@@ -3383,17 +3589,27 @@ function renderChatInput() {
   return `
     <footer class="chat-input-shell">
       <div class="chat-input-inner">
-        <div class="chat-input-container composer-panel">
+        <div class="chat-input-container composer-panel reference-composer-panel">
           ${notices.length ? `<div class="composer-notice-row">${notices.map(renderComposerNotice).join("")}</div>` : ""}
-          <div class="chat-input-row">
+          <div class="reference-composer-head">
+            <div class="reference-composer-heading">
+              <span class="reference-kicker">Prompt</span>
+              <strong>${escapeHtml(composerHint(workspace))}</strong>
+            </div>
+            <span class="reference-composer-shortcut">Ctrl+Enter senden</span>
+          </div>
+          <div class="chat-input-row reference-chat-input-row">
+            <div class="reference-composer-gutter" aria-hidden="true">
+              <span class="reference-composer-sigil">${workspace ? ">" : "!"}</span>
+            </div>
             <textarea
               id="composerInput"
-              class="chat-input"
+              class="chat-input reference-chat-input"
               rows="3"
               placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
             ></textarea>
             <button
-              class="send-button ${running ? "stop" : "send"}"
+              class="send-button reference-send-button ${running ? "stop" : "send"}"
               type="button"
               data-action="${running ? "stop-session" : "submit-prompt"}"
               aria-label="${running ? "Stoppen" : "Senden"}"
@@ -3401,12 +3617,12 @@ function renderChatInput() {
               ${icon(running ? "stop" : "arrow")}
             </button>
           </div>
-          <div class="composer-meta-row">
+          <div class="composer-meta-row reference-composer-footer">
             ${renderMetaChip(workspace?.name || "Kein Projekt", "muted")}
             ${renderMetaChip(state.composer.modelName || state.config?.model_name || "Standardmodell", "muted")}
             ${renderMetaChip(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode), "muted")}
             ${renderMetaChip(executionProfileLabelFromState(), "muted")}
-            <button class="button-ghost composer-options-button" type="button" data-action="open-settings-page">
+            <button class="button-ghost composer-options-button reference-composer-options" type="button" data-action="open-settings-page">
               Optionen
             </button>
           </div>
@@ -5842,27 +6058,27 @@ function isSessionRunning(session) {
   return Boolean(session && ["queued", "running"].includes(session.status));
 }
 
-function currentThought() {
-  if (!isSessionRunning(state.activeSession)) {
+function currentThoughtFrom(sourceState = state) {
+  if (!isSessionRunning(sourceState.activeSession)) {
     return "";
   }
 
-  if (state.activeSession?.stop_requested) {
+  if (sourceState.activeSession?.stop_requested) {
     return "Der laufende Schritt wird sauber beendet.";
   }
 
-  if (state.activeSession?.status === "queued" && state.logs.length === 0) {
+  if (sourceState.activeSession?.status === "queued" && (sourceState.logs || []).length === 0) {
     return "Der Lauf wird vorbereitet.";
   }
 
-  for (const record of [...state.logs].reverse()) {
+  for (const record of [...(sourceState.logs || [])].reverse()) {
     const thought = describeCurrentStep(record);
     if (thought) {
       return thought;
     }
   }
 
-  const latestToolCall = [...(state.activeSession?.tool_calls || [])]
+  const latestToolCall = [...(sourceState.activeSession?.tool_calls || [])]
     .reverse()
     .find((item) => item.tool_name || item.thought_summary || item.expected_outcome);
   if (latestToolCall) {
@@ -5879,6 +6095,10 @@ function currentThought() {
   }
 
   return "Der Agent arbeitet am aktuellen Auftrag.";
+}
+
+function currentThought() {
+  return currentThoughtFrom(state);
 }
 
 function describeCurrentStep(record) {
@@ -6366,6 +6586,7 @@ function icon(name) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildActivityClusters,
+    buildReferenceHeroView,
     buildRuntimeStatusItems,
     buildUiRoute,
     buildWorkspaceShellView,

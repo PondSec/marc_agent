@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   buildActivityClusters,
+  buildReferenceHeroView,
   buildRuntimeStatusItems,
   buildUiRoute,
   buildWorkspaceShellView,
@@ -273,4 +274,60 @@ test("buildWorkspaceShellView kapselt Toolbar-Entscheidungen zentral", () => {
   assert.equal(view.canDeleteSession, false);
   assert.equal(view.canDownloadHandoff, false);
   assert.match(view.subtitle, /alpha|\/tmp\/alpha/i);
+});
+
+test("buildReferenceHeroView erzeugt im Startzustand Welcome-Feeds aus dem Workspace-Kontext", () => {
+  const hero = buildReferenceHeroView({
+    config: { model_name: "qwen3-coder:30b" },
+    composer: {
+      modelName: "",
+      accessMode: "approval",
+      executionProfile: "balanced",
+    },
+    workspaces: [{ id: "ws-1", name: "alpha", path: "/tmp/alpha" }],
+    sessions: [
+      makeSession({
+        id: "session-2",
+        workspace_id: "ws-1",
+        status: "completed",
+        current_phase: "completed",
+        updated_at: "2026-03-27T10:00:00.000Z",
+      }),
+    ],
+    selectedWorkspaceId: "ws-1",
+    activeSession: null,
+    logs: [],
+  });
+
+  assert.equal(hero.compact, false);
+  assert.equal(hero.welcomeTitle, "Welcome to MARC A2");
+  assert.equal(hero.feeds[0].title, "Workspace");
+  assert.equal(hero.feeds[2].title, "Recent activity");
+  assert.match(hero.feeds[0].lines[0].meta, /alpha|tmp/i);
+});
+
+test("buildReferenceHeroView wechselt bei aktiver Session in den kompakten Modus", () => {
+  const hero = buildReferenceHeroView({
+    config: { model_name: "qwen3-coder:30b" },
+    composer: {
+      modelName: "",
+      accessMode: "approval",
+      executionProfile: "balanced",
+    },
+    workspaces: [{ id: "ws-1", name: "alpha", path: "/tmp/alpha" }],
+    sessions: [],
+    selectedWorkspaceId: "ws-1",
+    activeSession: makeSession({
+      workspace_id: "ws-1",
+      status: "running",
+      current_phase: "editing",
+      changed_files: [{ path: "webui/app.js", operation: "write" }],
+    }),
+    logs: [],
+  });
+
+  assert.equal(hero.compact, true);
+  assert.equal(hero.statusText, "Aktiv");
+  assert.equal(hero.feeds[1].title, "Current session");
+  assert.match(hero.locationLabel, /alpha|tmp/i);
 });
