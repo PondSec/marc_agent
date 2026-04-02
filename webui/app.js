@@ -1679,11 +1679,8 @@ function renderApp() {
         ${renderToast()}
       `
     : `
-        <div class="shell">
-          <aside class="sidebar">
-            ${renderSidebar()}
-          </aside>
-          <main class="workspace-shell">
+        <div class="reference-shell">
+          <main class="workspace-shell reference-workspace-shell">
             ${renderTopBar()}
             ${renderChatContainer()}
             ${renderChatInput()}
@@ -1715,96 +1712,98 @@ function renderSetupShell() {
     : "Der Assistent richtet die Web-Konsole, die lokale Runtime und den ersten Administrator in einem Durchgang ein. Die Laufzeitkonfiguration wird als .env gespeichert, dein Passwort nur gehasht in der Auth-Datenbank.";
 
   return `
-    <div class="auth-shell">
-      <div class="auth-shell-inner">
-        <section class="auth-hero surface-panel">
-          <div class="brand-panel auth-brand-panel">
-            <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
-            <div class="brand-copy">
-              <p class="brand-title">${APP_BRAND_NAME}</p>
-              <p class="brand-subtitle">Gefuehrter Setup-Assistent fuer die lokale Agent-Runtime</p>
-            </div>
+    <div class="reference-access-shell">
+      <section class="reference-access-hero">
+        <div class="reference-access-brand">
+          <div class="reference-hero-mark" aria-hidden="true">${icon("spark")}</div>
+          <div class="reference-access-brand-copy">
+            <strong>${APP_BRAND_NAME}</strong>
+            <span>Gefuehrter Setup-Assistent fuer die Agent-Runtime</span>
           </div>
-          <div class="auth-copy">
-            <p class="panel-kicker">Erststart</p>
-            <h1>In wenigen Schritten startklar</h1>
-            <p>${escapeHtml(copy)}</p>
+        </div>
+        <div class="reference-access-copy">
+          <span class="reference-kicker">Setup</span>
+          <h1>Runtime und Operator in einem Fluss einrichten</h1>
+          <p>${escapeHtml(copy)}</p>
+        </div>
+        <pre class="reference-welcome-art" aria-hidden="true">${escapeHtml(REFERENCE_WELCOME_ART.join("\n"))}</pre>
+        <div class="reference-feed-column">
+          ${renderReferenceFeedCard({
+            title: "Setup status",
+            lines: [
+              { text: state.setup.reason ? setupReasonCopy(state.setup.reason) : "Die Runtime braucht noch ihre Ersteinrichtung.", meta: `.env: ${state.setup.envPath || ".env"}` },
+              { text: `Schritt ${step} / 3`, meta: state.setup.submitting ? "Speichert Konfiguration" : "Runtime, Admin und Projekt" },
+            ],
+          })}
+        </div>
+      </section>
+      <section class="reference-access-panel">
+        <div class="reference-access-panel-head">
+          <div>
+            <span class="reference-kicker">Configuration</span>
+            <h2>${escapeHtml(loading ? "Assistent wird vorbereitet" : "Basis konfigurieren")}</h2>
           </div>
-          <div class="auth-feature-list">
-            ${renderAuthFeature("Keine Handarbeit", "Die .env, der erste Admin und das erste Projekt werden direkt aus der Web-Oberflaeche angelegt.")}
-            ${renderAuthFeature("Sichere Defaults", "Der Assistent erzeugt automatisch einen starken Secret Key und speichert Passwoerter nicht im Klartext in der .env.")}
-            ${renderAuthFeature("Ollama im Blick", "Host, Standardmodell und Router-Modell werden sauber vorbelegt und koennen spaeter weiter angepasst werden.")}
-            ${renderAuthFeature("Im selben Stil", "Der Setup-Flow nutzt bewusst dieselbe Oberflaechenlogik wie der restliche Workspace statt einer separaten Fremdoberflaeche.")}
+          ${renderStatusBadge(loading ? "Wird vorbereitet" : `Schritt ${step} / 3`, tone, {
+            compact: true,
+            live: loading || state.setup.submitting,
+          })}
+        </div>
+        <p class="reference-access-panel-copy">
+          ${escapeHtml(
+            state.setup.reason
+              ? setupReasonCopy(state.setup.reason)
+              : "Nur die noetigen Angaben werden abgefragt. Der Rest wird aus sicheren Defaults und der Runtime selbst abgeleitet.",
+          )}
+        </p>
+        ${renderReferenceAccessStatus(
+          loading ? "Initialisierung" : state.setup.error ? "Setup braucht Aufmerksamkeit" : "Bereit fuer die Einrichtung",
+          loading
+            ? "Pruefe vorhandene Konfiguration, Sicherheitskontext und Modell-Status."
+            : state.setup.error || "Nach dem Abschluss wird die Konfiguration gespeichert, der erste Admin angelegt und der erste Workspace verbunden.",
+          tone,
+        )}
+        ${renderSetupStepTabs(step)}
+        <form id="setupForm" class="reference-access-form">
+          ${renderSetupStep(step, loading)}
+          <div class="reference-access-meta">
+            <span>.env-Ziel: ${escapeHtml(state.setup.envPath || ".env")}</span>
+            <span>Passwort mindestens ${escapeHtml(String(state.setup.passwordPolicy?.min_length || 14))} Zeichen</span>
+            <span>${escapeHtml(state.setup.hasEnvFile ? "Vorhandene .env wird gezielt erweitert." : "Eine neue .env wird automatisch erzeugt.")}</span>
           </div>
-        </section>
-        <section class="auth-card surface-panel setup-card">
-          <div class="auth-card-head">
-            <div>
-              <p class="panel-kicker">Setup</p>
-              <h2>${escapeHtml(loading ? "Assistent wird vorbereitet" : "Basis konfigurieren")}</h2>
-            </div>
-            ${renderStatusBadge(loading ? "Wird vorbereitet" : `Schritt ${step} / 3`, tone, {
-              compact: true,
-              live: loading || state.setup.submitting,
-            })}
+          <div class="reference-access-actions">
+            <button
+              class="button-secondary"
+              type="button"
+              data-action="setup-prev"
+              ${loading || state.setup.submitting || step === 1 ? "disabled" : ""}
+            >
+              Zurueck
+            </button>
+            ${
+              step < 3
+                ? `
+                  <button
+                    class="button-primary"
+                    type="button"
+                    data-action="setup-next"
+                    ${loading || state.setup.submitting ? "disabled" : ""}
+                  >
+                    Weiter
+                  </button>
+                `
+                : `
+                  <button
+                    class="button-primary"
+                    type="submit"
+                    ${loading || state.setup.submitting ? "disabled" : ""}
+                  >
+                    ${escapeHtml(submitLabel)}
+                  </button>
+                `
+            }
           </div>
-          <p class="auth-card-copy">
-            ${escapeHtml(
-              state.setup.reason
-                ? setupReasonCopy(state.setup.reason)
-                : "Der Assistent sammelt nur die Angaben, die fuer einen sicheren und direkt nutzbaren Start wirklich benoetigt werden.",
-            )}
-          </p>
-          ${renderSetupStatusPanel(tone, loading)}
-          ${renderSetupStepTabs(step)}
-          <form id="setupForm" class="auth-form setup-form">
-            ${renderSetupStep(step, loading)}
-            <div class="auth-meta-row setup-meta-row">
-              <span class="auth-meta-copy">
-                .env-Ziel: ${escapeHtml(state.setup.envPath || ".env")}
-              </span>
-              <span class="auth-meta-copy">
-                Mindestlaenge Passwort: ${escapeHtml(String(state.setup.passwordPolicy?.min_length || 14))} Zeichen
-              </span>
-              <span class="auth-meta-copy">
-                ${escapeHtml(state.setup.hasEnvFile ? "Vorhandene .env wird gezielt ergaenzt." : "Eine neue .env wird automatisch erzeugt.")}
-              </span>
-            </div>
-            <div class="setup-actions">
-              <button
-                class="button-secondary"
-                type="button"
-                data-action="setup-prev"
-                ${loading || state.setup.submitting || step === 1 ? "disabled" : ""}
-              >
-                Zurueck
-              </button>
-              ${
-                step < 3
-                  ? `
-                    <button
-                      class="button-primary"
-                      type="button"
-                      data-action="setup-next"
-                      ${loading || state.setup.submitting ? "disabled" : ""}
-                    >
-                      Weiter
-                    </button>
-                  `
-                  : `
-                    <button
-                      class="button-primary"
-                      type="submit"
-                      ${loading || state.setup.submitting ? "disabled" : ""}
-                    >
-                      ${escapeHtml(submitLabel)}
-                    </button>
-                  `
-              }
-            </div>
-          </form>
-        </section>
-      </div>
+        </form>
+      </section>
     </div>
   `;
 }
@@ -1825,6 +1824,15 @@ function renderSetupStatusPanel(tone, loading) {
     <div class="auth-status tone-${escapeHtml(tone)}" aria-live="polite">
       <strong>${escapeHtml(heading)}</strong>
       <p>${escapeHtml(message)}</p>
+    </div>
+  `;
+}
+
+function renderReferenceAccessStatus(title, copy, tone = "muted") {
+  return `
+    <div class="auth-status reference-access-status tone-${escapeHtml(tone)}" aria-live="polite">
+      <strong>${escapeHtml(title || "Status")}</strong>
+      <p>${escapeHtml(copy || "")}</p>
     </div>
   `;
 }
@@ -2055,86 +2063,97 @@ function renderAuthShell() {
       : "Anmelden";
 
   return `
-    <div class="auth-shell">
-      <div class="auth-shell-inner">
-        <section class="auth-hero surface-panel">
-          <div class="brand-panel auth-brand-panel">
-            <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
-            <div class="brand-copy">
-              <p class="brand-title">${APP_BRAND_NAME}</p>
-              <p class="brand-subtitle">Gesicherte Operator-Konsole fuer lokale Agent-Laufzeiten</p>
-            </div>
+    <div class="reference-access-shell">
+      <section class="reference-access-hero">
+        <div class="reference-access-brand">
+          <div class="reference-hero-mark" aria-hidden="true">${icon("spark")}</div>
+          <div class="reference-access-brand-copy">
+            <strong>${APP_BRAND_NAME}</strong>
+            <span>Gesicherte Operator-Shell fuer echte Agent-Laeufe</span>
           </div>
-          <div class="auth-copy">
-            <p class="panel-kicker">Security</p>
-            <h1>Produktionsreife Anmeldung fuer die Runtime</h1>
-            <p>
-              Authentifizierung, Session-Verwaltung und API-Zugriffe laufen zentral ueber den Server.
-              Das Frontend speichert keinen Auth-State im Local Storage.
-            </p>
+        </div>
+        <div class="reference-access-copy">
+          <span class="reference-kicker">Security</span>
+          <h1>Direkter Zugang zur Runtime, ohne Dashboard-Overhead</h1>
+          <p>${escapeHtml(copy)}</p>
+        </div>
+        <pre class="reference-welcome-art" aria-hidden="true">${escapeHtml(REFERENCE_WELCOME_ART.join("\n"))}</pre>
+        <div class="reference-feed-column">
+          ${renderReferenceFeedCard({
+            title: "Security",
+            lines: [
+              { text: "Argon2id + HttpOnly Sessions", meta: "Passwoerter werden gehasht, Sessions serverseitig invalidiert." },
+              { text: "CSRF und Origin-Pruefung", meta: "Schreibende Requests brauchen denselben Ursprung und einen CSRF-Token." },
+              { text: lockedSeconds > 0 ? `Gedrosselt fuer ${lockedSeconds}s` : "Anmeldung bereit", meta: "2FA via TOTP wird unterstuetzt." },
+            ],
+          })}
+        </div>
+      </section>
+      <section class="reference-access-panel">
+        <div class="reference-access-panel-head">
+          <div>
+            <span class="reference-kicker">Login</span>
+            <h2>${escapeHtml(heading)}</h2>
           </div>
-          <div class="auth-feature-list">
-            ${renderAuthFeature("Argon2id", "Passwoerter werden serverseitig mit moderner, speicherhaerter Hashing-Strategie verarbeitet.")}
-            ${renderAuthFeature("Session-Cookies", "HttpOnly, Secure und SameSite-geschuetzt mit serverseitiger Invalidierung und Idle-Timeout.")}
-            ${renderAuthFeature("CSRF + Origin Checks", "Schreibende Requests brauchen denselben Ursprung und einen gueltigen CSRF-Token.")}
-            ${renderAuthFeature("Abuse-Schutz", "IP- und konto-bezogene Drosselung mit progressivem Backoff gegen Brute Force und Credential Stuffing.")}
+          ${renderStatusBadge(lockedSeconds > 0 ? "Gedrosselt" : loading ? "Wird vorbereitet" : "Geschuetzt", tone, {
+            compact: true,
+            live: state.auth.submitting || loading,
+          })}
+        </div>
+        <p class="reference-access-panel-copy">${escapeHtml(copy)}</p>
+        ${renderReferenceAccessStatus(
+          loading ? "Initialisierung" : lockedSeconds > 0 ? "Schutz aktiv" : state.auth.error ? "Anmeldung fehlgeschlagen" : state.auth.success ? "Erfolg" : "Bereit",
+          loading
+            ? "Initiale Sitzung wird aufgebaut."
+            : lockedSeconds > 0
+              ? `Neue Versuche sind noch ${lockedSeconds} Sekunden gesperrt.`
+              : state.auth.error || (state.auth.success ? "Anmeldung erfolgreich. Konsole wird geladen." : "Die Anmeldung erfolgt ueber denselben Ursprung mit CSRF-Schutz."),
+          tone,
+        )}
+        <form id="loginForm" class="reference-access-form">
+          <label class="auth-field" for="loginEmailInput">
+            <span>E-Mail-Adresse</span>
+            <input
+              id="loginEmailInput"
+              type="email"
+              inputmode="email"
+              autocomplete="username"
+              value="${escapeAttribute(state.auth.login.email)}"
+              placeholder="operator@example.com"
+              ${loading ? "disabled" : ""}
+              required
+            />
+          </label>
+          <label class="auth-field" for="loginPasswordInput">
+            <span>Passwort</span>
+            <input
+              id="loginPasswordInput"
+              type="password"
+              autocomplete="current-password"
+              value="${escapeAttribute(state.auth.login.password)}"
+              placeholder="Passwort eingeben"
+              ${loading ? "disabled" : ""}
+              required
+            />
+          </label>
+          <label class="auth-field" for="loginTotpInput">
+            <span>Einmalcode</span>
+            <input
+              id="loginTotpInput"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              value="${escapeAttribute(state.auth.login.totpCode)}"
+              placeholder="Nur falls 2FA aktiviert ist"
+              ${loading ? "disabled" : ""}
+            />
+          </label>
+          <div class="reference-access-meta">
+            <span>Mindestens ${escapeHtml(String(state.auth.passwordPolicy?.min_length || 14))} Zeichen</span>
+            <span>Einheitliche Fehlermeldungen gegen Enumeration</span>
+            <span>2FA via TOTP verfuegbar</span>
           </div>
-        </section>
-        <section class="auth-card surface-panel">
-          <div class="auth-card-head">
-            <div>
-              <p class="panel-kicker">Login</p>
-              <h2>${escapeHtml(heading)}</h2>
-            </div>
-            ${renderStatusBadge(lockedSeconds > 0 ? "Gedrosselt" : loading ? "Wird vorbereitet" : "Geschuetzt", tone, {
-              compact: true,
-              live: state.auth.submitting || loading,
-            })}
-          </div>
-          <p class="auth-card-copy">${escapeHtml(copy)}</p>
-          ${renderAuthStatusPanel(tone, loading, lockedSeconds)}
-          <form id="loginForm" class="auth-form">
-            <label class="auth-field" for="loginEmailInput">
-              <span>E-Mail-Adresse</span>
-              <input
-                id="loginEmailInput"
-                type="email"
-                inputmode="email"
-                autocomplete="username"
-                value="${escapeAttribute(state.auth.login.email)}"
-                placeholder="operator@example.com"
-                ${loading ? "disabled" : ""}
-                required
-              />
-            </label>
-            <label class="auth-field" for="loginPasswordInput">
-              <span>Passwort</span>
-              <input
-                id="loginPasswordInput"
-                type="password"
-                autocomplete="current-password"
-                value="${escapeAttribute(state.auth.login.password)}"
-                placeholder="Passwort eingeben"
-                ${loading ? "disabled" : ""}
-                required
-              />
-            </label>
-            <label class="auth-field" for="loginTotpInput">
-              <span>Einmalcode</span>
-              <input
-                id="loginTotpInput"
-                type="text"
-                inputmode="numeric"
-                autocomplete="one-time-code"
-                value="${escapeAttribute(state.auth.login.totpCode)}"
-                placeholder="Nur falls 2FA aktiviert ist"
-                ${loading ? "disabled" : ""}
-              />
-            </label>
-            <div class="auth-meta-row">
-              <span class="auth-meta-copy">Mindestens ${escapeHtml(String(state.auth.passwordPolicy?.min_length || 14))} Zeichen. Gleiche Fehlermeldung fuer unbekannte und falsche Zugangsdaten.</span>
-              <span class="auth-meta-copy">2FA via TOTP wird unterstuetzt.</span>
-            </div>
+          <div class="reference-access-actions">
             <button
               class="button-primary auth-submit"
               type="submit"
@@ -2142,9 +2161,9 @@ function renderAuthShell() {
             >
               ${escapeHtml(submitLabel)}
             </button>
-          </form>
-        </section>
-      </div>
+          </div>
+        </form>
+      </section>
     </div>
   `;
 }
@@ -2744,62 +2763,108 @@ function buildReferenceHeroView(sourceState = state) {
   const activeRuns = Array.isArray(sourceState.sessions)
     ? sourceState.sessions.filter((item) => isSessionRunning(item)).length
     : 0;
-  const recentSessions = workspaceSessions.slice(0, 3).map((item) => ({
+  const recentSessions = workspaceSessions.slice(0, 6).map((item) => ({
     text: shorten(item.title || item.last_message_preview || item.task || "Neuer Thread", 56),
     meta: `${sessionBadgeText(item)} · ${formatSessionTimestamp(item.updated_at)}`,
+    action: "open-session",
+    tone: sessionStatusTone(item),
+    active: item.id === sourceState.activeSessionId,
+    dataset: {
+      sessionId: item.id,
+    },
   }));
   const currentStep = currentThoughtFrom(sourceState);
   const welcomeCopy = session
     ? "Transcript, Tool-Aktivitaet und Laufzustand bleiben in einer einzigen konzentrierten REPL-Sicht gebuendelt."
     : workspace
-      ? "Die Workspace-Shell orientiert sich jetzt direkt an der Referenz-REPL: erst Kontext und Status, dann der Verlauf, dann der Prompt."
+      ? "Die Workspace-Shell ist jetzt transcript-zentriert aufgebaut: Workspace links im Kopf, Verlauf im selben Fluss, Prompt immer am unteren Rand wie in der Referenz."
       : "Verbinde ein Projekt und arbeite dann in derselben transcript-zentrierten Shell weiter, statt in einer losen Dashboard-Ansicht.";
+  const workspaceLines = (sourceState.workspaces || []).slice(0, 8).map((item) => ({
+    text: item.name,
+    meta: shortenPath(item.path, 52),
+    action: "select-workspace",
+    active: item.id === activeWorkspaceIdFrom(sourceState),
+    dataset: {
+      workspaceId: item.id,
+    },
+  }));
+  const operatorName = sourceState.auth?.user?.display_name || sourceState.auth?.user?.email || "Operator";
   const feeds = [
     {
-      title: "Workspace",
-      lines: workspace
-        ? [
-            { text: workspace.name, meta: shortenPath(workspace.path, 72) },
-            {
-              text: countLabel(workspaceSessions.length, "1 Thread", `${workspaceSessions.length} Threads`),
-              meta: activeRuns ? `${activeRuns} aktive Laeufe` : "Keine aktiven Laeufe",
-            },
-          ]
-        : [{ text: "Noch kein Projekt verbunden", meta: "Lege links einen lokalen Workspace an." }],
-      footer: workspace ? "Lokaler Kontext verbunden" : "Projekt anlegen, um zu starten",
+      title: "Workspaces",
+      lines: workspaceLines.length
+        ? workspaceLines
+        : [{ text: "Noch kein Projekt verbunden", meta: "Lege einen lokalen Workspace an, um zu starten." }],
+      footerActions: [
+        {
+          label: "Projekt anlegen",
+          action: "open-workspace-modal",
+          tone: "primary",
+        },
+      ],
     },
     {
-      title: session ? "Current session" : "Start prompt",
-      lines: session
-        ? [
-            { text: shell.title, meta: labelForPhase(session.current_phase) },
-            { text: labelForAccessMode(session.access_mode), meta: sessionStatusTone(session) === "running" ? "Agent arbeitet" : shell.statusText },
-            {
-              text: countLabel(session.changed_files?.length || 0, "1 Datei geaendert", `${session.changed_files?.length || 0} Dateien geaendert`),
-              meta: validation ? validation.statusLabel : "Noch keine Checks",
-            },
-          ]
-        : [
-            { text: workspace ? composerPlaceholder(workspace) : "Verbinde zuerst ein lokales Projekt", meta: composerHint(workspace) },
-            { text: "Ctrl+Enter sendet direkt", meta: "Zugriff, Modell und Profil bleiben im Footer sichtbar" },
-          ],
-      footer: currentStep || "Bereit fuer den naechsten Auftrag",
-    },
-    {
-      title: "Recent activity",
+      title: workspace ? `Sessions · ${workspace.name}` : "Sessions",
       lines: recentSessions.length
         ? recentSessions
         : [
             {
-              text: workspace ? "Noch kein Verlauf in diesem Workspace" : "Noch keine Sessions",
-              meta: workspace ? "Starte den ersten Thread, um hier Aktivitaet zu sehen." : "Nach dem ersten Lauf erscheint hier der Verlauf.",
+              text: workspace ? "Noch keine Sessions in diesem Workspace" : "Waehle zuerst ein Projekt",
+              meta: workspace ? "Starte den ersten Thread direkt von hier." : "Sobald ein Projekt aktiv ist, erscheinen hier die letzten Laeufe.",
             },
           ],
-      footer: validation
-        ? `Checks: ${validation.statusLabel}`
-        : activeRuns
-          ? `${activeRuns} aktive Laeufe`
-          : "Leerlauf",
+      footerActions: workspace
+        ? [
+            {
+              label: "Neuer Thread",
+              action: "new-chat",
+              dataset: { workspaceId: workspace.id },
+              tone: "primary",
+            },
+            {
+              label: "Export",
+              action: "download-workspace-export",
+              dataset: { workspaceId: workspace.id },
+              tone: "ghost",
+              disabled: !shell.canDownloadWorkspace,
+            },
+          ]
+        : [],
+    },
+    {
+      title: "Operator",
+      lines: [
+        {
+          text: operatorName,
+          meta: sourceState.auth?.user?.email || "Sichere Session aktiv",
+        },
+        {
+          text: sourceState.composer.modelName || sourceState.config?.model_name || "Standard",
+          meta: labelForAccessMode(session?.access_mode || sourceState.composer.accessMode),
+        },
+        {
+          text: currentStep || "Bereit",
+          meta: validation
+            ? `${validation.title}: ${validation.statusLabel}`
+            : activeRuns
+              ? `${activeRuns} aktive Laeufe`
+              : "Leerlauf",
+        },
+      ],
+      footerActions: [
+        {
+          label: "Einstellungen",
+          action: "open-settings-page",
+          tone: "ghost",
+        },
+        sourceState.auth?.user
+          ? {
+              label: "Abmelden",
+              action: "logout",
+              tone: "ghost",
+            }
+          : null,
+      ].filter(Boolean),
     },
   ];
 
@@ -2844,6 +2909,9 @@ function renderReferenceHero() {
           </div>
           ${renderReferenceStatusLine(hero.runtimeStatusItems, hero.currentStep)}
         </div>
+        <div class="reference-hero-compact-grid">
+          ${hero.feeds.map(renderReferenceFeedCard).join("")}
+        </div>
       </section>
     `;
   }
@@ -2887,17 +2955,54 @@ function renderReferenceFeedCard(feed) {
             : `<p class="reference-feed-empty">Noch keine Daten verfuegbar.</p>`
         }
       </div>
-      ${feed?.footer ? `<div class="reference-feed-footer">${escapeHtml(feed.footer)}</div>` : ""}
+      ${
+        Array.isArray(feed?.footerActions) && feed.footerActions.length
+          ? `<div class="reference-feed-actions">${feed.footerActions.map(renderReferenceFeedAction).join("")}</div>`
+          : feed?.footer
+            ? `<div class="reference-feed-footer">${escapeHtml(feed.footer)}</div>`
+            : ""
+      }
     </section>
   `;
 }
 
 function renderReferenceFeedLine(line) {
+  if (line?.action) {
+    return `
+      <button
+        class="reference-feed-line reference-feed-line-button ${line.active ? "active" : ""} tone-${escapeHtml(line.tone || "muted")}"
+        type="button"
+        data-action="${escapeHtml(line.action)}"${renderDatasetAttributes(line.dataset)}
+        ${line.disabled ? "disabled" : ""}
+      >
+        <span class="reference-feed-line-copy">
+          <strong>${escapeHtml(line?.text || "")}</strong>
+          ${line?.meta ? `<span>${escapeHtml(line.meta)}</span>` : ""}
+        </span>
+      </button>
+    `;
+  }
   return `
     <div class="reference-feed-line">
       <strong>${escapeHtml(line?.text || "")}</strong>
       ${line?.meta ? `<span>${escapeHtml(line.meta)}</span>` : ""}
     </div>
+  `;
+}
+
+function renderReferenceFeedAction(action) {
+  if (!action) {
+    return "";
+  }
+  return `
+    <button
+      class="reference-feed-action button-${escapeHtml(action.tone === "primary" ? "primary" : "ghost")}"
+      type="button"
+      data-action="${escapeHtml(action.action)}"${renderDatasetAttributes(action.dataset)}
+      ${action.disabled ? "disabled" : ""}
+    >
+      ${escapeHtml(action.label)}
+    </button>
   `;
 }
 
@@ -2920,6 +3025,16 @@ function renderReferenceStatusLine(items, currentStep = "") {
     );
   }
   return `<div class="reference-status-line">${segments.join("")}</div>`;
+}
+
+function renderDatasetAttributes(dataset = {}) {
+  return Object.entries(dataset || {})
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(
+      ([key, value]) =>
+        ` data-${key.replace(/[A-Z]/g, (match) => `-${match.toLowerCase()}`)}="${escapeAttribute(value)}"`,
+    )
+    .join("");
 }
 
 function renderRuntimeStatusStrip(items) {
@@ -3137,13 +3252,11 @@ function renderEmptyThreadState() {
 
 function renderThreadView(session) {
   return `
-    <div class="thread-workbench">
-      <div class="thread-workbench-main">
+    <div class="reference-repl-shell">
+      <div class="reference-repl-main">
         ${renderConversationPanel(session)}
       </div>
-      <aside class="thread-workbench-rail">
-        ${renderThreadSideRail(session, state.logs)}
-      </aside>
+      ${renderReferenceSessionPanels(session, state.logs)}
     </div>
   `;
 }
@@ -3227,6 +3340,186 @@ function renderConversationPanel(session) {
         ${isSessionRunning(session) ? renderRunningMessage(session) : ""}
       </div>
     </section>
+  `;
+}
+
+function renderReferenceSessionPanels(session, logs) {
+  const validation = buildValidationSnapshot(session);
+  const changes = Array.isArray(session.changed_files) ? session.changed_files : [];
+  const issues = buildIssueItems(session);
+  const activity = buildActivityClusters(session, logs).slice(0, 8);
+
+  return `
+    <section class="reference-detail-stack">
+      ${renderReferenceSummaryPanel(session, validation)}
+      ${renderReferenceValidationPanel(validation)}
+      ${changes.length ? renderReferenceFilesPanel(changes) : ""}
+      ${issues.length ? renderReferenceIssuesPanel(issues) : ""}
+      ${activity.length ? renderReferenceActivityPanel(activity) : ""}
+    </section>
+  `;
+}
+
+function renderReferenceSummaryPanel(session, validation) {
+  const overview = buildSessionOverview(session);
+  const steps = buildPhaseSteps(session);
+  return `
+    <section class="reference-detail-card tone-${escapeHtml(overview.tone)}">
+      <div class="reference-detail-head">
+        <div>
+          <span class="reference-kicker">Run</span>
+          <h3>${escapeHtml(sessionBadgeText(session))}</h3>
+        </div>
+        <span class="reference-detail-badge tone-${escapeHtml(sessionStatusTone(session))}">${escapeHtml(
+          labelForPhase(session.current_phase),
+        )}</span>
+      </div>
+      <p class="reference-detail-copy">${escapeHtml(overview.summary)}</p>
+      <div class="reference-detail-meta">
+        ${renderMetaChip(labelForAccessMode(session.access_mode), "muted")}
+        ${renderMetaChip(countLabel(session.tool_calls?.length || 0, "1 Schritt", `${session.tool_calls?.length || 0} Schritte`), "muted")}
+        ${renderMetaChip(validation.statusLabel, validation.tone)}
+      </div>
+      <div class="reference-phase-track">
+        ${steps
+          .map(
+            (step) => `
+              <span class="reference-phase-pill ${escapeHtml(step.state)}">${escapeHtml(step.label)}</span>
+            `,
+          )
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderReferenceValidationPanel(validation) {
+  return `
+    <section class="reference-detail-card tone-${escapeHtml(validation.tone)}">
+      <div class="reference-detail-head">
+        <div>
+          <span class="reference-kicker">Validation</span>
+          <h3>${escapeHtml(validation.title)}</h3>
+        </div>
+        <span class="reference-detail-badge tone-${escapeHtml(validation.tone)}">${escapeHtml(
+          validation.statusLabel,
+        )}</span>
+      </div>
+      <p class="reference-detail-copy">${escapeHtml(validation.summary)}</p>
+      ${
+        validation.latest?.command
+          ? `<code class="reference-inline-code">${escapeHtml(validation.latest.command)}</code>`
+          : ""
+      }
+      ${
+        validation.runs.length
+          ? `
+            <div class="reference-detail-list">
+              ${validation.runs.slice(0, 4).map(renderReferenceValidationRow).join("")}
+            </div>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
+function renderReferenceValidationRow(run) {
+  return `
+    <div class="reference-detail-row tone-${escapeHtml(sessionStatusTone({ status: run.status }))}">
+      <div class="reference-detail-row-top">
+        <strong>${escapeHtml(run.command || "Check")}</strong>
+        <span>${escapeHtml(run.status || "unknown")}</span>
+      </div>
+      <p>${escapeHtml(run.summary || run.verification_scope || "")}</p>
+    </div>
+  `;
+}
+
+function renderReferenceFilesPanel(changes) {
+  return `
+    <section class="reference-detail-card">
+      <div class="reference-detail-head">
+        <div>
+          <span class="reference-kicker">Files</span>
+          <h3>${escapeHtml(countLabel(changes.length, "1 Datei", `${changes.length} Dateien`))}</h3>
+        </div>
+      </div>
+      <div class="reference-detail-list">
+        ${changes.slice(0, 10).map(renderReferenceFileRow).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderReferenceFileRow(change) {
+  return `
+    <div class="reference-detail-row">
+      <div class="reference-detail-row-top">
+        <strong>${escapeHtml(change.path || "-")}</strong>
+        <span>${escapeHtml(change.operation || "write")}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderReferenceIssuesPanel(issues) {
+  const tone = issues.some((item) => item.tone === "danger")
+    ? "danger"
+    : issues.some((item) => item.tone === "warning")
+      ? "warning"
+      : "muted";
+  return `
+    <section class="reference-detail-card tone-${escapeHtml(tone)}">
+      <div class="reference-detail-head">
+        <div>
+          <span class="reference-kicker">Risks</span>
+          <h3>${escapeHtml(countLabel(issues.length, "1 Punkt", `${issues.length} Punkte`))}</h3>
+        </div>
+      </div>
+      <div class="reference-detail-list">
+        ${issues.slice(0, 6).map(renderReferenceIssueRow).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderReferenceIssueRow(issue) {
+  return `
+    <div class="reference-detail-row tone-${escapeHtml(issue.tone || "muted")}">
+      <div class="reference-detail-row-top">
+        <strong>${escapeHtml(issue.title || "Hinweis")}</strong>
+      </div>
+      <p>${escapeHtml(issue.summary || issue.copy || "")}</p>
+    </div>
+  `;
+}
+
+function renderReferenceActivityPanel(activity) {
+  return `
+    <section class="reference-detail-card">
+      <div class="reference-detail-head">
+        <div>
+          <span class="reference-kicker">Activity</span>
+          <h3>Zuletzt</h3>
+        </div>
+      </div>
+      <div class="reference-detail-list">
+        ${activity.map(renderReferenceActivityRow).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderReferenceActivityRow(item) {
+  return `
+    <div class="reference-detail-row tone-${escapeHtml(item.tone || "muted")}">
+      <div class="reference-detail-row-top">
+        <strong>${escapeHtml(item.text || "")}</strong>
+        <span>${escapeHtml(formatTime(item.timestamp))}</span>
+      </div>
+      ${item.meta ? `<p>${escapeHtml(item.meta)}</p>` : ""}
+    </div>
   `;
 }
 
