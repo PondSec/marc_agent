@@ -7122,11 +7122,35 @@ class Planner:
     ) -> bool:
         if review.safe_to_write:
             return False
-        if repair_context is None or repair_context.verification_scope != "runtime":
-            return False
         if not self._review_rejection_looks_like_scope_broadening(review):
             return False
+        return self._repair_update_is_evidence_backed_behavior_adjustment(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        )
+
+    def _repair_update_is_evidence_backed_behavior_adjustment(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
         if not _repair_semantic_delta_lines(repair_context, limit=2):
+            return False
+
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return False
+        brief = getattr(repair_context, "repair_brief", None)
+        locked_target = str(getattr(brief, "locked_target", "") or "").strip()
+        primary_target = str(getattr(brief, "primary_target", "") or "").strip()
+        if normalized_path not in {locked_target, primary_target}:
             return False
 
         changed_line_count = self._compact_repair_change_line_count(
@@ -7147,7 +7171,7 @@ class Planner:
             return False
 
         identifiers = self._repair_identifiers_for_target(
-            path,
+            normalized_path,
             repair_context,
             current_content=current_content,
             proposed_content=proposed_content,
@@ -7213,6 +7237,13 @@ class Planner:
         if locked_target and locked_target != normalized_path and not target_is_explicitly_allowed:
             return False
         if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
+            return False
+        if self._repair_update_is_evidence_backed_behavior_adjustment(
+            path=normalized_path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        ):
             return False
         if allowed_files and normalized_path not in allowed_files:
             return False

@@ -11553,6 +11553,83 @@ def test_should_skip_model_backed_repair_review_disables_skip_after_first_failed
     )
 
 
+def test_should_skip_model_backed_repair_review_disables_skip_for_first_evidence_backed_local_behavior_fix(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Repair texttools/normalize.py", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the locked normalization behavior."}],
+        target_paths=["texttools/normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        line_hints=[2],
+        action_hints=[],
+        repair_requirements=["Change texttools/normalize.py so the keep-case output drops the observed-only punctuation."],
+        evidence_signature="sig-normalize-first-evidence-backed-fix",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:normalize-first-evidence-backed-fix",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Stay on the locked normalization target and remove the observed-only punctuation."],
+            recent_failed_attempts=[],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    current_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    if keep_case:\n"
+        "        return ' '.join(text.replace(',', ' ').split())\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n"
+    )
+    proposed_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    cleaned = ' '.join(text.replace(',', ' ').replace('!', '').split())\n"
+        "    if keep_case:\n"
+        "        return cleaned\n"
+        "    return cleaned.lower()\n"
+    )
+
+    assert (
+        planner._should_skip_model_backed_repair_review(
+            session.router_result,
+            session,
+            path="texttools/normalize.py",
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=None,
+        )
+        is False
+    )
+
+
 def test_should_skip_model_backed_repair_review_disables_skip_after_prior_failed_mutation_on_same_target(tmp_path):
     llm = ScriptedLLM(
         config=AppConfig(
