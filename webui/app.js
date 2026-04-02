@@ -2270,6 +2270,7 @@ function renderAuthStatusPanel(tone, loading, lockedSeconds) {
 function renderSidebar() {
   const workspace = selectedWorkspace();
   const activeRuns = state.sessions.filter((session) => isSessionRunning(session)).length;
+  const totalThreads = state.sessions.length;
   const primaryAction = workspace
     ? `
         <button
@@ -2290,29 +2291,19 @@ function renderSidebar() {
       `;
 
   return `
-    <div class="sidebar-shell">
-      <div class="sidebar-header">
-        <div class="sidebar-brand-row">
-          <div class="brand-mark" aria-hidden="true">${icon("spark")}</div>
-          <div class="brand-copy">
-            <p class="brand-title">${APP_BRAND_NAME}</p>
-            <p class="brand-subtitle">${escapeHtml(activeRuns ? `${activeRuns} aktive Laeufe` : "Lokale Agentenarbeit")}</p>
-          </div>
+    <div class="sidebar-shell sidebar-shell-minimal">
+      <div class="sidebar-header sidebar-header-minimal">
+        <div class="sidebar-brandline">
+          <strong>${escapeHtml(APP_BRAND_NAME)}</strong>
+          <span>${escapeHtml(activeRuns ? `${activeRuns} aktiv` : workspace ? "Bereit" : "Kein Projekt")}</span>
         </div>
         ${primaryAction}
       </div>
       <div class="sidebar-scroll">
         <section class="sidebar-section sidebar-project-section">
           <div class="sidebar-section-head">
-            <p class="sidebar-label">Projekte</p>
-            <button
-              class="icon-button"
-              type="button"
-              data-action="open-workspace-modal"
-              aria-label="Projekt anlegen"
-            >
-              ${icon("plus")}
-            </button>
+            <p class="sidebar-label">Threads</p>
+            <span class="sidebar-count">${escapeHtml(String(totalThreads))}</span>
           </div>
           ${renderSidebarProjectList()}
         </section>
@@ -2434,10 +2425,10 @@ function renderSidebarThreadItem(session) {
       data-session-id="${escapeHtml(session.id)}"
     >
       <span class="thread-nav-main">
-        <span class="thread-nav-title">${escapeHtml(shorten(title, 34))}</span>
+        <span class="thread-nav-title">${escapeHtml(shorten(title, 30))}</span>
         <span class="thread-nav-status tone-${escapeHtml(badgeTone)}">${escapeHtml(badgeLabel)}</span>
       </span>
-      <span class="thread-nav-preview">${escapeHtml(shorten(preview, 108))}</span>
+      <span class="thread-nav-preview">${escapeHtml(shorten(preview, 72))}</span>
       <span class="thread-nav-meta">
         <span>${escapeHtml(formatSessionTimestamp(session.updated_at))}</span>
         ${
@@ -2453,7 +2444,7 @@ function renderSidebarThreadItem(session) {
 function renderSidebarFooter(activeRuns) {
   if (!state.auth.user) {
     return `
-      <div class="sidebar-footer">
+      <div class="sidebar-footer sidebar-footer-minimal">
         <button class="button-ghost sidebar-footer-button" type="button" data-action="open-settings-page">
           Einstellungen
         </button>
@@ -2462,7 +2453,7 @@ function renderSidebarFooter(activeRuns) {
   }
 
   return `
-    <div class="sidebar-footer">
+    <div class="sidebar-footer sidebar-footer-minimal">
       <div class="sidebar-footer-copy">
         <strong>${escapeHtml(state.auth.user.display_name || state.auth.user.email)}</strong>
         <span>${escapeHtml(activeRuns ? `${activeRuns} aktive Laeufe` : "Bereit")}</span>
@@ -3040,20 +3031,24 @@ function renderRuntimeStatusItem(item) {
 function renderTopBar() {
   const shell = buildWorkspaceShellView();
   const { workspace, session } = shell;
+  const title = shell.title || APP_BRAND_NAME;
+  const subtitle = workspace
+    ? [workspace.name, workspace.path ? shortenPath(workspace.path, 48) : "", session?.updated_at ? `Aktualisiert ${formatSessionTimestamp(session.updated_at)}` : ""]
+        .filter(Boolean)
+        .join(" · ")
+    : shell.subtitle;
 
   return `
-    <header class="reference-toolbar">
-      <div class="reference-toolbar-inner">
-        <div class="reference-toolbar-copy">
-          <strong class="reference-toolbar-title">${escapeHtml(APP_BRAND_NAME)}</strong>
-          <span class="reference-toolbar-subtitle">${escapeHtml(
-            workspace ? `${workspace.name} · ${shortenPath(workspace.path, 56)}` : "Kein Projekt verbunden",
-          )}</span>
+    <header class="thread-topbar">
+      <div class="thread-topbar-inner">
+        <div class="thread-topbar-copy">
+          <h1 class="thread-topbar-title">${escapeHtml(title)}</h1>
+          <p class="thread-topbar-subtitle">${escapeHtml(subtitle)}</p>
         </div>
-        <div class="reference-toolbar-actions">
-          <span class="reference-toolbar-status tone-${escapeHtml(shell.statusTone)}">${escapeHtml(shell.statusText)}</span>
+        <div class="thread-toolbar">
+          <span class="thread-toolbar-status tone-${escapeHtml(shell.statusTone)}">${escapeHtml(shell.statusText)}</span>
           <button
-            class="icon-button reference-toolbar-icon"
+            class="icon-button thread-toolbar-icon"
             type="button"
             data-action="open-workspace-preview"
             data-workspace-id="${escapeHtml(workspace?.id || "")}"
@@ -3068,7 +3063,7 @@ function renderTopBar() {
             ${icon("play")}
           </button>
           <button
-            class="button-ghost reference-toolbar-button"
+            class="button-ghost thread-toolbar-button"
             type="button"
             data-action="download-session-handoff"
             data-session-id="${escapeHtml(session?.id || "")}"
@@ -3082,7 +3077,7 @@ function renderTopBar() {
             Handoff
           </button>
           <button
-            class="button-ghost reference-toolbar-button"
+            class="button-ghost thread-toolbar-button"
             type="button"
             data-action="${workspace ? "new-chat" : "open-workspace-modal"}"
             ${workspace ? `data-workspace-id="${escapeHtml(workspace.id)}"` : ""}
@@ -3090,7 +3085,7 @@ function renderTopBar() {
             Neuer Thread
           </button>
           <button
-            class="icon-button reference-toolbar-icon"
+            class="icon-button thread-toolbar-icon"
             type="button"
             data-action="download-workspace-export"
             data-workspace-id="${escapeHtml(workspace?.id || "")}"
@@ -3105,7 +3100,7 @@ function renderTopBar() {
             ${icon("download")}
           </button>
           <button
-            class="icon-button reference-toolbar-icon"
+            class="icon-button thread-toolbar-icon"
             type="button"
             data-action="commit-push"
             aria-label="Commit und Push an den Agenten senden"
@@ -3119,7 +3114,7 @@ function renderTopBar() {
             ${icon("git-push")}
           </button>
           <button
-            class="icon-button reference-toolbar-icon"
+            class="icon-button thread-toolbar-icon"
             type="button"
             data-action="delete-session"
             data-session-id="${escapeHtml(session?.id || "")}"
@@ -3134,7 +3129,7 @@ function renderTopBar() {
             ${icon("trash")}
           </button>
           <button
-            class="icon-button reference-toolbar-icon"
+            class="icon-button thread-toolbar-icon"
             type="button"
             data-action="open-settings-page"
             aria-label="Einstellungen"
@@ -3856,35 +3851,26 @@ function renderChatInput() {
   const thought = currentThought();
   const running = shell.running;
   const modelInstallNotice = currentModelInstallNotice();
-  const notices = [
-    modelInstallNotice ? { label: "Modelle", text: modelInstallNotice, tone: "muted" } : null,
-    thought ? { label: "Laufstatus", text: thought, tone: running ? "running" : "muted" } : null,
-  ].filter(Boolean);
+  const notice = thought
+    ? { label: "Laufstatus", text: thought, tone: running ? "running" : "muted" }
+    : modelInstallNotice
+      ? { label: "Modelle", text: modelInstallNotice, tone: "muted" }
+      : null;
 
   return `
     <footer class="chat-input-shell">
       <div class="chat-input-inner">
-        <div class="chat-input-container composer-panel reference-composer-panel">
-          ${notices.length ? `<div class="composer-notice-row">${notices.map(renderComposerNotice).join("")}</div>` : ""}
-          <div class="reference-composer-head">
-            <div class="reference-composer-heading">
-              <span class="reference-kicker">Prompt</span>
-              <strong>${escapeHtml(composerHint(workspace))}</strong>
-            </div>
-            <span class="reference-composer-shortcut">Ctrl+Enter senden</span>
-          </div>
-          <div class="chat-input-row reference-chat-input-row">
-            <div class="reference-composer-gutter" aria-hidden="true">
-              <span class="reference-composer-sigil">${workspace ? ">" : "!"}</span>
-            </div>
+        <div class="chat-input-container composer-panel minimal-composer-panel">
+          ${notice ? `<div class="composer-inline-status">${renderComposerNotice(notice)}</div>` : ""}
+          <div class="chat-input-row minimal-chat-input-row">
             <textarea
               id="composerInput"
-              class="chat-input reference-chat-input"
+              class="chat-input minimal-chat-input"
               rows="3"
               placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
             ></textarea>
             <button
-              class="send-button reference-send-button ${running ? "stop" : "send"}"
+              class="send-button minimal-send-button ${running ? "stop" : "send"}"
               type="button"
               data-action="${running ? "stop-session" : "submit-prompt"}"
               aria-label="${running ? "Stoppen" : "Senden"}"
@@ -3892,12 +3878,12 @@ function renderChatInput() {
               ${icon(running ? "stop" : "arrow")}
             </button>
           </div>
-          <div class="composer-meta-row reference-composer-footer">
-            ${renderMetaChip(workspace?.name || "Kein Projekt", "muted")}
-            ${renderMetaChip(state.composer.modelName || state.config?.model_name || "Standardmodell", "muted")}
-            ${renderMetaChip(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode), "muted")}
-            ${renderMetaChip(executionProfileLabelFromState(), "muted")}
-            <button class="button-ghost composer-options-button reference-composer-options" type="button" data-action="open-settings-page">
+          <div class="composer-meta-row minimal-composer-footer">
+            ${renderComposerMetaItem(workspace?.name || "Kein Projekt")}
+            ${renderComposerMetaItem(state.composer.modelName || state.config?.model_name || "Standardmodell")}
+            ${renderComposerMetaItem(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode))}
+            ${renderComposerMetaItem(executionProfileLabelFromState())}
+            <button class="button-ghost composer-options-button minimal-composer-options" type="button" data-action="open-settings-page">
               Optionen
             </button>
           </div>
@@ -3909,6 +3895,10 @@ function renderChatInput() {
 
 function currentExecutionProfileLabel() {
   return executionProfileLabelFromState();
+}
+
+function renderComposerMetaItem(value) {
+  return `<span class="composer-meta-item">${escapeHtml(value)}</span>`;
 }
 
 function renderComposerNotice(notice) {
