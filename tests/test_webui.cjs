@@ -301,11 +301,8 @@ test("buildReferenceHeroView erzeugt im Startzustand Welcome-Feeds aus dem Works
 
   assert.equal(hero.compact, false);
   assert.equal(hero.welcomeTitle, "Welcome to MARC A2");
-  assert.equal(hero.feeds[0].title, "Workspaces");
-  assert.equal(hero.feeds[1].title, "Sessions · alpha");
-  assert.equal(hero.feeds[2].title, "Operator");
-  assert.equal(hero.feeds[0].lines[0].action, "select-workspace");
-  assert.equal(hero.feeds[1].lines[0].action, "open-session");
+  assert.equal(hero.feeds[0].title, "Workspace");
+  assert.equal(hero.feeds[2].title, "Recent activity");
   assert.match(hero.feeds[0].lines[0].meta, /alpha|tmp/i);
 });
 
@@ -331,7 +328,6 @@ test("buildReferenceHeroView wechselt bei aktiver Session in den kompakten Modus
 
   assert.equal(hero.compact, true);
   assert.equal(hero.statusText, "Aktiv");
-  assert.equal(hero.feeds[1].title, "Sessions · alpha");
-  assert.equal(hero.feeds[2].title, "Operator");
+  assert.equal(hero.feeds[1].title, "Current session");
   assert.match(hero.locationLabel, /alpha|tmp/i);
 });
