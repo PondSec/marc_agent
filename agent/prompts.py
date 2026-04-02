@@ -4970,11 +4970,21 @@ def _repair_related_file_context(
         ):
             continue
         normalized_excerpt = str(excerpt or "").strip()
+        test_support_line_hints = (
+            [
+                int(raw)
+                for raw in repair_context.line_hints
+                if isinstance(raw, int) and 1 <= raw <= len(normalized_excerpt.splitlines())
+            ]
+            if _related_context_is_test_like(path)
+            else []
+        )
         frame_line_hints = _repair_failure_frame_line_hints(
             path,
             repair_context=repair_context,
         )
         focused_line_hints = _merge_repair_line_hints(
+            test_support_line_hints,
             frame_line_hints,
             _supporting_file_line_hints(
                 excerpt,
