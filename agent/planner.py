@@ -28,6 +28,7 @@ from agent.models import (
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
+    _direct_main_runtime_contract,
     _line_focused_excerpt,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
@@ -7957,36 +7958,59 @@ class Planner:
         proposed_content: str,
         repair_context: ValidationFailureEvidence | None,
     ) -> ProposedUpdateReview | None:
-        if repair_context is None or repair_context.verification_scope != "runtime":
-            return None
         if Path(path).suffix.lower() not in {".py", ".pyi"}:
             return None
+        if repair_context is not None and repair_context.verification_scope != "runtime":
+            return None
 
-        option_tokens, positional_tokens = self._direct_main_option_contract_details(
-            session,
-            repair_context,
-        )
+        if repair_context is not None:
+            option_tokens, positional_tokens = self._direct_main_option_contract_details(
+                session,
+                repair_context,
+            )
+        else:
+            if not self._path_exposes_direct_main_contract_target(
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            ):
+                return None
+            option_tokens, positional_tokens = self._session_direct_main_option_contract_details(
+                session,
+            )
         if not option_tokens:
             return None
 
         lowered_current = str(current_content or "").lower()
         lowered_proposed = str(proposed_content or "").lower()
+        target_evidence = (
+            self._runtime_target_evidence_lines(path, repair_context)
+            if repair_context is not None
+            else []
+        )
         missing_exact_tokens = [
             token for token in option_tokens if token.lower() not in lowered_proposed
         ]
         if missing_exact_tokens:
             option_preview = ", ".join(missing_exact_tokens[:3])
             positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
-            target_evidence = self._runtime_target_evidence_lines(path, repair_context)
             repair_hints = [
                 f"Handle the exact option token sequence {option_preview} in {path}; do not rewrite those tokens into stripped-hyphen or underscore-only lookalikes.",
                 "Keep the repair grounded in the direct main([...]) contract instead of approximating the option spelling.",
-                *self._runtime_target_repair_hints(path, repair_context, evidence_lines=target_evidence),
             ]
             if positional_tokens:
                 repair_hints.insert(
                     1,
                     f"After recognizing {option_preview}, derive behavior from the remaining argv payload {positional_preview} instead of hardcoding those sample values.",
+                )
+            if repair_context is not None:
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
                 )
             return ProposedUpdateReview(
                 safe_to_write=False,
@@ -8004,6 +8028,17 @@ class Planner:
                 repair_hints=repair_hints[:4],
             )
 
+        argv_contract_misindex_review = self._direct_main_option_contract_argv_index_review(
+            path=path,
+            proposed_content=proposed_content,
+            option_tokens=option_tokens,
+            positional_tokens=positional_tokens,
+            target_evidence=target_evidence,
+            repair_context=repair_context,
+        )
+        if argv_contract_misindex_review is not None:
+            return argv_contract_misindex_review
+
         current_contract_lines = self._runtime_argv_contract_lines(current_content)
         proposed_contract_lines = self._runtime_argv_contract_lines(proposed_content)
         if not current_contract_lines or current_contract_lines != proposed_contract_lines:
@@ -8012,9 +8047,20 @@ class Planner:
         if any(token.lower() in lowered_current for token in option_tokens):
             return None
 
-        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
         option_preview = ", ".join(option_tokens[:3])
         evidence_hint = f" near {' | '.join(target_evidence[:2])}" if target_evidence else ""
+        repair_hints = [
+            f"Change the argv-handling lines in {path} so the direct main([...]) invocation recognizes option tokens like {option_preview} before formatting stdout.",
+            "Do not stop at output-only formatting changes if the provided runtime option tokens are still ignored.",
+        ]
+        if repair_context is not None:
+            repair_hints.extend(
+                self._runtime_target_repair_hints(
+                    path,
+                    repair_context,
+                    evidence_lines=target_evidence,
+                )
+            )
         return ProposedUpdateReview(
             safe_to_write=False,
             summary=(
@@ -8028,11 +8074,7 @@ class Planner:
                 )
             ],
             preservation_risks=[],
-            repair_hints=[
-                f"Change the argv-handling lines in {path} so the direct main([...]) invocation recognizes option tokens like {option_preview} before formatting stdout.",
-                "Do not stop at output-only formatting changes if the provided runtime option tokens are still ignored.",
-                *self._runtime_target_repair_hints(path, repair_context, evidence_lines=target_evidence),
-            ],
+            repair_hints=repair_hints[:4],
         )
 
     def _direct_main_option_contract_details(
@@ -8095,6 +8137,133 @@ class Planner:
                     if len(positional_tokens) >= limit:
                         return tokens[:limit], positional_tokens[:limit]
         return tokens[:limit], positional_tokens[:limit]
+
+    def _session_direct_main_option_contract_details(
+        self,
+        session: SessionState,
+        *,
+        limit: int = 4,
+    ) -> tuple[list[str], list[str]]:
+        route_target_paths = (
+            list(getattr(getattr(session, "router_result", None), "entities", None).target_paths or [])
+            if getattr(getattr(session, "router_result", None), "entities", None) is not None
+            else []
+        )
+        candidate_paths = self._unique_paths(
+            [
+                *[
+                    str(item.tool_args.get("path") or "").strip()
+                    for item in reversed(session.tool_calls)
+                    if item.tool_name == "read_file"
+                    and self._path_is_test_like(str(item.tool_args.get("path") or "").strip())
+                ],
+                *[
+                    str(path or "").strip()
+                    for path in route_target_paths
+                    if str(path or "").strip() and self._path_is_test_like(str(path or "").strip())
+                ],
+                *(
+                    list(getattr(session.workspace_snapshot, "test_files", []) or [])
+                    if session.workspace_snapshot is not None
+                    else []
+                ),
+            ]
+        )
+        if not candidate_paths:
+            return [], []
+
+        option_tokens: list[str] = []
+        positional_tokens: list[str] = []
+        for candidate in candidate_paths[:8]:
+            excerpt = self._current_or_last_read_excerpt(session, path=candidate)
+            if "main([" not in excerpt:
+                continue
+            option_candidates, positional_candidates = _direct_main_runtime_contract(
+                excerpt,
+                limit=limit,
+            )
+            for token in option_candidates:
+                if token and token not in option_tokens:
+                    option_tokens.append(token)
+                    if len(option_tokens) >= limit:
+                        break
+            for token in positional_candidates:
+                if token and token not in positional_tokens:
+                    positional_tokens.append(token)
+                    if len(positional_tokens) >= limit:
+                        break
+            if len(option_tokens) >= limit and len(positional_tokens) >= limit:
+                break
+        return option_tokens[:limit], positional_tokens[:limit]
+
+    def _path_exposes_direct_main_contract_target(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> bool:
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return False
+        if normalized_path == "__main__.py" or Path(normalized_path).name == "__main__.py":
+            return True
+        if normalized_path in (getattr(session.workspace_snapshot, "entrypoints", []) or []):
+            return True
+        combined = "\n".join([str(current_content or ""), str(proposed_content or "")])
+        return bool(re.search(r"^\s*def\s+main\s*\(", combined, re.MULTILINE))
+
+    def _direct_main_option_contract_argv_index_review(
+        self,
+        *,
+        path: str,
+        proposed_content: str,
+        option_tokens: list[str],
+        positional_tokens: list[str],
+        target_evidence: list[str],
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if not option_tokens or not positional_tokens:
+            return None
+
+        lowered_proposed = str(proposed_content or "").lower()
+        if not any(marker in lowered_proposed for marker in ("argv[1]", "argv[2:]", "argv[2]")):
+            return None
+        if "argv[0]" in lowered_proposed or "argv[1:]" in lowered_proposed:
+            return None
+
+        option_preview = ", ".join(option_tokens[:3])
+        positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
+        repair_hints = [
+            f"The direct main([...]) contract already provides argv itself, so treat {option_preview} as the leading runtime tokens instead of assuming a launcher/program name at argv[0].",
+            f"After handling {option_preview}, consume the remaining argv payload {positional_preview} directly instead of skipping past it with launcher-style indices like argv[2:].",
+            "For direct main([...]) tests, do not read argv[1] as the first option token unless the function normalized argv earlier in the same code path.",
+        ]
+        if repair_context is not None:
+            repair_hints.extend(
+                self._runtime_target_repair_hints(
+                    path,
+                    repair_context,
+                    evidence_lines=target_evidence,
+                )
+            )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair still treats direct main([...]) argv input as though argv[0] were a launcher or program name."
+            ),
+            confidence=0.91,
+            blocking_issues=[
+                (
+                    f"The failing direct main([...]) path passes option tokens like {option_preview} and payload "
+                    f"{positional_preview} into {path}, but the proposal still uses launcher-style argv indexing "
+                    "such as argv[1] or argv[2:]."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
 
     def _direct_main_option_contract_tokens(
         self,

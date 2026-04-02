@@ -501,6 +501,12 @@ def generate_content_prompt(
         explicit_constraints = _explicit_generation_constraints(route, session)
         related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
         related_context = _related_file_context(session, path)
+        runtime_hints = _targeted_runtime_prompt_hints(
+            path=path,
+            current_content=current_content or "",
+            supporting_context=related_context,
+            targeted_context={},
+        )
         if current_content is None:
             sections = [
                 "Produce the full file content for exactly one file.",
@@ -517,6 +523,11 @@ def generate_content_prompt(
                 )
             if related_context != "none":
                 sections.append(f"Related file hints: {related_context}")
+            if runtime_hints:
+                sections.append(
+                    "Targeted runtime hints: "
+                    + " ".join(_trim_text(item, 180) for item in runtime_hints[:6])
+                )
             if repair_context is not None:
                 sections.extend(
                     [
@@ -565,6 +576,11 @@ def generate_content_prompt(
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
+        if runtime_hints:
+            sections.append(
+                "Targeted runtime hints: "
+                + " ".join(_trim_text(item, 180) for item in runtime_hints[:6])
+            )
         diagnostic_context = _diagnostic_context(session)
         if diagnostic_context:
             sections.append(f"Diagnostic context: {diagnostic_context}")
@@ -613,6 +629,13 @@ def generate_content_prompt(
         return "\n\n".join(sections)
 
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+    related_context = _related_file_context(session, path)
+    runtime_hints = _targeted_runtime_prompt_hints(
+        path=path,
+        current_content=current_content or "",
+        supporting_context=related_context,
+        targeted_context={},
+    )
     sections = [
         "Produce the full file content for the requested task.",
         f"Latest user request: {_trim_text(session.task, 700)}",
@@ -632,6 +655,13 @@ def generate_content_prompt(
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    if related_context != "none":
+        sections.append(f"Related file hints: {related_context}")
+    if runtime_hints:
+        sections.append(
+            "Targeted runtime hints: "
+            + " ".join(_trim_text(item, 180) for item in runtime_hints[:6])
+        )
     if repair_context is not None:
         sections.extend(
             [
@@ -721,6 +751,13 @@ def generate_content_retry_prompt(
                 review_feedback=review_feedback,
             )
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        related_context = _related_file_context(session, path) if session is not None else "none"
+        runtime_hints = _targeted_runtime_prompt_hints(
+            path=path,
+            current_content=current_content or "",
+            supporting_context=related_context,
+            targeted_context={},
+        )
         sections = [
             "Produce the full file content for exactly one file.",
             f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
@@ -736,7 +773,12 @@ def generate_content_retry_prompt(
         if file_requirement_summary:
             sections.append(file_requirement_summary)
         if session is not None:
-            sections.append(f"Related file hints: {_related_file_context(session, path)}")
+            sections.append(f"Related file hints: {related_context}")
+            if runtime_hints:
+                sections.append(
+                    "Targeted runtime hints: "
+                    + " ".join(_trim_text(item, 180) for item in runtime_hints[:6])
+                )
             diagnostic_context = _diagnostic_context(session)
             if diagnostic_context:
                 sections.append(f"Diagnostic context: {diagnostic_context}")
@@ -780,6 +822,13 @@ def generate_content_retry_prompt(
         )
 
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+    related_context = _related_file_context(session, path) if session is not None else "none"
+    runtime_hints = _targeted_runtime_prompt_hints(
+        path=path,
+        current_content=current_content or "",
+        supporting_context=related_context,
+        targeted_context={},
+    )
     sections = [
         "Produce the full file content for exactly one file.",
         f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 700)}",
@@ -797,6 +846,13 @@ def generate_content_retry_prompt(
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    if related_context != "none":
+        sections.append(f"Related file hints: {related_context}")
+    if runtime_hints:
+        sections.append(
+            "Targeted runtime hints: "
+            + " ".join(_trim_text(item, 180) for item in runtime_hints[:6])
+        )
     if session is not None:
         sections.extend(
             [
@@ -1867,7 +1923,10 @@ def _compact_repair_update_prompt(
         excerpt_limit=support_excerpt_limit,
         max_files=support_max_files,
     )
-    direct_main_option_contract = _direct_main_option_contract_present(related_context)
+    direct_main_option_contract = _path_exposes_direct_main_contract_target(
+        path,
+        current_content,
+    ) and _direct_main_option_contract_present(related_context)
     if compact_focus.get("current_write_requirements"):
         sections.append(
             "Repair-scoped requirements: "
@@ -2021,7 +2080,10 @@ def _compact_repair_retry_prompt(
         max_files=support_max_files,
     )
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
-    direct_main_option_contract = _direct_main_option_contract_present(related_context)
+    direct_main_option_contract = _path_exposes_direct_main_contract_target(
+        path,
+        current_content,
+    ) and _direct_main_option_contract_present(related_context)
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2195,7 +2257,10 @@ def _focused_full_repair_update_prompt(
     working_memory = _compact_working_memory(session)
     noop_followup = _review_feedback_indicates_noop_repair(review_feedback)
     concrete_examples = _repair_behavior_examples(repair_context)
-    direct_main_option_contract = _direct_main_option_contract_present(related_context)
+    direct_main_option_contract = _path_exposes_direct_main_contract_target(
+        path,
+        current_content,
+    ) and _direct_main_option_contract_present(related_context)
     implicated_line_excerpt = ""
     if noop_followup:
         implicated_line_excerpt = _line_focused_excerpt(
@@ -2605,6 +2670,56 @@ def _direct_main_runtime_contract(
 def _direct_main_option_contract_present(supporting_context: str) -> bool:
     option_tokens, _ = _direct_main_runtime_contract(supporting_context)
     return bool(option_tokens)
+
+
+def _path_exposes_direct_main_contract_target(path: str, current_content: str) -> bool:
+    normalized_path = str(path or "").strip()
+    if not normalized_path:
+        return False
+    if Path(normalized_path).name == "__main__.py":
+        return True
+    return bool(re.search(r"^\s*def\s+main\s*\(", str(current_content or ""), re.MULTILINE))
+
+
+def _preserve_runtime_contract_excerpt(
+    excerpt: str,
+    *,
+    focused_excerpt: str,
+    excerpt_limit: int,
+) -> str:
+    full_text = str(excerpt or "")
+    compact_text = str(focused_excerpt or "")
+    if not full_text:
+        return compact_text
+
+    preserve_direct_main = _direct_main_option_contract_present(full_text) and not _direct_main_option_contract_present(
+        compact_text
+    )
+    if not preserve_direct_main:
+        return compact_text
+
+    contract_line_hints: list[int] = []
+    for index, raw_line in enumerate(full_text.splitlines(), start=1):
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if re.search(r"(?:__main__\.)?main\(\s*\[[^\n]*\]\s*\)", line):
+            contract_line_hints.append(index)
+        if len(contract_line_hints) >= 4:
+            break
+    if not contract_line_hints:
+        return compact_text
+
+    contract_excerpt = _line_focused_excerpt(
+        full_text,
+        line_hints=contract_line_hints,
+        limit=max(excerpt_limit, 220),
+        before_radius=1,
+        after_radius=0,
+    )
+    if not contract_excerpt:
+        return compact_text
+    return contract_excerpt
 
 
 def _first_mismatching_semantic_line_pair(observed_value: str, expected_value: str) -> tuple[str, str]:
@@ -4792,6 +4907,25 @@ def _related_file_context(
             continue
         candidate_paths.append(path)
 
+    router_entities = getattr(getattr(session, "router_result", None), "entities", None)
+    if router_entities is not None:
+        for path in getattr(router_entities, "target_paths", []) or []:
+            candidate = str(path or "").strip()
+            if not candidate or candidate == target_path or candidate in candidate_paths:
+                continue
+            candidate_paths.append(candidate)
+
+    snapshot = getattr(session, "workspace_snapshot", None)
+    if snapshot is not None:
+        for path in [
+            *(getattr(snapshot, "test_files", []) or []),
+            *(getattr(snapshot, "focus_files", []) or []),
+        ]:
+            candidate = str(path or "").strip()
+            if not candidate or candidate == target_path or candidate in candidate_paths:
+                continue
+            candidate_paths.append(candidate)
+
     candidate_paths = _prioritize_related_context_paths(candidate_paths, target_path=target_path)
 
     for path in candidate_paths:
@@ -4833,6 +4967,12 @@ def _related_file_context(
                 focused_excerpt = _trim_balanced_text(excerpt, excerpt_limit)
         else:
             focused_excerpt = excerpt[:excerpt_limit]
+        if _related_context_is_test_like(path):
+            focused_excerpt = _preserve_runtime_contract_excerpt(
+                excerpt,
+                focused_excerpt=focused_excerpt,
+                excerpt_limit=excerpt_limit,
+            )
         sections.append(f"{path}:\n{focused_excerpt}")
         if len(sections) >= max_files:
             break
@@ -5107,6 +5247,12 @@ def _repair_related_file_context(
                     line_hints=repair_context.line_hints,
                     limit=excerpt_limit,
                 )
+        if _related_context_is_test_like(path):
+            focused_excerpt = _preserve_runtime_contract_excerpt(
+                excerpt,
+                focused_excerpt=focused_excerpt,
+                excerpt_limit=excerpt_limit,
+            )
         sections.append(f"{path}:\n{focused_excerpt}")
         if len(sections) >= max_files:
             break

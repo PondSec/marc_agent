@@ -10097,6 +10097,222 @@ def test_compact_repair_prompt_prioritizes_test_line_hints_for_stdout_contract(t
     assert "output.getvalue().strip()" in prompt
 
 
+def test_compact_repair_retry_prompt_preserves_parseable_direct_main_contract_lines(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text: str, keep_case: bool = False) -> list:\n"
+        "    parts = text.replace(',', ' ').replace('!', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return parts\n"
+        "    return [part.lower() for part in parts]\n\n"
+        "def normalize_words_keep_case(text: str) -> list:\n"
+        "    return normalize_words(text, keep_case=True)\n",
+        encoding="utf-8",
+    )
+    current_cli = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    result = normalize_words('Hello, WORLD!', keep_case)\n"
+        "    print(' '.join(result))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_normalize_words_lowercases_by_default(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!'), ['hello', 'world'])\n\n"
+        "    def test_normalize_words_can_keep_case(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!', keep_case=True), ['Hello', 'WORLD'])\n\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+            "focus_files": ["normalize_cli.py", "texttools/normalize.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "symbol_index": {
+                "normalize_cli.py": ["main"],
+                "texttools/normalize.py": ["normalize_words", "normalize_words_keep_case"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Repair the normalize keep-case runtime flow after the library fix.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI entrypoint."}],
+        target_paths=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_normalize and fix the keep-case runtime flow.",
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair still misses the exact direct main([...]) option tokens exercised by the failed runtime path.",
+        confidence=0.9,
+        blocking_issues=[
+            "The failing runtime path passes option tokens like --keep-case into main([...]), but the proposal never recognizes those exact tokens in normalize_cli.py."
+        ],
+        preservation_risks=[],
+        repair_hints=[
+            "Handle the exact option token sequence --keep-case in normalize_cli.py; do not rewrite those tokens into stripped-hyphen or underscore-only lookalikes.",
+            "After recognizing --keep-case, derive behavior from the remaining argv payload 'Hello', 'WORLD' instead of hardcoding those sample values.",
+        ],
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior: expected Validation should produce: Hello WORLD but observed Validation currently produces: hello world.",
+        file_hints=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        line_hints=[19, 20],
+        repair_requirements=["Change normalize_cli.py so the failing runtime path produces the expected output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:compact-direct-main-contract",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the repair on normalize_cli.py."],
+            allowed_files=["normalize_cli.py", "texttools/normalize.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_cli,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "main(['--keep-case', 'Hello', 'WORLD'])" in prompt
+    assert "Recognize those tokens verbatim" in prompt
+    assert "derive behavior from the remaining argv payload 'Hello', 'WORLD'" in prompt
+    assert "Expected semantics:" not in prompt
+    assert "Observed semantics:" not in prompt
+    assert "Minimal semantic delta:" not in prompt
+
+
+def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repair(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .normalize import normalize_words\n", encoding="utf-8")
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text: str, keep_case: bool = False) -> list:\n"
+        "    parts = text.replace(',', ' ').replace('!', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return parts\n"
+        "    return [part.lower() for part in parts]\n",
+        encoding="utf-8",
+    )
+    current_cli = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+            "focus_files": ["normalize_cli.py", "texttools/normalize.py"],
+            "test_files": ["tests/test_normalize.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "symbol_index": {
+                "normalize_cli.py": ["main"],
+                "texttools/normalize.py": ["normalize_words"],
+            },
+        }
+    )
+    session = SessionState(
+        task="Aktiviere die vorhandene keep-case-Unterstuetzung auch in der CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the CLI behavior."}],
+        target_paths=["normalize_cli.py", "texttools/normalize.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_cli,
+        mode="compact",
+    )
+
+    assert "main(['--keep-case', 'Hello', 'WORLD'])" in prompt
+    assert "The test calls main([...]) directly." in prompt
+    assert "Recognize those tokens verbatim" in prompt
+    assert "remaining argv payload 'Hello', 'WORLD'" in prompt
+
+
 def test_planner_current_repair_context_pivots_back_to_provider_after_support_noop(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
@@ -13108,6 +13324,144 @@ def test_pre_write_update_review_rejects_stdout_only_fix_when_direct_main_option
     assert review.safe_to_write is False
     assert "exact direct main([...]) option tokens" in review.summary
     assert any("--keep-case" in issue for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep_case CLI path without changing unrelated behavior.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(update={"entrypoints": ["normalize_cli.py"]}),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        if argv[1].lower() == '--keep-case':\n"
+        "            keep_case = True\n"
+        "    result = normalize_words(' '.join(argv[2:] if argv and len(argv) > 2 else ['Hello, WORLD!']), keep_case)\n"
+        "    print(' '.join(result))\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=(tmp_path / "normalize_cli.py").read_text(encoding="utf-8"),
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "launcher or program name" in review.summary
+    assert any("argv[1]" in issue or "argv[2:]" in issue for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_allows_initial_direct_main_contract_fix_when_payload_is_preserved(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the keep_case CLI path without changing unrelated behavior.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(update={"entrypoints": ["normalize_cli.py"]}),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays local and preserves the direct runtime contract.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    source = ' '.join(source_tokens or ['Hello, WORLD!'])\n"
+        "    print(' '.join(normalize_words(source, keep_case)))\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is True
 
 
 def test_pre_write_update_review_rejects_direct_main_option_fix_with_inexact_token_spellings(
