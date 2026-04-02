@@ -5,12 +5,14 @@ const {
   buildActivityClusters,
   buildReferenceHeroView,
   buildRuntimeStatusItems,
+  buildThreadPresentationView,
   buildUiRoute,
   buildWorkspaceShellView,
   buildPhaseSteps,
   buildSessionOverview,
   buildValidationSnapshot,
   createRefreshController,
+  formatSessionElapsed,
   parseUiRoute,
   renderRichText,
   sanitizeAssistantMessageContent,
@@ -110,6 +112,56 @@ test("buildSessionOverview gibt fertige Threads als sauberen Erfolgszustand aus"
 
   assert.equal(overview.tone, "success");
   assert.match(overview.summary, /getrennt|Validierung/i);
+});
+
+test("formatSessionElapsed formatiert kurze und laengere Laufzeiten stabil", () => {
+  assert.equal(
+    formatSessionElapsed({
+      created_at: "2026-04-02T10:00:00.000Z",
+      updated_at: "2026-04-02T10:01:09.000Z",
+    }),
+    "1m 9s",
+  );
+
+  assert.equal(
+    formatSessionElapsed({
+      created_at: "2026-04-02T10:00:00.000Z",
+      updated_at: "2026-04-02T12:07:00.000Z",
+    }),
+    "2h 7m",
+  );
+
+  assert.equal(formatSessionElapsed({ created_at: "", updated_at: "" }), "");
+});
+
+test("buildThreadPresentationView leitet laufende Threads in eine kompakte Live-Ansicht ueber", () => {
+  const session = makeSession({
+    status: "running",
+    current_phase: "editing",
+    created_at: "2026-04-02T10:00:00.000Z",
+    updated_at: "2026-04-02T10:00:42.000Z",
+    changed_files: [{ path: "webui/app.js", operation: "write", diff: "@@ -1 +1 @@\n-old\n+new" }],
+  });
+  const logs = [
+    {
+      timestamp: "2026-04-02T10:00:12.000Z",
+      event: "tool_call",
+      payload: { tool: "rg", mode: "read", summary: "Suche nach Thread-View-Komponenten" },
+    },
+    {
+      timestamp: "2026-04-02T10:00:24.000Z",
+      event: "content_generation_progress",
+      payload: { type: "chunk", path: "webui/app.js", model: "qwen-coder" },
+    },
+  ];
+
+  const presentation = buildThreadPresentationView(session, logs);
+
+  assert.equal(presentation.running, true);
+  assert.equal(presentation.durationLabel, "42s");
+  assert.equal(presentation.changes.length, 1);
+  assert.ok(presentation.activity.length >= 1);
+  assert.match(presentation.currentStep, /bearbeitet|edit|denke|webui/i);
 });
 
 test("buildPhaseSteps markiert blockierte Threads im Validierungsschritt", () => {

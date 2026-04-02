@@ -124,6 +124,11 @@ const state = {
     },
     toast: null,
     toastTimer: null,
+    diffViewer: {
+      open: false,
+      expanded: false,
+      path: null,
+    },
     chatScroll: {
       stickToBottom: true,
       distanceFromBottom: 0,
@@ -385,6 +390,7 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
   state.ui.page = preserveRoute ? state.ui.page : "workspace";
   state.ui.sessionLoading = false;
   state.ui.workspaceModalOpen = false;
+  resetDiffViewer();
   resetChatScrollState();
   if (!preserveRoute) {
     syncHistory(null);
@@ -566,6 +572,7 @@ async function openSession(sessionId, { updateHistory = true } = {}) {
       fetchJSON(`/api/sessions/${sessionId}/logs`),
     ]);
     state.activeSession = session;
+    syncDiffViewerState(session);
     state.logs = Array.isArray(logs) ? logs : [];
     state.activeSessionId = session.id;
     state.selectedWorkspaceId = session.workspace_id || state.selectedWorkspaceId;
@@ -604,9 +611,75 @@ function clearActiveSession() {
   state.activeSessionId = null;
   state.activeSession = null;
   state.logs = [];
+  resetDiffViewer();
   resetChatScrollState();
   disconnectStream();
   syncHistory(null);
+}
+
+function resetDiffViewer() {
+  state.ui.diffViewer = {
+    open: false,
+    expanded: false,
+    path: null,
+  };
+}
+
+function syncDiffViewerState(session) {
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+  if (!changes.length) {
+    resetDiffViewer();
+    return;
+  }
+  if (!state.ui.diffViewer.path || !changes.some((item) => item.path === state.ui.diffViewer.path)) {
+    state.ui.diffViewer.path = changes[0].path;
+  }
+}
+
+function openDiffFile(path) {
+  const session = state.activeSession;
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+  if (!changes.length) {
+    return;
+  }
+  state.ui.diffViewer.path = changes.some((item) => item.path === path) ? path : changes[0].path;
+  state.ui.diffViewer.open = true;
+  renderApp();
+}
+
+function toggleDiffPanel() {
+  const session = state.activeSession;
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+  if (!changes.length) {
+    return;
+  }
+  if (state.ui.diffViewer.open) {
+    closeDiffPanel();
+    return;
+  }
+  openDiffFile(state.ui.diffViewer.path || changes[0].path);
+}
+
+function toggleDiffExpanded() {
+  const session = state.activeSession;
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+  if (!changes.length) {
+    return;
+  }
+  if (!state.ui.diffViewer.open) {
+    state.ui.diffViewer.open = true;
+  }
+  state.ui.diffViewer.expanded = !state.ui.diffViewer.expanded;
+  if (!state.ui.diffViewer.path) {
+    state.ui.diffViewer.path = changes[0].path;
+  }
+  renderApp();
+}
+
+function closeDiffPanel() {
+  state.ui.diffViewer.open = false;
+  state.ui.diffViewer.expanded = false;
+  renderApp();
 }
 
 async function submitPrompt({ promptOverride = null, accessModeOverride = null } = {}) {
@@ -1149,6 +1222,7 @@ function connectStream(sessionId) {
       return;
     }
     state.activeSession = session;
+    syncDiffViewerState(session);
     renderApp();
     scheduleSessionRefresh({ delayMs: 1200, source: "stream" });
   });
@@ -1325,6 +1399,26 @@ function handleClick(event) {
 
   if (action === "clear-active-session") {
     startNewChat(state.selectedWorkspaceId);
+    return;
+  }
+
+  if (action === "toggle-diff-panel") {
+    toggleDiffPanel();
+    return;
+  }
+
+  if (action === "open-diff-file") {
+    openDiffFile(target.dataset.path);
+    return;
+  }
+
+  if (action === "toggle-diff-expanded") {
+    toggleDiffExpanded();
+    return;
+  }
+
+  if (action === "close-diff-panel") {
+    closeDiffPanel();
     return;
   }
 
@@ -3065,26 +3159,25 @@ function renderChatContainer() {
 }
 
 function renderChatStateMessages() {
-  const hero = renderReferenceHero();
   if (state.ui.booting) {
-    return `${hero}${renderStageState(
+    return `${renderStageState(
       "Oberflaeche wird vorbereitet",
       "Projekte, Threads und Laufzeitstatus werden geladen.",
     )}`;
   }
 
   if (state.ui.sessionLoading) {
-    return `${hero}${renderStageState(
+    return `${renderStageState(
       "Thread wird geladen",
       "Konversation, Arbeitsdetails und Validierung werden zusammengestellt.",
     )}`;
   }
 
   if (!state.activeSession) {
-    return `${hero}${renderEmptyThreadState()}`;
+    return renderEmptyThreadState();
   }
 
-  return `${hero}${renderThreadView(state.activeSession)}`;
+  return renderThreadView(state.activeSession);
 }
 
 function renderStageState(title, copy, actions = "") {
@@ -3136,14 +3229,19 @@ function renderEmptyThreadState() {
 }
 
 function renderThreadView(session) {
+  const presentation = buildThreadPresentationView(session, state.logs);
+  const diffFile = activeDiffFile(session);
   return `
-    <div class="thread-workbench">
-      <div class="thread-workbench-main">
-        ${renderConversationPanel(session)}
+    <div class="thread-shell ${diffFile ? "with-diff" : ""} ${diffFile && state.ui.diffViewer.expanded ? "diff-expanded" : ""}">
+      <div class="thread-column">
+        ${renderConversationPanel(session, presentation)}
+        ${
+          presentation.running
+            ? renderThreadLivePanel(session, presentation)
+            : renderThreadOutcomePanel(session, presentation, diffFile)
+        }
       </div>
-      <aside class="thread-workbench-rail">
-        ${renderThreadSideRail(session, state.logs)}
-      </aside>
+      ${diffFile ? renderThreadDiffViewer(diffFile) : ""}
     </div>
   `;
 }
@@ -3200,33 +3298,210 @@ function renderMessageBubble(message, options = {}) {
   `;
 }
 
-function renderConversationPanel(session) {
-  const timeline = conversationTimeline(session, state.logs);
+function renderConversationPanel(session, presentation = buildThreadPresentationView(session, state.logs)) {
+  const timeline = conversationTimeline(session);
   const workspace = workspaceForSession(session);
-  const overview = buildSessionOverview(session);
   const title = session.title || shorten(session.task, 96) || "Neuer Thread";
-  const contextMeta = [
-    labelForAccessMode(session.access_mode),
-    workspace?.path ? shortenPath(workspace.path, 96) : "",
-    session.updated_at ? `Aktualisiert ${formatSessionTimestamp(session.updated_at)}` : "",
-  ]
+  const contextMeta = [workspace?.name || "", workspace?.path ? shortenPath(workspace.path, 84) : "", labelForAccessMode(session.access_mode)]
     .filter(Boolean)
-    .join(" | ");
+    .join(" · ");
   return `
     <section class="thread-canvas">
-      <div class="reference-transcript-head">
-        <div class="reference-transcript-copy">
-          <span class="reference-kicker">Transcript</span>
-          <h2>${escapeHtml(title)}</h2>
-          <p>${escapeHtml(overview.summary)}</p>
+      <div class="thread-session-head">
+        <div class="thread-session-headline">
+          <span class="thread-session-kicker">Thread</span>
+          <h2 class="thread-session-title">${escapeHtml(title)}</h2>
+          ${contextMeta ? `<p class="thread-session-subtitle">${escapeHtml(contextMeta)}</p>` : ""}
         </div>
-        ${contextMeta ? `<p class="reference-transcript-meta">${escapeHtml(contextMeta)}</p>` : ""}
+        <div class="thread-session-meta">
+          <span class="thread-session-status tone-${escapeHtml(sessionStatusTone(session))}">${escapeHtml(sessionBadgeText(session))}</span>
+          ${
+            presentation.durationLabel
+              ? `<span class="thread-session-duration">${escapeHtml(presentation.durationLabel)}</span>`
+              : ""
+          }
+        </div>
       </div>
-      <div class="thread-feed reference-thread-feed">
+      <div class="thread-feed thread-feed-minimal">
         ${timeline.length ? timeline.map((entry) => renderTimelineEntry(entry, session)).join("") : `<div class="inline-note">Noch keine Nachrichten in diesem Thread.</div>`}
-        ${isSessionRunning(session) ? renderRunningMessage(session) : ""}
       </div>
     </section>
+  `;
+}
+
+function renderThreadLivePanel(session, presentation) {
+  const headline = presentation.currentStep || phaseHeadline(session?.current_phase);
+  return `
+    <section class="thread-live-panel">
+      <div class="thread-panel-head">
+        <div>
+          <span class="thread-panel-kicker">Denke nach</span>
+          <h3>${escapeHtml(headline)}</h3>
+        </div>
+        <span class="thread-panel-meta">${escapeHtml(labelForPhase(session?.current_phase || "planning"))}</span>
+      </div>
+      ${
+        presentation.activity.length
+          ? `
+            <div class="thread-live-list">
+              ${presentation.activity.map(renderThreadLiveRow).join("")}
+            </div>
+          `
+          : `<p class="thread-panel-copy">Der Agent arbeitet gerade, aber es liegt noch keine sichtbare Aktivitaet vor.</p>`
+      }
+    </section>
+  `;
+}
+
+function renderThreadLiveRow(item) {
+  return `
+    <div class="thread-live-row tone-${escapeHtml(item.tone || "muted")}">
+      <div class="thread-live-copy">
+        <strong>${escapeHtml(item.text || "")}</strong>
+        ${item.meta ? `<p>${escapeHtml(item.meta)}</p>` : ""}
+      </div>
+      <span class="thread-live-time">${escapeHtml(formatTime(item.timestamp))}</span>
+    </div>
+  `;
+}
+
+function renderThreadOutcomePanel(session, presentation, diffFile) {
+  const changeLabel = countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`);
+  return `
+    <section class="thread-outcome-panel tone-${escapeHtml(presentation.overview.tone)}">
+      <div class="thread-panel-head">
+        <div>
+          <span class="thread-panel-kicker">Zusammenfassung</span>
+          <h3>${escapeHtml(presentation.overview.title)}</h3>
+        </div>
+        <div class="thread-panel-actions">
+          ${
+            presentation.durationLabel
+              ? `<span class="thread-panel-meta">${escapeHtml(presentation.durationLabel)} lang gearbeitet</span>`
+              : ""
+          }
+          ${
+            presentation.changes.length
+              ? `
+                <button class="thread-panel-toggle" type="button" data-action="toggle-diff-panel" aria-label="Diff-Bereich umschalten">
+                  ${state.ui.diffViewer.open ? "−" : "+"}
+                </button>
+              `
+              : ""
+          }
+        </div>
+      </div>
+      <p class="thread-panel-copy">${escapeHtml(presentation.overview.summary)}</p>
+      <div class="thread-outcome-stats">
+        ${renderThreadOutcomeStat("Status", sessionBadgeText(session))}
+        ${renderThreadOutcomeStat("Checks", presentation.validation.statusLabel)}
+        ${renderThreadOutcomeStat("Dateien", changeLabel)}
+        ${renderThreadOutcomeStat("Schritte", String(session.tool_calls?.length || 0))}
+      </div>
+      ${
+        presentation.changes.length
+          ? `
+            <div class="thread-outcome-files">
+              ${presentation.changes
+                .slice(0, 8)
+                .map((change) => renderThreadOutcomeFile(change, diffFile?.path === change.path))
+                .join("")}
+            </div>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
+function renderThreadOutcomeStat(label, value) {
+  return `
+    <div class="thread-outcome-stat">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
+function renderThreadOutcomeFile(change, active = false) {
+  return `
+    <button
+      class="thread-outcome-file ${active ? "active" : ""}"
+      type="button"
+      data-action="open-diff-file"
+      data-path="${escapeAttribute(change.path)}"
+    >
+      <span>${escapeHtml(labelForFileOperation(change.operation))}</span>
+      <strong>${escapeHtml(shortenPath(change.path, 104))}</strong>
+    </button>
+  `;
+}
+
+function activeDiffFile(session) {
+  if (!state.ui.diffViewer.open) {
+    return null;
+  }
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+  if (!changes.length) {
+    return null;
+  }
+  return changes.find((item) => item.path === state.ui.diffViewer.path) || changes[0] || null;
+}
+
+function renderThreadDiffViewer(change) {
+  return `
+    <aside class="thread-diff-panel">
+      <div class="thread-diff-head">
+        <div class="thread-diff-copy">
+          <span class="thread-panel-kicker">Aenderung</span>
+          <h3>${escapeHtml(shortenPath(change.path, 96))}</h3>
+        </div>
+        <div class="thread-diff-actions">
+          <button class="thread-panel-toggle" type="button" data-action="toggle-diff-expanded" aria-label="Diff-Bereich vergroessern oder verkleinern">
+            ${state.ui.diffViewer.expanded ? "−" : "+"}
+          </button>
+          <button class="thread-panel-toggle" type="button" data-action="close-diff-panel" aria-label="Diff-Bereich schliessen">
+            ×
+          </button>
+        </div>
+      </div>
+      <div class="thread-diff-scroll">
+        ${renderThreadDiff(change)}
+      </div>
+    </aside>
+  `;
+}
+
+function renderThreadDiff(change) {
+  const diff = String(change?.diff || "").trim();
+  if (!diff) {
+    return `
+      <div class="thread-diff-empty">
+        <p>Fuer diese Datei liegt aktuell kein Patch vor.</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="thread-diff-code">
+      ${diff.split("\n").map(renderThreadDiffLine).join("")}
+    </div>
+  `;
+}
+
+function renderThreadDiffLine(line) {
+  const value = String(line || "");
+  let tone = "context";
+  if (value.startsWith("@@") || value.startsWith("---") || value.startsWith("+++")) {
+    tone = "meta";
+  } else if (value.startsWith("+")) {
+    tone = "add";
+  } else if (value.startsWith("-")) {
+    tone = "remove";
+  }
+  return `
+    <div class="thread-diff-line tone-${escapeHtml(tone)}">
+      <code>${escapeHtml(value || " ")}</code>
+    </div>
   `;
 }
 
@@ -4546,19 +4821,14 @@ function conversationMessages(session) {
   return fallback;
 }
 
-function conversationTimeline(session, logs) {
+function conversationTimeline(session) {
   const messageEntries = conversationMessages(session).map((message) => ({
     type: "message",
     timestamp: message.created_at,
     message,
   }));
-  const activityEntries = buildActivityClusters(session, logs).map((record) => ({
-      type: "activity",
-      timestamp: record.timestamp,
-      record,
-    }));
 
-  return [...messageEntries, ...activityEntries].sort((left, right) =>
+  return [...messageEntries].sort((left, right) =>
     String(left.timestamp || "").localeCompare(String(right.timestamp || "")),
   );
 }
@@ -4669,6 +4939,19 @@ function buildRunHighlights(session) {
       tone: validation.tone,
     },
   ];
+}
+
+function buildThreadPresentationView(session, logs) {
+  return {
+    running: isSessionRunning(session),
+    currentStep: currentThoughtFrom({ activeSession: session, logs }),
+    durationLabel: formatSessionElapsed(session),
+    overview: buildSessionOverview(session),
+    validation: buildValidationSnapshot(session),
+    changes: Array.isArray(session?.changed_files) ? session.changed_files : [],
+    activity: buildActivityClusters(session, logs).slice(0, 6),
+    highlights: buildRunHighlights(session),
+  };
 }
 
 function buildValidationSnapshot(session) {
@@ -6022,6 +6305,26 @@ function formatTime(value) {
   return date.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatSessionElapsed(session) {
+  const startedAt = new Date(session?.created_at || "");
+  const finishedAt = new Date(session?.updated_at || "");
+  if (Number.isNaN(startedAt.getTime()) || Number.isNaN(finishedAt.getTime())) {
+    return "";
+  }
+  const totalSeconds = Math.max(0, Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
+}
+
 function shorten(text, limit = 72) {
   const value = String(text || "");
   if (value.length <= limit) {
@@ -6588,6 +6891,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildActivityClusters,
     buildReferenceHeroView,
     buildRuntimeStatusItems,
+    buildThreadPresentationView,
     buildUiRoute,
     buildWorkspaceShellView,
     buildPhaseSteps,
@@ -6599,6 +6903,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseUiRoute,
     shouldStartRefresh,
     updateRefreshBackoff,
+    formatSessionElapsed,
     phaseStepKey,
     renderRichText,
     sanitizeAssistantMessageContent,
