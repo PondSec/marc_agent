@@ -3540,6 +3540,18 @@ class Planner:
         session: SessionState,
         candidate_paths: list[str],
     ) -> list[str]:
+        repair_context = self._current_repair_context_hint(session)
+        if repair_context is not None and route.intent in {
+            RouteIntent.UPDATE,
+            RouteIntent.DEBUG,
+            RouteIntent.DELETE,
+            RouteIntent.EXPLAIN,
+        }:
+            repair_targets = [
+                path for path in route.entities.target_paths if path and Path(path).suffix
+            ]
+            if repair_targets:
+                return self._unique_paths(repair_targets)
         explicit_targets = self._explicit_target_paths(route, session)
         if explicit_targets and route.intent in {
             RouteIntent.UPDATE,
@@ -4066,7 +4078,7 @@ class Planner:
 
     def _next_update_target(self, route: RouterOutput, session: SessionState) -> str | None:
         repair_context = self._current_repair_context_hint(session)
-        if route.intent == RouteIntent.UPDATE and repair_context is not None:
+        if route.intent in {RouteIntent.UPDATE, RouteIntent.DEBUG} and repair_context is not None:
             failed_run = self.validation_planner.latest_failed_run(
                 session,
                 current_generation_only=False,
