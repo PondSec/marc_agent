@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +10,12 @@ from agent.core import AgentCore
 from agent.decision import ExecutionDecisionPolicy
 from agent.models import ChatMessage, FollowUpContext, SessionState, WorkspaceSnapshot
 from agent.planner import Planner
-from agent.prompts import task_state_update_prompt
+from agent.prompts import (
+    _compact_follow_up_context,
+    _compact_workspace_snapshot,
+    _prioritized_compact_payload,
+    task_state_update_prompt,
+)
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
@@ -3018,6 +3024,85 @@ def test_task_state_update_prompt_compact_stays_smaller_than_full(tmp_path):
     assert '"file_briefs"' not in compact_prompt
     assert '"symbol_index"' in full_prompt
     assert '"file_briefs"' in full_prompt
+
+
+def test_prioritized_compact_payload_keeps_high_value_keys_under_budget():
+    payload = {
+        "repo_summary": "A" * 420,
+        "important_files": [f"app/module_{idx}.py" for idx in range(8)],
+        "file_briefs": {f"app/module_{idx}.py": "B" * 120 for idx in range(6)},
+        "symbol_index": {f"app/module_{idx}.py": [f"Symbol{inner}" for inner in range(6)] for idx in range(6)},
+    }
+
+    compacted = _prioritized_compact_payload(
+        payload,
+        ordered_keys=["repo_summary", "important_files", "file_briefs", "symbol_index"],
+        max_chars=260,
+    )
+
+    assert "repo_summary" in compacted
+    assert len(json.dumps(compacted, ensure_ascii=False)) <= 280
+    assert "file_briefs" not in compacted
+    assert "symbol_index" not in compacted
+
+
+def test_compact_follow_up_context_keeps_targets_and_last_error_when_oversized(tmp_path):
+    session = SessionState(
+        task="mach weiter",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task=" ".join(["continue the same repair"] * 30),
+            previous_root_goal=" ".join(["Fix the backend auth flow."] * 24),
+            previous_active_goal=" ".join(["Repair the broken auth endpoint."] * 22),
+            previous_requested_outcome=" ".join(["A working auth flow."] * 24),
+            previous_constraints=["backend only"] * 10,
+            previous_assumptions=["the same workspace is still active"] * 10,
+            target_paths=["app/auth.py", "tests/test_auth.py"],
+            changed_files=["app/auth.py"],
+            read_files=["app/auth.py", "server/app.py"],
+            recent_commands=["pytest -q", "python -m unittest", "ruff check", "mypy app"] * 3,
+            last_error="AssertionError: unauthorized request still returns 401 after the repair path ran.",
+            notes=[" ".join(["long note"] * 40)] * 8,
+        ),
+    )
+
+    compacted = _compact_follow_up_context(session)
+
+    assert compacted["target_paths"] == ["app/auth.py", "tests/test_auth.py"]
+    assert compacted["changed_files"] == ["app/auth.py"]
+    assert "last_error" in compacted
+    assert "previous_root_goal" in compacted
+    assert len(json.dumps(compacted, ensure_ascii=False)) <= 760
+    assert "notes" not in compacted
+
+
+def test_compact_workspace_snapshot_prefers_primary_repo_context_before_auxiliary_details(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=240,
+        language_counts={"python": 180, "json": 20},
+        top_directories=["app", "server", "tests", "docs", "tools"],
+        important_files=[f"app/module_{idx}.py" for idx in range(10)],
+        focus_files=[f"app/module_{idx}.py" for idx in range(8)],
+        file_briefs={f"app/module_{idx}.py": " ".join(["brief"] * 30) for idx in range(8)},
+        manifests=["pyproject.toml", "requirements.txt"],
+        entrypoints=["app.py", "server.py"],
+        test_mappings=["tests/test_auth.py -> app/auth.py", "tests/test_api.py -> server/api.py"],
+        service_files=["server/api.py", "server/auth.py"],
+        import_hotspots=["app/core.py", "server/app.py"],
+        symbol_index={f"app/module_{idx}.py": [f"Symbol{inner}" for inner in range(8)] for idx in range(8)},
+        project_labels=["python", "backend-service"],
+        likely_commands=["pytest -q", "ruff check", "python -m unittest"],
+        repo_summary=" ".join(["Large Python service with tests, entrypoints, and validation commands."] * 18),
+    )
+
+    compacted = _compact_workspace_snapshot(snapshot, detail="decision")
+
+    assert "repo_summary" in compacted
+    assert "important_files" in compacted
+    assert "entrypoints" in compacted
+    assert len(json.dumps(compacted, ensure_ascii=False)) <= 1320
+    assert "file_briefs" not in compacted or "symbol_index" not in compacted
 
 
 def test_task_state_updater_uses_compact_generation_for_fresh_session(tmp_path):

@@ -13,6 +13,12 @@ from llm.schemas import RouteActionName, RouterOutput
 
 
 REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
+FOLLOW_UP_CONTEXT_CHAR_BUDGET = 720
+WORKING_MEMORY_CHAR_BUDGET = 520
+STANDARD_MEMORY_CONTEXT_CHAR_BUDGET = 1100
+SEMANTIC_START_MEMORY_CONTEXT_CHAR_BUDGET = 760
+ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET = 900
+DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET = 1280
 UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
     re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
     re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -1211,7 +1217,7 @@ def _compact_follow_up_context(session: SessionState | None) -> dict[str, object
     if session is None or session.follow_up_context is None:
         return {}
     follow_up = session.follow_up_context
-    return {
+    payload = {
         "previous_task": _trim_text(follow_up.previous_task or "", 220),
         "previous_root_goal": _trim_text(follow_up.previous_root_goal or "", 220),
         "previous_active_goal": _trim_text(follow_up.previous_active_goal or "", 220),
@@ -1231,13 +1237,37 @@ def _compact_follow_up_context(session: SessionState | None) -> dict[str, object
         "last_error": _trim_text(follow_up.last_error or "", 240),
         "notes": [_trim_text(item, 140) for item in follow_up.notes[-6:]],
     }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "previous_root_goal",
+            "previous_active_goal",
+            "previous_task",
+            "previous_requested_outcome",
+            "last_error",
+            "target_paths",
+            "changed_files",
+            "read_files",
+            "recent_commands",
+            "previous_constraints",
+            "previous_assumptions",
+            "previous_next_action",
+            "previous_intent",
+            "previous_interpreted_goal",
+            "previous_recommended_mode",
+            "previous_confidence",
+            "previous_final_response",
+            "notes",
+        ],
+        max_chars=FOLLOW_UP_CONTEXT_CHAR_BUDGET,
+    )
 
 
 def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
     if session is None or session.working_memory is None:
         return {}
     working = session.working_memory
-    return {
+    payload = {
         "current_goal": _trim_text(working.current_goal or "", 180),
         "current_subtask": _trim_text(working.current_subtask or "", 160),
         "primary_target": working.primary_target,
@@ -1250,6 +1280,26 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
         "last_ineffective_strategy": working.last_ineffective_strategy,
         "summary": _trim_text(working.compact_state_summary, 260),
     }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "current_goal",
+            "primary_target",
+            "verification_target",
+            "current_subtask",
+            "active_failure_signature",
+            "active_constraints",
+            "relevant_files",
+            "relevant_symbols",
+            "last_effective_strategy",
+            "last_ineffective_strategy",
+            "summary",
+            "recent_failures",
+            "recent_attempts",
+            "recent_successes",
+        ],
+        max_chars=WORKING_MEMORY_CHAR_BUDGET,
+    )
 
 
 def _compact_memory_context(
@@ -1324,7 +1374,20 @@ def _compact_standard_memory_context(session: SessionState | None) -> dict[str, 
         "stale_recall_rate": memory_context.stale_recall_rate,
         "useful_recall_rate": memory_context.useful_recall_rate,
     }
-    return payload
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "working",
+            "retrieval_summary",
+            "recall",
+            "suggested_files",
+            "suggested_symbols",
+            "repo_map_hints",
+            "retrieved",
+            "metrics",
+        ],
+        max_chars=STANDARD_MEMORY_CONTEXT_CHAR_BUDGET,
+    )
 
 
 def _compact_semantic_start_memory_context(session: SessionState | None) -> dict[str, object]:
@@ -1414,7 +1477,19 @@ def _compact_semantic_start_memory_context(session: SessionState | None) -> dict
         payload["suggested_symbols"] = list(memory_context.suggested_symbols[:4])
     if getattr(memory_context, "repo_map_hints", None):
         payload["repo_map_hints"] = [_trim_text(item, 120) for item in list(memory_context.repo_map_hints[:3])]
-    return payload
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "working",
+            "retrieval_summary",
+            "suggested_files",
+            "suggested_symbols",
+            "repo_map_hints",
+            "memory_hints",
+            "recall",
+        ],
+        max_chars=SEMANTIC_START_MEMORY_CONTEXT_CHAR_BUDGET,
+    )
 
 
 def _should_include_persistent_memory(memory_context) -> bool:
@@ -1493,7 +1568,29 @@ def _compact_workspace_snapshot(
             path: list(symbols[:4])
             for path, symbols in list(snapshot.symbol_index.items())[:4]
         }
-    return payload
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "repo_summary",
+            "focus_files",
+            "important_files",
+            "entrypoints",
+            "manifests",
+            "likely_commands",
+            "project_labels",
+            "top_directories",
+            "service_files",
+            "test_mappings",
+            "import_hotspots",
+            "file_briefs",
+            "symbol_index",
+        ],
+        max_chars=(
+            ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET
+            if detail == "router"
+            else DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET
+        ),
+    )
 
 
 def _compact_route(route: RouterOutput | None) -> dict[str, object]:
@@ -5295,6 +5392,96 @@ def _trim_text(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1].rstrip() + "…"
+
+
+def _has_payload_signal(value: object) -> bool:
+    return value not in ("", [], {}, None)
+
+
+def _json_char_cost(value: object) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except TypeError:
+        return len(json.dumps(str(value), ensure_ascii=False))
+
+
+def _trim_value_to_budget(value: object, *, max_chars: int) -> object | None:
+    if max_chars <= 0:
+        return None
+    if isinstance(value, str):
+        return _trim_text(value, max_chars)
+    if isinstance(value, list):
+        items: list[object] = []
+        for item in value:
+            candidate = [*items, item]
+            if _json_char_cost(candidate) <= max_chars:
+                items.append(item)
+                continue
+            if isinstance(item, str):
+                remaining = max(max_chars - _json_char_cost(items) - 4, 12)
+                trimmed = _trim_text(item, remaining)
+                candidate = [*items, trimmed]
+                if _json_char_cost(candidate) <= max_chars:
+                    items.append(trimmed)
+            break
+        return items
+    if isinstance(value, dict):
+        items: dict[object, object] = {}
+        for key, item in value.items():
+            candidate = {**items, key: item}
+            if _json_char_cost(candidate) <= max_chars:
+                items[key] = item
+                continue
+            if isinstance(item, str):
+                remaining = max(max_chars - _json_char_cost(items) - len(str(key)) - 8, 12)
+                trimmed = _trim_text(item, remaining)
+                candidate = {**items, key: trimmed}
+                if _json_char_cost(candidate) <= max_chars:
+                    items[key] = trimmed
+            break
+        return items
+    return value
+
+
+# Borrow the reference agent's core compaction idea: preserve the highest-signal
+# sections first and only drop lower-value context when the serialized payload
+# would otherwise bloat the prompt.
+def _prioritized_compact_payload(
+    payload: dict[str, object],
+    *,
+    ordered_keys: list[str],
+    max_chars: int,
+) -> dict[str, object]:
+    filtered = {
+        key: value
+        for key, value in payload.items()
+        if _has_payload_signal(value)
+    }
+    if not filtered or _json_char_cost(filtered) <= max_chars:
+        return filtered
+
+    ordered = [key for key in ordered_keys if key in filtered]
+    ordered.extend(key for key in filtered if key not in ordered)
+
+    compacted: dict[str, object] = {}
+    for key in ordered:
+        value = filtered[key]
+        candidate = {**compacted, key: value}
+        if _json_char_cost(candidate) <= max_chars:
+            compacted[key] = value
+            continue
+        if compacted:
+            continue
+        trimmed = _trim_value_to_budget(
+            value,
+            max_chars=max(max_chars - len(str(key)) - 8, 12),
+        )
+        if not _has_payload_signal(trimmed):
+            continue
+        single = {key: trimmed}
+        if _json_char_cost(single) <= max_chars:
+            compacted[key] = trimmed
+    return compacted
 
 
 def _trim_balanced_text(text: str, limit: int) -> str:
