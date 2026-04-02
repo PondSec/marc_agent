@@ -4492,7 +4492,7 @@ class Planner:
                         summary=review.summary,
                         blocking_issues=review.blocking_issues[:4],
                     )
-                    self._record_noop_review_attempt(
+                    recorded_noop_review = self._record_noop_review_attempt(
                         session,
                         target=path,
                         current_content=current_content,
@@ -4501,6 +4501,17 @@ class Planner:
                         strategy=repair_strategy,
                         review=review,
                     )
+                    if recorded_noop_review:
+                        return ContentGenerationResult(
+                            source="failed",
+                            failure=self._build_update_review_failure(
+                                session,
+                                path,
+                                review,
+                                current_content=current_content,
+                            ),
+                            repair_strategy_used=repair_strategy,
+                        )
                     review_retry = self._retry_update_after_review_failure(
                         route,
                         session,
@@ -4628,7 +4639,7 @@ class Planner:
                     summary=review.summary,
                     blocking_issues=review.blocking_issues[:4],
                 )
-                self._record_noop_review_attempt(
+                recorded_noop_review = self._record_noop_review_attempt(
                     session,
                     target=path,
                     current_content=current_content,
@@ -4641,6 +4652,17 @@ class Planner:
                     ),
                     review=review,
                 )
+                if recorded_noop_review:
+                    return ContentGenerationResult(
+                        source="failed",
+                        failure=self._build_update_review_failure(
+                            session,
+                            path,
+                            review,
+                            current_content=current_content,
+                        ),
+                        repair_strategy_used=repair_strategy,
+                    )
                 review_retry = self._retry_update_after_review_failure(
                     route,
                     session,
@@ -8500,6 +8522,25 @@ class Planner:
                 ],
                 repair_hints=[
                     "Produce a smaller focused update that preserves unrelated existing behavior.",
+                ],
+            )
+        if (
+            model_backed_review_failed
+            and repair_context is not None
+            and repair_context.verification_scope == "structural"
+            and (
+                bool(getattr(repair_context, "missing_features", []))
+                or self.validation_planner.command_identity(repair_context.command).startswith("internal:web_artifact:")
+            )
+        ):
+            return ProposedUpdateReview(
+                safe_to_write=True,
+                summary=(
+                    f"Model-backed pre-write review was unavailable, but the proposed update for {path} is already anchored by deterministic structural validation evidence."
+                ),
+                confidence=0.41,
+                repair_hints=[
+                    "Keep the update strictly aligned to the reported missing structural features and avoid unrelated rewrites.",
                 ],
             )
         if (
