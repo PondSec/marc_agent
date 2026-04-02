@@ -1715,6 +1715,30 @@ class Planner:
                 count += 1
         return count
 
+    def _repair_attempt_mutation_count(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        target: str,
+    ) -> int:
+        normalized_target = str(target or "").strip()
+        if not normalized_target:
+            return 0
+        failure_signature = self._repair_failure_signature(repair_context)
+        evidence_signature = str(repair_context.evidence_signature or "").strip()
+        count = 0
+        for item in reversed(session.repair_history):
+            if str(item.artifact_path or "").strip() != normalized_target:
+                continue
+            if item.result != "mutation_planned":
+                continue
+            if failure_signature and str(item.failure_signature or "").strip() == failure_signature:
+                count += 1
+                continue
+            if not failure_signature and evidence_signature and str(item.evidence_signature or "").strip() == evidence_signature:
+                count += 1
+        return count
+
     def _assess_effective_mutation(
         self,
         path: str,
@@ -7210,6 +7234,8 @@ class Planner:
         if len(unresolved_competing_scope) > 1:
             return False
         if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
+            return False
+        if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
             return False
 
         changed_line_count = self._compact_repair_change_line_count(
