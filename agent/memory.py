@@ -187,6 +187,7 @@ class RepoMemoryStore:
             test_files=test_files,
         )
         symbol_index, import_hotspots, service_files = self._deep_repo_signals(deep_repo_paths)
+        entrypoints = self._augment_entrypoints_from_symbols(entrypoints, symbol_index)
 
         validation_commands, workflow_commands = self._detect_commands(
             manifests=manifests,
@@ -249,6 +250,29 @@ class RepoMemoryStore:
         )
         self.snapshot_path.write_text(snapshot.model_dump_json(indent=2), encoding="utf-8")
         return snapshot
+
+    def _augment_entrypoints_from_symbols(
+        self,
+        entrypoints: list[str],
+        symbol_index: dict[str, list[str]],
+    ) -> list[str]:
+        inferred: list[str] = []
+        for relative_path, symbols in symbol_index.items():
+            path = str(relative_path or "").strip()
+            if (
+                not path
+                or self._is_test_file(path)
+                or Path(path).name.lower() == "__init__.py"
+            ):
+                continue
+            normalized_symbols = {
+                str(symbol or "").strip().lower()
+                for symbol in list(symbols or [])
+                if str(symbol or "").strip()
+            }
+            if "main" in normalized_symbols:
+                inferred.append(path)
+        return list(dict.fromkeys([*entrypoints, *inferred]))
 
     def render_snapshot(self, snapshot: WorkspaceSnapshot) -> str:
         lines = [

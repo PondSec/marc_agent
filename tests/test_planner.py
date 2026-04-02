@@ -39,11 +39,13 @@ from agent.prompts import (
 )
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
+from agent.memory import RepoMemoryStore
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
 from llm.runtime_resilience import ExecutionFailure
 from llm.schemas import AgentActionType, AgentDecision, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
+from runtime.workspace import WorkspaceManager
 
 
 class ScriptedLLM:
@@ -9345,6 +9347,135 @@ def test_planner_prefers_import_provider_after_recent_support_patch_runtime_fail
     )
 
     assert next_target == "texttools/normalize.py"
+
+
+def test_planner_runtime_repair_pivots_to_inferred_main_entrypoint_after_library_fix(tmp_path):
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    (pkg / "normalize.py").write_text(
+        "def normalize_words(text: str, keep_case: bool = False) -> list:\n"
+        "    parts = text.replace(',', ' ').replace('!', ' ').split()\n"
+        "    if keep_case:\n"
+        "        return parts\n"
+        "    return [part.lower() for part in parts]\n\n"
+        "def normalize_words_keep_case(text: str) -> str:\n"
+        "    return ' '.join(normalize_words(text, keep_case=True))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = bool(argv and '--keep-case' in argv)\n"
+        "    return normalize_words('Hello, WORLD!', keep_case=keep_case)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# texttools\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n"
+        "from texttools import normalize_words, normalize_words_keep_case\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_normalize_words_lowercases_by_default(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!'), ['hello', 'world'])\n\n"
+        "    def test_normalize_words_can_keep_case(self):\n"
+        "        self.assertEqual(normalize_words('Hello, WORLD!', keep_case=True), ['Hello', 'WORLD'])\n\n"
+        "    def test_cli_supports_keep_case_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    snapshot = RepoMemoryStore(config, WorkspaceManager(tmp_path)).build_snapshot("cli unittest")
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="update",
+                action_plan=[
+                    {"step": 1, "action": "update_artifact", "reason": "Repair the keep-case implementation."},
+                    {"step": 2, "action": "run_validation", "reason": "Rerun the targeted unittest module."},
+                ],
+                target_paths=["texttools/normalize.py", "normalize_cli.py", "README.md", "tests/test_normalize.py"],
+                target_name="texttools/normalize.py",
+            )
+        ],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Ergänze keep_case in texttools und der CLI, sodass python -m unittest tests.test_normalize grün wird.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        validation_status="failed",
+        edit_generation=3,
+        validation_plan=[
+            ValidationCommand(
+                command="python -m unittest tests.test_normalize",
+                kind="test",
+                verification_scope="runtime",
+            )
+        ],
+        verification_commands=["python -m unittest tests.test_normalize"],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        llm.json_payloads[0],
+        verification_target="Run python -m unittest tests.test_normalize and fix the keep-case runtime flow.",
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="write"),
+            FileChangeRecord(path="texttools/__init__.py", operation="write"),
+        ]
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.test_normalize",
+            kind="test",
+            verification_scope="runtime",
+            status="failed",
+            edit_generation=3,
+            iteration=13,
+            summary="Validation command exited with 1.",
+            excerpt=(
+                "F..\n"
+                "======================================================================\n"
+                "FAIL: test_cli_supports_keep_case_flag (tests.test_normalize.NormalizeTests.test_cli_supports_keep_case_flag)\n"
+                "----------------------------------------------------------------------\n"
+                f'  File "{tests_dir / "test_normalize.py"}", line 17, in test_cli_supports_keep_case_flag\n'
+                "    self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n"
+                "AssertionError: '' != 'Hello WORLD'\n"
+                "+ Hello WORLD\n"
+            ),
+        )
+    )
+
+    failed_run = session.validation_runs[-1]
+    repair_context = planner.validation_planner.build_failure_evidence(session, failed_run)
+
+    next_target = planner._repair_target_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    assert "normalize_cli.py" in snapshot.entrypoints
+    assert repair_context.repair_brief.primary_target == "normalize_cli.py"
+    assert repair_context.repair_brief.locked_target == "normalize_cli.py"
+    assert next_target == "normalize_cli.py"
 
 
 def test_planner_current_repair_context_pivots_back_to_provider_after_support_noop(tmp_path):

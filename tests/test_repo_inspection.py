@@ -92,6 +92,31 @@ def test_repo_snapshot_detects_unittest_command_from_python_test_files_without_m
     assert any(item.command == "python -m unittest" for item in snapshot.validation_commands)
 
 
+def test_repo_snapshot_infers_entrypoint_from_main_symbol_when_name_is_not_builtin(tmp_path):
+    (tmp_path / "normalize_cli.py").write_text(
+        "def main(argv=None):\n"
+        "    return ' '.join(argv or [])\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_normalize.py").write_text(
+        "import unittest\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_ok(self):\n"
+        "        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    memory = RepoMemoryStore(config, WorkspaceManager(tmp_path))
+
+    snapshot = memory.build_snapshot("cli unittest")
+
+    assert "normalize_cli.py" in snapshot.entrypoints
+    assert snapshot.symbol_index["normalize_cli.py"] == ["main"]
+
+
 def test_repo_snapshot_collects_service_files_and_symbols_for_repo_map(tmp_path):
     (tmp_path / "app").mkdir()
     (tmp_path / "app" / "router.py").write_text(
