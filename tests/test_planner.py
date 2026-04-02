@@ -42,7 +42,7 @@ from agent.task_state import TaskState
 from agent.memory import RepoMemoryStore
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
-from llm.runtime_resilience import ExecutionFailure
+from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure
 from llm.schemas import AgentActionType, AgentDecision, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
 from runtime.workspace import WorkspaceManager
@@ -15346,6 +15346,112 @@ def test_planner_repair_followup_retry_budget_expands_for_single_model_runtime(t
     assert total_timeout_seconds == 420
 
 
+def test_review_guided_retry_uses_deterministic_direct_main_recovery_before_extra_model_retry(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:14b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    result = normalize_words(' '.join(argv[2:] if argv and len(argv) > 2 else ['Hello, WORLD!']), keep_case)\n"
+        "    print(' '.join(result))\n"
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello World' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still misreads the direct main keep-case option and payload.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-deterministic-recovery",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello World."],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still misses the exact direct main([...]) option tokens exercised by the failed runtime path.",
+            confidence=0.92,
+            blocking_issues=[
+                "The failing runtime path passes option tokens like --keep-case into main([...]), but the proposal never recognizes those exact tokens in normalize_cli.py."
+            ],
+            preservation_risks=[],
+            repair_hints=["Handle the exact option token sequence --keep-case in normalize_cli.py."],
+        ),
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "--keep-case" in result.content
+    assert "argv[0]" in result.content
+    assert "argv[1:]" in result.content
+    assert result.recovery_strategy == "deterministic_direct_main_contract"
+    assert result.capability_tier == "tier_d"
+    assert llm.generate_calls == []
+
+
 def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[
@@ -17820,6 +17926,122 @@ def test_planner_preserves_progress_budget_for_compact_retry_after_resume_no_sta
     assert llm.generate_calls[3]["kwargs"]["model"] is None
     assert llm.generate_calls[3]["kwargs"]["timeout"] >= 60
     assert llm.generate_calls[3]["kwargs"]["total_timeout"] >= 270
+
+
+def test_no_start_recovery_uses_deterministic_direct_main_runtime_patch_for_updates(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:14b",
+                router_model_name="qwen2.5-coder:7b",
+            )
+        ),
+        "",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello World' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still misreads the direct main keep-case option and payload.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-no-start-recovery",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello World."],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    attempts = [
+        ExecutionAttemptRecord(
+            operation_name="content_generation",
+            task_class="content_generation",
+            attempt_number=1,
+            capability_tier="tier_a",
+            recovery_strategy="retry_same_model",
+            model_identifier="qwen2.5-coder:14b",
+            backend_identifier="ollama",
+            state="failed_startup",
+            failure=ExecutionFailure(
+                failure_class="startup_timeout",
+                state="failed_startup",
+                had_progress=False,
+                first_output_received=False,
+                model_identifier="qwen2.5-coder:14b",
+                backend_identifier="ollama",
+                context_pressure_estimate="low",
+                retryable=False,
+                raw_reason="startup_timeout",
+            ),
+        )
+    ]
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    result = normalize_words(' '.join(argv[2:] if argv and len(argv) > 2 else ['Hello, WORLD!']), keep_case)\n"
+        "    print(' '.join(result))\n"
+    )
+
+    result = planner._no_start_recovery_content(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        attempts=attempts,
+    )
+
+    assert result is not None
+    assert result.source == "deterministic_direct_main_contract"
+    assert result.content is not None
+    assert "--keep-case" in result.content
+    assert "argv[0]" in result.content
+    assert "argv[1:]" in result.content
 
 
 def test_planner_classifies_repeated_no_start_as_model_start_failure(tmp_path):

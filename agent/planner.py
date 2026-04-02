@@ -173,6 +173,14 @@ class ContentGenerationResult:
 
 
 @dataclass(slots=True)
+class DeterministicUpdateRecovery:
+    content: str
+    review: ProposedUpdateReview
+    recovery_strategy: str
+    capability_tier: str = "tier_d"
+
+
+@dataclass(slots=True)
 class MutationAssessment:
     effective: bool
     reason: str
@@ -4642,14 +4650,17 @@ class Planner:
                                     repair_context,
                                 )
                             ),
-                        )
+                    )
                     approved_content = review_retry.content
                     repair_strategy = review_retry.effective_repair_strategy or repair_strategy
+                    primary_tier = review_retry.capability_tier or primary_tier
+                    primary_strategy = review_retry.recovery_strategy or primary_strategy
                 self._log(
                     "content_generation_finished",
                     path=path,
                     characters=len(approved_content),
                     update=current_content is not None,
+                    source=primary_strategy,
                 )
                 self._append_runtime_execution(
                     session,
@@ -4793,9 +4804,11 @@ class Planner:
                                 repair_context,
                             )
                         ),
-                    )
+                )
                 approved_content = review_retry.content
                 repair_strategy = review_retry.effective_repair_strategy or repair_strategy
+                retry_result.capability_tier = review_retry.capability_tier or retry_result.capability_tier
+                retry_result.recovery_strategy = review_retry.recovery_strategy or retry_result.recovery_strategy
             self._log(
                 "content_generation_finished",
                 path=path,
@@ -5558,6 +5571,58 @@ class Planner:
         current_content: str | None,
         attempts: list[ExecutionAttemptRecord],
     ) -> ContentGenerationResult | None:
+        direct_main_recovery = self._deterministic_direct_main_runtime_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=session.active_repair_context,
+        )
+        if direct_main_recovery is not None:
+            self._log(
+                "content_generation_recovery_started",
+                path=path,
+                strategy=direct_main_recovery.recovery_strategy,
+                failure_class="startup_failure_exhausted",
+                models=self._generation_models_summary(attempts),
+            )
+            self._log(
+                "content_generation_fallback_started",
+                path=path,
+                source="deterministic_direct_main_contract",
+            )
+            self._log(
+                "content_generation_fallback_finished",
+                path=path,
+                source="deterministic_direct_main_contract",
+            )
+            self._log(
+                "content_generation_recovery_finished",
+                path=path,
+                strategy=direct_main_recovery.recovery_strategy,
+                source="deterministic_direct_main_contract",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="degraded_success",
+                    capability_tier=direct_main_recovery.capability_tier,
+                    recovery_strategy=direct_main_recovery.recovery_strategy,
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(direct_main_recovery.content),
+                    validation_possible=True,
+                    summary="Artifact generation degraded to a deterministic direct-main runtime repair after repeated startup failures.",
+                    attempts=attempts,
+                ),
+            )
+            return ContentGenerationResult(
+                content=direct_main_recovery.content,
+                source="deterministic_direct_main_contract",
+            )
+
         template = self._template_fallback_content(
             route,
             session,
@@ -8015,6 +8080,171 @@ class Planner:
             )
         return review
 
+    def _deterministic_direct_main_runtime_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        if not self._path_exposes_direct_main_contract_target(
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=current_content,
+        ):
+            return None
+
+        review_text = self._proposed_update_review_text(review_feedback) if review_feedback is not None else ""
+        if review_text and not any(
+            marker in review_text
+            for marker in ("direct main", "argv", "launcher", "option token")
+        ):
+            return None
+
+        option_tokens, _ = self._direct_main_option_contract_details(session, repair_context)
+        if not option_tokens:
+            return None
+
+        patched_content = self._apply_direct_main_contract_patch(
+            current_content=current_content,
+            option_tokens=option_tokens,
+        )
+        if patched_content is None or patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_direct_main_contract",
+        )
+
+    def _apply_direct_main_contract_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+    ) -> str | None:
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block = "".join(lines[start:end])
+        if "argv" not in block:
+            return None
+
+        updated_block = self._rewrite_equivalent_option_literals(block, option_tokens=option_tokens)
+        replacements: tuple[tuple[re.Pattern[str], str], ...] = (
+            (re.compile(r"\bargv\s*\[\s*2\s*:\s*\]"), "argv[1:]"),
+            (re.compile(r"\bargv\s*\[\s*2\s*\]"), "argv[1]"),
+            (re.compile(r"\bargv\s*\[\s*1\s*\]"), "argv[0]"),
+            (re.compile(r"\blen\(\s*argv\s*\)\s*>\s*2\b"), "len(argv) > 1"),
+            (re.compile(r"\blen\(\s*argv\s*\)\s*>=\s*3\b"), "len(argv) >= 2"),
+            (re.compile(r"\blen\(\s*argv\s*\)\s*==\s*2\b"), "len(argv) == 1"),
+            (re.compile(r"\blen\(\s*argv\s*\)\s*>\s*1\b"), "len(argv) > 0"),
+            (re.compile(r"\blen\(\s*argv\s*\)\s*>=\s*2\b"), "len(argv) >= 1"),
+        )
+        for pattern, replacement in replacements:
+            updated_block = pattern.sub(replacement, updated_block)
+        updated_block = re.sub(r"\bargv\s+and\s+len\(argv\)\s*>\s*0\b", "argv", updated_block)
+        updated_block = re.sub(r"\bargv\s+and\s+len\(argv\)\s*>=\s*1\b", "argv", updated_block)
+        if updated_block == block:
+            return None
+
+        updated_lines = [*lines[:start], updated_block, *lines[end:]]
+        return "".join(updated_lines)
+
+    def _canonical_cli_option_token(self, token: str) -> str:
+        normalized = str(token or "").strip().lower()
+        if normalized.startswith("--"):
+            normalized = normalized[2:]
+        return re.sub(r"[^a-z0-9]", "", normalized)
+
+    def _rewrite_equivalent_option_literals(
+        self,
+        text: str,
+        *,
+        option_tokens: list[str],
+    ) -> str:
+        canonical_options = {
+            self._canonical_cli_option_token(token): token
+            for token in option_tokens
+            if self._canonical_cli_option_token(token)
+        }
+        if not canonical_options:
+            return text
+
+        def _replace(match: re.Match[str]) -> str:
+            quote = str(match.group("quote") or "")
+            literal = str(match.group("literal") or "")
+            replacement = canonical_options.get(self._canonical_cli_option_token(literal))
+            if replacement is None or replacement == literal:
+                return match.group(0)
+            return f"{quote}{replacement}{quote}"
+
+        return re.sub(
+            r"(?P<quote>['\"])(?P<literal>[A-Za-z0-9][A-Za-z0-9_-]*)(?P=quote)",
+            _replace,
+            text,
+        )
+
+    def _python_function_block_bounds(
+        self,
+        content: str,
+        *,
+        function_name: str,
+    ) -> tuple[int, int] | None:
+        lines = str(content or "").splitlines(keepends=True)
+        pattern = re.compile(rf"^(?P<indent>\s*)def\s+{re.escape(function_name)}\s*\(")
+        start_index: int | None = None
+        base_indent = 0
+        for index, raw_line in enumerate(lines):
+            match = pattern.match(raw_line)
+            if match is None:
+                continue
+            start_index = index
+            base_indent = len(str(match.group("indent") or ""))
+            break
+        if start_index is None:
+            return None
+
+        end_index = len(lines)
+        for index in range(start_index + 1, len(lines)):
+            raw_line = lines[index]
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            current_indent = len(raw_line) - len(raw_line.lstrip())
+            if current_indent <= base_indent and not raw_line.lstrip().startswith("#"):
+                end_index = index
+                break
+        return start_index, end_index
+
     def _direct_main_option_contract_review(
         self,
         session: SessionState,
@@ -8466,6 +8696,82 @@ class Planner:
             ],
         )
 
+    def _local_pre_write_update_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview:
+        review = self._generated_content_integrity_review(path=path, proposed_content=proposed_content)
+        if review is None:
+            review = self._explicit_constraint_integrity_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+        if review is None:
+            review = self._helper_entrypoint_scope_review(
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+        if review is None:
+            review = self._entrypoint_helper_contract_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+        if review is None:
+            review = self._repair_target_scope_review(
+                session=session,
+                path=path,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._cli_wrapper_responsibility_review(
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
+        if review is None:
+            review = self._direct_main_option_contract_review(
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._validation_repair_relevance_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._repair_no_effective_change_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._fallback_proposed_update_review(
+                route,
+                session=session,
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+        return review
+
     def _retry_update_after_review_failure(
         self,
         route: RouterOutput,
@@ -8500,6 +8806,41 @@ class Planner:
                 current_content=current_content,
             )
         )
+
+        deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            review_feedback=review_feedback,
+        )
+        if deterministic_recovery is not None:
+            effective_repair_strategy = self._review_retry_repair_strategy(
+                repair_strategy,
+                review_feedback,
+                repair_context,
+            )
+            self._log(
+                "content_generation_recovery_started",
+                path=path,
+                strategy=deterministic_recovery.recovery_strategy,
+                failure_class="proposed_update_review_rejected",
+                models=self._generation_models_summary(prior_attempts),
+            )
+            self._log(
+                "content_generation_recovery_finished",
+                path=path,
+                strategy=deterministic_recovery.recovery_strategy,
+                source="deterministic_direct_main_contract",
+            )
+            return UpdateReviewRetryResult(
+                content=deterministic_recovery.content,
+                review=deterministic_recovery.review,
+                capability_tier=deterministic_recovery.capability_tier,
+                recovery_strategy=deterministic_recovery.recovery_strategy,
+                effective_repair_strategy=effective_repair_strategy,
+            )
 
         retry_models: list[tuple[str | None, str, str, int, int, int, str]] = []
         if prefer_compact_create_retry:
