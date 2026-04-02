@@ -15290,6 +15290,9 @@ def test_planner_reuses_active_artifact_instead_of_junk_follow_up_filename(tmp_p
     assert decision.tool_name == "write_file"
     assert decision.tool_args["path"] == "tic_tac_toe.py"
     assert "du_aber" not in decision.tool_args["path"]
+    assert "Produce the full file content for exactly one file." not in llm.generate_calls[0]["args"][0]
+    assert "Current file content:" in llm.generate_calls[0]["args"][0]
+    assert "print('old version')" in llm.generate_calls[0]["args"][0]
 
 
 def test_planner_uses_tic_tac_toe_template_when_generation_times_out(tmp_path):

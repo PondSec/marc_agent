@@ -799,13 +799,19 @@ class Planner:
         path = self._choose_create_path(route, session)
         if not path:
             return None
-        generation = self._generate_file_content(route, session, path=path)
+        current_content = self._current_file_content(session, path)
+        generation = self._generate_file_content(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+        )
         if not generation.content:
             failure = generation.failure or self._build_content_generation_failure(
                 route,
                 session,
                 path=path,
-                current_content=None,
+                current_content=current_content,
                 repair_context=None,
                 attempts=[],
             )
