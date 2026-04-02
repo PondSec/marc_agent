@@ -2013,6 +2013,26 @@ class ValidationPlanner:
             return normalized
         return relative.as_posix()
 
+    def _existing_workspace_candidate_paths(
+        self,
+        session: SessionState,
+        values: list[str],
+    ) -> list[str]:
+        workspace_root = Path(session.workspace_root).resolve()
+        existing: list[str] = []
+        for raw in self._unique_paths(values):
+            normalized = str(raw or "").strip().replace("\\", "/").removeprefix("./")
+            if not normalized:
+                continue
+            candidate = (workspace_root / normalized).resolve()
+            try:
+                candidate.relative_to(workspace_root)
+            except ValueError:
+                continue
+            if candidate.exists() and candidate.is_file():
+                existing.append(normalized)
+        return existing
+
     def _python_script_target_from_command(self, command: str) -> str | None:
         try:
             tokens = shlex.split(str(command or "").strip())
@@ -3000,16 +3020,22 @@ class ValidationPlanner:
         snapshot = session.workspace_snapshot
         no_tests_executed = self._no_tests_executed(failed_run)
         if failed_run.verification_scope == "runtime" and task_state is not None and not no_tests_executed:
-            paths.extend(
+            task_paths = [
                 artifact.path
                 for artifact in task_state.target_artifacts
                 if artifact.path and artifact.role != "supporting_context"
-            )
+            ]
+            paths.extend(self._existing_workspace_candidate_paths(session, task_paths))
             if snapshot is not None:
-                paths.extend(snapshot.entrypoints[:4])
+                paths.extend(
+                    self._existing_workspace_candidate_paths(
+                        session,
+                        snapshot.entrypoints[:4],
+                    )
+                )
         if no_tests_executed:
             if task_state is not None:
-                paths.extend(
+                test_paths = [
                     artifact.path
                     for artifact in task_state.target_artifacts
                     if artifact.path
@@ -3017,7 +3043,8 @@ class ValidationPlanner:
                         artifact.role == "validation_target"
                         or artifact.kind == "test"
                     )
-                )
+                ]
+                paths.extend(self._existing_workspace_candidate_paths(session, test_paths))
             paths.extend(
                 item.path
                 for item in session.changed_files
@@ -3105,7 +3132,7 @@ class ValidationPlanner:
             if lowered_symbols.intersection(wanted):
                 candidates.append(normalized_path)
         return sorted(
-            self._unique_paths(candidates),
+            self._existing_workspace_candidate_paths(session, candidates),
             key=lambda path: (
                 1 if self._is_test_path(path) else 0,
                 1 if self._is_documentation_path(path) else 0,

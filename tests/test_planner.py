@@ -8226,6 +8226,8 @@ def test_planner_repair_switches_to_another_candidate_after_no_effective_change(
         repair_context,
     )
 
+    assert "app/main.py" not in repair_context.artifact_paths
+    assert repair_context.repair_brief.primary_target == "greet_cli/__main__.py"
     assert next_target == "greet_cli/__main__.py"
 
 
