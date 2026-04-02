@@ -2788,6 +2788,65 @@ body {
   flex-wrap: wrap;
 }
 
+.thread-status-strip {
+  width: min(100%, 1120px);
+  margin: 0 auto;
+  padding: 0 0 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.runtime-status-item {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid #32353c;
+  border-radius: 999px;
+  background: rgba(21, 23, 28, 0.92);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.runtime-status-item.tone-running {
+  border-color: rgba(123, 183, 255, 0.34);
+  background: rgba(35, 51, 72, 0.34);
+}
+
+.runtime-status-item.tone-success {
+  border-color: rgba(113, 212, 155, 0.32);
+  background: rgba(32, 58, 45, 0.32);
+}
+
+.runtime-status-item.tone-warning {
+  border-color: rgba(242, 184, 108, 0.34);
+  background: rgba(66, 47, 24, 0.34);
+}
+
+.runtime-status-item.tone-danger {
+  border-color: rgba(255, 143, 135, 0.34);
+  background: rgba(68, 35, 31, 0.36);
+}
+
+.runtime-status-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.runtime-status-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .top-bar-icon {
   width: 36px;
   height: 36px;

@@ -3,7 +3,9 @@ const assert = require("node:assert/strict");
 
 const {
   buildActivityClusters,
+  buildRuntimeStatusItems,
   buildUiRoute,
+  buildWorkspaceShellView,
   buildPhaseSteps,
   buildSessionOverview,
   buildValidationSnapshot,
@@ -215,4 +217,60 @@ test("buildUiRoute baut Workspace- und Settings-URLs stabil auf", () => {
   assert.equal(buildUiRoute({ sessionId: "abc123" }), "/?session=abc123");
   assert.equal(buildUiRoute({ page: "settings" }), "/?view=settings");
   assert.equal(buildUiRoute({ sessionId: "abc123", page: "settings" }), "/?session=abc123&view=settings");
+});
+
+test("buildRuntimeStatusItems leitet zentrale Laufzeitinfos konsistent aus dem Shell-State ab", () => {
+  const items = buildRuntimeStatusItems({
+    config: { model_name: "qwen3-coder:30b" },
+    composer: {
+      modelName: "",
+      accessMode: "approval",
+      executionProfile: "balanced",
+    },
+    workspaces: [{ id: "ws-1", name: "alpha", path: "/tmp/alpha" }],
+    sessions: [makeSession({ id: "session-2", workspace_id: "ws-1" })],
+    selectedWorkspaceId: "ws-1",
+    activeSession: makeSession({
+      workspace_id: "ws-1",
+      validation_status: "passed",
+      status: "completed",
+      current_phase: "completed",
+    }),
+  });
+
+  assert.deepEqual(
+    items.map((item) => item.label),
+    ["Projekt", "Modell", "Zugriff", "Profil", "Status", "Checks", "Laeufe"],
+  );
+  assert.equal(items[0].value, "alpha");
+  assert.equal(items[1].value, "qwen3-coder:30b");
+  assert.equal(items[5].value, "Bestanden");
+});
+
+test("buildWorkspaceShellView kapselt Toolbar-Entscheidungen zentral", () => {
+  const view = buildWorkspaceShellView({
+    config: { model_name: "qwen3-coder:30b" },
+    composer: {
+      modelName: "",
+      accessMode: "approval",
+      executionProfile: "balanced",
+    },
+    workspaces: [{ id: "ws-1", name: "alpha", path: "/tmp/alpha" }],
+    sessions: [],
+    selectedWorkspaceId: "ws-1",
+    activeSession: makeSession({
+      workspace_id: "ws-1",
+      status: "running",
+      current_phase: "editing",
+      changed_files: [{ path: "webui/app.js", operation: "write" }],
+    }),
+  });
+
+  assert.equal(view.workspace.name, "alpha");
+  assert.equal(view.statusText, "Aktiv");
+  assert.equal(view.canPreview, false);
+  assert.equal(view.canCommit, false);
+  assert.equal(view.canDeleteSession, false);
+  assert.equal(view.canDownloadHandoff, false);
+  assert.match(view.subtitle, /alpha|\/tmp\/alpha/i);
 });

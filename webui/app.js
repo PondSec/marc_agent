@@ -2614,21 +2614,81 @@ function renderExecutionProfileOptions() {
     .join("");
 }
 
-function renderTopBar() {
-  const workspace = workspaceForSession(state.activeSession) || selectedWorkspace();
-  const session = state.activeSession;
-  const commitDisabled = !workspace || isSessionRunning(state.activeSession);
-  const deleteDisabled = !session || isSessionRunning(session);
-  const previewDisabled = !workspace || isSessionRunning(session);
-  const handoffDisabled =
-    !session || isSessionRunning(session) || !Array.isArray(session.changed_files) || !session.changed_files.length;
-  const exportDisabled = !workspace || isSessionRunning(session);
+function executionProfilesFromState(sourceState = state) {
+  return sourceState.config?.execution_profiles || [];
+}
+
+function executionProfileLabelFromState(sourceState = state) {
+  return (
+    executionProfilesFromState(sourceState).find((item) => item.id === sourceState.composer.executionProfile)?.label ||
+    sourceState.composer.executionProfile ||
+    "Standardprofil"
+  );
+}
+
+function buildRuntimeStatusItems(sourceState = state) {
+  const session = sourceState.activeSession || null;
+  const workspace = workspaceForSessionFrom(sourceState, session) || selectedWorkspaceFrom(sourceState);
+  const validation = session ? buildValidationSnapshot(session) : null;
+  const activeRuns = Array.isArray(sourceState.sessions)
+    ? sourceState.sessions.filter((item) => isSessionRunning(item)).length
+    : 0;
+
+  const items = [
+    {
+      label: "Projekt",
+      value: workspace?.name || "Kein Projekt",
+      tone: workspace ? "muted" : "warning",
+    },
+    {
+      label: "Modell",
+      value: sourceState.composer.modelName || sourceState.config?.model_name || "Standard",
+      tone: "muted",
+    },
+    {
+      label: "Zugriff",
+      value: labelForAccessMode(session?.access_mode || sourceState.composer.accessMode),
+      tone: "muted",
+    },
+    {
+      label: "Profil",
+      value: executionProfileLabelFromState(sourceState),
+      tone: "muted",
+    },
+    {
+      label: "Status",
+      value: session ? sessionBadgeText(session) : "Bereit",
+      tone: session ? sessionStatusTone(session) : "muted",
+    },
+    {
+      label: "Laeufe",
+      value: activeRuns ? `${activeRuns} aktiv` : "Leerlauf",
+      tone: activeRuns ? "running" : "muted",
+    },
+  ];
+
+  if (validation) {
+    items.splice(5, 0, {
+      label: "Checks",
+      value: validation.statusLabel,
+      tone: validation.tone,
+    });
+  }
+
+  return items;
+}
+
+function buildWorkspaceShellView(sourceState = state) {
+  const session = sourceState.activeSession || null;
+  const workspace = workspaceForSessionFrom(sourceState, session) || selectedWorkspaceFrom(sourceState);
   const statusTone = session ? sessionStatusTone(session) : "muted";
   const statusText = session ? sessionBadgeText(session) : "Bereit";
+  const running = isSessionRunning(session);
   const title = session
     ? session.title || shorten(session.task, 84) || "Neuer Thread"
     : workspace?.name || "Projekt auswaehlen";
   const subtitleParts = [];
+
   if (workspace?.name && workspace.name !== title) {
     subtitleParts.push(workspace.name);
   }
@@ -2638,17 +2698,60 @@ function renderTopBar() {
   if (session?.updated_at) {
     subtitleParts.push(`Aktualisiert ${formatSessionTimestamp(session.updated_at)}`);
   }
-  const subtitle = subtitleParts.join(" | ") || "Links ein Projekt waehlen oder einen neuen Thread starten.";
+
+  return {
+    workspace,
+    session,
+    running,
+    title,
+    statusTone,
+    statusText,
+    runtimeStatusItems: buildRuntimeStatusItems(sourceState),
+    subtitle:
+      subtitleParts.join(" | ") || "Links ein Projekt waehlen oder einen neuen Thread starten.",
+    canPreview: Boolean(workspace) && !running,
+    canCommit: Boolean(workspace) && !running,
+    canDeleteSession: Boolean(session) && !running,
+    canDownloadHandoff:
+      Boolean(session) && !running && Array.isArray(session?.changed_files) && session.changed_files.length > 0,
+    canDownloadWorkspace: Boolean(workspace) && !running,
+  };
+}
+
+function renderRuntimeStatusStrip(items) {
+  if (!Array.isArray(items) || !items.length) {
+    return "";
+  }
+
+  return `
+    <div class="thread-status-strip">
+      ${items.map(renderRuntimeStatusItem).join("")}
+    </div>
+  `;
+}
+
+function renderRuntimeStatusItem(item) {
+  return `
+    <div class="runtime-status-item tone-${escapeHtml(item.tone || "muted")}">
+      <span class="runtime-status-label">${escapeHtml(item.label)}</span>
+      <strong class="runtime-status-value">${escapeHtml(item.value)}</strong>
+    </div>
+  `;
+}
+
+function renderTopBar() {
+  const shell = buildWorkspaceShellView();
+  const { workspace, session } = shell;
 
   return `
     <header class="thread-topbar">
       <div class="thread-topbar-inner">
         <div class="thread-topbar-copy">
-          <h1 class="thread-topbar-title">${escapeHtml(title)}</h1>
-          <p class="thread-topbar-subtitle">${escapeHtml(subtitle)}</p>
+          <h1 class="thread-topbar-title">${escapeHtml(shell.title)}</h1>
+          <p class="thread-topbar-subtitle">${escapeHtml(shell.subtitle)}</p>
         </div>
         <div class="thread-toolbar">
-          <span class="thread-toolbar-status tone-${escapeHtml(statusTone)}">${escapeHtml(statusText)}</span>
+          <span class="thread-toolbar-status tone-${escapeHtml(shell.statusTone)}">${escapeHtml(shell.statusText)}</span>
           <button
             class="icon-button top-bar-icon"
             type="button"
@@ -2656,11 +2759,11 @@ function renderTopBar() {
             data-workspace-id="${escapeHtml(workspace?.id || "")}"
             aria-label="Workspace in der Cloud starten"
             title="${escapeAttribute(
-              previewDisabled
+              !shell.canPreview
                 ? "Die Vorschau ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
                 : "Workspace direkt auf dem Agent-Server testen",
             )}"
-            ${previewDisabled ? "disabled" : ""}
+            ${shell.canPreview ? "" : "disabled"}
           >
             ${icon("play")}
           </button>
@@ -2670,11 +2773,11 @@ function renderTopBar() {
             data-action="download-session-handoff"
             data-session-id="${escapeHtml(session?.id || "")}"
             title="${escapeAttribute(
-              handoffDisabled
+              !shell.canDownloadHandoff
                 ? "Der Handoff ist verfuegbar, sobald ein abgeschlossener Thread Dateien geaendert hat."
                 : "Nur die geaenderten Dateien, Report und Logs herunterladen",
             )}"
-            ${handoffDisabled ? "disabled" : ""}
+            ${shell.canDownloadHandoff ? "" : "disabled"}
           >
             Aenderungen laden
           </button>
@@ -2693,11 +2796,11 @@ function renderTopBar() {
             data-workspace-id="${escapeHtml(workspace?.id || "")}"
             aria-label="Kompletten Workspace herunterladen"
             title="${escapeAttribute(
-              exportDisabled
+              !shell.canDownloadWorkspace
                 ? "Der Workspace-Export ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
                 : "Kompletten Workspace als Zip herunterladen",
             )}"
-            ${exportDisabled ? "disabled" : ""}
+            ${shell.canDownloadWorkspace ? "" : "disabled"}
           >
             ${icon("download")}
           </button>
@@ -2707,11 +2810,11 @@ function renderTopBar() {
             data-action="commit-push"
             aria-label="Commit und Push an den Agenten senden"
             title="${escapeAttribute(
-              commitDisabled
+              !shell.canCommit
                 ? "Commit und Push ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
                 : "Commit und Push anfordern",
             )}"
-            ${commitDisabled ? "disabled" : ""}
+            ${shell.canCommit ? "" : "disabled"}
           >
             ${icon("git-push")}
           </button>
@@ -2722,11 +2825,11 @@ function renderTopBar() {
             data-session-id="${escapeHtml(session?.id || "")}"
             aria-label="Thread loeschen"
             title="${escapeAttribute(
-              deleteDisabled
+              !shell.canDeleteSession
                 ? "Thread kann erst geloescht werden, wenn kein Lauf aktiv ist."
                 : "Thread loeschen",
             )}"
-            ${deleteDisabled ? "disabled" : ""}
+            ${shell.canDeleteSession ? "" : "disabled"}
           >
             ${icon("trash")}
           </button>
@@ -2741,6 +2844,7 @@ function renderTopBar() {
           </button>
         </div>
       </div>
+      ${renderRuntimeStatusStrip(shell.runtimeStatusItems)}
     </header>
   `;
 }
@@ -3266,9 +3370,10 @@ function renderThreadSideRail(session, logs) {
 }
 
 function renderChatInput() {
-  const workspace = workspaceForSession(state.activeSession) || selectedWorkspace();
+  const shell = buildWorkspaceShellView();
+  const workspace = shell.workspace;
   const thought = currentThought();
-  const running = isSessionRunning(state.activeSession);
+  const running = shell.running;
   const modelInstallNotice = currentModelInstallNotice();
   const notices = [
     modelInstallNotice ? { label: "Modelle", text: modelInstallNotice, tone: "muted" } : null,
@@ -3298,9 +3403,9 @@ function renderChatInput() {
           </div>
           <div class="composer-meta-row">
             ${renderMetaChip(workspace?.name || "Kein Projekt", "muted")}
-            ${renderMetaChip(state.composer.modelName || "Standardmodell", "muted")}
-            ${renderMetaChip(labelForAccessMode(state.composer.accessMode), "muted")}
-            ${renderMetaChip(currentExecutionProfileLabel(), "muted")}
+            ${renderMetaChip(state.composer.modelName || state.config?.model_name || "Standardmodell", "muted")}
+            ${renderMetaChip(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode), "muted")}
+            ${renderMetaChip(executionProfileLabelFromState(), "muted")}
             <button class="button-ghost composer-options-button" type="button" data-action="open-settings-page">
               Optionen
             </button>
@@ -3312,11 +3417,7 @@ function renderChatInput() {
 }
 
 function currentExecutionProfileLabel() {
-  return (
-    getExecutionProfiles().find((item) => item.id === state.composer.executionProfile)?.label ||
-    state.composer.executionProfile ||
-    "Standardprofil"
-  );
+  return executionProfileLabelFromState();
 }
 
 function renderComposerNotice(notice) {
@@ -5057,25 +5158,41 @@ function appendLogRecord(record) {
   state.logs = [...state.logs, record];
 }
 
+function selectedWorkspaceFrom(sourceState = state) {
+  return sourceState.workspaces.find((workspace) => workspace.id === sourceState.selectedWorkspaceId) || null;
+}
+
 function selectedWorkspace() {
-  return state.workspaces.find((workspace) => workspace.id === state.selectedWorkspaceId) || null;
+  return selectedWorkspaceFrom(state);
+}
+
+function activeWorkspaceIdFrom(sourceState = state) {
+  return sourceState.activeSession?.workspace_id || sourceState.selectedWorkspaceId;
 }
 
 function activeWorkspaceId() {
-  return state.activeSession?.workspace_id || state.selectedWorkspaceId;
+  return activeWorkspaceIdFrom(state);
 }
 
-function workspaceForSession(session) {
+function workspaceForSessionFrom(sourceState = state, session) {
   if (!session) {
     return null;
   }
-  return state.workspaces.find((workspace) => workspace.id === session.workspace_id) || null;
+  return sourceState.workspaces.find((workspace) => workspace.id === session.workspace_id) || null;
+}
+
+function workspaceForSession(session) {
+  return workspaceForSessionFrom(state, session);
+}
+
+function sessionsForWorkspaceFrom(sourceState = state, workspaceId) {
+  return sourceState.sessions
+    .filter((session) => session.workspace_id === workspaceId && !session.archived)
+    .sort((left, right) => new Date(right.updated_at) - new Date(left.updated_at));
 }
 
 function sessionsForWorkspace(workspaceId) {
-  return state.sessions
-    .filter((session) => session.workspace_id === workspaceId && !session.archived)
-    .sort((left, right) => new Date(right.updated_at) - new Date(left.updated_at));
+  return sessionsForWorkspaceFrom(state, workspaceId);
 }
 
 function isWorkspaceBusy(workspaceId) {
@@ -6249,7 +6366,9 @@ function icon(name) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildActivityClusters,
+    buildRuntimeStatusItems,
     buildUiRoute,
+    buildWorkspaceShellView,
     buildPhaseSteps,
     buildSessionOverview,
     buildValidationSnapshot,
