@@ -748,6 +748,117 @@ def test_validation_planner_keeps_multiple_assertion_semantic_pairs_in_repair_br
     assert "multiple validation assertions" in evidence.repair_brief.root_cause_summary
 
 
+def test_validation_planner_prefers_library_target_for_multi_assertion_runtime_failures(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "texttools"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from .normalize import normalize_words, normalize_words_keep_case\n",
+        encoding="utf-8",
+    )
+    normalize_path = pkg / "normalize.py"
+    normalize_path.write_text(
+        "def normalize_words(text, keep_case=False):\n    return text\n\n"
+        "def normalize_words_keep_case(text):\n    return text\n",
+        encoding="utf-8",
+    )
+    cli_path = tmp_path / "normalize_cli.py"
+    cli_path.write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n    return normalize_words('Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_normalize.py"
+    test_path.write_text("pass\n", encoding="utf-8")
+
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 4},
+        top_directories=["texttools", "tests"],
+        important_files=[
+            "texttools/normalize.py",
+            "texttools/__init__.py",
+            "normalize_cli.py",
+            "tests/test_normalize.py",
+        ],
+        focus_files=[
+            "texttools/normalize.py",
+            "texttools/__init__.py",
+            "normalize_cli.py",
+            "tests/test_normalize.py",
+        ],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_normalize.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=["python -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Normalize CLI and library implementation.",
+        symbol_index={
+            "texttools/normalize.py": ["normalize_words", "normalize_words_keep_case"],
+            "normalize_cli.py": ["main"],
+        },
+        import_hotspots=["texttools/normalize.py"],
+    )
+    session = SessionState(
+        task="Repair the normalize keep-case workflow.",
+        workspace_root=str(tmp_path),
+        edit_generation=2,
+        workspace_snapshot=snapshot,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="texttools/normalize.py", operation="modify"),
+            FileChangeRecord(path="normalize_cli.py", operation="modify"),
+            FileChangeRecord(path="texttools/__init__.py", operation="modify"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=2,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_cli_supports_keep_case_flag (tests.test_normalize.NormalizeTests.test_cli_supports_keep_case_flag)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 20, in test_cli_supports_keep_case_flag\n'
+            "    self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n"
+            "AssertionError: '' != 'Hello WORLD'\n"
+            "+ Hello WORLD\n\n"
+            "FAIL: test_normalize_words_can_keep_case (tests.test_normalize.NormalizeTests.test_normalize_words_can_keep_case)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 14, in test_normalize_words_can_keep_case\n'
+            "    self.assertEqual(normalize_words('Hello, WORLD!', keep_case=True), ['Hello', 'WORLD'])\n"
+            "AssertionError: 'Hello WORLD' != ['Hello', 'WORLD']\n\n"
+            "FAIL: test_normalize_words_lowercases_by_default (tests.test_normalize.NormalizeTests.test_normalize_words_lowercases_by_default)\n"
+            "Traceback (most recent call last):\n"
+            f'  File "{test_path}", line 11, in test_normalize_words_lowercases_by_default\n'
+            "    self.assertEqual(normalize_words('Hello, WORLD!'), ['hello', 'world'])\n"
+            "AssertionError: 'hello world' != ['hello', 'world']\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "texttools/normalize.py"
+    assert evidence.repair_brief.locked_target == "texttools/normalize.py"
+    assert "normalize_words" in evidence.repair_brief.implicated_symbols
+    assert evidence.repair_brief.implicated_region_hint.startswith("texttools/normalize.py")
+    assert evidence.repair_requirements[0].startswith("Change texttools/normalize.py")
+
+
 def test_validation_planner_repair_brief_tracks_recent_failed_attempts_for_same_signature(tmp_path):
     planner = ValidationPlanner()
     pkg = tmp_path / "greet_cli"

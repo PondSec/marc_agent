@@ -970,6 +970,7 @@ class ValidationPlanner:
             session,
             failed_run,
             artifact_paths=artifact_paths,
+            symbol_resolved_paths=symbol_resolved_paths,
             file_hints=file_hints,
             line_hints=line_hints,
             summary=summary,
@@ -1045,6 +1046,7 @@ class ValidationPlanner:
         failed_run: ValidationRunRecord,
         *,
         artifact_paths: list[str],
+        symbol_resolved_paths: list[str],
         file_hints: list[str],
         line_hints: list[int],
         summary: str,
@@ -1100,6 +1102,15 @@ class ValidationPlanner:
             failure_type=failure_type,
             primary_target=primary_target,
             normalized_script_target=normalized_script,
+        )
+        primary_target = self._prefer_multi_assertion_symbol_primary_target(
+            session,
+            verification_scope=failed_run.verification_scope,
+            failure_type=failure_type,
+            primary_target=primary_target,
+            expected_semantics=expected_semantics,
+            observed_semantics=observed_semantics,
+            symbol_resolved_paths=symbol_resolved_paths,
         )
         if failure_type == "import_failure":
             if normalized_script:
@@ -1269,6 +1280,49 @@ class ValidationPlanner:
         ]
         if implementation:
             return implementation[0]
+        return primary_target
+
+    def _prefer_multi_assertion_symbol_primary_target(
+        self,
+        session: SessionState,
+        *,
+        verification_scope: str,
+        failure_type: str,
+        primary_target: str | None,
+        expected_semantics: list[str],
+        observed_semantics: list[str],
+        symbol_resolved_paths: list[str],
+    ) -> str | None:
+        if verification_scope != "runtime" or failure_type != "assertion_mismatch":
+            return primary_target
+        if len(expected_semantics) < 2 or len(observed_semantics) < 2:
+            return primary_target
+
+        snapshot = session.workspace_snapshot
+        if snapshot is None:
+            return primary_target
+
+        entrypoints = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "entrypoints", [])
+            if str(path or "").strip()
+        }
+        current_target = str(primary_target or "").strip()
+        preferred_candidates = [
+            path
+            for path in self._unique_paths(symbol_resolved_paths)
+            if path
+            and not self._is_test_path(path)
+            and not self._is_documentation_path(path)
+            and path not in entrypoints
+            and Path(path).name.lower() != "__init__.py"
+        ]
+        if not preferred_candidates:
+            return primary_target
+        if not current_target:
+            return preferred_candidates[0]
+        if current_target in entrypoints or Path(current_target).name.lower() == "__init__.py":
+            return preferred_candidates[0]
         return primary_target
 
     def _failure_type(
@@ -1641,12 +1695,19 @@ class ValidationPlanner:
             symbols.append(missing_module)
         for match in self.TRACEBACK_FRAME_PATTERN.finditer(text):
             symbol = str(match.group("symbol") or "").strip()
-            if symbol and not self._is_generic_runtime_failure_symbol(symbol) and symbol not in symbols:
+            if (
+                symbol
+                and not symbol.startswith("test_")
+                and not self._is_generic_runtime_failure_symbol(symbol)
+                and symbol not in symbols
+            ):
                 symbols.append(symbol)
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\(", text):
             name = str(match.group(1) or "").strip()
+            prefix = text[: match.start(1)].rstrip()
             if (
                 not name
+                or prefix.endswith(".")
                 or name in {"self", "print", "open"}
                 or name.startswith("test_")
                 or self._is_generic_runtime_failure_symbol(name)
