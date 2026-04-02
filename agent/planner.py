@@ -7120,6 +7120,7 @@ class Planner:
     def _evidence_backed_behavior_adjustment_is_in_scope(
         self,
         *,
+        session: SessionState,
         path: str,
         current_content: str,
         proposed_content: str,
@@ -7130,12 +7131,80 @@ class Planner:
             return False
         if not self._review_rejection_looks_like_scope_broadening(review):
             return False
+        if self._supporting_runtime_contract_requires_stdout_emission(
+            session,
+            repair_context=repair_context,
+        ) and not self._repair_update_addresses_stdout_contract(
+            current_content=current_content,
+            proposed_content=proposed_content,
+        ):
+            return False
         return self._repair_update_is_evidence_backed_behavior_adjustment(
             path=path,
             current_content=current_content,
             proposed_content=proposed_content,
             repair_context=repair_context,
         )
+
+    def _supporting_runtime_contract_requires_stdout_emission(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+
+        candidate_paths = list(
+            dict.fromkeys(
+                [
+                    str(candidate or "").strip()
+                    for candidate in getattr(repair_context, "file_hints", []) or []
+                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+                ]
+            )
+        )
+        if not candidate_paths:
+            return False
+
+        stdout_capture_markers = (
+            "redirect_stdout(",
+            ".getvalue().strip(",
+            ".getvalue().strip()",
+            "capsys.readouterr(",
+            "patch('sys.stdout'",
+            'patch("sys.stdout"',
+        )
+        for candidate in candidate_paths[:4]:
+            excerpt = self._current_or_last_read_excerpt(session, path=candidate)
+            if any(marker in excerpt for marker in stdout_capture_markers):
+                return True
+        return False
+
+    def _repair_update_addresses_stdout_contract(
+        self,
+        *,
+        current_content: str,
+        proposed_content: str,
+    ) -> bool:
+        current_markers = self._stdout_emission_markers_in_content(current_content)
+        proposed_markers = self._stdout_emission_markers_in_content(proposed_content)
+        if not proposed_markers:
+            return False
+        if not current_markers:
+            return True
+        return proposed_markers != current_markers
+
+    def _stdout_emission_markers_in_content(self, content: str) -> tuple[str, ...]:
+        matches: list[str] = []
+        for raw_line in str(content or "").splitlines():
+            line = raw_line.strip()
+            lowered = line.lower()
+            if "print(" in line:
+                matches.append(line)
+            elif "sys.stdout.write(" in lowered or "stdout.write(" in lowered:
+                matches.append(line)
+        return tuple(matches)
 
     def _repair_update_is_evidence_backed_behavior_adjustment(
         self,
@@ -7781,6 +7850,7 @@ class Planner:
             and
             not review.safe_to_write
             and self._evidence_backed_behavior_adjustment_is_in_scope(
+                session=session,
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
