@@ -2276,7 +2276,13 @@ class Planner:
             non_documentation_candidates = [
                 candidate
                 for candidate in ordered_candidates
-                if not self.validation_planner._is_documentation_path(candidate)
+                if (
+                    not self.validation_planner._is_documentation_path(candidate)
+                    or (
+                        repair_context.verification_scope == "runtime"
+                        and self._is_runtime_support_repair_target(candidate, repair_context)
+                    )
+                )
             ]
             if non_documentation_candidates:
                 ordered_candidates = non_documentation_candidates
@@ -7245,25 +7251,31 @@ class Planner:
         if proposed_length < int(current_length * 0.6) and proposed_lines < int(current_lines * 0.7):
             return False
 
+        brief_symbols = [
+            str(symbol or "").strip()
+            for symbol in getattr(brief, "implicated_symbols", [])
+            if str(symbol or "").strip()
+        ]
         identifiers = self._repair_identifiers_for_target(
             normalized_path,
             repair_context,
             current_content=current_content,
             proposed_content=proposed_content,
         )
-        if identifiers:
-            relevant_identifiers = [
+        relevant_identifiers = self._unique_paths(
+            [
                 identifier
-                for identifier in identifiers
-                if identifier in current_content or identifier in proposed_content
+                for identifier in [*identifiers, *brief_symbols]
+                if identifier and (identifier in current_content or identifier in proposed_content)
             ]
-            if not relevant_identifiers:
-                return False
-            if not any(
-                self._identifier_lines_changed(identifier, current_content, proposed_content)
-                for identifier in relevant_identifiers
-            ):
-                return False
+        )
+        if not relevant_identifiers:
+            return False
+        if not any(
+            self._identifier_lines_changed(identifier, current_content, proposed_content)
+            for identifier in relevant_identifiers
+        ):
+            return False
 
         return True
 
@@ -7650,12 +7662,17 @@ class Planner:
                 )
             )
             prompt = compact_prompt if use_compact_prompt else full_prompt
+            same_model_compact_review = (
+                use_compact_prompt
+                and capability_tier == "tier_a"
+                and reserve_model is None
+            )
             if use_compact_prompt:
                 # Primary-model compact reviews still pay the full local startup cost on
                 # constrained single-model hardware. Keep the prompt compact, but avoid
                 # treating the review like a short strict-timeout hop when it is the same
                 # model that just needed a longer warm start for generation.
-                if capability_tier == "tier_a":
+                if same_model_compact_review:
                     if repair_review:
                         timeout, total_timeout = self._content_generation_time_budget(
                             prompt_variant="compact",
@@ -7672,7 +7689,7 @@ class Planner:
                 total_timeout = max(timeout + 12, timeout * 2)
             num_ctx = min(self._llm_num_ctx(2048), 2048) if use_compact_prompt else min(self._llm_num_ctx(6144), 6144)
             prompt_variant = "compact" if use_compact_prompt else "full"
-            strict_timeouts = use_compact_prompt and capability_tier != "tier_a"
+            strict_timeouts = use_compact_prompt and not same_model_compact_review
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,
