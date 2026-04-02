@@ -11780,6 +11780,309 @@ def test_primary_compact_repair_review_uses_compact_repair_runtime_budget(tmp_pa
     assert kwargs["strict_timeouts"] is False
 
 
+def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the keep_case normalization so the tested output matches the expected strings.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        repair_requirements=["Change texttools/normalize.py so the observed-only punctuation is removed."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:prompt-deltas",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words_keep_case"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Keep the fix local to the normalization behavior."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        supporting_artifact_context="tests/test_normalize.py expects punctuation to be removed.",
+        current_excerpt=(
+            "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+            "    if keep_case:\n"
+            "        return ' '.join(text.replace(',', ' ').split())\n"
+            "    return ' '.join(text.replace(',', ' ').split()).lower()\n"
+        ),
+        proposed_excerpt=(
+            "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+            "    cleaned = ' '.join(text.replace(',', ' ').replace('!', '').split())\n"
+            "    if keep_case:\n"
+            "        return cleaned\n"
+            "    return cleaned.lower()\n"
+        ),
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert '"failure_evidence_behavior_deltas"' in prompt
+    assert "When active runtime failure evidence for this file includes observed-vs-expected behavior deltas" in prompt
+
+
+def test_pre_write_update_review_allows_evidence_backed_local_behavior_adjustment_after_scope_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the keep_case normalization behavior without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        repair_requirements=["Change texttools/normalize.py so the observed-only punctuation is removed."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:evidence-backed-scope-allow",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Keep the fix local to the normalization behavior."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal broadens scope by changing current behavior more broadly than requested.",
+            confidence=0.83,
+            blocking_issues=["This changes current behavior more broadly than requested."],
+            preservation_risks=["Unrelated existing behavior may drift."],
+            repair_hints=["Keep the change narrower."],
+        ),
+    )
+
+    current_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    if keep_case:\n"
+        "        return ' '.join(text.replace(',', ' ').split())\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n"
+    )
+    proposed_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    cleaned = ' '.join(text.replace(',', ' ').replace('!', '').split())\n"
+        "    if keep_case:\n"
+        "        return cleaned\n"
+        "    return cleaned.lower()\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert "runtime failure evidence" in review.summary.lower()
+
+
+def test_pre_write_update_review_keeps_scope_rejection_without_direct_failure_evidence(tmp_path, monkeypatch):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the keep_case normalization behavior without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: normalization output mismatch",
+        failure_summary="The normalization output still differs from the expected result.",
+        repair_requirements=["Repair texttools/normalize.py."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:no-direct-delta",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=[],
+            observed_semantics=[],
+            implicated_symbols=["normalize_words"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Keep the fix local to the normalization behavior."],
+            allowed_files=["texttools/normalize.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal broadens scope by changing current behavior more broadly than requested.",
+            confidence=0.83,
+            blocking_issues=["This changes current behavior more broadly than requested."],
+            preservation_risks=["Unrelated existing behavior may drift."],
+            repair_hints=["Keep the change narrower."],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content="def normalize_words(text: str) -> str:\n    return text.lower()\n",
+        proposed_content=(
+            "def normalize_words(text: str) -> str:\n"
+            "    return text.replace('!', '').replace(',', ' ').lower()\n"
+        ),
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is False
+    assert "broadens scope" in review.summary.lower()
+
+
+def test_pre_write_update_review_keeps_scope_rejection_for_too_broad_evidence_backed_rewrite(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the keep_case normalization behavior without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing normalization behavior."}],
+        target_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        target_name="texttools/normalize.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["texttools/normalize.py", "normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello WORLD!' != 'Hello WORLD'",
+        failure_summary="The keep-case normalization still leaves punctuation in the observed output.",
+        repair_requirements=["Change texttools/normalize.py so the observed-only punctuation is removed."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:evidence-backed-too-broad",
+            primary_target="texttools/normalize.py",
+            locked_target="texttools/normalize.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: Hello WORLD!"],
+            implicated_symbols=["normalize_words"],
+            implicated_region_hint="texttools/normalize.py",
+            repair_constraints=["Keep the fix local to the normalization behavior."],
+            allowed_files=["texttools/normalize.py", "normalize_cli.py"],
+            forbidden_files=["README.md", "tests/test_normalize.py"],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal broadens scope by changing current behavior more broadly than requested.",
+            confidence=0.83,
+            blocking_issues=["This changes current behavior more broadly than requested."],
+            preservation_risks=["Unrelated existing behavior may drift."],
+            repair_hints=["Keep the change narrower."],
+        ),
+    )
+
+    current_content = (
+        "def normalize_words(text: str, keep_case: bool = False) -> str:\n"
+        "    if keep_case:\n"
+        "        return ' '.join(text.replace(',', ' ').split())\n"
+        "    return ' '.join(text.replace(',', ' ').split()).lower()\n"
+    )
+    proposed_content = (
+        "import re\n\n"
+        "def _normalize_tokens(text: str) -> list[str]:\n"
+        "    cleaned = re.sub(r'[^A-Za-z ]+', ' ', text)\n"
+        "    return [token for token in cleaned.split() if token]\n\n"
+        "def normalize_words(text: str, keep_case: bool = False, collapse_duplicates: bool = False) -> str:\n"
+        "    tokens = _normalize_tokens(text)\n"
+        "    if collapse_duplicates:\n"
+        "        deduped = []\n"
+        "        for token in tokens:\n"
+        "            if token not in deduped:\n"
+        "                deduped.append(token)\n"
+        "        tokens = deduped\n"
+        "    if keep_case:\n"
+        "        return ' '.join(tokens)\n"
+        "    return ' '.join(token.lower() for token in tokens)\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="texttools/normalize.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is False
+    assert "broadens scope" in review.summary.lower()
+
+
 def test_validation_repair_relevance_review_allows_python_body_change_with_same_function_signature(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(

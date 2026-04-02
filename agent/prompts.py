@@ -1016,6 +1016,7 @@ def proposed_update_review_prompt(
     mode: str = "full",
 ) -> str:
     compact = mode != "full"
+    repair_context = session.active_repair_context
     changed_paths: list[str] = []
     for item in session.changed_files:
         candidate = str(item.path or "").strip()
@@ -1060,6 +1061,14 @@ def proposed_update_review_prompt(
         review_context["task_understanding"] = _compact_task_understanding(session.task_understanding)
         review_context["diagnostics"] = _compact_recent_diagnostics(session)
         review_context["follow_up_context"] = _compact_follow_up_context(session)
+    if repair_context is not None:
+        review_context["active_repair"] = _targeted_compact_repair_context(
+            repair_context,
+            target_path=path,
+        )
+        semantic_deltas = _repair_semantic_delta_lines(repair_context, limit=2)
+        if semantic_deltas:
+            review_context["failure_evidence_behavior_deltas"] = semantic_deltas
     return "\n".join(
         [
             "Review the proposed file update before it is written to disk.",
@@ -1069,6 +1078,8 @@ def proposed_update_review_prompt(
             "- Judge whether writing this file now is safe as one step in the task, not whether the entire multi-file task is already finished.",
             "- Approve only when the proposal is tightly aligned with the explicit request and keeps unrelated existing behavior intact.",
             "- Do not treat an explicitly requested behavior change for this file as scope broadening just because the current implementation behaves differently.",
+            "- When active runtime failure evidence for this file includes observed-vs-expected behavior deltas, treat the smallest local change that closes those deltas as in scope for this write.",
+            "- Do not call an evidence-backed local repair broadening solely because it changes current default behavior, as long as the diff stays local to the implicated responsibility and does not introduce extra semantics beyond the evidenced fix.",
             "- Fail when the proposal broadens scope without evidence, or removes working behavior, imports, config handling, startup code, public interfaces, commands, docs, or tests that the request did not ask to remove.",
             "- Fail when a narrow request adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance unless the visible evidence clearly requires that extra content.",
             "- Treat explicit literal examples from the request as hard constraints when they are clearly part of the requested outcome; wrong placeholders, argument order, command shape, or snippet content are failures unless visible evidence contradicts them.",

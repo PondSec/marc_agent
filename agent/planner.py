@@ -7063,6 +7063,87 @@ class Planner:
                 count += 1
         return count
 
+    def _review_rejection_looks_like_scope_broadening(
+        self,
+        review: ProposedUpdateReview,
+    ) -> bool:
+        text = " ".join(
+            part.strip().lower()
+            for part in [review.summary, *review.blocking_issues, *review.preservation_risks]
+            if str(part or "").strip()
+        )
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "scope",
+                "too broad",
+                "broadens",
+                "broader",
+                "unrequested",
+                "unrelated existing behavior",
+                "remove working behavior",
+            )
+        )
+
+    def _evidence_backed_behavior_adjustment_is_in_scope(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+        review: ProposedUpdateReview,
+    ) -> bool:
+        if review.safe_to_write:
+            return False
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        if not self._review_rejection_looks_like_scope_broadening(review):
+            return False
+        if not _repair_semantic_delta_lines(repair_context, limit=2):
+            return False
+
+        changed_line_count = self._compact_repair_change_line_count(
+            current_content=current_content,
+            proposed_content=proposed_content,
+        )
+        if changed_line_count <= 0 or changed_line_count > 16:
+            return False
+
+        current_lines = max(len(str(current_content or "").splitlines()), 1)
+        proposed_lines = max(len(str(proposed_content or "").splitlines()), 1)
+        if abs(proposed_lines - current_lines) > 4:
+            return False
+
+        current_length = max(len(str(current_content or "")), 1)
+        proposed_length = max(len(str(proposed_content or "")), 1)
+        if proposed_length < int(current_length * 0.6) and proposed_lines < int(current_lines * 0.7):
+            return False
+
+        identifiers = self._repair_identifiers_for_target(
+            path,
+            repair_context,
+            current_content=current_content,
+            proposed_content=proposed_content,
+        )
+        if identifiers:
+            relevant_identifiers = [
+                identifier
+                for identifier in identifiers
+                if identifier in current_content or identifier in proposed_content
+            ]
+            if not relevant_identifiers:
+                return False
+            if not any(
+                self._identifier_lines_changed(identifier, current_content, proposed_content)
+                for identifier in relevant_identifiers
+            ):
+                return False
+
+        return True
+
     def _should_skip_model_backed_repair_review(
         self,
         route: RouterOutput,
@@ -7574,6 +7655,7 @@ class Planner:
                 proposed_content=proposed_content,
             )
 
+        review_from_generated = False
         review = self._generated_content_integrity_review(path=path, proposed_content=proposed_content)
         if review is None:
             review = self._explicit_constraint_integrity_review(
@@ -7629,7 +7711,39 @@ class Planner:
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
-        )
+            )
+            review_from_generated = True
+        if (
+            review_from_generated
+            and
+            not review.safe_to_write
+            and self._evidence_backed_behavior_adjustment_is_in_scope(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+                review=review,
+            )
+        ):
+            self._log(
+                "proposed_update_review_scope_override",
+                path=path,
+                summary=review.summary,
+                reason="failure_evidence_backed_local_behavior_change",
+            )
+            review = ProposedUpdateReview(
+                safe_to_write=True,
+                summary=(
+                    "The proposed repair stays local and makes a behavior adjustment that is directly supported "
+                    "by the active runtime failure evidence."
+                ),
+                confidence=max(float(review.confidence or 0.0), 0.58),
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=[
+                    "Keep the repair anchored to the evidenced behavior delta and avoid unrelated follow-on changes.",
+                ],
+            )
         return review
 
     def _repair_target_scope_review(
