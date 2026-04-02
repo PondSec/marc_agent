@@ -2159,6 +2159,109 @@ def test_task_state_a2_restores_grounded_code_scope_when_semantic_state_collapse
     assert route.entities.target_name == "texttools/normalize.py"
 
 
+def test_task_state_a2_restores_missing_request_anchored_primary_targets_from_local_scope(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=5,
+        language_counts={"python": 4, "markdown": 1},
+        top_directories=["texttools", "tests"],
+        important_files=[
+            "texttools/__init__.py",
+            "texttools/normalize.py",
+            "normalize_cli.py",
+            "README.md",
+            "tests/test_normalize.py",
+        ],
+        focus_files=["texttools/normalize.py", "normalize_cli.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_normalize.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=["texttools/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python3 -m unittest tests.test_normalize"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small text normalization project with helper module, CLI wrapper, README, and tests.",
+    )
+    prompt = (
+        "Ergänze die keep_case-Unterstützung in texttools und der CLI so, dass "
+        "python3 -m unittest tests.test_normalize grün wird."
+    )
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": "Implementieren und Validieren der keep_case-Unterstützung",
+        "active_goal": "Ergänzen der keep_case-Unterstützung in texttools und der CLI",
+        "goal_relation": "continue",
+        "output_expectation": "Die keep_case-Unterstützung sollte implementiert werden und die Tests sollten erfolgreich laufen.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "tests.test_normalize",
+        "target_artifacts": [
+            {"path": "texttools/normalize.py", "name": "normalize.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "tests/test_normalize.py", "name": "test_normalize.py", "kind": "file", "role": "validation_target", "confidence": 1.0},
+        ],
+        "active_artifacts": [
+            {"path": "texttools/normalize.py", "name": "normalize.py", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "tests/test_normalize.py", "name": "test_normalize.py", "kind": "file", "role": "validation_target", "confidence": 1.0},
+        ],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [
+            "python3 -m unittest tests.test_normalize sollte grün werden",
+        ],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.92,
+        "next_action": "modify",
+        "next_best_action": "modify",
+        "execution_outline": [
+            "Inspect the active implementation before editing it.",
+            "Apply the focused change in the smallest sensible scope.",
+            "Verify the updated behavior.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ScriptedLLM(json_payloads=[payload])
+    llm.config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        prompt,
+        snapshot=snapshot,
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts if artifact.path}
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.target_artifacts[0].path == "texttools/normalize.py"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "texttools/normalize.py",
+        "normalize_cli.py",
+        "tests/test_normalize.py",
+    }
+    assert artifact_roles["normalize_cli.py"] == "primary_target"
+    assert route.intent == RouteIntent.UPDATE
+    assert "normalize_cli.py" in route.entities.target_paths
+
+
 def test_task_state_a2_keeps_documentation_only_scope_when_request_is_explicitly_docs_only(tmp_path):
     snapshot = WorkspaceSnapshot(
         root=str(tmp_path),

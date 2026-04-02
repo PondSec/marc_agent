@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import re
 import time
 from typing import Any
 
@@ -478,21 +479,23 @@ class TaskStateUpdater:
         if reason == "restore_grounded_mutation_scope":
             state.root_goal = local_state.root_goal
             state.active_goal = local_state.active_goal
-        state.current_user_intent = local_state.current_user_intent
-        state.execution_strategy = local_state.execution_strategy
-        state.next_action = local_state.next_action
-        state.next_best_action = local_state.next_best_action
         state.target_artifacts = merged_targets
         state.active_artifacts = merged_active
         state.relevant_context = merged_context[:8]
         state.constraints = merged_constraints[:8]
         state.execution_outline = merged_outline[:6]
-        state.output_expectation = local_state.output_expectation
-        state.verification_target = local_state.verification_target
+        if reason != "restore_missing_grounded_targets":
+            state.current_user_intent = local_state.current_user_intent
+            state.execution_strategy = local_state.execution_strategy
+            state.next_action = local_state.next_action
+            state.next_best_action = local_state.next_best_action
+            state.output_expectation = local_state.output_expectation
+            state.verification_target = local_state.verification_target
         if not state.assumptions:
             state.assumptions = list(local_state.assumptions or [])
-        state.risk_level = local_state.risk_level
-        state.ambiguity_level = local_state.ambiguity_level
+        if reason != "restore_missing_grounded_targets":
+            state.risk_level = local_state.risk_level
+            state.ambiguity_level = local_state.ambiguity_level
         state.confidence = max(float(state.confidence or 0.0), float(local_state.confidence or 0.0))
 
     def _local_reconciliation_reason(
@@ -502,6 +505,8 @@ class TaskStateUpdater:
     ) -> str | None:
         if self._should_prefer_local_mutation_semantics(state, local_state):
             return "prefer_local_mutation_semantics"
+        if self._should_restore_missing_grounded_targets(state, local_state):
+            return "restore_missing_grounded_targets"
         if self._should_restore_grounded_mutation_scope(state, local_state):
             return "restore_grounded_mutation_scope"
         return None
@@ -572,6 +577,58 @@ class TaskStateUpdater:
         ):
             return True
         return False
+
+    def _should_restore_missing_grounded_targets(
+        self,
+        state: TaskState,
+        local_state: TaskState,
+    ) -> bool:
+        if state.needs_clarification or local_state.needs_clarification:
+            return False
+        if float(local_state.confidence or 0.0) < 0.55:
+            return False
+        if not self._is_mutation_like_state(local_state):
+            return False
+
+        local_targets = list(local_state.target_artifacts or [])
+        state_targets = list(state.target_artifacts or [])
+        if not local_targets or not state_targets:
+            return False
+
+        local_primary_paths = self._technical_primary_paths(local_targets)
+        state_primary_paths = self._technical_primary_paths(state_targets)
+        return self._grounded_primary_scope_was_narrowed(
+            state_primary_paths=state_primary_paths,
+            local_primary_paths=local_primary_paths,
+            local_state=local_state,
+        )
+
+    def _grounded_primary_scope_was_narrowed(
+        self,
+        *,
+        state_primary_paths: list[str],
+        local_primary_paths: list[str],
+        local_state: TaskState,
+    ) -> bool:
+        if len(local_primary_paths) < 2 or not state_primary_paths:
+            return False
+        local_set = {path for path in local_primary_paths if path}
+        state_set = {path for path in state_primary_paths if path}
+        if not local_set or not state_set:
+            return False
+        if not state_set.issubset(local_set):
+            return False
+
+        missing_paths = [
+            path
+            for path in local_primary_paths
+            if path and path not in state_set
+        ]
+        if not missing_paths:
+            return False
+
+        request = str(local_state.latest_user_turn or "").strip()
+        return any(self._path_is_anchored_in_request(path, request) for path in missing_paths)
 
     def _is_mutation_like_state(self, state: TaskState) -> bool:
         strategy = str(state.execution_strategy or "").strip()
@@ -651,6 +708,40 @@ class TaskStateUpdater:
         if role == "supporting_context" and suffix in DOC_SUFFIXES:
             return True
         return kind == "doc" or suffix in DOC_SUFFIXES
+
+    def _path_is_anchored_in_request(self, path: str, request: str) -> bool:
+        path_text = str(path or "").strip()
+        request_text = str(request or "").strip().lower()
+        if not path_text or not request_text:
+            return False
+
+        request_space = f" {re.sub(r'[^0-9a-zäöüß]+', ' ', request_text).strip()} "
+        if not request_space.strip():
+            return False
+
+        basename = Path(path_text).name.lower()
+        stem = Path(path_text).stem.lower()
+        normalized_path = re.sub(r"[^0-9a-zäöüß]+", " ", path_text.lower()).strip()
+        normalized_basename = re.sub(r"[^0-9a-zäöüß]+", " ", basename).strip()
+        normalized_stem = re.sub(r"[^0-9a-zäöüß]+", " ", stem).strip()
+
+        if normalized_path and f" {normalized_path} " in request_space:
+            return True
+        if basename and basename in request_text:
+            return True
+        if normalized_basename and f" {normalized_basename} " in request_space:
+            return True
+        if normalized_stem and f" {normalized_stem} " in request_space:
+            return True
+
+        meaningful_tokens = [
+            token
+            for token in re.split(r"[^0-9a-zäöüß]+", normalized_stem)
+            if len(token) >= 3 and token not in {"app", "docs", "file", "main", "module", "package", "test", "tests"}
+        ]
+        if not meaningful_tokens:
+            return False
+        return any(f" {token} " in request_space for token in meaningful_tokens)
 
     def _should_short_circuit_with_local_state(
         self,
