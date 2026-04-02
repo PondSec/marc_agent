@@ -111,6 +111,35 @@ def test_normalized_adds_public_base_url_host_to_allowed_hosts():
     assert config.security_allowed_hosts == ("127.0.0.1", "localhost", "agent.pondsec.com")
 
 
+def test_normalized_exposes_active_models_as_candidates():
+    config = AppConfig(
+        workspace_root=".",
+        model_name="qwen3-coder:30b",
+        router_model_name="qwen2.5-coder:14b",
+    ).normalized()
+
+    assert config.model_candidates == ("qwen3-coder:30b", "qwen2.5-coder:14b")
+
+
+def test_from_sources_parses_model_candidates_and_keeps_active_models(tmp_path, monkeypatch):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    monkeypatch.chdir(workspace_root)
+    monkeypatch.setenv("WORKSPACE_ROOT", str(workspace_root))
+    monkeypatch.setenv("MODEL_NAME", "qwen2.5-coder:7b")
+    monkeypatch.setenv("ROUTER_MODEL_NAME", "qwen2.5-coder:14b")
+    monkeypatch.setenv("MODEL_CANDIDATES", "qwen3:8b,qwen2.5-coder:7b")
+
+    config = AppConfig.from_sources()
+
+    assert config.model_candidates == (
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:14b",
+        "qwen3:8b",
+    )
+
+
 def test_from_sources_prefers_workspace_env_for_runtime_settings(tmp_path, monkeypatch):
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()

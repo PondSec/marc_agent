@@ -52,6 +52,26 @@ def _parse_csv_list(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...
     return tuple(part.strip() for part in text.split(",") if part.strip()) or default
 
 
+def _normalize_model_candidates(
+    raw_candidates: Any,
+    *,
+    primary_model: str | None,
+    router_model: str | None,
+) -> tuple[str, ...]:
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+
+    add(primary_model)
+    add(router_model)
+    for raw in _parse_csv_list(raw_candidates, ()):
+        add(raw)
+    return tuple(candidates)
+
+
 def _load_dotenv(path: Path) -> dict[str, str]:
     data: dict[str, str] = {}
     if not path.exists():
@@ -132,6 +152,7 @@ class AppConfig:
     ollama_host: str = "http://127.0.0.1:11434"
     model_name: str = "qwen3:14b"
     router_model_name: str | None = "qwen3:8b"
+    model_candidates: tuple[str, ...] = ()
     workspace_root: str = "."
     state_root_override: str | None = None
     access_mode: str = AccessMode.APPROVAL.value
@@ -222,6 +243,10 @@ class AppConfig:
             ollama_host=str(pick("OLLAMA_HOST", defaults.ollama_host)),
             model_name=str(pick("MODEL_NAME", defaults.model_name)),
             router_model_name=pick("ROUTER_MODEL_NAME", defaults.router_model_name),
+            model_candidates=_parse_csv_list(
+                pick("MODEL_CANDIDATES", defaults.model_candidates),
+                defaults.model_candidates,
+            ),
             workspace_root=str(pick("WORKSPACE_ROOT", defaults.workspace_root)),
             state_root_override=str(
                 pick("STATE_ROOT_OVERRIDE", defaults.state_root_override) or ""
@@ -411,6 +436,11 @@ class AppConfig:
             access_mode=mode.value,
             read_only=mode == AccessMode.SAFE,
             approval_mode=mode == AccessMode.APPROVAL,
+            model_candidates=_normalize_model_candidates(
+                self.model_candidates,
+                primary_model=self.model_name,
+                router_model=self.router_model_name,
+            ),
             security_allowed_hosts=tuple(allowed_hosts),
         )
 
@@ -482,7 +512,7 @@ class AppConfig:
             "tagline": AGENT_TAGLINE,
         }
         data["access_modes"] = [item.value for item in AccessMode]
-        data["model_candidates"] = [self.model_name]
+        data["model_candidates"] = list(self.model_candidates)
         data["router_preferred_model_name"] = self.router_model_name
         data["agent_profiles"] = [
             {
