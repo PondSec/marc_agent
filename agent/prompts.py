@@ -1858,6 +1858,16 @@ def _compact_repair_update_prompt(
     ]
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     repair_brief = targeted_context.get("repair_brief") or {}
+    support_excerpt_limit = 500 if repair_context.verification_scope == "runtime" else 180
+    support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
+    related_context = _repair_related_file_context(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        excerpt_limit=support_excerpt_limit,
+        max_files=support_max_files,
+    )
+    direct_main_option_contract = _direct_main_option_contract_present(related_context)
     if compact_focus.get("current_write_requirements"):
         sections.append(
             "Repair-scoped requirements: "
@@ -1870,17 +1880,17 @@ def _compact_repair_update_prompt(
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         target_summary = repair_brief.get("locked_target") or repair_brief.get("primary_target")
         sections.append(f"Primary repair target: {target_summary}")
-    if repair_brief.get("expected_semantics"):
+    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
         sections.append(
             "Expected semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
         )
-    if repair_brief.get("observed_semantics"):
+    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
         sections.append(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -1898,15 +1908,6 @@ def _compact_repair_update_prompt(
             )
         if region_parts:
             sections.append("Repair focus: " + " ".join(region_parts))
-    support_excerpt_limit = 500 if repair_context.verification_scope == "runtime" else 180
-    support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
-    related_context = _repair_related_file_context(
-        session,
-        target_path=path,
-        repair_context=repair_context,
-        excerpt_limit=support_excerpt_limit,
-        max_files=support_max_files,
-    )
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
     runtime_hints = _targeted_runtime_prompt_hints(
@@ -1920,6 +1921,7 @@ def _compact_repair_update_prompt(
         current_content=current_content,
         repair_context=repair_context,
         review_feedback=review_feedback,
+        supporting_context=related_context,
     )
     sections.extend(
         [
@@ -2019,6 +2021,7 @@ def _compact_repair_retry_prompt(
         max_files=support_max_files,
     )
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
+    direct_main_option_contract = _direct_main_option_contract_present(related_context)
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2030,6 +2033,7 @@ def _compact_repair_retry_prompt(
         current_content=current_content,
         repair_context=repair_context,
         review_feedback=review_feedback,
+        supporting_context=related_context,
     )
 
     sections = [
@@ -2060,17 +2064,17 @@ def _compact_repair_retry_prompt(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if repair_brief.get("expected_semantics"):
+    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
         sections.append(
             "Expected semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("expected_semantics", [])[:3])
         )
-    if repair_brief.get("observed_semantics"):
+    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
         sections.append(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2186,10 +2190,12 @@ def _focused_full_repair_update_prompt(
         current_content=current_content,
         repair_context=repair_context,
         review_feedback=review_feedback,
+        supporting_context=related_context,
     )
     working_memory = _compact_working_memory(session)
     noop_followup = _review_feedback_indicates_noop_repair(review_feedback)
     concrete_examples = _repair_behavior_examples(repair_context)
+    direct_main_option_contract = _direct_main_option_contract_present(related_context)
     implicated_line_excerpt = ""
     if noop_followup:
         implicated_line_excerpt = _line_focused_excerpt(
@@ -2276,23 +2282,23 @@ def _focused_full_repair_update_prompt(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if repair_brief.get("expected_semantics"):
+    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
         sections.append(
             "Expected semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
         )
-    if repair_brief.get("observed_semantics"):
+    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
         sections.append(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
             + " | ".join(_trim_text(item, 180) for item in semantic_deltas[:2])
         )
-    if concrete_examples:
+    if concrete_examples and not direct_main_option_contract:
         sections.append(
             "Concrete behavior examples: "
             + " | ".join(_trim_text(item, 180) for item in concrete_examples[:2])
@@ -2554,6 +2560,53 @@ def _repair_semantic_value_text(raw: object) -> str:
     return text
 
 
+def _direct_main_runtime_contract(
+    supporting_context: str,
+    *,
+    limit: int = 6,
+) -> tuple[list[str], list[str]]:
+    text = str(supporting_context or "")
+    if "main([" not in text:
+        return [], []
+
+    option_tokens: list[str] = []
+    positional_tokens: list[str] = []
+    for match in re.finditer(r"(?:__main__\.)?main\(\s*(\[[^\]]*\])\s*\)", text):
+        raw_argv = str(match.group(1) or "").strip()
+        if not raw_argv:
+            continue
+        try:
+            values = ast.literal_eval(raw_argv)
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(values, (list, tuple)):
+            continue
+
+        saw_option = False
+        for value in values:
+            token = str(value or "").strip()
+            if not token:
+                continue
+            if token.startswith("-"):
+                saw_option = True
+                if token not in option_tokens:
+                    option_tokens.append(token)
+                    if len(option_tokens) >= limit:
+                        return option_tokens[:limit], positional_tokens[:limit]
+                continue
+            if not saw_option or token in positional_tokens:
+                continue
+            positional_tokens.append(token)
+            if len(positional_tokens) >= limit:
+                return option_tokens[:limit], positional_tokens[:limit]
+    return option_tokens[:limit], positional_tokens[:limit]
+
+
+def _direct_main_option_contract_present(supporting_context: str) -> bool:
+    option_tokens, _ = _direct_main_runtime_contract(supporting_context)
+    return bool(option_tokens)
+
+
 def _first_mismatching_semantic_line_pair(observed_value: str, expected_value: str) -> tuple[str, str]:
     observed = str(observed_value or "")
     expected = str(expected_value or "")
@@ -2787,8 +2840,10 @@ def _mandatory_mutation_anchors(
     current_content: str,
     repair_context: ValidationFailureEvidence,
     review_feedback: ProposedUpdateReview | None,
+    supporting_context: str = "",
 ) -> list[str]:
     anchors: list[str] = []
+    direct_main_option_contract = _direct_main_option_contract_present(supporting_context)
     direct_script_anchor = _direct_python_script_execution_anchor(
         path=path,
         current_content=current_content,
@@ -2852,11 +2907,12 @@ def _mandatory_mutation_anchors(
     ):
         anchors.append(literal_anchor)
 
-    for delta in _repair_semantic_delta_lines(repair_context, limit=2):
-        anchors.append(
-            "Apply this exact semantic delta in the behavior produced by this file: "
-            + _trim_text(delta, 220)
-        )
+    if not direct_main_option_contract:
+        for delta in _repair_semantic_delta_lines(repair_context, limit=2):
+            anchors.append(
+                "Apply this exact semantic delta in the behavior produced by this file: "
+                + _trim_text(delta, 220)
+            )
 
     if review_feedback is not None:
         if review_feedback.blocking_issues:
@@ -3390,8 +3446,22 @@ def _targeted_runtime_prompt_hints(
         hints.append(
             "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
         )
+    option_tokens, positional_tokens = _direct_main_runtime_contract(supporting_context)
+    if option_tokens:
+        option_preview = ", ".join(option_tokens[:3])
+        hints.append(
+            f"The failing main([...]) call exercises exact option tokens like {option_preview}. Recognize those tokens verbatim; do not drop leading hyphens or rewrite them into lookalike spellings."
+        )
+        if positional_tokens:
+            positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
+            hints.append(
+                f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
+            )
     repair_brief = targeted_context.get("repair_brief") or {}
-    if repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics"):
+    if (
+        not option_tokens
+        and (repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics"))
+    ):
         hints.append(
             "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source unless the current implementation already derives it directly."
         )

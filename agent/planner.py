@@ -7962,16 +7962,53 @@ class Planner:
         if Path(path).suffix.lower() not in {".py", ".pyi"}:
             return None
 
-        option_tokens = self._direct_main_option_contract_tokens(session, repair_context)
+        option_tokens, positional_tokens = self._direct_main_option_contract_details(
+            session,
+            repair_context,
+        )
         if not option_tokens:
             return None
+
+        lowered_current = str(current_content or "").lower()
+        lowered_proposed = str(proposed_content or "").lower()
+        missing_exact_tokens = [
+            token for token in option_tokens if token.lower() not in lowered_proposed
+        ]
+        if missing_exact_tokens:
+            option_preview = ", ".join(missing_exact_tokens[:3])
+            positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
+            target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+            repair_hints = [
+                f"Handle the exact option token sequence {option_preview} in {path}; do not rewrite those tokens into stripped-hyphen or underscore-only lookalikes.",
+                "Keep the repair grounded in the direct main([...]) contract instead of approximating the option spelling.",
+                *self._runtime_target_repair_hints(path, repair_context, evidence_lines=target_evidence),
+            ]
+            if positional_tokens:
+                repair_hints.insert(
+                    1,
+                    f"After recognizing {option_preview}, derive behavior from the remaining argv payload {positional_preview} instead of hardcoding those sample values.",
+                )
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary=(
+                    "The proposed repair still misses the exact direct main([...]) option tokens exercised by the failed runtime path."
+                ),
+                confidence=0.92,
+                blocking_issues=[
+                    (
+                        f"The failing runtime path passes option tokens like {option_preview} into main([...]), "
+                        f"but the proposal never recognizes those exact tokens in {path}."
+                    )
+                ],
+                preservation_risks=[],
+                repair_hints=repair_hints[:4],
+            )
 
         current_contract_lines = self._runtime_argv_contract_lines(current_content)
         proposed_contract_lines = self._runtime_argv_contract_lines(proposed_content)
         if not current_contract_lines or current_contract_lines != proposed_contract_lines:
             return None
 
-        lowered_current = str(current_content or "").lower()
         if any(token.lower() in lowered_current for token in option_tokens):
             return None
 
@@ -7998,15 +8035,15 @@ class Planner:
             ],
         )
 
-    def _direct_main_option_contract_tokens(
+    def _direct_main_option_contract_details(
         self,
         session: SessionState,
         repair_context: ValidationFailureEvidence,
         *,
         limit: int = 4,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str]]:
         if repair_context.verification_scope != "runtime":
-            return []
+            return [], []
 
         candidate_paths = self._unique_paths(
             [
@@ -8023,9 +8060,10 @@ class Planner:
             ]
         )
         if not candidate_paths:
-            return []
+            return [], []
 
         tokens: list[str] = []
+        positional_tokens: list[str] = []
         for candidate in candidate_paths[:4]:
             excerpt = self._current_or_last_read_excerpt(session, path=candidate)
             if "main([" not in excerpt:
@@ -8040,14 +8078,37 @@ class Planner:
                     continue
                 if not isinstance(values, (list, tuple)):
                     continue
+                saw_option = False
                 for value in values:
                     token = str(value or "").strip()
-                    if not token.startswith("-") or token in tokens:
+                    if token.startswith("-"):
+                        saw_option = True
+                        if token in tokens:
+                            continue
+                        tokens.append(token)
+                        if len(tokens) >= limit:
+                            return tokens[:limit], positional_tokens[:limit]
                         continue
-                    tokens.append(token)
-                    if len(tokens) >= limit:
-                        return tokens[:limit]
-        return tokens[:limit]
+                    if not saw_option or token in positional_tokens:
+                        continue
+                    positional_tokens.append(token)
+                    if len(positional_tokens) >= limit:
+                        return tokens[:limit], positional_tokens[:limit]
+        return tokens[:limit], positional_tokens[:limit]
+
+    def _direct_main_option_contract_tokens(
+        self,
+        session: SessionState,
+        repair_context: ValidationFailureEvidence,
+        *,
+        limit: int = 4,
+    ) -> list[str]:
+        tokens, _ = self._direct_main_option_contract_details(
+            session,
+            repair_context,
+            limit=limit,
+        )
+        return tokens
 
     def _runtime_argv_contract_lines(
         self,
