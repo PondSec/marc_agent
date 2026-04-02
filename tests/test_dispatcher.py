@@ -35,3 +35,38 @@ def test_dispatcher_rejects_invalid_tool_args(tmp_path):
 
     assert result.success is False
     assert "validation" in result.message.lower()
+    assert result.tool_meta is not None
+    assert result.tool_meta.read_only is True
+    assert result.tool_meta.concurrency_safe is True
+
+
+def test_dispatcher_marks_read_only_tools_as_concurrency_safe(tmp_path):
+    workspace_file = tmp_path / "notes.txt"
+    workspace_file.write_text("hello\n", encoding="utf-8")
+    dispatcher = build_dispatcher(tmp_path)
+
+    result = dispatcher.dispatch("read_file", {"path": "notes.txt"}, iteration=1)
+
+    assert result.success is True
+    assert result.tool_meta is not None
+    assert result.tool_meta.category == "read"
+    assert result.tool_meta.read_only is True
+    assert result.tool_meta.concurrency_safe is True
+    assert result.tool_meta.execution_mode == "read_only"
+
+
+def test_dispatcher_marks_mutating_tools_as_exclusive(tmp_path):
+    dispatcher = build_dispatcher(tmp_path)
+
+    result = dispatcher.dispatch(
+        "create_file",
+        {"path": "created.txt", "content": "hello\n", "overwrite": False},
+        iteration=1,
+    )
+
+    assert result.success is True
+    assert result.tool_meta is not None
+    assert result.tool_meta.category == "write"
+    assert result.tool_meta.read_only is False
+    assert result.tool_meta.concurrency_safe is False
+    assert result.tool_meta.execution_mode == "mutating"

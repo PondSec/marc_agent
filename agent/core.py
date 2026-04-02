@@ -183,6 +183,7 @@ class AgentCore:
                     expected_outcome=decision.expected_outcome,
                     output_excerpt=self._build_output_excerpt(result.data),
                     risk_level=result.risk_level,
+                    tool_meta=result.tool_meta,
                 )
             )
             self._merge_changed_files(session, result.changed_files)

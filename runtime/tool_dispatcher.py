@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
-from agent.models import FileChangeRecord, ToolRunResult
+from agent.models import FileChangeRecord, ToolExecutionMeta, ToolRunResult
 from runtime.logger import AgentLogger
 from tools.registry import ToolRegistry
 from tools.safety import SafetyManager
@@ -35,12 +35,16 @@ class ToolDispatcher:
             )
             return result
 
+        tool_meta = ToolExecutionMeta.model_validate(spec.runtime_traits())
         self.logger.log_event(
             "tool_requested",
             iteration=iteration,
             tool=tool_name,
             args=raw_args or {},
             category=spec.category,
+            execution_mode=tool_meta.execution_mode,
+            read_only=tool_meta.read_only,
+            concurrency_safe=tool_meta.concurrency_safe,
         )
 
         try:
@@ -51,6 +55,7 @@ class ToolDispatcher:
                 success=False,
                 message="Tool argument validation failed.",
                 data={"errors": exc.errors()},
+                tool_meta=tool_meta,
             )
             self.logger.log_event(
                 "tool_validation_error",
@@ -68,6 +73,7 @@ class ToolDispatcher:
                 message="; ".join(access.reasons),
                 data={"blocked": True, "reasons": access.reasons},
                 risk_level=access.risk_level,
+                tool_meta=tool_meta,
             )
             self.logger.log_event(
                 "tool_blocked",
@@ -75,6 +81,7 @@ class ToolDispatcher:
                 tool=tool_name,
                 risk_level=access.risk_level,
                 reasons=access.reasons,
+                execution_mode=tool_meta.execution_mode,
             )
             return result
 
@@ -86,12 +93,14 @@ class ToolDispatcher:
                 success=False,
                 message=f"Tool execution failed: {exc}",
                 risk_level=access.risk_level,
+                tool_meta=tool_meta,
             )
             self.logger.log_event(
                 "tool_execution_error",
                 iteration=iteration,
                 tool=tool_name,
                 error=str(exc),
+                execution_mode=tool_meta.execution_mode,
             )
             return result
 
@@ -106,6 +115,7 @@ class ToolDispatcher:
             data=payload,
             risk_level=payload.get("risk_level", access.risk_level),
             changed_files=changed_files,
+            tool_meta=tool_meta,
         )
         self.logger.log_event(
             "tool_result",
@@ -115,5 +125,6 @@ class ToolDispatcher:
             message=result.message,
             risk_level=result.risk_level,
             changed_files=len(changed_files),
+            execution_mode=tool_meta.execution_mode,
         )
         return result

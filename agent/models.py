@@ -48,6 +48,7 @@ WorkflowStage = Literal[
     "blocked",
     "completed",
 ]
+ToolExecutionMode = Literal["read_only", "exclusive", "mutating", "destructive"]
 
 
 class StrictModel(BaseModel):
@@ -470,6 +471,15 @@ class FileChangeRecord(StrictModel):
     diff: str | None = None
 
 
+class ToolExecutionMeta(StrictModel):
+    category: str = "general"
+    read_only: bool = False
+    mutating: bool = False
+    destructive: bool = False
+    concurrency_safe: bool = False
+    execution_mode: ToolExecutionMode = "exclusive"
+
+
 class ToolCallRecord(StrictModel):
     iteration: int
     tool_name: str
@@ -481,6 +491,7 @@ class ToolCallRecord(StrictModel):
     expected_outcome: str | None = None
     output_excerpt: str | None = None
     risk_level: str | None = None
+    tool_meta: ToolExecutionMeta | None = None
     timestamp: str = Field(default_factory=utc_now)
 
 
@@ -491,6 +502,7 @@ class ToolRunResult(StrictModel):
     data: dict[str, Any] = Field(default_factory=dict)
     risk_level: str | None = None
     changed_files: list[FileChangeRecord] = Field(default_factory=list)
+    tool_meta: ToolExecutionMeta | None = None
 
 
 class ChatMessage(StrictModel):

@@ -25,6 +25,8 @@ from llm.schemas import (
     WriteFileArgs,
 )
 
+READ_ONLY_CATEGORIES = frozenset({"inspect", "read", "git"})
+
 
 @dataclass(slots=True)
 class ToolSpec:
@@ -36,6 +38,31 @@ class ToolSpec:
     mutating: bool = False
     destructive: bool = False
 
+    def is_read_only(self) -> bool:
+        return not self.mutating and self.category in READ_ONLY_CATEGORIES
+
+    def is_concurrency_safe(self) -> bool:
+        return self.is_read_only() and not self.destructive
+
+    def execution_mode(self) -> str:
+        if self.destructive:
+            return "destructive"
+        if self.mutating:
+            return "mutating"
+        if self.is_read_only():
+            return "read_only"
+        return "exclusive"
+
+    def runtime_traits(self) -> dict[str, object]:
+        return {
+            "category": self.category,
+            "read_only": self.is_read_only(),
+            "mutating": self.mutating,
+            "destructive": self.destructive,
+            "concurrency_safe": self.is_concurrency_safe(),
+            "execution_mode": self.execution_mode(),
+        }
+
     def prompt_line(self) -> str:
         fields = []
         for name, field in self.input_model.model_fields.items():
@@ -44,6 +71,10 @@ class ToolSpec:
             fields.append(f"{name}:{annotation} ({required})")
         signature = ", ".join(fields) if fields else "no args"
         traits = [self.category]
+        if self.is_read_only():
+            traits.append("read_only")
+        if self.is_concurrency_safe():
+            traits.append("concurrency_safe")
         if self.mutating:
             traits.append("mutating")
         if self.destructive:
