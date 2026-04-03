@@ -4384,6 +4384,28 @@ def _request_literal_candidates(text: str) -> list[str]:
     return candidates[:8]
 
 
+def _python_call_literal_contains_example_payload(candidate: str) -> bool:
+    normalized = str(candidate or "").strip()
+    if "(" not in normalized or ")" not in normalized:
+        return False
+    try:
+        expression = ast.parse(normalized, mode="eval").body
+    except SyntaxError:
+        return False
+    if not isinstance(expression, ast.Call):
+        return False
+    arguments = [*expression.args, *(keyword.value for keyword in expression.keywords)]
+    return any(_python_call_argument_contains_example_payload(argument) for argument in arguments)
+
+
+def _python_call_argument_contains_example_payload(argument: ast.AST) -> bool:
+    if isinstance(argument, ast.Constant):
+        return argument.value is Ellipsis
+    if isinstance(argument, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Starred)):
+        return True
+    return any(_python_call_argument_contains_example_payload(child) for child in ast.iter_child_nodes(argument))
+
+
 def _target_literal_constraints(
     route: RouterOutput,
     session: SessionState | None,
@@ -4409,14 +4431,17 @@ def _target_literal_constraints(
     for candidate in _request_literal_candidates(request_text):
         if not _literal_matches_reference(candidate, current_tokens):
             continue
-        if _python_call_literal_needs_path_scope(candidate, path) and not _call_literal_scopes_to_current_artifact(
-            candidate,
-            request_text=request_text,
-            current_path=path,
-            other_paths=other_paths,
-            reference=reference,
-        ):
-            continue
+        if _python_call_literal_needs_path_scope(candidate, path):
+            if _python_call_literal_contains_example_payload(candidate):
+                continue
+            if not _call_literal_scopes_to_current_artifact(
+                candidate,
+                request_text=request_text,
+                current_path=path,
+                other_paths=other_paths,
+                reference=reference,
+            ):
+                continue
         scoped_candidate = _scoped_literal_constraint(candidate, path)
         if scoped_candidate and scoped_candidate not in literals:
             literals.append(scoped_candidate)

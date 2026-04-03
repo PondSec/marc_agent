@@ -3336,6 +3336,61 @@ def test_artifact_scoped_focus_scopes_helper_signature_literal_to_owning_python_
     assert "greet(name, shout=False)" in cli_focus["literal_constraints"]
 
 
+def test_artifact_scoped_focus_ignores_placeholder_call_example_for_python_target(tmp_path):
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source = ' '.join(args[1:] if keep_case else args)\n"
+        "    print(' '.join(normalize_words(source or 'Hello WORLD', keep_case)))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    main(['--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."},
+        ],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+        current_content=current_content,
+    )
+
+    assert "main([...])" not in focus["literal_constraints"]
+
+
 def test_artifact_scoped_focus_adds_cross_file_import_consistency_requirement(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
@@ -13614,6 +13669,83 @@ def test_pre_write_update_review_allows_initial_direct_main_contract_fix_when_pa
     assert review.safe_to_write is True
 
 
+def test_pre_write_update_review_allows_direct_main_contract_fix_when_request_mentions_placeholder_call_example(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(update={"entrypoints": ["normalize_cli.py"]}),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays local and preserves the direct runtime contract.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    source = ' '.join(source_tokens or ['Hello, WORLD!'])\n"
+        "    print(' '.join(normalize_words(source, keep_case)))\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is True
+
+
 def test_pre_write_update_review_does_not_apply_direct_main_option_guard_to_library_repair_targets(
     tmp_path,
     monkeypatch,
@@ -13821,6 +13953,73 @@ def test_pre_write_update_review_rejects_direct_main_option_fix_with_inexact_tok
     assert "exact direct main([...]) option tokens" in review.summary
     assert any("--keep-case" in issue for issue in review.blocking_issues)
     assert any("remaining argv payload" in hint for hint in review.repair_hints)
+
+
+def test_pre_write_update_review_still_rejects_launcher_style_direct_main_argv_indexing_when_request_mentions_placeholder_call_example(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "normalize_cli.py").write_text(
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        keep_case = argv[1].lower() == 'keep_case'\n"
+        "    return normalize_words('Hello, WORLD!', keep_case)\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(update={"entrypoints": ["normalize_cli.py"]}),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    keep_case = False\n"
+        "    if argv and len(argv) > 1:\n"
+        "        if argv[1].lower() == '--keep-case':\n"
+        "            keep_case = True\n"
+        "    result = normalize_words(' '.join(argv[2:] if argv and len(argv) > 2 else ['Hello, WORLD!']), keep_case)\n"
+        "    print(' '.join(result))\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=(tmp_path / "normalize_cli.py").read_text(encoding="utf-8"),
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "launcher or program name" in review.summary
+    assert any("argv[1]" in issue or "argv[2:]" in issue for issue in review.blocking_issues)
 
 
 def test_pre_write_update_review_allows_direct_main_option_contract_fix_when_argv_lines_change(
