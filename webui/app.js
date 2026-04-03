@@ -130,8 +130,7 @@ const state = {
       path: null,
     },
     chatScroll: {
-      stickToBottom: true,
-      distanceFromBottom: 0,
+      positions: {},
     },
   },
 };
@@ -390,6 +389,7 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
   state.ui.page = preserveRoute ? state.ui.page : "workspace";
   state.ui.sessionLoading = false;
   state.ui.workspaceModalOpen = false;
+  state.ui.chatScroll.positions = {};
   resetDiffViewer();
   resetChatScrollState();
   if (!preserveRoute) {
@@ -560,10 +560,11 @@ async function openSession(sessionId, { updateHistory = true } = {}) {
     return;
   }
 
+  captureChatScrollState();
   disconnectStream();
-  resetChatScrollState();
   state.ui.sessionLoading = true;
   state.activeSessionId = sessionId;
+  ensureChatScrollState(chatScrollKeyForSession(sessionId));
   renderApp();
 
   try {
@@ -590,15 +591,19 @@ async function openSession(sessionId, { updateHistory = true } = {}) {
 }
 
 function selectWorkspace(workspaceId) {
+  captureChatScrollState();
   state.selectedWorkspaceId = workspaceId;
   if (!state.activeSession || state.activeSession.workspace_id !== workspaceId) {
     clearActiveSession();
+  } else {
+    ensureChatScrollState(currentChatScrollKey());
   }
   persistPreferences();
   renderApp();
 }
 
 function startNewChat(workspaceId) {
+  captureChatScrollState();
   state.selectedWorkspaceId = workspaceId || state.selectedWorkspaceId;
   clearActiveSession();
   state.composer.prompt = "";
@@ -612,9 +617,9 @@ function clearActiveSession() {
   state.activeSession = null;
   state.logs = [];
   resetDiffViewer();
-  resetChatScrollState();
   disconnectStream();
   syncHistory(null);
+  ensureChatScrollState(currentChatScrollKey());
 }
 
 function resetDiffViewer() {
@@ -1331,6 +1336,16 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "focus-composer") {
+    focusComposer();
+    return;
+  }
+
+  if (action === "prefill-composer") {
+    prefillComposer(target.dataset.prompt);
+    return;
+  }
+
   if (action === "edit-workspace") {
     openWorkspaceModal("edit", target.dataset.workspaceId);
     return;
@@ -1556,6 +1571,7 @@ function handleChange(event) {
     return;
   }
   persistPreferences();
+  renderApp();
 }
 
 function handleKeydown(event) {
@@ -2270,43 +2286,48 @@ function renderAuthStatusPanel(tone, loading, lockedSeconds) {
 function renderSidebar() {
   const workspace = selectedWorkspace();
   const activeRuns = state.sessions.filter((session) => isSessionRunning(session)).length;
-  const totalThreads = state.sessions.length;
-  const primaryAction = workspace
-    ? `
-        <button
-          class="sidebar-primary-action"
-          type="button"
-          data-action="new-chat"
-          data-workspace-id="${escapeHtml(workspace.id)}"
-        >
-          ${icon("compose")}
-          <span>Neuer Thread</span>
-        </button>
-      `
-    : `
-        <button class="sidebar-primary-action" type="button" data-action="open-workspace-modal">
-          ${icon("plus")}
-          <span>Projekt anlegen</span>
-        </button>
-      `;
+  const selectedSessions = workspace ? sessionsForWorkspace(workspace.id) : [];
 
   return `
     <div class="sidebar-shell sidebar-shell-minimal">
-      <div class="sidebar-header sidebar-header-minimal">
-        <div class="sidebar-brandline">
-          <strong>${escapeHtml(APP_BRAND_NAME)}</strong>
-          <span>${escapeHtml(activeRuns ? `${activeRuns} aktiv` : workspace ? "Bereit" : "Kein Projekt")}</span>
+      <div class="sidebar-header sidebar-header-minimal workbench-sidebar-header">
+        <div class="sidebar-brand-card">
+          <div class="sidebar-brand-mark" aria-hidden="true">${icon("spark")}</div>
+          <div class="sidebar-brand-copy">
+            <strong>${escapeHtml(APP_BRAND_PLAIN)}</strong>
+            <span>Agent Workbench</span>
+          </div>
+          ${renderStatusBadge(activeRuns ? `${activeRuns} aktiv` : workspace ? "Bereit" : "Ohne Projekt", activeRuns ? "running" : "muted", {
+            compact: true,
+            live: activeRuns > 0,
+          })}
         </div>
-        ${primaryAction}
+        <div class="sidebar-cta-grid">
+          <button class="sidebar-primary-action sidebar-cta-button primary" type="button" data-action="open-workspace-modal">
+            ${icon("project-add")}
+            <span>Projekt anlegen</span>
+          </button>
+          <button
+            class="sidebar-primary-action sidebar-cta-button secondary"
+            type="button"
+            data-action="${workspace ? "new-chat" : "open-workspace-modal"}"
+            ${workspace ? `data-workspace-id="${escapeHtml(workspace.id)}"` : ""}
+            ${workspace ? "" : "disabled"}
+          >
+            ${icon("compose")}
+            <span>Thread starten</span>
+          </button>
+        </div>
       </div>
       <div class="sidebar-scroll">
-        <section class="sidebar-section sidebar-project-section">
+        <section class="sidebar-section sidebar-panel sidebar-project-section">
           <div class="sidebar-section-head">
-            <p class="sidebar-label">Threads</p>
-            <span class="sidebar-count">${escapeHtml(String(totalThreads))}</span>
+            <p class="sidebar-label">Projekte</p>
+            <span class="sidebar-count">${escapeHtml(countLabel(state.workspaces.length, "1 Projekt", `${state.workspaces.length} Projekte`))}</span>
           </div>
           ${renderSidebarProjectList()}
         </section>
+        ${renderSidebarThreadSection(workspace, selectedSessions)}
       </div>
       ${renderSidebarFooter(activeRuns)}
     </div>
@@ -2323,7 +2344,7 @@ function renderSidebarProjectList() {
   }
 
   return `
-    <div class="project-nav-list">
+    <div class="project-nav-list workbench-project-list">
       ${state.workspaces.map(renderSidebarProject).join("")}
     </div>
   `;
@@ -2333,80 +2354,34 @@ function renderSidebarProject(workspace) {
   const active = workspace.id === activeWorkspaceId();
   const sessions = sessionsForWorkspace(workspace.id);
   const activeRuns = sessions.filter((session) => isSessionRunning(session)).length;
+  const latestSession = sessions[0] || null;
   const disabled = isWorkspaceBusy(workspace.id);
+  const metaParts = [
+    countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`),
+    activeRuns ? `${activeRuns} aktiv` : "Bereit",
+    latestSession?.updated_at ? `Zuletzt ${formatSessionTimestamp(latestSession.updated_at)}` : "",
+  ].filter(Boolean);
 
   return `
-    <section class="project-group ${active ? "active" : ""}">
-      <div class="project-group-head">
+    <article class="project-row ${active ? "active" : ""}">
+      <div class="project-row-main">
         <button
-          class="project-button"
+          class="project-button project-row-button"
           type="button"
           data-action="select-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
         >
-          <span class="project-button-icon" aria-hidden="true">${icon("folder")}</span>
-          <span class="project-button-copy">
-            <span class="project-button-name">${escapeHtml(workspace.name)}</span>
-            <span class="project-button-path">${escapeHtml(shortenPath(workspace.path, 42))}</span>
+          <span class="project-button-icon project-row-icon" aria-hidden="true">${icon(active ? "folder-open" : "folder")}</span>
+          <span class="project-button-copy project-row-copy">
+            <span class="project-button-name project-row-title">${escapeHtml(workspace.name)}</span>
+            <span class="project-button-path project-row-path">${escapeHtml(shortenPath(workspace.path, 42))}</span>
+            <span class="project-row-meta">${escapeHtml(metaParts.join(" · "))}</span>
           </span>
-          <span class="project-button-count">${escapeHtml(String(sessions.length))}</span>
+          <span class="project-button-count project-row-count">${escapeHtml(String(sessions.length))}</span>
         </button>
-        <div class="project-tools">
-          <button
-            class="workspace-action"
-            type="button"
-            data-action="edit-workspace"
-            data-workspace-id="${escapeHtml(workspace.id)}"
-            aria-label="Projekt bearbeiten"
-          >
-            ${icon("edit")}
-          </button>
-          <button
-            class="workspace-action warning-button"
-            type="button"
-            data-action="clear-workspace-contents"
-            data-workspace-id="${escapeHtml(workspace.id)}"
-            aria-label="Projektordner leeren"
-            title="${escapeAttribute(
-              disabled
-                ? "Projekt kann erst geleert werden, wenn keine Threads mehr laufen."
-                : "Dateien und Unterordner auf der Platte loeschen, Projekt behalten",
-            )}"
-            ${disabled ? "disabled" : ""}
-          >
-            ${icon("broom")}
-          </button>
-          <button
-            class="workspace-action danger-button"
-            type="button"
-            data-action="delete-workspace"
-            data-workspace-id="${escapeHtml(workspace.id)}"
-            aria-label="Projekt loeschen"
-            title="${escapeAttribute(
-              disabled
-                ? "Projekt kann erst geloescht werden, wenn keine Threads mehr laufen."
-                : "Projekt aus der Webapp loeschen",
-            )}"
-            ${disabled ? "disabled" : ""}
-          >
-            ${icon("trash")}
-          </button>
-        </div>
+        ${renderProjectOverflowMenu(workspace, { disabled })}
       </div>
-      ${
-        active
-          ? `
-            <div class="project-thread-list">
-              <div class="project-group-meta">
-                <span>${escapeHtml(activeRuns ? `${activeRuns} aktiv` : "Bereit")}</span>
-                <span>${escapeHtml(countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`))}</span>
-              </div>
-              ${sessions.length ? sessions.map(renderSidebarThreadItem).join("") : `<div class="sidebar-empty sidebar-empty-compact">In diesem Projekt gibt es noch keinen Thread.</div>`}
-            </div>
-          `
-          : ""
-      }
-    </section>
+    </article>
   `;
 }
 
@@ -2414,30 +2389,105 @@ function renderSidebarThreadItem(session) {
   const active = session.id === state.activeSessionId;
   const title = session.title || session.last_message_preview || session.task || "Neuer Thread";
   const preview = threadPreview(session);
-  const badgeTone = sessionStatusTone(session);
-  const badgeLabel = sessionBadgeText(session);
+  const changedCount = session.changed_files?.length || 0;
 
   return `
     <button
-      class="thread-nav-item ${active ? "active" : ""}"
+      class="thread-nav-item thread-nav-card ${active ? "active" : ""}"
       type="button"
       data-action="open-session"
       data-session-id="${escapeHtml(session.id)}"
     >
-      <span class="thread-nav-main">
-        <span class="thread-nav-title">${escapeHtml(shorten(title, 30))}</span>
-        <span class="thread-nav-status tone-${escapeHtml(badgeTone)}">${escapeHtml(badgeLabel)}</span>
+      <span class="thread-nav-main thread-nav-card-top">
+        <span class="thread-nav-title">${escapeHtml(shorten(title, 40))}</span>
+        ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
+          compact: true,
+          live: isSessionRunning(session),
+        })}
       </span>
       <span class="thread-nav-preview">${escapeHtml(shorten(preview, 72))}</span>
-      <span class="thread-nav-meta">
+      <span class="thread-nav-meta thread-nav-card-meta">
         <span>${escapeHtml(formatSessionTimestamp(session.updated_at))}</span>
-        ${
-          session.changed_files?.length
-            ? `<span>${escapeHtml(countLabel(session.changed_files.length, "1 Datei", `${session.changed_files.length} Dateien`))}</span>`
-            : ""
-        }
+        ${changedCount ? `<span>${escapeHtml(countLabel(changedCount, "1 Datei", `${changedCount} Dateien`))}</span>` : ""}
       </span>
     </button>
+  `;
+}
+
+function renderSidebarThreadSection(workspace, sessions) {
+  return `
+    <section class="sidebar-section sidebar-panel sidebar-thread-section">
+      <div class="sidebar-section-head sidebar-thread-head">
+        <div>
+          <p class="sidebar-label">Threads</p>
+          <span class="sidebar-section-subtitle">${escapeHtml(workspace ? workspace.name : "Kein Projekt gewaehlt")}</span>
+        </div>
+        ${
+          workspace
+            ? `
+              <button
+                class="sidebar-inline-action"
+                type="button"
+                data-action="new-chat"
+                data-workspace-id="${escapeHtml(workspace.id)}"
+              >
+                ${icon("compose")}
+                <span>Neu</span>
+              </button>
+            `
+            : ""
+        }
+      </div>
+      ${
+        !workspace
+          ? `<div class="sidebar-empty sidebar-empty-compact">Waehle links ein Projekt aus, damit die zugehoerigen Threads hier fokussiert erscheinen.</div>`
+          : !sessions.length
+            ? `<div class="sidebar-empty sidebar-empty-compact">Dieses Projekt ist bereit. Starte den ersten Thread, um Verlauf, Status und Diffs zentral zu sehen.</div>`
+            : `<div class="thread-nav-list">${sessions.map(renderSidebarThreadItem).join("")}</div>`
+      }
+    </section>
+  `;
+}
+
+function renderProjectOverflowMenu(workspace, options = {}) {
+  const { disabled = false } = options;
+  return `
+    <details class="overflow-menu project-row-menu" data-preserve-open id="project-menu-${escapeHtml(workspace.id)}">
+      <summary class="overflow-action" aria-label="Projektaktionen">
+        ${icon("more")}
+      </summary>
+      <div class="overflow-menu-panel">
+        <button
+          class="overflow-menu-item"
+          type="button"
+          data-action="edit-workspace"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+        >
+          ${icon("edit")}
+          <span>Projekt bearbeiten</span>
+        </button>
+        <button
+          class="overflow-menu-item warning"
+          type="button"
+          data-action="clear-workspace-contents"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+          ${disabled ? "disabled" : ""}
+        >
+          ${icon("broom")}
+          <span>Inhalt leeren</span>
+        </button>
+        <button
+          class="overflow-menu-item danger"
+          type="button"
+          data-action="delete-workspace"
+          data-workspace-id="${escapeHtml(workspace.id)}"
+          ${disabled ? "disabled" : ""}
+        >
+          ${icon("trash")}
+          <span>Projekt entfernen</span>
+        </button>
+      </div>
+    </details>
   `;
 }
 
@@ -2787,6 +2837,8 @@ function buildWorkspaceShellView(sourceState = state) {
   const statusTone = session ? sessionStatusTone(session) : "muted";
   const statusText = session ? sessionBadgeText(session) : "Bereit";
   const running = isSessionRunning(session);
+  const accessModeLabel = labelForAccessMode(session?.access_mode || sourceState.composer.accessMode);
+  const profileLabel = executionProfileLabelFromState(sourceState);
   const title = session
     ? session.title || shorten(session.task, 84) || "Neuer Thread"
     : workspace?.name || "Projekt auswaehlen";
@@ -2809,6 +2861,28 @@ function buildWorkspaceShellView(sourceState = state) {
     title,
     statusTone,
     statusText,
+    metaItems: [
+      {
+        label: "Projekt",
+        value: workspace?.name || "Kein Projekt",
+        tone: workspace ? "muted" : "warning",
+      },
+      {
+        label: "Workspace",
+        value: workspace?.path ? shortenPath(workspace.path, 72) : "Nicht verbunden",
+        tone: workspace?.path ? "muted" : "warning",
+      },
+      {
+        label: "Zuletzt",
+        value: session?.updated_at ? formatSessionTimestamp(session.updated_at) : workspace ? "Bereit" : "Noch offen",
+        tone: "muted",
+      },
+      {
+        label: "Modus",
+        value: [accessModeLabel, profileLabel].filter(Boolean).join(" · ") || "Standard",
+        tone: "muted",
+      },
+    ],
     runtimeStatusItems: buildRuntimeStatusItems(sourceState),
     subtitle:
       subtitleParts.join(" | ") || "Links ein Projekt waehlen oder einen neuen Thread starten.",
@@ -3031,121 +3105,123 @@ function renderRuntimeStatusItem(item) {
 function renderTopBar() {
   const shell = buildWorkspaceShellView();
   const { workspace, session } = shell;
-  const title = shell.title || APP_BRAND_NAME;
-  const subtitle = workspace
-    ? [workspace.name, workspace.path ? shortenPath(workspace.path, 48) : "", session?.updated_at ? `Aktualisiert ${formatSessionTimestamp(session.updated_at)}` : ""]
-        .filter(Boolean)
-        .join(" · ")
-    : shell.subtitle;
+  const primaryActionLabel = workspace ? "Neuer Thread" : "Projekt anlegen";
+  const primaryAction = workspace
+    ? `data-action="new-chat" data-workspace-id="${escapeHtml(workspace.id)}"`
+    : `data-action="open-workspace-modal"`;
 
   return `
-    <header class="thread-topbar">
-      <div class="thread-topbar-inner">
+    <header class="thread-topbar workbench-topbar">
+      <div class="thread-topbar-inner workbench-topbar-inner">
         <div class="thread-topbar-copy">
-          <h1 class="thread-topbar-title">${escapeHtml(title)}</h1>
-          <p class="thread-topbar-subtitle">${escapeHtml(subtitle)}</p>
+          <div class="thread-topbar-title-row">
+            <h1 class="thread-topbar-title">${escapeHtml(shell.title || APP_BRAND_NAME)}</h1>
+            ${renderStatusBadge(shell.statusText, shell.statusTone, {
+              compact: true,
+              live: shell.running,
+            })}
+          </div>
+          <div class="thread-topbar-meta-grid">
+            ${shell.metaItems.map(renderTopbarMetaItem).join("")}
+          </div>
         </div>
-        <div class="thread-toolbar">
-          <span class="thread-toolbar-status tone-${escapeHtml(shell.statusTone)}">${escapeHtml(shell.statusText)}</span>
-          <button
-            class="icon-button thread-toolbar-icon"
-            type="button"
-            data-action="open-workspace-preview"
-            data-workspace-id="${escapeHtml(workspace?.id || "")}"
-            aria-label="Workspace in der Cloud starten"
-            title="${escapeAttribute(
-              !shell.canPreview
-                ? "Die Vorschau ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
-                : "Workspace direkt auf dem Agent-Server testen",
-            )}"
-            ${shell.canPreview ? "" : "disabled"}
-          >
-            ${icon("play")}
+        <div class="thread-toolbar workbench-toolbar">
+          ${
+            workspace
+              ? `
+                <button
+                  class="button-secondary thread-toolbar-button thread-toolbar-preview"
+                  type="button"
+                  data-action="open-workspace-preview"
+                  data-workspace-id="${escapeHtml(workspace.id)}"
+                  ${shell.canPreview ? "" : "disabled"}
+                >
+                  ${icon("play")}
+                  <span>Vorschau</span>
+                </button>
+              `
+              : ""
+          }
+          <button class="button-primary thread-toolbar-button thread-toolbar-primary" type="button" ${primaryAction}>
+            ${icon(workspace ? "compose" : "project-add")}
+            <span>${escapeHtml(primaryActionLabel)}</span>
           </button>
-          <button
-            class="button-ghost thread-toolbar-button"
-            type="button"
-            data-action="download-session-handoff"
-            data-session-id="${escapeHtml(session?.id || "")}"
-            title="${escapeAttribute(
-              !shell.canDownloadHandoff
-                ? "Der Handoff ist verfuegbar, sobald ein abgeschlossener Thread Dateien geaendert hat."
-                : "Nur die geaenderten Dateien, Report und Logs herunterladen",
-            )}"
-            ${shell.canDownloadHandoff ? "" : "disabled"}
-          >
-            Handoff
-          </button>
-          <button
-            class="button-ghost thread-toolbar-button"
-            type="button"
-            data-action="${workspace ? "new-chat" : "open-workspace-modal"}"
-            ${workspace ? `data-workspace-id="${escapeHtml(workspace.id)}"` : ""}
-          >
-            Neuer Thread
-          </button>
-          <button
-            class="icon-button thread-toolbar-icon"
-            type="button"
-            data-action="download-workspace-export"
-            data-workspace-id="${escapeHtml(workspace?.id || "")}"
-            aria-label="Kompletten Workspace herunterladen"
-            title="${escapeAttribute(
-              !shell.canDownloadWorkspace
-                ? "Der Workspace-Export ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
-                : "Kompletten Workspace als Zip herunterladen",
-            )}"
-            ${shell.canDownloadWorkspace ? "" : "disabled"}
-          >
-            ${icon("download")}
-          </button>
-          <button
-            class="icon-button thread-toolbar-icon"
-            type="button"
-            data-action="commit-push"
-            aria-label="Commit und Push an den Agenten senden"
-            title="${escapeAttribute(
-              !shell.canCommit
-                ? "Commit und Push ist erst verfuegbar, wenn kein Agent-Schritt mehr laeuft."
-                : "Commit und Push anfordern",
-            )}"
-            ${shell.canCommit ? "" : "disabled"}
-          >
-            ${icon("git-push")}
-          </button>
-          <button
-            class="icon-button thread-toolbar-icon"
-            type="button"
-            data-action="delete-session"
-            data-session-id="${escapeHtml(session?.id || "")}"
-            aria-label="Thread loeschen"
-            title="${escapeAttribute(
-              !shell.canDeleteSession
-                ? "Thread kann erst geloescht werden, wenn kein Lauf aktiv ist."
-                : "Thread loeschen",
-            )}"
-            ${shell.canDeleteSession ? "" : "disabled"}
-          >
-            ${icon("trash")}
-          </button>
-          <button
-            class="icon-button thread-toolbar-icon"
-            type="button"
-            data-action="open-settings-page"
-            aria-label="Einstellungen"
-            title="Agent- und Laufzeitoptionen"
-          >
-            ${icon("sliders")}
-          </button>
+          ${renderThreadToolbarMenu(shell)}
         </div>
       </div>
     </header>
   `;
 }
 
+function renderTopbarMetaItem(item) {
+  return `
+    <div class="thread-topbar-meta-item tone-${escapeHtml(item.tone || "muted")}">
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${escapeHtml(item.value)}</strong>
+    </div>
+  `;
+}
+
+function renderThreadToolbarMenu(shell) {
+  const { workspace, session } = shell;
+
+  return `
+    <details class="overflow-menu thread-toolbar-menu" data-preserve-open id="thread-toolbar-menu">
+      <summary class="overflow-action" aria-label="Weitere Thread-Aktionen">
+        ${icon("more")}
+      </summary>
+      <div class="overflow-menu-panel">
+        <button
+          class="overflow-menu-item"
+          type="button"
+          data-action="download-session-handoff"
+          data-session-id="${escapeHtml(session?.id || "")}"
+          ${shell.canDownloadHandoff ? "" : "disabled"}
+        >
+          ${icon("download")}
+          <span>Handoff exportieren</span>
+        </button>
+        <button
+          class="overflow-menu-item"
+          type="button"
+          data-action="download-workspace-export"
+          data-workspace-id="${escapeHtml(workspace?.id || "")}"
+          ${shell.canDownloadWorkspace ? "" : "disabled"}
+        >
+          ${icon("download")}
+          <span>Workspace herunterladen</span>
+        </button>
+        <button
+          class="overflow-menu-item"
+          type="button"
+          data-action="commit-push"
+          ${shell.canCommit ? "" : "disabled"}
+        >
+          ${icon("git-push")}
+          <span>Commit und Push anfordern</span>
+        </button>
+        <button class="overflow-menu-item" type="button" data-action="open-settings-page">
+          ${icon("sliders")}
+          <span>Einstellungen</span>
+        </button>
+        <button
+          class="overflow-menu-item danger"
+          type="button"
+          data-action="delete-session"
+          data-session-id="${escapeHtml(session?.id || "")}"
+          ${shell.canDeleteSession ? "" : "disabled"}
+        >
+          ${icon("trash")}
+          <span>Thread loeschen</span>
+        </button>
+      </div>
+    </details>
+  `;
+}
+
 function renderChatContainer() {
   return `
-    <section class="chat-stage">
+    <section class="chat-stage" data-scroll-key="${escapeAttribute(currentChatScrollKey())}">
       <div class="chat-stage-inner">
         ${renderChatStateMessages()}
       </div>
@@ -3188,47 +3264,189 @@ function renderStageState(title, copy, actions = "") {
   `;
 }
 
-function renderEmptyThreadState() {
-  const workspace = selectedWorkspace();
+function buildReadyStateView(sourceState = state) {
+  const workspace = selectedWorkspaceFrom(sourceState);
+  const sessions = workspace ? sessionsForWorkspaceFrom(sourceState, workspace.id) : [];
+  const activeRuns = sessions.filter((session) => isSessionRunning(session)).length;
+  const accessModeLabel = labelForAccessMode(sourceState.composer.accessMode);
+
   if (!workspace) {
-    return renderStageState(
-      "Verbinde zuerst ein Projekt",
-      "Lege einen lokalen Projektordner an. Danach erscheinen Threads, Laufstatus und Dateiaenderungen direkt hier.",
-      `
-        <button class="button-primary" type="button" data-action="open-workspace-modal">
-          Projekt anlegen
-        </button>
-      `,
-    );
+    return {
+      workspace: null,
+      sessions: [],
+      activeRuns: 0,
+      facts: [],
+      suggestions: [],
+      recentSessions: [],
+      title: "Projekt verbinden oder anlegen",
+      copy:
+        "Lege einen lokalen Projektordner an. Danach erscheinen Threads, Aktivitaet, Diff-Ansichten und Validierung in einer gemeinsamen Workbench.",
+    };
   }
 
-  const sessions = sessionsForWorkspace(workspace.id);
-  return renderStageState(
-    `${workspace.name} ist bereit`,
-    "Starte einen neuen Thread. Status, Dateien und Validierung erscheinen anschliessend direkt im Verlauf.",
-    `
-      <div class="empty-state-facts">
-        ${renderMetaChip(shortenPath(workspace.path, 60), "muted")}
-        ${renderMetaChip(countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`), "muted")}
-      </div>
-      <button
-        class="button-primary"
-        type="button"
-        data-action="new-chat"
-        data-workspace-id="${escapeHtml(workspace.id)}"
-      >
-        Neuen Thread starten
-      </button>
-    `,
-  );
+  return {
+    workspace,
+    sessions,
+    activeRuns,
+    facts: [
+      { label: "Workspace", value: shortenPath(workspace.path, 82) },
+      { label: "Threads", value: countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`) },
+      { label: "Aktivitaet", value: activeRuns ? `${activeRuns} aktiv` : "Bereit" },
+      { label: "Modus", value: accessModeLabel },
+    ],
+    suggestions: [
+      `Analysiere den aktuellen Stand in ${workspace.name} und nenne die naechsten sinnvollen UI-Schritte.`,
+      `Pruefe offene Diffs, Hinweise und Validierung in ${workspace.name}.`,
+      `Starte eine neue Frontend-Aufgabe in ${workspace.name} und halte die vorhandene Struktur konsistent.`,
+    ],
+    recentSessions: sessions.slice(0, 3),
+    title: `${workspace.name} ist bereit`,
+    copy:
+      "Starte einen neuen Thread oder springe in einen bestehenden Verlauf. Die Workbench bleibt projektzentriert und zeigt Status, Fortschritt und Aenderungen in einer Linie.",
+  };
+}
+
+function renderEmptyThreadState() {
+  const ready = buildReadyStateView();
+
+  if (!ready.workspace) {
+    return `
+      <section class="thread-card ready-state-card ready-state-empty">
+        <div class="ready-state-header">
+          <div>
+            <p class="panel-kicker">Ready</p>
+            <h2>${escapeHtml(ready.title)}</h2>
+          </div>
+          ${renderStatusBadge("Ohne Projekt", "warning", { compact: true })}
+        </div>
+        <p class="ready-state-copy">${escapeHtml(ready.copy)}</p>
+        <div class="ready-state-actions">
+          <button class="button-primary" type="button" data-action="open-workspace-modal">
+            ${icon("project-add")}
+            <span>Projekt anlegen</span>
+          </button>
+          <button class="button-secondary" type="button" data-action="open-settings-page">
+            ${icon("sliders")}
+            <span>Runtime ansehen</span>
+          </button>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <div class="ready-state-workbench">
+      <section class="thread-card ready-state-card">
+        <div class="ready-state-header">
+          <div>
+            <p class="panel-kicker">Ready</p>
+            <h2>${escapeHtml(ready.title)}</h2>
+          </div>
+          ${renderStatusBadge(ready.activeRuns ? `${ready.activeRuns} aktiv` : "Bereit", ready.activeRuns ? "running" : "success", {
+            compact: true,
+            live: ready.activeRuns > 0,
+          })}
+        </div>
+        <p class="ready-state-copy">${escapeHtml(ready.copy)}</p>
+        <div class="ready-state-facts">
+          ${ready.facts
+            .map(
+              (item) => `
+                <div class="ready-state-fact">
+                  <span>${escapeHtml(item.label)}</span>
+                  <strong>${escapeHtml(item.value)}</strong>
+                </div>
+              `,
+            )
+            .join("")}
+        </div>
+      </section>
+      <section class="thread-card ready-state-card ready-state-actions-card">
+        <div class="ready-state-header compact">
+          <div>
+            <p class="panel-kicker">Start</p>
+            <h3>Naechster Schritt</h3>
+          </div>
+        </div>
+        <div class="ready-state-actions">
+          <button
+            class="button-primary"
+            type="button"
+            data-action="new-chat"
+            data-workspace-id="${escapeHtml(ready.workspace.id)}"
+          >
+            ${icon("compose")}
+            <span>Thread starten</span>
+          </button>
+          <button class="button-secondary" type="button" data-action="focus-composer">
+            ${icon("arrow")}
+            <span>In Composer springen</span>
+          </button>
+        </div>
+        <div class="ready-prompt-list">
+          ${ready.suggestions
+            .map(
+              (prompt) => `
+                <button
+                  class="ready-prompt-button"
+                  type="button"
+                  data-action="prefill-composer"
+                  data-prompt="${escapeAttribute(prompt)}"
+                >
+                  ${escapeHtml(prompt)}
+                </button>
+              `,
+            )
+            .join("")}
+        </div>
+      </section>
+      <section class="thread-card ready-state-card ready-state-recent">
+        <div class="ready-state-header compact">
+          <div>
+            <p class="panel-kicker">Verlauf</p>
+            <h3>Letzte Threads</h3>
+          </div>
+        </div>
+        ${
+          ready.recentSessions.length
+            ? `
+              <div class="ready-recent-list">
+                ${ready.recentSessions
+                  .map(
+                    (session) => `
+                      <button
+                        class="ready-recent-item"
+                        type="button"
+                        data-action="open-session"
+                        data-session-id="${escapeHtml(session.id)}"
+                      >
+                        <span class="ready-recent-top">
+                          <strong>${escapeHtml(shorten(session.title || session.task || "Neuer Thread", 58))}</strong>
+                          ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
+                            compact: true,
+                            live: isSessionRunning(session),
+                          })}
+                        </span>
+                        <span>${escapeHtml(shorten(threadPreview(session), 92))}</span>
+                      </button>
+                    `,
+                  )
+                  .join("")}
+              </div>
+            `
+            : `<p class="ready-state-copy small">Noch kein Verlauf in diesem Projekt. Der erste Thread schafft hier sofort Kontext.</p>`
+        }
+      </section>
+    </div>
+  `;
 }
 
 function renderThreadView(session) {
   const presentation = buildThreadPresentationView(session, state.logs);
   const diffFile = activeDiffFile(session);
   return `
-    <div class="thread-shell ${diffFile ? "with-diff" : ""} ${diffFile && state.ui.diffViewer.expanded ? "diff-expanded" : ""}">
-      <div class="thread-column">
+    <div class="thread-workbench ${presentation.running ? "is-running" : "is-complete"}">
+      <div class="thread-workbench-main">
         ${renderConversationPanel(session, presentation)}
         ${
           presentation.running
@@ -3236,8 +3454,73 @@ function renderThreadView(session) {
             : renderThreadOutcomePanel(session, presentation, diffFile)
         }
       </div>
-      ${diffFile ? renderThreadDiffViewer(diffFile) : ""}
+      ${presentation.running ? renderThreadSideRail(session, state.logs) : ""}
     </div>
+  `;
+}
+
+function primaryPromptForSession(session) {
+  const firstUserMessage = conversationMessages(session).find(
+    (message) => message.role === "user" && String(message.content || "").trim(),
+  );
+
+  return {
+    content: String(session?.task || firstUserMessage?.content || "").trim() || "Noch kein Auftrag hinterlegt.",
+    timestamp: firstUserMessage?.created_at || session?.created_at,
+  };
+}
+
+function latestAssistantResponse(session) {
+  const latestAssistantMessage = [...conversationMessages(session)]
+    .reverse()
+    .find((message) => message.role === "assistant" && String(message.content || "").trim());
+  return sanitizeAssistantMessageContent(session?.final_response || latestAssistantMessage?.content || "");
+}
+
+function conversationTranscriptMessages(session, options = {}) {
+  const { includeLatestAssistant = true } = options;
+  const prompt = primaryPromptForSession(session);
+  const latestAssistant = includeLatestAssistant
+    ? null
+    : [...conversationMessages(session)]
+        .reverse()
+        .find((message) => message.role === "assistant" && String(message.content || "").trim()) || null;
+
+  return conversationMessages(session).filter((message) => {
+    if (!message || !String(message.content || "").trim()) {
+      return false;
+    }
+    if (message.role === "user" && String(message.content || "").trim() === prompt.content) {
+      return false;
+    }
+    if (!includeLatestAssistant && latestAssistant && latestAssistant.id === message.id) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function renderPromptCard(session) {
+  const prompt = primaryPromptForSession(session);
+  const workspace = workspaceForSession(session);
+
+  return `
+    <section class="thread-card prompt-card">
+      <div class="prompt-card-head">
+        <div>
+          <p class="panel-kicker">User Prompt</p>
+          <h2>${escapeHtml(shorten(prompt.content, 96))}</h2>
+        </div>
+        ${renderStatusBadge("Anfrage", "muted", { compact: true })}
+      </div>
+      <div class="prompt-card-body rich-text">${renderRichText(prompt.content)}</div>
+      <div class="prompt-card-meta">
+        ${workspace?.name ? renderMetaChip(workspace.name, "muted") : ""}
+        ${workspace?.path ? renderMetaChip(shortenPath(workspace.path, 72), "muted") : ""}
+        ${renderMetaChip(labelForAccessMode(session.access_mode), "muted")}
+        ${prompt.timestamp ? renderMetaChip(`Gesendet ${formatSessionTimestamp(prompt.timestamp)}`, "muted") : ""}
+      </div>
+    </section>
   `;
 }
 
@@ -3294,57 +3577,118 @@ function renderMessageBubble(message, options = {}) {
 }
 
 function renderConversationPanel(session, presentation = buildThreadPresentationView(session, state.logs)) {
-  const timeline = conversationTimeline(session);
-  const workspace = workspaceForSession(session);
-  const title = session.title || shorten(session.task, 96) || "Neuer Thread";
-  const contextMeta = [workspace?.name || "", workspace?.path ? shortenPath(workspace.path, 84) : "", labelForAccessMode(session.access_mode)]
-    .filter(Boolean)
-    .join(" · ");
+  const transcript = conversationTranscriptMessages(session, {
+    includeLatestAssistant: presentation.running,
+  });
   return `
-    <section class="thread-canvas">
-      <div class="thread-session-head">
-        <div class="thread-session-headline">
-          <span class="thread-session-kicker">Thread</span>
-          <h2 class="thread-session-title">${escapeHtml(title)}</h2>
-          ${contextMeta ? `<p class="thread-session-subtitle">${escapeHtml(contextMeta)}</p>` : ""}
-        </div>
-        <div class="thread-session-meta">
-          <span class="thread-session-status tone-${escapeHtml(sessionStatusTone(session))}">${escapeHtml(sessionBadgeText(session))}</span>
-          ${
-            presentation.durationLabel
-              ? `<span class="thread-session-duration">${escapeHtml(presentation.durationLabel)}</span>`
-              : ""
-          }
-        </div>
-      </div>
-      <div class="thread-feed thread-feed-minimal">
-        ${timeline.length ? timeline.map((entry) => renderTimelineEntry(entry, session)).join("") : `<div class="inline-note">Noch keine Nachrichten in diesem Thread.</div>`}
-      </div>
+    <section class="thread-canvas conversation-workbench">
+      ${renderPromptCard(session)}
+      ${
+        transcript.length
+          ? `
+            <section class="thread-card transcript-card">
+              <div class="workbench-card-head">
+                <div>
+                  <p class="panel-kicker">Thread</p>
+                  <h3>Kontext und Verlauf</h3>
+                </div>
+                ${
+                  presentation.durationLabel
+                    ? renderStatusBadge(presentation.durationLabel, "muted", { compact: true })
+                    : ""
+                }
+              </div>
+              <div class="thread-feed thread-feed-minimal">
+                ${transcript
+                  .map((message) =>
+                    renderTimelineEntry(
+                      {
+                        type: "message",
+                        timestamp: message.created_at,
+                        message,
+                      },
+                      session,
+                    ),
+                  )
+                  .join("")}
+              </div>
+            </section>
+          `
+          : ""
+      }
     </section>
   `;
 }
 
 function renderThreadLivePanel(session, presentation) {
-  const headline = presentation.currentStep || phaseHeadline(session?.current_phase);
+  const headline = phaseHeadline(session?.current_phase);
+  const currentStep = presentation.currentStep || currentThoughtFrom({ activeSession: session, logs: state.logs });
+  const activity = presentation.activity.length
+    ? presentation.activity
+    : [
+        {
+          text: currentStep || "Der Agent arbeitet.",
+          meta: "Sobald der naechste sichtbare Schritt vorliegt, erscheint er hier im Verlauf.",
+          timestamp: session.updated_at,
+          tone: sessionStatusTone(session),
+          live: true,
+        },
+      ];
   return `
-    <section class="thread-live-panel">
-      <div class="thread-panel-head">
-        <div>
-          <span class="thread-panel-kicker">Denke nach</span>
-          <h3>${escapeHtml(headline)}</h3>
+    <div class="thread-live-workbench">
+      <section class="thread-card thread-live-panel thread-stage-card">
+        <div class="workbench-card-head">
+          <div>
+            <p class="panel-kicker">Live Run</p>
+            <h3>${escapeHtml(headline)}</h3>
+          </div>
+          ${renderStatusBadge(labelForPhase(session?.current_phase || "planning"), sessionStatusTone(session), {
+            compact: true,
+            live: true,
+          })}
         </div>
-        <span class="thread-panel-meta">${escapeHtml(labelForPhase(session?.current_phase || "planning"))}</span>
-      </div>
-      ${
-        presentation.activity.length
-          ? `
-            <div class="thread-live-list">
-              ${presentation.activity.map(renderThreadLiveRow).join("")}
-            </div>
-          `
-          : `<p class="thread-panel-copy">Der Agent arbeitet gerade, aber es liegt noch keine sichtbare Aktivitaet vor.</p>`
-      }
-    </section>
+        <div class="thread-live-summary">
+          <div class="thread-live-summary-copy">
+            <strong>${escapeHtml(currentStep || "Der Agent arbeitet fokussiert am aktuellen Auftrag.")}</strong>
+            <p>${escapeHtml(buildSessionOverview(session).summary)}</p>
+          </div>
+          <div class="thread-live-metric-list">
+            ${renderThreadLiveMetric("Dauer", presentation.durationLabel || "Gerade gestartet")}
+            ${renderThreadLiveMetric("Dateien", countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`))}
+            ${renderThreadLiveMetric("Checks", presentation.validation.statusLabel)}
+          </div>
+        </div>
+        <div class="thread-phase-focus">
+          <span class="thread-phase-focus-label">Aktuelle Phase</span>
+          <strong>${escapeHtml(labelForPhase(session?.current_phase || "planning"))}</strong>
+          <p>${escapeHtml(currentStep || headline)}</p>
+        </div>
+        ${renderPhaseTrack(session)}
+      </section>
+      <section class="thread-card timeline-card">
+        <div class="workbench-card-head">
+          <div>
+            <p class="panel-kicker">Aktivitaet</p>
+            <h3>Live Timeline</h3>
+          </div>
+          ${renderStatusBadge(countLabel(activity.length, "1 Eintrag", `${activity.length} Eintraege`), "muted", {
+            compact: true,
+          })}
+        </div>
+        <div class="thread-timeline-list">
+          ${activity.map(renderActivityStreamItem).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderThreadLiveMetric(label, value) {
+  return `
+    <div class="thread-live-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
   `;
 }
 
@@ -3361,50 +3705,127 @@ function renderThreadLiveRow(item) {
 }
 
 function renderThreadOutcomePanel(session, presentation, diffFile) {
-  const changeLabel = countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`);
+  const assistantResponse = latestAssistantResponse(session);
+  const issues = buildIssueItems(session);
+  const reportSummary = session?.report?.summary || presentation.overview.summary;
+
   return `
-    <section class="thread-outcome-panel tone-${escapeHtml(presentation.overview.tone)}">
-      <div class="thread-panel-head">
+    <div class="thread-result-workbench">
+      <section class="thread-card thread-outcome-panel tone-${escapeHtml(presentation.overview.tone)}">
+        <div class="workbench-card-head">
+          <div>
+            <p class="panel-kicker">Result</p>
+            <h3>${escapeHtml(presentation.overview.title)}</h3>
+          </div>
+          ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), { compact: true })}
+        </div>
+        <p class="thread-panel-copy">${escapeHtml(presentation.overview.summary)}</p>
+        <div class="thread-outcome-stats">
+          ${renderThreadOutcomeStat("Status", sessionBadgeText(session))}
+          ${renderThreadOutcomeStat("Dauer", presentation.durationLabel || "-")}
+          ${renderThreadOutcomeStat("Dateien", countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`))}
+          ${renderThreadOutcomeStat("Checks", presentation.validation.statusLabel)}
+          ${renderThreadOutcomeStat("Schritte", String(session.tool_calls?.length || 0))}
+        </div>
+      </section>
+      ${
+        assistantResponse
+          ? `
+            <section class="thread-card result-response-card">
+              <div class="workbench-card-head">
+                <div>
+                  <p class="panel-kicker">Agent</p>
+                  <h3>Antwort</h3>
+                </div>
+              </div>
+              <div class="result-response-body rich-text">${renderRichText(assistantResponse)}</div>
+            </section>
+          `
+          : ""
+      }
+      <section class="thread-card result-summary-card">
+        <div class="workbench-card-head">
+          <div>
+            <p class="panel-kicker">Summary</p>
+            <h3>Abschluss und Validierung</h3>
+          </div>
+          ${renderStatusBadge(presentation.validation.statusLabel, presentation.validation.tone, { compact: true })}
+        </div>
+        <p class="thread-panel-copy">${escapeHtml(reportSummary)}</p>
+        <div class="result-summary-list">
+          <article class="result-summary-item tone-${escapeHtml(presentation.validation.tone)}">
+            <span>Checks</span>
+            <strong>${escapeHtml(presentation.validation.title)}</strong>
+            <p>${escapeHtml(presentation.validation.summary)}</p>
+          </article>
+          ${
+            issues.length
+              ? issues
+                  .slice(0, 3)
+                  .map(
+                    (issue) => `
+                      <article class="result-summary-item tone-${escapeHtml(issue.tone)}">
+                        <span>${escapeHtml(issue.label)}</span>
+                        <strong>${escapeHtml(issue.meta || issue.label)}</strong>
+                        <p>${escapeHtml(issue.text)}</p>
+                      </article>
+                    `,
+                  )
+                  .join("")
+              : `
+                <article class="result-summary-item tone-success">
+                  <span>Status</span>
+                  <strong>Keine offenen Hinweise</strong>
+                  <p>Der Thread ist aus UI-Sicht sauber abgeschlossen.</p>
+                </article>
+              `
+          }
+        </div>
+      </section>
+      ${renderThreadFilesWorkbench(session, presentation, diffFile)}
+    </div>
+  `;
+}
+
+function renderThreadFilesWorkbench(session, presentation, diffFile) {
+  if (!presentation.changes.length) {
+    return "";
+  }
+
+  return `
+    <section class="thread-card thread-files-card">
+      <div class="workbench-card-head">
         <div>
-          <span class="thread-panel-kicker">Zusammenfassung</span>
-          <h3>${escapeHtml(presentation.overview.title)}</h3>
+          <p class="panel-kicker">Dateien</p>
+          <h3>Geaenderte Dateien und Diff</h3>
         </div>
         <div class="thread-panel-actions">
+          <button class="button-secondary thread-files-toggle" type="button" data-action="toggle-diff-panel">
+            ${icon(state.ui.diffViewer.open ? "panel-hide" : "panel-show")}
+            <span>${state.ui.diffViewer.open ? "Diff ausblenden" : "Diff einblenden"}</span>
+          </button>
           ${
-            presentation.durationLabel
-              ? `<span class="thread-panel-meta">${escapeHtml(presentation.durationLabel)} lang gearbeitet</span>`
-              : ""
-          }
-          ${
-            presentation.changes.length
+            state.ui.diffViewer.open
               ? `
-                <button class="thread-panel-toggle" type="button" data-action="toggle-diff-panel" aria-label="Diff-Bereich umschalten">
-                  ${state.ui.diffViewer.open ? "−" : "+"}
+                <button class="icon-button thread-panel-toggle" type="button" data-action="toggle-diff-expanded" aria-label="Diff-Bereich vergroessern">
+                  ${icon(state.ui.diffViewer.expanded ? "collapse" : "expand")}
+                </button>
+                <button class="icon-button thread-panel-toggle" type="button" data-action="close-diff-panel" aria-label="Diff-Bereich schliessen">
+                  ${icon("close")}
                 </button>
               `
               : ""
           }
         </div>
       </div>
-      <p class="thread-panel-copy">${escapeHtml(presentation.overview.summary)}</p>
-      <div class="thread-outcome-stats">
-        ${renderThreadOutcomeStat("Status", sessionBadgeText(session))}
-        ${renderThreadOutcomeStat("Checks", presentation.validation.statusLabel)}
-        ${renderThreadOutcomeStat("Dateien", changeLabel)}
-        ${renderThreadOutcomeStat("Schritte", String(session.tool_calls?.length || 0))}
+      <div class="thread-files-workbench ${state.ui.diffViewer.open ? "is-open" : ""} ${state.ui.diffViewer.expanded ? "is-expanded" : ""}">
+        <div class="thread-outcome-files">
+          ${presentation.changes
+            .map((change) => renderThreadOutcomeFile(change, diffFile?.path === change.path))
+            .join("")}
+        </div>
+        ${state.ui.diffViewer.open && diffFile ? renderThreadDiffViewer(diffFile) : ""}
       </div>
-      ${
-        presentation.changes.length
-          ? `
-            <div class="thread-outcome-files">
-              ${presentation.changes
-                .slice(0, 8)
-                .map((change) => renderThreadOutcomeFile(change, diffFile?.path === change.path))
-                .join("")}
-            </div>
-          `
-          : ""
-      }
     </section>
   `;
 }
@@ -3426,7 +3847,9 @@ function renderThreadOutcomeFile(change, active = false) {
       data-action="open-diff-file"
       data-path="${escapeAttribute(change.path)}"
     >
-      <span>${escapeHtml(labelForFileOperation(change.operation))}</span>
+      <span class="thread-outcome-file-badge tone-${escapeHtml(operationTone(change.operation))}">${escapeHtml(
+        labelForFileOperation(change.operation),
+      )}</span>
       <strong>${escapeHtml(shortenPath(change.path, 104))}</strong>
     </button>
   `;
@@ -3445,25 +3868,17 @@ function activeDiffFile(session) {
 
 function renderThreadDiffViewer(change) {
   return `
-    <aside class="thread-diff-panel">
+    <div class="thread-diff-panel">
       <div class="thread-diff-head">
         <div class="thread-diff-copy">
-          <span class="thread-panel-kicker">Aenderung</span>
+          <span class="thread-panel-kicker">Diff</span>
           <h3>${escapeHtml(shortenPath(change.path, 96))}</h3>
-        </div>
-        <div class="thread-diff-actions">
-          <button class="thread-panel-toggle" type="button" data-action="toggle-diff-expanded" aria-label="Diff-Bereich vergroessern oder verkleinern">
-            ${state.ui.diffViewer.expanded ? "−" : "+"}
-          </button>
-          <button class="thread-panel-toggle" type="button" data-action="close-diff-panel" aria-label="Diff-Bereich schliessen">
-            ×
-          </button>
         </div>
       </div>
       <div class="thread-diff-scroll">
         ${renderThreadDiff(change)}
       </div>
-    </aside>
+    </div>
   `;
 }
 
@@ -3858,34 +4273,41 @@ function renderChatInput() {
       : null;
 
   return `
-    <footer class="chat-input-shell">
+    <footer class="chat-input-shell workbench-composer-shell">
       <div class="chat-input-inner">
-        <div class="chat-input-container composer-panel minimal-composer-panel">
-          ${notice ? `<div class="composer-inline-status">${renderComposerNotice(notice)}</div>` : ""}
-          <div class="chat-input-row minimal-chat-input-row">
+        <div class="chat-input-container composer-panel workbench-composer-panel">
+          <div class="composer-topline">
+            <div class="composer-topline-copy">
+              <strong>${escapeHtml(workspace?.name || "Kein Projekt verbunden")}</strong>
+              <span>${escapeHtml(composerHint(workspace))}</span>
+            </div>
+            ${notice ? renderComposerNotice(notice) : renderComposerNotice({ label: "Shortcut", text: "Ctrl/Cmd + Enter sendet", tone: "muted" })}
+          </div>
+          <div class="chat-input-row workbench-chat-input-row">
             <textarea
               id="composerInput"
-              class="chat-input minimal-chat-input"
-              rows="3"
+              class="chat-input workbench-chat-input"
+              rows="1"
               placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
             ></textarea>
-            <button
-              class="send-button minimal-send-button ${running ? "stop" : "send"}"
-              type="button"
-              data-action="${running ? "stop-session" : "submit-prompt"}"
-              aria-label="${running ? "Stoppen" : "Senden"}"
-            >
-              ${icon(running ? "stop" : "arrow")}
-            </button>
+            <div class="composer-action-column">
+              ${renderComposerControlsMenu()}
+              <button
+                class="send-button workbench-send-button ${running ? "stop" : "send"}"
+                type="button"
+                data-action="${running ? "stop-session" : "submit-prompt"}"
+                aria-label="${running ? "Stoppen" : "Senden"}"
+              >
+                ${icon(running ? "stop" : "arrow")}
+              </button>
+            </div>
           </div>
-          <div class="composer-meta-row minimal-composer-footer">
+          <div class="composer-meta-row workbench-composer-footer">
             ${renderComposerMetaItem(workspace?.name || "Kein Projekt")}
             ${renderComposerMetaItem(state.composer.modelName || state.config?.model_name || "Standardmodell")}
             ${renderComposerMetaItem(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode))}
             ${renderComposerMetaItem(executionProfileLabelFromState())}
-            <button class="button-ghost composer-options-button minimal-composer-options" type="button" data-action="open-settings-page">
-              Optionen
-            </button>
+            <span class="composer-shortcut-hint">Ctrl/Cmd + Enter</span>
           </div>
         </div>
       </div>
@@ -3899,6 +4321,53 @@ function currentExecutionProfileLabel() {
 
 function renderComposerMetaItem(value) {
   return `<span class="composer-meta-item">${escapeHtml(value)}</span>`;
+}
+
+function renderComposerControlsMenu() {
+  return `
+    <details class="overflow-menu composer-controls-menu" data-preserve-open id="composer-controls-menu">
+      <summary class="overflow-action composer-options-trigger" aria-label="Composer Optionen">
+        ${icon("sliders")}
+        <span>Optionen</span>
+      </summary>
+      <div class="overflow-menu-panel composer-options-panel">
+        <label class="composer-control-field">
+          <span>Agent</span>
+          <select id="agentProfileSelect">
+            ${renderAgentProfileOptions()}
+          </select>
+        </label>
+        <label class="composer-control-field">
+          <span>Zugriff</span>
+          <select id="accessModeSelect">
+            ${renderAccessModeOptions()}
+          </select>
+        </label>
+        <label class="composer-control-field">
+          <span>Modell</span>
+          <select id="modelNameSelect">
+            ${renderModelOptions()}
+          </select>
+        </label>
+        <label class="composer-control-field">
+          <span>Profil</span>
+          <select id="executionProfileSelect">
+            ${renderExecutionProfileOptions()}
+          </select>
+        </label>
+        <label class="composer-control-toggle">
+          <span>
+            <strong>Trockenlauf</strong>
+            <small>Bereitet den Auftrag vor, ohne mutierende Schritte auszufuehren.</small>
+          </span>
+          <input id="dryRunToggle" type="checkbox"${state.composer.dryRun ? " checked" : ""} />
+        </label>
+        <button class="button-ghost composer-settings-link" type="button" data-action="open-settings-page">
+          Erweiterte Einstellungen
+        </button>
+      </div>
+    </details>
+  `;
 }
 
 function renderComposerNotice(notice) {
@@ -4663,11 +5132,56 @@ function syncTextArea(id, value) {
   autosizeTextarea(target);
 }
 
-function resetChatScrollState() {
-  state.ui.chatScroll = {
+function defaultChatScrollSnapshot() {
+  return {
     stickToBottom: true,
     distanceFromBottom: 0,
   };
+}
+
+function currentChatScrollKey(sourceState = state) {
+  if (sourceState.ui?.page === "settings") {
+    return "view:settings";
+  }
+  const sessionId = sourceState.activeSessionId || sourceState.activeSession?.id || null;
+  if (sessionId) {
+    return chatScrollKeyForSession(sessionId);
+  }
+  if (sourceState.selectedWorkspaceId) {
+    return `workspace:${sourceState.selectedWorkspaceId}:ready`;
+  }
+  return "workspace:empty";
+}
+
+function chatScrollKeyForSession(sessionId) {
+  return `session:${sessionId}`;
+}
+
+function readChatScrollState(key) {
+  return state.ui.chatScroll.positions[key] || null;
+}
+
+function writeChatScrollState(key, snapshot) {
+  state.ui.chatScroll.positions[key] = {
+    stickToBottom: Boolean(snapshot?.stickToBottom),
+    distanceFromBottom: Math.max(0, Number(snapshot?.distanceFromBottom) || 0),
+  };
+}
+
+function ensureChatScrollState(key) {
+  if (!key || readChatScrollState(key)) {
+    return;
+  }
+  writeChatScrollState(key, defaultChatScrollSnapshot());
+}
+
+function scrollKeyFromContainer(container) {
+  const key = container?.dataset?.scrollKey;
+  return key || currentChatScrollKey();
+}
+
+function resetChatScrollState(key = currentChatScrollKey()) {
+  writeChatScrollState(key, defaultChatScrollSnapshot());
 }
 
 function captureChatScrollState() {
@@ -4684,31 +5198,23 @@ function restoreChatScrollState() {
     return;
   }
 
-  const chatScroll = state.ui.chatScroll || {
-    stickToBottom: true,
-    distanceFromBottom: 0,
-  };
+  const key = scrollKeyFromContainer(container);
+  const chatScroll = readChatScrollState(key) || defaultChatScrollSnapshot();
   if (chatScroll.stickToBottom) {
     container.scrollTop = container.scrollHeight;
     return;
   }
 
   const nextDistance = Math.max(0, Number(chatScroll.distanceFromBottom) || 0);
-  container.scrollTop = Math.max(
-    0,
-    container.scrollHeight - container.clientHeight - nextDistance,
-  );
+  container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight - nextDistance);
 }
 
 function syncChatScrollState(container) {
-  const distanceFromBottom = Math.max(
-    0,
-    container.scrollHeight - container.scrollTop - container.clientHeight,
-  );
-  state.ui.chatScroll = {
+  const distanceFromBottom = Math.max(0, container.scrollHeight - container.scrollTop - container.clientHeight);
+  writeChatScrollState(scrollKeyFromContainer(container), {
     stickToBottom: distanceFromBottom <= CHAT_SCROLL_BOTTOM_THRESHOLD,
     distanceFromBottom,
-  };
+  });
 }
 
 function autosizeTextarea(textarea) {
@@ -4724,6 +5230,17 @@ function focusComposer() {
   if (target) {
     target.focus();
   }
+}
+
+function prefillComposer(prompt) {
+  const value = String(prompt || "").trim();
+  if (!value) {
+    focusComposer();
+    return;
+  }
+  state.composer.prompt = value;
+  renderApp();
+  focusComposer();
 }
 
 function threadPreview(session) {
@@ -6838,8 +7355,12 @@ function icon(name) {
   const icons = {
     plus:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>',
+    "project-add":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M2.5 6h4.2l1.6 1.7h9.2v6.8a2 2 0 0 1-2 2H4.5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/><path d="M14.5 4.5v4M12.5 6.5h4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/></svg>',
     folder:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M2.5 5.5h4.2l1.6 1.8h9.2v7.2a2 2 0 0 1-2 2H4.5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.6"/></svg>',
+    "folder-open":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M2.5 6h4l1.7 1.7h8.8a1.5 1.5 0 0 1 1.4 2l-1.5 4.6a2 2 0 0 1-1.9 1.4H4.3a1.9 1.9 0 0 1-1.8-2.4L4 7.5" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     edit:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 13.8V16h2.2l7.2-7.2-2.2-2.2zM12.5 4.7l2.2 2.2 1-1a1.6 1.6 0 0 0-2.2-2.2z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     compose:
@@ -6852,6 +7373,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor"/></svg>',
     close:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.8"/></svg>',
+    more:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><circle cx="5" cy="10" r="1.4" fill="currentColor"/><circle cx="10" cy="10" r="1.4" fill="currentColor"/><circle cx="15" cy="10" r="1.4" fill="currentColor"/></svg>',
     trash:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5.5 6.5h9M8 6.5V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M7 8.5v6M10 8.5v6M13 8.5v6M6.5 6.5l.6 9a1.8 1.8 0 0 0 1.8 1.5h2.2a1.8 1.8 0 0 0 1.8-1.5l.6-9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     broom:
@@ -6870,6 +7393,14 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><circle cx="8.5" cy="8.5" r="4.8" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m12.2 12.2 3.6 3.6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.6"/></svg>',
     spark:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M10 3.5 11.8 8.2 16.5 10l-4.7 1.8L10 16.5l-1.8-4.7L3.5 10l4.7-1.8z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
+    expand:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M7 3.5H3.5V7M13 3.5h3.5V7M7 16.5H3.5V13M13 16.5h3.5V13" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
+    collapse:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 6h8M6 10h8M6 14h8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/></svg>',
+    "panel-show":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M3.5 4.5h13v11h-13z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5v11" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10h4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/></svg>',
+    "panel-hide":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M3.5 4.5h13v11h-13z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.5v11" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10h4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/><path d="m11.5 6.5 4 7" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/></svg>',
     terminal:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M3.5 5.5h13v9h-13z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/><path d="m6 8 2 2-2 2M9.8 12h4.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
   };
