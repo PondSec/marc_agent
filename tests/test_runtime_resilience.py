@@ -183,6 +183,51 @@ def test_invoke_model_allows_delayed_response_before_timeout(monkeypatch):
     assert outcome.attempt.output_characters >= 5
 
 
+def test_invoke_model_watchdog_uses_provider_reported_effective_timeouts(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_resilience.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime_resilience.time, "sleep", clock.sleep)
+    blocker = threading.Event()
+
+    def hanging_invoke(progress):
+        progress(
+            {
+                "type": "status",
+                "stage": "request_started",
+                "model": "qwen2.5-coder:14b",
+                "startup_timeout": 10,
+                "inactivity_timeout": 6,
+                "total_timeout": 12,
+            }
+        )
+        blocker.wait(timeout=60)
+        return "never"
+
+    outcome = runtime_resilience.invoke_model(
+        hanging_invoke,
+        operation_name="task_state_generation",
+        task_class="task_state_generation",
+        attempt_number=1,
+        capability_tier="tier_a",
+        recovery_strategy="retry_same_backend",
+        prompt_variant="full",
+        model_identifier="qwen2.5-coder:14b",
+        backend_identifier="ollama",
+        startup_timeout_seconds=4,
+        inactivity_timeout_seconds=2,
+        total_timeout_seconds=5,
+    )
+
+    assert outcome.value is None
+    assert outcome.exception is not None
+    assert outcome.attempt.failure is not None
+    assert outcome.attempt.failure.failure_class == "startup_timeout"
+    assert 10.0 <= outcome.attempt.failure.elapsed_seconds < 11.0
+    assert outcome.attempt.failure.startup_timeout_seconds == 10
+    assert outcome.attempt.failure.inactivity_timeout_seconds == 6
+    assert outcome.attempt.failure.total_timeout_seconds == 12
+
+
 def test_invoke_model_watchdog_tracks_terminal_outcomes_across_multiple_attempts(monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(runtime_resilience.time, "monotonic", clock.monotonic)

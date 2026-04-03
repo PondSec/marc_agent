@@ -645,12 +645,15 @@ class ExecutionAttemptStateMachine:
         return None
 
     def _sync_timeouts(self, payload: dict[str, Any]) -> None:
-        if self.record.startup_timeout_seconds is None:
-            self.record.startup_timeout_seconds = _coerce_int(payload.get("startup_timeout"))
-        if self.record.inactivity_timeout_seconds is None:
-            self.record.inactivity_timeout_seconds = _coerce_int(payload.get("inactivity_timeout"))
-        if self.record.total_timeout_seconds is None:
-            self.record.total_timeout_seconds = _coerce_int(payload.get("total_timeout"))
+        startup_timeout = _coerce_int(payload.get("startup_timeout"))
+        inactivity_timeout = _coerce_int(payload.get("inactivity_timeout"))
+        total_timeout = _coerce_int(payload.get("total_timeout"))
+        if startup_timeout is not None and startup_timeout > 0:
+            self.record.startup_timeout_seconds = startup_timeout
+        if inactivity_timeout is not None and inactivity_timeout > 0:
+            self.record.inactivity_timeout_seconds = inactivity_timeout
+        if total_timeout is not None and total_timeout > 0:
+            self.record.total_timeout_seconds = total_timeout
 
     def _emit(self, payload: dict[str, Any]) -> None:
         if self._event_callback is None:
