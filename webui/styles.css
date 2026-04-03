@@ -10625,3 +10625,28 @@ body {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+
+/* Final alignment and diff color pass */
+
+.thread-transcript-layout,
+.thread-transcript-layout.with-review {
+  justify-content: center;
+}
+
+.thread-transcript-view,
+.workbench-composer {
+  width: min(100%, 760px);
+}
+
+.thread-diff-line.tone-add {
+  background: rgba(128, 239, 128, 0.18);
+}
+
+.thread-diff-line.tone-remove {
+  background: rgba(222, 49, 99, 0.16);
+}
+
+.thread-review-pane .thread-outcome-file.active {
+  box-shadow: inset 2px 0 0 #80ef80;
+  background: rgba(128, 239, 128, 0.08);
+}
