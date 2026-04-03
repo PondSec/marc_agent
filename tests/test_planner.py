@@ -17215,6 +17215,102 @@ def test_direct_main_option_contract_review_ignores_unrelated_test_option_tokens
     assert review is None
 
 
+def test_draft_update_decision_normalizes_direct_main_prefixed_argv_binding(tmp_path):
+    llm = ScriptedLLM(text_payloads=["def wrong():\n    return None\n"])
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])[1:]\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).lower())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package\n", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_greet_cli.py").write_text(
+        "def test_prefix_flag():\n"
+        "    main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py", "tests/__init__.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-prefixed-argv-binding",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    decision = planner._draft_update_decision(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "write_file"
+    assert "args = list(argv or [])" in decision.tool_args["content"]
+    assert "print(' '.join(args[1:]))" in decision.tool_args["content"]
+    assert llm.generate_calls == []
+
+
 def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[

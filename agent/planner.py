@@ -8365,6 +8365,15 @@ class Planner:
             has_return = any(line.lstrip().startswith("return") for line in branch_lines)
             if not has_print and not has_return:
                 return None
+            normalized_block_lines = list(block_lines)
+            for binding_index in range(index):
+                normalized_line = self._normalize_direct_main_option_binding_line(
+                    normalized_block_lines[binding_index],
+                    binding_name=branch_arg_name,
+                )
+                if normalized_line != normalized_block_lines[binding_index]:
+                    normalized_block_lines[binding_index] = normalized_line
+                    break
             replacement_lines = [block_lines[index]]
             if has_print:
                 replacement_lines.append(f"{branch_body_indent}print(' '.join({branch_arg_name}[1:]))\n")
@@ -8372,12 +8381,38 @@ class Planner:
                     replacement_lines.append(f"{branch_body_indent}return\n")
             else:
                 replacement_lines.append(f"{branch_body_indent}return ' '.join({branch_arg_name}[1:])\n")
-            updated_lines = [*lines[: start + index], *replacement_lines, *lines[start + branch_end_index :]]
+            updated_lines = [
+                *lines[:start],
+                *normalized_block_lines[:index],
+                *replacement_lines,
+                *normalized_block_lines[branch_end_index:],
+                *lines[end:],
+            ]
             updated_content = "".join(updated_lines)
             if updated_content == current_content:
                 return None
             return updated_content
         return None
+
+    def _normalize_direct_main_option_binding_line(
+        self,
+        raw_line: str,
+        *,
+        binding_name: str,
+    ) -> str:
+        pattern = re.compile(
+            rf"^(?P<indent>\s*){re.escape(binding_name)}\s*=\s*(?P<expr>.+?)\s*\[\s*1\s*:\s*\]\s*$"
+        )
+        stripped_line = raw_line.rstrip("\n")
+        match = pattern.match(stripped_line)
+        if match is None:
+            return raw_line
+        expression = str(match.group("expr") or "").strip()
+        if "argv" not in expression:
+            return raw_line
+        indent = str(match.group("indent") or "")
+        suffix = "\n" if raw_line.endswith("\n") else ""
+        return f"{indent}{binding_name} = {expression}{suffix}"
 
     def _direct_main_expected_payload_output(
         self,
