@@ -30,6 +30,7 @@ from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
     _direct_main_runtime_contract,
+    _direct_python_script_runtime_contract,
     _line_focused_excerpt,
     _repair_semantic_value_text,
     _repair_target_line_hints,
@@ -220,6 +221,14 @@ class WebContractFinding:
     token: str
     source_paths: tuple[str, ...]
     summary: str
+
+
+@dataclass(slots=True)
+class PythonSequencePrefixContract:
+    variable_expression: str
+    slice_length: int
+    literal_tokens: tuple[str, ...]
+    lineno: int
 
 
 class Planner:
@@ -8142,6 +8151,12 @@ class Planner:
             return False
         if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
             return False
+        direct_script_option_tokens, _ = self._direct_python_script_option_contract_details(
+            repair_context,
+            path=normalized_path,
+        )
+        if direct_script_option_tokens:
+            return False
         if self._repair_update_is_evidence_backed_behavior_adjustment(
             path=normalized_path,
             current_content=current_content,
@@ -8677,6 +8692,12 @@ class Planner:
                 session,
                 path=path,
                 current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._direct_python_script_option_contract_review(
+                path=path,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
             )
@@ -9389,6 +9410,268 @@ class Planner:
         combined = "\n".join([str(current_content or ""), str(proposed_content or "")])
         return bool(re.search(r"^\s*def\s+main\s*\(", combined, re.MULTILINE))
 
+    def _direct_python_script_option_contract_details(
+        self,
+        repair_context: ValidationFailureEvidence,
+        *,
+        path: str,
+        limit: int = 4,
+    ) -> tuple[list[str], list[str]]:
+        if repair_context.verification_scope != "runtime":
+            return [], []
+        return _direct_python_script_runtime_contract(
+            repair_context.command,
+            target_path=path,
+            limit=limit,
+        )
+
+    def _python_constant_string_sequence(
+        self,
+        node: ast.AST,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            return None
+        values: list[str] = []
+        for element in node.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+                return None
+            values.append(str(element.value))
+        return tuple(values)
+
+    def _python_prefix_slice_contract(
+        self,
+        sequence_node: ast.AST,
+        literal_node: ast.AST,
+    ) -> PythonSequencePrefixContract | None:
+        if not isinstance(sequence_node, ast.Subscript):
+            return None
+        slice_node = sequence_node.slice
+        if not isinstance(slice_node, ast.Slice):
+            return None
+        if slice_node.lower is not None or slice_node.step is not None:
+            return None
+        upper = slice_node.upper
+        if not isinstance(upper, ast.Constant) or not isinstance(upper.value, int):
+            return None
+        literal_tokens = self._python_constant_string_sequence(literal_node)
+        if literal_tokens is None:
+            return None
+        try:
+            variable_expression = ast.unparse(sequence_node.value).strip()
+        except Exception:
+            return None
+        if not variable_expression:
+            return None
+        return PythonSequencePrefixContract(
+            variable_expression=variable_expression,
+            slice_length=int(upper.value),
+            literal_tokens=literal_tokens,
+            lineno=int(getattr(sequence_node, "lineno", 0) or 0),
+        )
+
+    def _python_prefix_sequence_contracts(
+        self,
+        content: str,
+    ) -> list[PythonSequencePrefixContract]:
+        try:
+            tree = ast.parse(str(content or ""))
+        except SyntaxError:
+            return []
+        contracts: list[PythonSequencePrefixContract] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            if len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq) or len(node.comparators) != 1:
+                continue
+            comparator = node.comparators[0]
+            for sequence_node, literal_node in ((node.left, comparator), (comparator, node.left)):
+                contract = self._python_prefix_slice_contract(sequence_node, literal_node)
+                if contract is not None:
+                    contracts.append(contract)
+                    break
+        return contracts
+
+    def _python_sequence_accesses(
+        self,
+        content: str,
+        *,
+        variable_expression: str,
+    ) -> tuple[set[int], set[int]]:
+        try:
+            tree = ast.parse(str(content or ""))
+        except SyntaxError:
+            return set(), set()
+        index_accesses: set[int] = set()
+        slice_starts: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Subscript):
+                continue
+            try:
+                base_expression = ast.unparse(node.value).strip()
+            except Exception:
+                continue
+            if base_expression != variable_expression:
+                continue
+            slice_node = node.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
+                index_accesses.add(int(slice_node.value))
+                continue
+            if (
+                isinstance(slice_node, ast.Slice)
+                and isinstance(slice_node.lower, ast.Constant)
+                and isinstance(slice_node.lower.value, int)
+                and slice_node.upper is None
+                and slice_node.step is None
+            ):
+                slice_starts.add(int(slice_node.lower.value))
+        return index_accesses, slice_starts
+
+    def _direct_python_script_option_contract_review(
+        self,
+        *,
+        path: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        option_tokens, tail_tokens = self._direct_python_script_option_contract_details(
+            repair_context,
+            path=path,
+        )
+        if not option_tokens:
+            return None
+
+        lowered_proposed = str(proposed_content or "").lower()
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        option_preview = ", ".join(option_tokens[:3])
+        tail_preview = ", ".join(repr(token) for token in tail_tokens[:3])
+        missing_exact_tokens = [
+            token for token in option_tokens if token.lower() not in lowered_proposed
+        ]
+        if missing_exact_tokens:
+            repair_hints = [
+                f"Handle the exact direct script option token sequence {option_preview} in {path}; do not rewrite those tokens into stripped-hyphen or underscore-only lookalikes.",
+            ]
+            if tail_tokens:
+                repair_hints.append(
+                    f"After recognizing {option_preview}, derive behavior from the remaining argv payload {tail_preview} instead of hardcoding those sample values."
+                )
+            repair_hints.extend(
+                self._runtime_target_repair_hints(
+                    path,
+                    repair_context,
+                    evidence_lines=target_evidence,
+                )
+            )
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary=(
+                    "The proposed repair still misses the exact direct python script option tokens exercised by the failed runtime path."
+                ),
+                confidence=0.92,
+                blocking_issues=[
+                    (
+                        f"The failing runtime command invokes {Path(path).name} with option tokens like {option_preview}, "
+                        f"but the proposal never recognizes those exact tokens in {path}."
+                    )
+                ],
+                preservation_risks=[],
+                repair_hints=repair_hints[:4],
+            )
+
+        prefix_contracts = [
+            contract
+            for contract in self._python_prefix_sequence_contracts(proposed_content)
+            if any(token in option_tokens for token in contract.literal_tokens)
+        ]
+        for contract in prefix_contracts:
+            literal_preview = ", ".join(repr(token) for token in contract.literal_tokens)
+            if contract.slice_length != len(contract.literal_tokens):
+                repair_hints = [
+                    f"If you compare {contract.variable_expression}[:N] against a literal option sequence in {path}, keep the slice length aligned with the compared literal tokens.",
+                    f"Match the exercised option prefix {option_preview} on the real argv payload after {Path(path).name}; do not write a branch that can never satisfy the runtime contract.",
+                ]
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
+                )
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary=(
+                        "The proposed repair still misstates the direct python script argv prefix contract exercised by the failed runtime path."
+                    ),
+                    confidence=0.9,
+                    blocking_issues=[
+                        (
+                            f"The proposal compares {contract.variable_expression}[:{contract.slice_length}] against "
+                            f"{literal_preview} in {path}, but that branch can never match because the slice length "
+                            "and literal token count differ."
+                        )
+                    ],
+                    preservation_risks=[],
+                    repair_hints=repair_hints[:4],
+                )
+
+        payload_start = len(option_tokens)
+        for contract in prefix_contracts:
+            if payload_start <= 0:
+                break
+            if list(contract.literal_tokens) != option_tokens[: len(contract.literal_tokens)]:
+                continue
+            if contract.slice_length != payload_start:
+                continue
+            index_accesses, slice_starts = self._python_sequence_accesses(
+                proposed_content,
+                variable_expression=contract.variable_expression,
+            )
+            suspicious_slice_starts = sorted(
+                start for start in slice_starts if start > payload_start
+            )
+            if (
+                suspicious_slice_starts
+                and payload_start not in index_accesses
+                and payload_start not in slice_starts
+            ):
+                suspicious_start = suspicious_slice_starts[0]
+                repair_hints = [
+                    f"Once {contract.variable_expression}[:{payload_start}] matches {option_preview}, consume the remaining payload from {contract.variable_expression}[{payload_start}:] or {contract.variable_expression}[{payload_start}] onward instead of skipping past the first non-option token.",
+                ]
+                if tail_tokens:
+                    repair_hints.append(
+                        f"The exercised runtime payload after {option_preview} begins with {tail_preview}; do not drop that first payload token when formatting stdout."
+                    )
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
+                )
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary=(
+                        "The proposed repair still drops the first direct python script payload token after matching the exercised option prefix."
+                    ),
+                    confidence=0.88,
+                    blocking_issues=[
+                        (
+                            f"The proposal recognizes {option_preview} in {contract.variable_expression}[:{payload_start}] "
+                            f"but then consumes {contract.variable_expression}[{suspicious_start}:], which skips the first "
+                            "runtime payload token required by the failing path."
+                        )
+                    ],
+                    preservation_risks=[],
+                    repair_hints=repair_hints[:4],
+                )
+        return None
+
     def _direct_main_option_contract_argv_index_review(
         self,
         *,
@@ -9624,6 +9907,12 @@ class Planner:
                 session,
                 path=path,
                 current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._direct_python_script_option_contract_review(
+                path=path,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
             )

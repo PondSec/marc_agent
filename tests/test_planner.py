@@ -11732,6 +11732,166 @@ def test_targeted_runtime_prompt_hints_cover_direct_script_cli_contracts():
     assert any("stop echoing that option token" in hint for hint in hints)
 
 
+def test_direct_python_script_option_contract_review_rejects_impossible_prefix_slice(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-impossible-slice",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-impossible-slice",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:2] == ['--prefix']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "direct python script argv prefix contract" in review.summary
+    assert any("args[:2]" in issue and "never match" in issue for issue in review.blocking_issues)
+
+
+def test_direct_python_script_option_contract_review_rejects_payload_skip_without_first_tail_access(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-tail-skip",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-tail-skip",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:1] == ['--prefix']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "drops the first direct python script payload token" in review.summary
+    assert any("args[2:]" in issue or "first runtime payload token" in issue for issue in review.blocking_issues)
+
+
+def test_direct_python_script_option_contract_review_allows_explicit_first_tail_access(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-tail-safe",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-tail-safe",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:1] == ['--prefix'] and len(args) > 1:\n"
+            "        words = [args[1], *[word.capitalize() for word in args[2:]]]\n"
+            "        print(' '.join(words))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is None
+
+
 def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repair(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
@@ -14087,6 +14247,86 @@ def test_should_skip_model_backed_repair_review_disables_skip_for_first_evidence
             session.router_result,
             session,
             path="texttools/normalize.py",
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=None,
+        )
+        is False
+    )
+
+
+def test_should_skip_model_backed_repair_review_disables_skip_for_direct_script_option_contract(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Repair prefix_cli.py", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["prefix_cli.py"],
+        target_name="prefix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path formats the prefixed name correctly."],
+        evidence_signature="sig-direct-script-prefix-no-skip",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-no-skip",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            recent_failed_attempts=[],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:1] == ['--prefix']:\n"
+        "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+
+    assert (
+        planner._should_skip_model_backed_repair_review(
+            session.router_result,
+            session,
+            path="prefix_cli.py",
             current_content=current_content,
             proposed_content=proposed_content,
             reserve_model=None,
