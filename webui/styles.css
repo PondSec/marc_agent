@@ -10473,3 +10473,155 @@ body {
 .workbench-composer-footer {
   padding-top: 6px;
 }
+
+/* Sidebar row mechanics and upward composer menu */
+
+.sidebar-scroll {
+  gap: 16px;
+}
+
+.workbench-project-list {
+  gap: 4px;
+}
+
+.sidebar-entry-row,
+.thread-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.project-row,
+.thread-row {
+  display: grid;
+  gap: 2px;
+}
+
+.project-row-main,
+.thread-row-actions {
+  align-items: center;
+}
+
+.project-row-button,
+.thread-nav-row {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+}
+
+.project-row-button:hover,
+.thread-nav-row:hover {
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.project-row.active .project-row-button,
+.thread-row.active .thread-nav-row,
+.thread-nav-row.active {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.project-row-icon {
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: rgba(223, 229, 237, 0.76);
+}
+
+.project-row-title,
+.thread-nav-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.3;
+}
+
+.project-row-copy,
+.project-row-path,
+.project-row-meta,
+.project-row-count,
+.thread-nav-preview,
+.thread-nav-meta,
+.thread-nav-age {
+  display: none !important;
+}
+
+.sidebar-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.project-row:hover .sidebar-row-actions,
+.project-row:focus-within .sidebar-row-actions,
+.thread-row:hover .sidebar-row-actions,
+.thread-row:focus-within .sidebar-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.sidebar-row-icon-button {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(199, 206, 216, 0.76);
+}
+
+.sidebar-row-icon-button:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(240, 244, 247, 0.94);
+}
+
+.project-row-menu .overflow-menu-panel,
+.thread-row-menu .overflow-menu-panel {
+  right: 0;
+  top: calc(100% + 6px);
+}
+
+.project-thread-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 2px;
+  padding-left: 24px;
+}
+
+.project-thread-list .thread-nav-row {
+  padding-left: 10px;
+}
+
+.composer-controls-menu {
+  position: relative;
+}
+
+.composer-controls-menu .overflow-menu-panel {
+  top: auto;
+  right: 0;
+  bottom: calc(100% + 10px);
+  max-height: min(420px, calc(100vh - 180px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}

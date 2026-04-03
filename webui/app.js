@@ -2286,7 +2286,6 @@ function renderAuthStatusPanel(tone, loading, lockedSeconds) {
 function renderSidebar() {
   const workspace = selectedWorkspace();
   const activeRuns = state.sessions.filter((session) => isSessionRunning(session)).length;
-  const selectedSessions = workspace ? sessionsForWorkspace(workspace.id) : [];
 
   return `
     <div class="sidebar-shell sidebar-shell-minimal workbench-sidebar">
@@ -2327,7 +2326,6 @@ function renderSidebar() {
           </div>
           ${renderSidebarProjectList()}
         </section>
-        ${renderSidebarThreadSection(workspace, selectedSessions)}
       </div>
       ${renderSidebarFooter(activeRuns)}
     </div>
@@ -2353,38 +2351,35 @@ function renderSidebarProjectList() {
 function renderSidebarProject(workspace) {
   const active = workspace.id === activeWorkspaceId();
   const sessions = sessionsForWorkspace(workspace.id);
-  const activeRuns = sessions.filter((session) => isSessionRunning(session)).length;
-  const latestSession = sessions[0] || null;
   const disabled = isWorkspaceBusy(workspace.id);
-  const metaParts = [
-    countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`),
-    activeRuns ? `${activeRuns} aktiv` : "Bereit",
-    latestSession?.updated_at ? `Zuletzt ${formatSessionTimestamp(latestSession.updated_at)}` : "",
-  ].filter(Boolean);
 
   return `
     <div class="project-row ${active ? "active" : ""}">
-      <div class="project-row-main">
+      <div class="project-row-main sidebar-entry-row">
         <button
           class="project-button project-row-button"
           type="button"
           data-action="select-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
+          title="${escapeAttribute(workspace.name)}"
         >
-          <span class="project-row-mainline">
-            <span class="project-row-titlewrap">
-              <span class="project-button-icon project-row-icon" aria-hidden="true">${icon(active ? "folder-open" : "folder")}</span>
-              <span class="project-button-name project-row-title">${escapeHtml(workspace.name)}</span>
-            </span>
-            <span class="project-button-count project-row-count">${escapeHtml(String(sessions.length))}</span>
-          </span>
-          <span class="project-button-copy project-row-copy">
-            <span class="project-button-path project-row-path">${escapeHtml(shortenPath(workspace.path, 42))}</span>
-            <span class="project-row-meta">${escapeHtml(metaParts.join(" · "))}</span>
-          </span>
+          <span class="project-button-icon project-row-icon" aria-hidden="true">${icon("folder")}</span>
+          <span class="project-button-name project-row-title">${escapeHtml(workspace.name)}</span>
         </button>
-        ${renderProjectOverflowMenu(workspace, { disabled })}
+        <div class="sidebar-row-actions project-row-actions">
+          <button
+            class="icon-button sidebar-row-icon-button"
+            type="button"
+            data-action="edit-workspace"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt bearbeiten"
+          >
+            ${icon("edit")}
+          </button>
+          ${renderProjectOverflowMenu(workspace, { disabled, compact: true })}
+        </div>
       </div>
+      ${active && sessions.length ? `<div class="project-thread-list">${sessions.map(renderSidebarThreadItem).join("")}</div>` : ""}
     </div>
   `;
 }
@@ -2392,27 +2387,22 @@ function renderSidebarProject(workspace) {
 function renderSidebarThreadItem(session) {
   const active = session.id === state.activeSessionId;
   const title = session.title || session.last_message_preview || session.task || "Neuer Thread";
-  const changedCount = session.changed_files?.length || 0;
-  const meta = [
-    sessionBadgeText(session),
-    changedCount ? countLabel(changedCount, "1 Datei", `${changedCount} Dateien`) : "",
-  ].filter(Boolean);
 
   return `
-    <button
-      class="thread-nav-item thread-nav-row ${active ? "active" : ""}"
-      type="button"
-      data-action="open-session"
-      data-session-id="${escapeHtml(session.id)}"
-    >
-      <span class="thread-nav-main">
-        <span class="thread-nav-title">${escapeHtml(shorten(title, 40))}</span>
-        <span class="thread-nav-age">${escapeHtml(formatSessionTimestamp(session.updated_at))}</span>
-      </span>
-      <span class="thread-nav-meta thread-nav-card-meta">
-        ${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
-      </span>
-    </button>
+    <div class="thread-row ${active ? "active" : ""}">
+      <button
+        class="thread-nav-item thread-nav-row ${active ? "active" : ""}"
+        type="button"
+        data-action="open-session"
+        data-session-id="${escapeHtml(session.id)}"
+        title="${escapeAttribute(title)}"
+      >
+        <span class="thread-nav-title">${escapeHtml(title)}</span>
+      </button>
+      <div class="sidebar-row-actions thread-row-actions">
+        ${renderThreadOverflowMenu(session)}
+      </div>
+    </div>
   `;
 }
 
@@ -2452,10 +2442,10 @@ function renderSidebarThreadSection(workspace, sessions) {
 }
 
 function renderProjectOverflowMenu(workspace, options = {}) {
-  const { disabled = false } = options;
+  const { disabled = false, compact = false } = options;
   return `
     <details class="overflow-menu project-row-menu" data-preserve-open id="project-menu-${escapeHtml(workspace.id)}">
-      <summary class="overflow-action" aria-label="Projektaktionen">
+      <summary class="${compact ? "overflow-action sidebar-row-icon-button" : "overflow-action"}" aria-label="Projektaktionen">
         ${icon("more")}
       </summary>
       <div class="overflow-menu-panel">
@@ -2487,6 +2477,41 @@ function renderProjectOverflowMenu(workspace, options = {}) {
         >
           ${icon("trash")}
           <span>Projekt entfernen</span>
+        </button>
+      </div>
+    </details>
+  `;
+}
+
+function renderThreadOverflowMenu(session) {
+  const canDelete = !isSessionRunning(session);
+  const hasHandoff = Array.isArray(session?.changed_files) && session.changed_files.length > 0;
+
+  return `
+    <details class="overflow-menu thread-row-menu" data-preserve-open id="thread-menu-${escapeHtml(session.id)}">
+      <summary class="overflow-action sidebar-row-icon-button" aria-label="Threadaktionen">
+        ${icon("more")}
+      </summary>
+      <div class="overflow-menu-panel">
+        <button
+          class="overflow-menu-item"
+          type="button"
+          data-action="download-session-handoff"
+          data-session-id="${escapeHtml(session.id)}"
+          ${hasHandoff ? "" : "disabled"}
+        >
+          ${icon("download")}
+          <span>Handoff exportieren</span>
+        </button>
+        <button
+          class="overflow-menu-item danger"
+          type="button"
+          data-action="delete-session"
+          data-session-id="${escapeHtml(session.id)}"
+          ${canDelete ? "" : "disabled"}
+        >
+          ${icon("trash")}
+          <span>Thread loeschen</span>
         </button>
       </div>
     </details>
