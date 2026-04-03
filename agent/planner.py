@@ -21,6 +21,7 @@ from agent.models import (
     RepairAttemptRecord,
     SemanticChangeReview,
     SessionState,
+    ValidationCommand,
     ValidationFailureEvidence,
     ValidationRunRecord,
     WorkspaceSnapshot,
@@ -426,7 +427,8 @@ class Planner:
             if command is not None:
                 return self._validation_decision(
                     "Changed files must go through the remaining validation plan.",
-                    command,
+                    command.command,
+                    expected_stdout=command.expected_stdout,
                 )
             if self._requirements_review_missing(session):
                 self._run_semantic_change_review(route, session)
@@ -650,7 +652,11 @@ class Planner:
             if step.action == RouteActionName.RUN_VALIDATION and session.changed_files:
                 command = self._pick_validation_command(session)
                 if command is not None:
-                    return self._validation_decision(step.reason, command)
+                    return self._validation_decision(
+                        step.reason,
+                        command.command,
+                        expected_stdout=command.expected_stdout,
+                    )
 
             if step.action == RouteActionName.SUMMARIZE_RESULT:
                 return self._final_decision(
@@ -2166,7 +2172,8 @@ class Planner:
         if command is not None:
             return self._validation_decision(
                 "Only rerun validation after a substantive repair mutation has been prepared.",
-                command,
+                command.command,
+                expected_stdout=command.expected_stdout,
             )
 
         blocker = self._validation_repair_blocker_message(failed_run, repair_context)
@@ -3464,7 +3471,7 @@ class Planner:
                 return item
         return None
 
-    def _pick_validation_command(self, session: SessionState) -> str | None:
+    def _pick_validation_command(self, session: SessionState) -> ValidationCommand | None:
         passed = {
             self.validation_planner.command_identity(run.command)
             for run in session.validation_runs
@@ -3473,11 +3480,11 @@ class Planner:
         for item in session.validation_plan:
             identity = self.validation_planner.command_identity(item.command)
             if identity not in passed and self.validation_planner.can_repeat_command(session, item.command):
-                return item.command
+                return item
         for command in session.verification_commands:
             identity = self.validation_planner.command_identity(command)
             if command and identity not in passed and self.validation_planner.can_repeat_command(session, command):
-                return command
+                return ValidationCommand(command=command)
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return None
@@ -3490,11 +3497,11 @@ class Planner:
         for item in fallback_plan:
             identity = self.validation_planner.command_identity(item.command)
             if identity not in passed and self.validation_planner.can_repeat_command(session, item.command):
-                return item.command
+                return item
         for command in snapshot.likely_commands:
             identity = self.validation_planner.command_identity(command)
             if command and identity not in passed and self.validation_planner.can_repeat_command(session, command):
-                return command
+                return ValidationCommand(command=command)
         return None
 
     def _diagnostic_file_candidates(

@@ -22050,6 +22050,122 @@ def test_planner_reproduces_direct_cli_contract_with_expected_stdout(tmp_path):
     assert decision.tool_args["expected_stdout"] == "hello world"
 
 
+def test_planner_runs_pending_changed_file_validation_with_expected_stdout(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="debug",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "run_validation",
+                        "reason": "Verify the changed CLI behavior.",
+                    }
+                ],
+                target_paths=["prefix_cli.py"],
+                target_name="prefix_cli.py",
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the prefix CLI behavior safely.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python prefix_cli.py --prefix Ms. jane DOE",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="Ms. Jane Doe",
+                required=True,
+            ),
+            ValidationCommand(
+                command="python prefix_cli.py hello world",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="hello world",
+                required=True,
+            ),
+        ],
+    )
+    commit_task_state_and_route(planner, session, llm.json_payloads[0])
+    session.changed_files.append(FileChangeRecord(path="prefix_cli.py", operation="write"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python prefix_cli.py --prefix Ms. jane DOE"
+    assert decision.tool_args["expected_stdout"] == "Ms. Jane Doe"
+
+
+def test_planner_keeps_expected_stdout_for_second_pending_cli_contract(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="debug",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "run_validation",
+                        "reason": "Verify the remaining CLI contract.",
+                    }
+                ],
+                target_paths=["prefix_cli.py"],
+                target_name="prefix_cli.py",
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the prefix CLI behavior safely.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python prefix_cli.py --prefix Ms. jane DOE",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="Ms. Jane Doe",
+                required=True,
+            ),
+            ValidationCommand(
+                command="python prefix_cli.py hello world",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="hello world",
+                required=True,
+            ),
+        ],
+        validation_runs=[
+            ValidationRunRecord(
+                command="python prefix_cli.py --prefix Ms. jane DOE",
+                cwd=".",
+                kind="test",
+                verification_scope="runtime",
+                status="passed",
+                exit_code=0,
+                risk_level="medium",
+                iteration=4,
+                edit_generation=1,
+                summary="Validation command exited with 0.",
+                excerpt="Ms. Jane Doe\n",
+            )
+        ],
+    )
+    commit_task_state_and_route(planner, session, llm.json_payloads[0])
+    session.changed_files.append(FileChangeRecord(path="prefix_cli.py", operation="write"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python prefix_cli.py hello world"
+    assert decision.tool_args["expected_stdout"] == "hello world"
+
+
 def test_planner_plan_completion_criteria_uses_task_state_verification_target(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
