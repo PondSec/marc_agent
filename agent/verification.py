@@ -286,6 +286,7 @@ class ValidationPlanner:
         ]
         commands = self._merge_explicit_validation_commands(commands, session=session)
         commands = self._prefer_explicit_python_runtime_over_cli_smoke(commands)
+        commands = self._prefer_python_module_pytest_over_binary_pytest(commands)
         commands = self._replace_generic_unittest_commands(
             commands,
             snapshot=snapshot,
@@ -297,6 +298,7 @@ class ValidationPlanner:
         synthesized = self._synthesized_runtime_commands(
             snapshot,
             changed_paths,
+            commands=commands,
             session=session,
         )
         if synthesized:
@@ -502,6 +504,43 @@ class ValidationPlanner:
             filtered.append(command)
         return filtered
 
+    def _prefer_python_module_pytest_over_binary_pytest(
+        self,
+        commands: list[ValidationCommand],
+    ) -> list[ValidationCommand]:
+        explicit_module_signatures = {
+            signature[1]
+            for command in commands
+            if command.source in {"task_state", "user_request"}
+            and command.verification_scope == "runtime"
+            and (signature := self._pytest_command_signature(command.command)) is not None
+            and signature[0] == "python_module"
+        }
+        if not explicit_module_signatures:
+            return commands
+
+        filtered: list[ValidationCommand] = []
+        for command in commands:
+            signature = self._pytest_command_signature(command.command)
+            if signature is not None and signature[0] == "pytest_binary" and signature[1] in explicit_module_signatures:
+                continue
+            filtered.append(command)
+        return filtered
+
+    def _pytest_command_signature(self, command: str) -> tuple[str, tuple[str, ...]] | None:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+        lowered = [token.lower() for token in tokens]
+        if lowered[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):
+            return ("python_module", tuple(tokens[3:]))
+        if lowered[:1] == ["pytest"]:
+            return ("pytest_binary", tuple(tokens[1:]))
+        return None
+
     def _is_explicit_python_script_command(self, command: str) -> bool:
         try:
             tokens = shlex.split(str(command or "").strip())
@@ -534,11 +573,19 @@ class ValidationPlanner:
             raw_text = str(text or "")
             if not raw_text.strip():
                 continue
+            covered_pytest_signatures: set[tuple[str, ...]] = set()
             for spec in self.EXPLICIT_VALIDATION_COMMAND_SPECS:
                 for match in spec["pattern"].finditer(raw_text):
                     command = self._normalize_explicit_validation_command(match.group("command"))
                     if not command:
                         continue
+                    pytest_signature = self._pytest_command_signature(command)
+                    if pytest_signature is not None:
+                        flavor, suffix = pytest_signature
+                        if flavor == "python_module":
+                            covered_pytest_signatures.add(suffix)
+                        elif flavor == "pytest_binary" and suffix in covered_pytest_signatures:
+                            continue
                     extracted.append(
                         ValidationCommand(
                             command=command,
@@ -2827,9 +2874,10 @@ class ValidationPlanner:
         snapshot: WorkspaceSnapshot,
         changed_files: list[str],
         *,
+        commands: list[ValidationCommand],
         session: SessionState | None,
     ) -> list[ValidationCommand]:
-        if any(self.command_scope(command) == "runtime" for command in snapshot.validation_commands):
+        if any(self.command_scope(command) == "runtime" for command in commands):
             return []
         if session is not None and self.runtime_verification_required(session):
             return self.build_diagnostic_plan(session)

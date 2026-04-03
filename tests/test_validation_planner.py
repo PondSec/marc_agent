@@ -1854,6 +1854,124 @@ def test_validation_planner_prefers_explicit_python_cli_example_over_generic_smo
     assert explicit.required is True
 
 
+def test_validation_planner_deduplicates_nested_pytest_match_inside_python_module_request():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task=(
+            "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+            "in [lower, upper] begrenzen. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+        ),
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=(
+                "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+                "in [lower, upper] begrenzen. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+            ),
+            root_goal="Repair the failing range clamp behavior.",
+            active_goal="Fix the range clamp behavior and rerun the relevant test.",
+            goal_relation="report_problem",
+            output_expectation="Updated range helper plus a passing targeted pytest run.",
+            verification_target="Reproduce the failing path, apply the smallest safe fix, and rerun the most relevant validation.",
+            next_action="debug",
+            execution_strategy="debug_repair",
+        ),
+    )
+
+    commands = [item.command for item in planner._explicit_validation_commands(session)]
+
+    assert commands == ["python -m pytest tests/test_range_utils.py"]
+
+
+def test_validation_planner_skips_diagnostic_smokes_when_explicit_runtime_validation_exists():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["tests"],
+        important_files=["range_utils.py", "tests/test_range_utils.py"],
+        focus_files=["tests/test_range_utils.py", "range_utils.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_range_utils.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small Python helper with one focused pytest file.",
+    )
+    session = SessionState(
+        task=(
+            "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+            "in [lower, upper] begrenzen und lower/upper auch dann richtig behandeln, wenn sie "
+            "vertauscht uebergeben werden. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+        ),
+        workspace_root="/tmp/demo",
+        candidate_files=[
+            "tests/test_range_utils.py",
+            "range_utils.py",
+            "normalize_cli.py",
+            "tests/test_normalize.py",
+        ],
+        task_state=TaskState(
+            latest_user_turn=(
+                "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+                "in [lower, upper] begrenzen und lower/upper auch dann richtig behandeln, wenn sie "
+                "vertauscht uebergeben werden. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+            ),
+            root_goal="Repair the failing range clamp behavior.",
+            active_goal="Fix the range clamp behavior and rerun the relevant test.",
+            goal_relation="report_problem",
+            output_expectation="Updated range helper plus a passing targeted pytest run.",
+            verification_target="Reproduce the failing path, apply the smallest safe fix, and rerun the most relevant validation.",
+            next_action="debug",
+            execution_strategy="debug_repair",
+            target_artifacts=[
+                {"path": "range_utils.py", "name": "range_utils.py", "kind": ".py", "role": "primary_target", "confidence": 0.58},
+                {"path": "tests/test_range_utils.py", "name": "test_range_utils.py", "kind": ".py", "role": "validation_target", "confidence": 0.58},
+            ],
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["range_utils.py"],
+        session=session,
+    )
+
+    commands = [item.command for item in plan]
+
+    assert commands == ["python -m pytest tests/test_range_utils.py"]
+
+
+def test_validation_planner_keeps_explicit_pytest_binary_when_requested_directly():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Repariere range_utils.py und fuehre danach pytest tests/test_range_utils.py aus.",
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn="Repariere range_utils.py und fuehre danach pytest tests/test_range_utils.py aus.",
+            root_goal="Repair the failing range clamp behavior.",
+            active_goal="Fix the range clamp behavior and rerun the relevant test.",
+            goal_relation="report_problem",
+            output_expectation="Updated range helper plus a passing targeted pytest run.",
+            verification_target="pytest tests/test_range_utils.py",
+            next_action="debug",
+            execution_strategy="debug_repair",
+        ),
+    )
+
+    commands = [item.command for item in planner._explicit_validation_commands(session)]
+
+    assert commands == ["pytest tests/test_range_utils.py"]
+
+
 def test_validation_planner_targets_changed_unittest_module_instead_of_generic_command():
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(
