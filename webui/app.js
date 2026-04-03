@@ -2376,7 +2376,26 @@ function renderSidebarProject(workspace) {
           >
             ${icon("edit")}
           </button>
-          ${renderProjectOverflowMenu(workspace, { disabled, compact: true })}
+          <button
+            class="icon-button sidebar-row-icon-button warning"
+            type="button"
+            data-action="clear-workspace-contents"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt leeren"
+            ${disabled ? "disabled" : ""}
+          >
+            ${icon("broom")}
+          </button>
+          <button
+            class="icon-button sidebar-row-icon-button danger"
+            type="button"
+            data-action="delete-workspace"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt loeschen"
+            ${disabled ? "disabled" : ""}
+          >
+            ${icon("trash")}
+          </button>
         </div>
       </div>
       ${active && sessions.length ? `<div class="project-thread-list">${sessions.map(renderSidebarThreadItem).join("")}</div>` : ""}
