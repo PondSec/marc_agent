@@ -14723,6 +14723,158 @@ def test_validation_repair_relevance_review_rejects_unresolved_undefined_symbol(
     assert any("binds/imports 'sys'" in issue for issue in review.blocking_issues)
 
 
+def test_validation_repair_relevance_review_rejects_js_runtime_fix_that_skips_request_state_anchors(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt umschalten."
+        ),
+        workspace_root=str(tmp_path),
+    )
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    proposed_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "    return false; // Ensure the function returns 'false'\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_requirements=["Change app.js so the menu toggle initializes and toggles state correctly."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-request-anchors",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="app.js",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "failed runtime behavior" in review.summary.lower()
+    assert any("aria-expanded" in issue or "panel.hidden" in issue for issue in review.blocking_issues)
+
+
+def test_validation_repair_relevance_review_allows_js_runtime_fix_that_updates_request_state_anchors(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt umschalten."
+        ),
+        workspace_root=str(tmp_path),
+    )
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    proposed_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_requirements=["Change app.js so the menu toggle initializes and toggles state correctly."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-request-anchors-pass",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="app.js",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
+
+
 def test_fallback_proposed_update_review_reuses_runtime_symbol_review_after_model_timeout(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(task="Repair tests/test_wordfreq.py", workspace_root=str(tmp_path))

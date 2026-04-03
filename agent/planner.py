@@ -8708,6 +8708,7 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
+                session=session,
             )
         if review is None:
             review = self._repair_no_effective_change_review(
@@ -10373,6 +10374,7 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
+                session=session,
             )
         if review is None:
             review = self._repair_no_effective_change_review(
@@ -10893,6 +10895,7 @@ class Planner:
             current_content=current_content,
             proposed_content=proposed_content,
             repair_context=repair_context,
+            session=session,
         )
         if review is not None:
             return review
@@ -11553,6 +11556,7 @@ class Planner:
         current_content: str,
         proposed_content: str,
         repair_context: ValidationFailureEvidence | None,
+        session: SessionState | None = None,
     ) -> ProposedUpdateReview | None:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return None
@@ -11560,20 +11564,21 @@ class Planner:
             self._is_runtime_support_repair_target(path, repair_context)
             and Path(path).suffix.lower() not in {".py", ".pyi"}
         ):
-            return self._runtime_support_file_relevance_review(
+            support_review = self._runtime_support_file_relevance_review(
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
             )
-        if Path(path).suffix.lower() not in {".py", ".pyi"}:
-            return None
+            if support_review is not None:
+                return support_review
 
         identifiers = self._repair_identifiers_for_target(
             path,
             repair_context,
             current_content=current_content,
             proposed_content=proposed_content,
+            session=session,
         )
         if not identifiers:
             return None
@@ -11583,14 +11588,15 @@ class Planner:
             for identifier in identifiers
             if identifier in current_content or identifier in proposed_content
         ]
-        undefined_symbol_review = self._undefined_runtime_symbol_repair_review(
-            path=path,
-            current_content=current_content,
-            proposed_content=proposed_content,
-            repair_context=repair_context,
-        )
-        if undefined_symbol_review is not None:
-            return undefined_symbol_review
+        if Path(path).suffix.lower() in {".py", ".pyi"}:
+            undefined_symbol_review = self._undefined_runtime_symbol_repair_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+            if undefined_symbol_review is not None:
+                return undefined_symbol_review
         target_evidence = self._runtime_target_evidence_lines(path, repair_context)
         if not relevant_identifiers:
             evidence_hint = f" near {' | '.join(target_evidence[:2])}" if target_evidence else ""
@@ -12603,18 +12609,87 @@ class Planner:
         *,
         current_content: str,
         proposed_content: str,
+        session: SessionState | None = None,
     ) -> list[str]:
-        target_specific = self._target_specific_repair_identifiers(path, repair_context)
-        if target_specific:
-            relevant = [
+        candidates: list[str] = []
+        candidates.extend(self._target_specific_repair_identifiers(path, repair_context))
+        candidates.extend(self._repair_brief_implicated_identifiers(repair_context))
+        candidates.extend(
+            self._request_repair_identifiers(
+                session,
+                current_content=current_content,
+                proposed_content=proposed_content,
+            )
+        )
+        candidates.extend(self._repair_identifiers_from_failure_evidence(repair_context))
+
+        identifiers = self._unique_paths(
+            [
                 identifier
-                for identifier in target_specific
-                if identifier in current_content or identifier in proposed_content
+                for identifier in candidates
+                if identifier and not self._is_generic_runtime_repair_identifier(identifier)
             ]
-            if relevant:
-                return relevant[:6]
-            return target_specific[:6]
-        return self._repair_identifiers_from_failure_evidence(repair_context)
+        )
+        if not identifiers:
+            return []
+
+        relevant = [
+            identifier
+            for identifier in identifiers
+            if identifier in current_content or identifier in proposed_content
+        ]
+        if relevant:
+            return relevant[:8]
+        return identifiers[:8]
+
+    def _repair_brief_implicated_identifiers(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> list[str]:
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return []
+        return self._unique_paths(
+            [
+                str(identifier or "").strip()
+                for identifier in getattr(brief, "implicated_symbols", []) or []
+                if str(identifier or "").strip()
+            ]
+        )[:6]
+
+    def _request_repair_identifiers(
+        self,
+        session: SessionState | None,
+        *,
+        current_content: str,
+        proposed_content: str,
+    ) -> list[str]:
+        if session is None:
+            return []
+
+        texts: list[str] = [str(session.task or "").strip()]
+        task_state = getattr(session, "task_state", None)
+        if task_state is not None:
+            texts.append(str(getattr(task_state, "latest_user_turn", "") or "").strip())
+            texts.extend(str(item or "").strip() for item in getattr(task_state, "constraints", []) or [])
+
+        content_markers = f"{current_content}\n{proposed_content}"
+        identifiers: list[str] = []
+        patterns = (
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b",
+            r"(?<![A-Za-z0-9_])--?[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_](?![A-Za-z0-9_])",
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?=\()",
+        )
+        for text in texts:
+            if not text:
+                continue
+            for pattern in patterns:
+                for match in re.finditer(pattern, text):
+                    candidate = str(match.group(0) or "").strip()
+                    if not candidate or candidate not in content_markers:
+                        continue
+                    identifiers.append(candidate)
+        return self._unique_paths(identifiers)[:8]
 
     def _target_specific_repair_identifiers(
         self,
