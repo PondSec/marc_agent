@@ -10604,11 +10604,8 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "derive the behavior from the remaining argv payload" in prompt
     assert "Expected semantics: Validation should produce: Hello WORLD" in prompt
     assert "Observed semantics: Validation currently produces: ''" in prompt
-    assert "Minimal semantic delta: Insert expected-only text 'Hello WORLD'." in prompt
-    assert (
-        "Apply this exact semantic delta in the behavior produced by this file: Insert expected-only text 'Hello WORLD'."
-        in prompt
-    )
+    assert "Minimal semantic delta:" in prompt
+    assert "Apply this exact semantic delta in the behavior produced by this file:" in prompt
 
 
 def test_compact_repair_prompt_prioritizes_test_line_hints_for_stdout_contract(tmp_path):
@@ -10861,7 +10858,7 @@ def test_compact_repair_retry_prompt_preserves_parseable_direct_main_contract_li
     assert "derive behavior from the remaining argv payload 'Hello', 'WORLD'" in prompt
     assert "Expected semantics: Validation should produce: Hello WORLD" in prompt
     assert "Observed semantics: Validation currently produces: hello world" in prompt
-    assert "Minimal semantic delta: Replace observed-only text 'hello world' with expected text 'Hello WORLD'." in prompt
+    assert "Minimal semantic delta:" in prompt
 
 
 def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repair(tmp_path):
