@@ -303,6 +303,57 @@ def test_shell_web_runtime_smoke_reports_bootstrap_errors(tmp_path):
     assert "missingBootstrapCall" in result["stderr"]
 
 
+def test_shell_web_runtime_smoke_supports_insert_before_and_dynamic_button_events(tmp_path):
+    node_binary = shutil.which("node")
+    if not node_binary:
+        pytest.skip("node is required for web runtime smoke validation")
+
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<section class='panel'><p>Ready</p></section>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "document.addEventListener('DOMContentLoaded', () => {\n"
+            "  const panel = document.querySelector('.panel');\n"
+            "  const button = document.createElement('button');\n"
+            "  button.textContent = 'Toggle';\n"
+            "  button.addEventListener('click', () => {\n"
+            "    document.body.dataset.clicked = 'yes';\n"
+            "  });\n"
+            "  panel.insertBefore(button, panel.firstChild);\n"
+            "  setTimeout(() => {\n"
+            "    if (document.body.dataset.clicked !== 'yes') {\n"
+            "      throw new Error('dynamic button was not clicked');\n"
+            "    }\n"
+            "  }, 0);\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_runtime_smoke:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "runtime smoke passed" in result["stdout"]
+
+
 def test_shell_marks_zero_test_unittest_run_as_insufficient_validation(monkeypatch, tmp_path):
     config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
     config.ensure_state_dirs()

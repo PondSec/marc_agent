@@ -662,6 +662,26 @@ class ShellTools:
                 this._applyDescriptor(descriptor);
               }
 
+              get firstChild() {
+                return this.children[0] || null;
+              }
+
+              get nextSibling() {
+                if (!this.parentNode || !Array.isArray(this.parentNode.children)) {
+                  return null;
+                }
+                const index = this.parentNode.children.indexOf(this);
+                return index >= 0 ? this.parentNode.children[index + 1] || null : null;
+              }
+
+              get previousSibling() {
+                if (!this.parentNode || !Array.isArray(this.parentNode.children)) {
+                  return null;
+                }
+                const index = this.parentNode.children.indexOf(this);
+                return index > 0 ? this.parentNode.children[index - 1] || null : null;
+              }
+
               _applyDescriptor(descriptor) {
                 const attrs = descriptor.attributes || {};
                 for (const [name, value] of Object.entries(attrs)) {
@@ -731,10 +751,61 @@ class ShellTools:
                 }
               }
 
+              _detachFromParent() {
+                if (!this.parentNode || !Array.isArray(this.parentNode.children)) {
+                  return;
+                }
+                const siblings = this.parentNode.children;
+                const index = siblings.indexOf(this);
+                if (index >= 0) {
+                  siblings.splice(index, 1);
+                }
+                this.parentNode = null;
+              }
+
+              _registerChild(child) {
+                const owner = this.ownerDocument || child.ownerDocument;
+                if (!owner || typeof owner._registerElementTree !== "function") {
+                  return;
+                }
+                owner._registerElementTree(child);
+              }
+
               appendChild(child) {
+                if (!child) {
+                  return child;
+                }
+                if (typeof child._detachFromParent === "function") {
+                  child._detachFromParent();
+                }
+                child.ownerDocument = this.ownerDocument || child.ownerDocument;
                 child.parentNode = this;
                 this.children.push(child);
+                this._registerChild(child);
                 return child;
+              }
+
+              insertBefore(child, referenceChild) {
+                if (!child) {
+                  return child;
+                }
+                if (typeof child._detachFromParent === "function") {
+                  child._detachFromParent();
+                }
+                child.ownerDocument = this.ownerDocument || child.ownerDocument;
+                child.parentNode = this;
+                const index = referenceChild ? this.children.indexOf(referenceChild) : -1;
+                if (index < 0) {
+                  this.children.push(child);
+                } else {
+                  this.children.splice(index, 0, child);
+                }
+                this._registerChild(child);
+                return child;
+              }
+
+              remove() {
+                this._detachFromParent();
               }
 
               querySelector(selector) {
@@ -801,7 +872,21 @@ class ShellTools:
                   const element = new Element(descriptor);
                   element.ownerDocument = this;
                   this.body.appendChild(element);
+                }
+              }
+
+              _registerElementTree(element) {
+                if (!element) {
+                  return;
+                }
+                if (!element.ownerDocument) {
+                  element.ownerDocument = this;
+                }
+                if (!this.elements.includes(element)) {
                   this.elements.push(element);
+                }
+                for (const child of element.children || []) {
+                  this._registerElementTree(child);
                 }
               }
 
