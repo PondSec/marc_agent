@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
+
+import pytest
 
 from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
@@ -207,6 +210,97 @@ def test_shell_structural_web_validation_catches_dom_id_mismatch_across_referenc
 
     assert result["success"] is False
     assert "missing DOM ids referenced by JS (themeSwitcher)" in result["stderr"]
+
+
+def test_shell_web_runtime_smoke_executes_small_interactive_page(tmp_path):
+    node_binary = shutil.which("node")
+    if not node_binary:
+        pytest.skip("node is required for web runtime smoke validation")
+
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<form id='feedbackForm'>"
+            "<textarea id='feedbackInput' name='feedback'></textarea>"
+            "<button type='submit'>Save</button>"
+            "</form>"
+            "<p id='feedbackStatus'></p>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const form = document.getElementById('feedbackForm');\n"
+            "const input = document.getElementById('feedbackInput');\n"
+            "const status = document.getElementById('feedbackStatus');\n"
+            "form?.addEventListener('submit', (event) => {\n"
+            "  event.preventDefault();\n"
+            "  const value = input?.value.trim() || '';\n"
+            "  localStorage.setItem('feedback', value);\n"
+            "  status.textContent = value || 'empty';\n"
+            "  form.reset();\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_runtime_smoke:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "runtime smoke passed" in result["stdout"]
+
+
+def test_shell_web_runtime_smoke_reports_bootstrap_errors(tmp_path):
+    node_binary = shutil.which("node")
+    if not node_binary:
+        pytest.skip("node is required for web runtime smoke validation")
+
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<button id='launchButton'>Launch</button>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "document.addEventListener('DOMContentLoaded', () => {\n"
+            "  missingBootstrapCall();\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_runtime_smoke:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is False
+    assert "missingBootstrapCall" in result["stderr"]
 
 
 def test_shell_marks_zero_test_unittest_run_as_insufficient_validation(monkeypatch, tmp_path):

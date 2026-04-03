@@ -399,6 +399,8 @@ class ValidationPlanner:
             return "runtime"
         if lowered.startswith("internal:python_syntax:"):
             return "syntax"
+        if lowered.startswith("internal:web_runtime_smoke:"):
+            return "runtime"
         if lowered.startswith("internal:web_artifact:"):
             return "structural"
         if lowered.startswith("internal:semantic_review:"):
@@ -2034,6 +2036,25 @@ class ValidationPlanner:
                 existing.append(normalized)
         return existing
 
+    def _declared_workspace_candidate_paths(
+        self,
+        session: SessionState,
+        values: list[str],
+    ) -> list[str]:
+        workspace_root = Path(session.workspace_root).resolve()
+        declared: list[str] = []
+        for raw in self._unique_paths(values):
+            normalized = str(raw or "").strip().replace("\\", "/").removeprefix("./")
+            if not normalized:
+                continue
+            candidate = (workspace_root / normalized).resolve()
+            try:
+                candidate.relative_to(workspace_root)
+            except ValueError:
+                continue
+            declared.append(normalized)
+        return declared
+
     def _python_script_target_from_command(self, command: str) -> str | None:
         try:
             tokens = shlex.split(str(command or "").strip())
@@ -2691,6 +2712,17 @@ class ValidationPlanner:
                     reason="Check that local HTML asset references resolve.",
                 )
             )
+            if snapshot.file_count <= 40 and shutil.which("node"):
+                commands.append(
+                    ValidationCommand(
+                        command=f"internal:web_runtime_smoke:{json.dumps(html_targets)}",
+                        kind="test",
+                        verification_scope="runtime",
+                        source="default",
+                        priority=22,
+                        reason="Execute a bounded browser-like runtime smoke harness for the changed standalone web artifact.",
+                    )
+                )
 
         if js_files and shutil.which("node"):
             commands.append(
@@ -2725,9 +2757,20 @@ class ValidationPlanner:
     ) -> list[ValidationCommand]:
         if not any(command.verification_scope == "runtime" for command in commands):
             return commands
+        has_web_runtime_smoke = any(
+            command.command.startswith("internal:web_runtime_smoke:")
+            for command in commands
+        )
         return [
             command.model_copy(update={"required": False})
-            if command.source == "default" and command.verification_scope in {"syntax", "static", "structural"}
+            if (
+                command.source == "default"
+                and command.verification_scope in {"syntax", "static", "structural"}
+                and not (
+                    has_web_runtime_smoke
+                    and command.command.startswith("internal:web_artifact:")
+                )
+            )
             else command
             for command in commands
         ]
@@ -3036,7 +3079,8 @@ class ValidationPlanner:
                 for artifact in task_state.target_artifacts
                 if artifact.path and artifact.role != "supporting_context"
             ]
-            paths.extend(self._existing_workspace_candidate_paths(session, task_paths))
+            existing_task_paths = self._existing_workspace_candidate_paths(session, task_paths)
+            paths.extend(existing_task_paths or self._declared_workspace_candidate_paths(session, task_paths))
             if snapshot is not None:
                 paths.extend(
                     self._existing_workspace_candidate_paths(
@@ -3055,7 +3099,8 @@ class ValidationPlanner:
                         or artifact.kind == "test"
                     )
                 ]
-                paths.extend(self._existing_workspace_candidate_paths(session, test_paths))
+                existing_test_paths = self._existing_workspace_candidate_paths(session, test_paths)
+                paths.extend(existing_test_paths or self._declared_workspace_candidate_paths(session, test_paths))
             paths.extend(
                 item.path
                 for item in session.changed_files
@@ -3188,6 +3233,23 @@ class ValidationPlanner:
         return []
 
     def _unittest_targets_to_paths(self, targets: list[str]) -> list[str]:
+        normalized_targets = [str(target or "").strip() for target in targets if str(target or "").strip()]
+        if normalized_targets and normalized_targets[0].lower() == "discover":
+            start_directory: str | None = None
+            for index, token in enumerate(normalized_targets[1:], start=1):
+                lowered = token.lower()
+                if lowered in {"-s", "--start-directory"} and index + 1 < len(normalized_targets):
+                    start_directory = normalized_targets[index + 1]
+                    break
+            if not start_directory:
+                return []
+            cleaned_start = str(start_directory or "").strip().replace("\\", "/").removeprefix("./")
+            if not cleaned_start or cleaned_start.lower() in {"tests", "test"}:
+                return []
+            if cleaned_start.endswith(".py"):
+                return [cleaned_start]
+            return [f"{cleaned_start}.py"]
+
         paths: list[str] = []
         for target in targets:
             cleaned = str(target or "").strip()
@@ -3241,7 +3303,7 @@ class ValidationPlanner:
 
     def _expected_features_from_command(self, command: str) -> list[str]:
         kind, payload = self._decoded_internal_validation_payload(command)
-        if kind != "web_artifact":
+        if kind not in {"web_artifact", "web_runtime_smoke"}:
             return []
         values = payload if isinstance(payload, list) else [payload]
         features: list[str] = []

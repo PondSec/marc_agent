@@ -1657,7 +1657,46 @@ def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypat
     assert any(command.startswith("internal:python_syntax:") for command in commands)
     assert any(command.startswith("internal:web_artifact:") for command in commands)
     assert any(command.startswith("internal:html_refs:") for command in commands)
+    assert any(command.startswith("internal:web_runtime_smoke:") for command in commands)
     assert any(command.startswith("node --check") for command in commands)
+
+
+def test_validation_planner_keeps_structural_web_checks_required_when_runtime_smoke_exists(monkeypatch):
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=4,
+        language_counts={"html": 1, "javascript": 1},
+        top_directories=[],
+        important_files=["index.html", "app.js"],
+        focus_files=["index.html"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small standalone web artifact.",
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+
+    plan = planner.build_plan(
+        "Ergaenze einen keyboard-accessible Theme-Umschalter mit localStorage und Statusmeldung",
+        snapshot,
+        changed_files=["index.html", "app.js"],
+    )
+
+    structural = next(item for item in plan if item.command.startswith("internal:web_artifact:"))
+    runtime = next(item for item in plan if item.command.startswith("internal:web_runtime_smoke:"))
+
+    assert structural.required is True
+    assert runtime.verification_scope == "runtime"
 
 
 def test_validation_planner_prefers_runtime_smoke_for_small_python_entry_artifact():

@@ -10,6 +10,7 @@ import sys
 import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
+import textwrap
 
 from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
@@ -98,6 +99,8 @@ class ShellTools:
             return self._run_python_cli_smoke_validation(command, working_dir, relative_paths)
         if kind == "web_artifact":
             return self._run_web_artifact_validation(command, working_dir, relative_paths)
+        if kind == "web_runtime_smoke":
+            return self._run_web_runtime_smoke_validation(command, working_dir, relative_paths)
         if kind == "html_refs":
             return self._run_html_reference_validation(command, working_dir, relative_paths)
         return {
@@ -420,6 +423,627 @@ class ShellTools:
             "command": command,
         }
 
+    def _run_web_runtime_smoke_validation(self, command: str, working_dir: Path, payload_items: list) -> dict:
+        node_binary = shutil.which("node")
+        if not node_binary:
+            return {
+                "success": False,
+                "message": "Web runtime smoke test could not start because Node is unavailable.",
+                "risk_level": "low",
+                "stdout": "",
+                "stderr": "Node is required for internal:web_runtime_smoke validation.",
+                "exit_code": 1,
+                "command": command,
+            }
+
+        failures: list[str] = []
+        summaries: list[str] = []
+        checked = 0
+        max_targets = 2
+
+        for item in payload_items[:max_targets]:
+            descriptor = item if isinstance(item, dict) else {"path": item}
+            relative_path = str(descriptor.get("path") or "").strip()
+            if not relative_path:
+                continue
+            target = self.workspace.resolve_path(working_dir / relative_path)
+            if not target.exists():
+                failures.append(f"Missing HTML file: {relative_path}")
+                continue
+
+            parser = _HTMLArtifactParser()
+            parser.feed(target.read_text(encoding="utf-8"))
+            checked += 1
+
+            missing_refs: list[str] = []
+            script_texts: list[tuple[str, str]] = []
+            for reference in parser.references:
+                resolved = (target.parent / reference).resolve()
+                if not resolved.exists():
+                    missing_refs.append(reference)
+                    continue
+                if Path(reference).suffix.lower() in {".js", ".mjs", ".cjs"}:
+                    script_texts.append((reference, resolved.read_text(encoding="utf-8")))
+
+            if missing_refs:
+                failures.extend(f"{relative_path} -> {reference}" for reference in missing_refs)
+                continue
+
+            script_texts.extend(
+                (f"{relative_path}#inline-script-{index + 1}", content)
+                for index, content in enumerate(parser.inline_scripts)
+            )
+
+            runtime_result = self._execute_web_runtime_smoke(
+                node_binary=node_binary,
+                relative_path=relative_path,
+                elements=parser.elements,
+                script_texts=script_texts,
+            )
+            summaries.append(str(runtime_result.get("stdout") or "").strip())
+            if not runtime_result["success"]:
+                failure_text = str(runtime_result.get("stderr") or runtime_result.get("stdout") or "").strip()
+                failures.append(f"{relative_path}: {failure_text or 'Runtime smoke failed.'}")
+
+        success = not failures and checked > 0
+        return {
+            "success": success,
+            "message": (
+                "Runtime web smoke validation passed."
+                if success
+                else "Runtime web smoke validation failed."
+            ),
+            "risk_level": "low",
+            "stdout": "\n".join(part for part in summaries if part).strip(),
+            "stderr": "\n".join(failures),
+            "exit_code": 0 if success else 1,
+            "command": command,
+        }
+
+    def _execute_web_runtime_smoke(
+        self,
+        *,
+        node_binary: str,
+        relative_path: str,
+        elements: list[dict[str, object]],
+        script_texts: list[tuple[str, str]],
+    ) -> dict[str, object]:
+        payload = {
+            "path": relative_path,
+            "elements": elements,
+            "scripts": [
+                {"label": label, "content": content}
+                for label, content in script_texts
+            ],
+        }
+        harness = textwrap.dedent(
+            """
+            const fs = require("fs");
+            const vm = require("vm");
+
+            const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+
+            class EventTarget {
+              constructor() {
+                this._listeners = new Map();
+              }
+
+              addEventListener(type, handler) {
+                if (!type || typeof handler !== "function") {
+                  return;
+                }
+                const bucket = this._listeners.get(type) || [];
+                bucket.push(handler);
+                this._listeners.set(type, bucket);
+              }
+
+              removeEventListener(type, handler) {
+                const bucket = this._listeners.get(type);
+                if (!bucket) {
+                  return;
+                }
+                this._listeners.set(
+                  type,
+                  bucket.filter((candidate) => candidate !== handler),
+                );
+              }
+
+              dispatchEvent(event) {
+                if (!event || !event.type) {
+                  throw new Error("Event object with a type is required.");
+                }
+                event.target = event.target || this;
+                event.currentTarget = this;
+                const bucket = this._listeners.get(event.type) || [];
+                for (const handler of bucket) {
+                  handler.call(this, event);
+                }
+                return !event.defaultPrevented;
+              }
+            }
+
+            class BasicEvent {
+              constructor(type, init = {}) {
+                this.type = type;
+                this.bubbles = Boolean(init.bubbles);
+                this.cancelable = Boolean(init.cancelable);
+                this.defaultPrevented = false;
+                this.detail = init.detail;
+                this.key = init.key || "";
+                this.target = init.target || null;
+                this.currentTarget = null;
+              }
+
+              preventDefault() {
+                if (this.cancelable) {
+                  this.defaultPrevented = true;
+                }
+              }
+            }
+
+            class BasicCustomEvent extends BasicEvent {
+              constructor(type, init = {}) {
+                super(type, init);
+                this.detail = init.detail;
+              }
+            }
+
+            class ClassList {
+              constructor(owner, values = []) {
+                this.owner = owner;
+                this.values = new Set(values.filter(Boolean));
+              }
+
+              add(...tokens) {
+                for (const token of tokens) {
+                  if (token) {
+                    this.values.add(token);
+                  }
+                }
+                this.owner._syncClassAttr();
+              }
+
+              remove(...tokens) {
+                for (const token of tokens) {
+                  this.values.delete(token);
+                }
+                this.owner._syncClassAttr();
+              }
+
+              contains(token) {
+                return this.values.has(token);
+              }
+
+              toggle(token, force) {
+                if (force === true) {
+                  this.values.add(token);
+                  this.owner._syncClassAttr();
+                  return true;
+                }
+                if (force === false) {
+                  this.values.delete(token);
+                  this.owner._syncClassAttr();
+                  return false;
+                }
+                if (this.values.has(token)) {
+                  this.values.delete(token);
+                  this.owner._syncClassAttr();
+                  return false;
+                }
+                this.values.add(token);
+                this.owner._syncClassAttr();
+                return true;
+              }
+
+              toString() {
+                return [...this.values].join(" ");
+              }
+            }
+
+            class Element extends EventTarget {
+              constructor(descriptor = {}) {
+                super();
+                this.tagName = String(descriptor.tag || "div").toUpperCase();
+                this.nodeName = this.tagName;
+                this.id = String(descriptor.id || "");
+                this.name = String(descriptor.name || "");
+                this.type = String(descriptor.type || "");
+                this.value = "";
+                this.checked = false;
+                this.textContent = "";
+                this.innerHTML = "";
+                this.children = [];
+                this.parentNode = null;
+                this.ownerDocument = null;
+                this.style = {};
+                this.dataset = {};
+                this.attributes = {};
+                this.classList = new ClassList(this, descriptor.classes || []);
+                this._applyDescriptor(descriptor);
+              }
+
+              _applyDescriptor(descriptor) {
+                const attrs = descriptor.attributes || {};
+                for (const [name, value] of Object.entries(attrs)) {
+                  this.setAttribute(name, value);
+                }
+                if (descriptor.id) {
+                  this.setAttribute("id", descriptor.id);
+                }
+                if (descriptor.name) {
+                  this.setAttribute("name", descriptor.name);
+                }
+                if (descriptor.type) {
+                  this.setAttribute("type", descriptor.type);
+                }
+                for (const klass of descriptor.classes || []) {
+                  this.classList.add(klass);
+                }
+                this.value = this.tagName === "SELECT" ? "dark" : "demo";
+                if (this.type === "checkbox") {
+                  this.checked = true;
+                  this.value = "dark";
+                }
+              }
+
+              _syncClassAttr() {
+                const value = this.classList.toString();
+                if (value) {
+                  this.attributes.class = value;
+                } else {
+                  delete this.attributes.class;
+                }
+              }
+
+              setAttribute(name, value) {
+                const normalizedName = String(name || "");
+                const normalizedValue = String(value ?? "");
+                this.attributes[normalizedName] = normalizedValue;
+                if (normalizedName === "id") {
+                  this.id = normalizedValue;
+                } else if (normalizedName === "name") {
+                  this.name = normalizedValue;
+                } else if (normalizedName === "type") {
+                  this.type = normalizedValue;
+                } else if (normalizedName === "class") {
+                  this.classList = new ClassList(this, normalizedValue.split(/\\s+/).filter(Boolean));
+                } else if (normalizedName.startsWith("data-")) {
+                  const key = normalizedName
+                    .slice(5)
+                    .replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+                  this.dataset[key] = normalizedValue;
+                }
+              }
+
+              getAttribute(name) {
+                return Object.prototype.hasOwnProperty.call(this.attributes, name)
+                  ? this.attributes[name]
+                  : null;
+              }
+
+              removeAttribute(name) {
+                delete this.attributes[name];
+                if (name === "id") {
+                  this.id = "";
+                }
+                if (name === "class") {
+                  this.classList = new ClassList(this, []);
+                }
+              }
+
+              appendChild(child) {
+                child.parentNode = this;
+                this.children.push(child);
+                return child;
+              }
+
+              querySelector(selector) {
+                return this.ownerDocument ? this.ownerDocument.querySelector(selector) : null;
+              }
+
+              querySelectorAll(selector) {
+                return this.ownerDocument ? this.ownerDocument.querySelectorAll(selector) : [];
+              }
+
+              focus() {}
+
+              blur() {}
+
+              reset() {
+                if (!this.ownerDocument) {
+                  return;
+                }
+                for (const element of this.ownerDocument.elements) {
+                  if (element === this) {
+                    continue;
+                  }
+                  if (["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName)) {
+                    element.value = "";
+                    if (element.type === "checkbox") {
+                      element.checked = false;
+                    }
+                  }
+                }
+              }
+            }
+
+            function buildStorage() {
+              const values = new Map();
+              return {
+                getItem(key) {
+                  return values.has(key) ? values.get(key) : null;
+                },
+                setItem(key, value) {
+                  values.set(String(key), String(value));
+                },
+                removeItem(key) {
+                  values.delete(String(key));
+                },
+                clear() {
+                  values.clear();
+                },
+              };
+            }
+
+            class Document extends EventTarget {
+              constructor(descriptors = []) {
+                super();
+                this.readyState = "complete";
+                this.elements = [];
+                this.documentElement = new Element({ tag: "html" });
+                this.body = new Element({ tag: "body" });
+                this.documentElement.ownerDocument = this;
+                this.body.ownerDocument = this;
+                this.documentElement.appendChild(this.body);
+                this.elements.push(this.documentElement, this.body);
+
+                for (const descriptor of descriptors) {
+                  const element = new Element(descriptor);
+                  element.ownerDocument = this;
+                  this.body.appendChild(element);
+                  this.elements.push(element);
+                }
+              }
+
+              createElement(tagName) {
+                const element = new Element({ tag: tagName });
+                element.ownerDocument = this;
+                return element;
+              }
+
+              getElementById(id) {
+                return this.elements.find((element) => element.id === String(id)) || null;
+              }
+
+              querySelector(selector) {
+                return this.querySelectorAll(selector)[0] || null;
+              }
+
+              querySelectorAll(selector) {
+                const normalized = String(selector || "").trim();
+                if (!normalized) {
+                  return [];
+                }
+                if (normalized === "body") {
+                  return [this.body];
+                }
+                if (normalized === "html") {
+                  return [this.documentElement];
+                }
+                if (normalized.startsWith("#")) {
+                  const match = this.getElementById(normalized.slice(1));
+                  return match ? [match] : [];
+                }
+                if (normalized.startsWith(".")) {
+                  const token = normalized.slice(1);
+                  return this.elements.filter((element) => element.classList.contains(token));
+                }
+
+                const attrMatch = normalized.match(/^([a-zA-Z0-9_-]+)?\\[(.+?)\\]$/);
+                if (attrMatch) {
+                  const tagName = attrMatch[1] ? attrMatch[1].toUpperCase() : null;
+                  const [rawAttr, rawValue] = attrMatch[2].split("=");
+                  const attrName = String(rawAttr || "").trim();
+                  const attrValue = rawValue
+                    ? String(rawValue).trim().replace(/^["']|["']$/g, "")
+                    : null;
+                  return this.elements.filter((element) => {
+                    if (tagName && element.tagName !== tagName) {
+                      return false;
+                    }
+                    const current = element.getAttribute(attrName);
+                    if (current === null) {
+                      return false;
+                    }
+                    if (attrValue === null) {
+                      return true;
+                    }
+                    return current === attrValue;
+                  });
+                }
+
+                return this.elements.filter((element) => element.tagName === normalized.toUpperCase());
+              }
+            }
+
+            async function main() {
+              const document = new Document(payload.elements || []);
+              const localStorage = buildStorage();
+              const sessionStorage = buildStorage();
+              const windowTarget = new EventTarget();
+              const windowObject = {
+                window: null,
+                self: null,
+                globalThis: null,
+                document,
+                navigator: { userAgent: "marc-web-runtime-smoke" },
+                location: {
+                  href: "http://localhost/",
+                  reload() {},
+                },
+                localStorage,
+                sessionStorage,
+                console,
+                setTimeout,
+                clearTimeout,
+                setInterval,
+                clearInterval,
+                requestAnimationFrame(callback) {
+                  return setTimeout(() => callback(Date.now()), 0);
+                },
+                cancelAnimationFrame(handle) {
+                  clearTimeout(handle);
+                },
+                matchMedia() {
+                  return {
+                    matches: false,
+                    addEventListener() {},
+                    removeEventListener() {},
+                    addListener() {},
+                    removeListener() {},
+                  };
+                },
+                getComputedStyle() {
+                  return {
+                    getPropertyValue() {
+                      return "";
+                    },
+                  };
+                },
+                alert() {},
+                confirm() {
+                  return true;
+                },
+                Event: BasicEvent,
+                CustomEvent: BasicCustomEvent,
+                Element,
+                HTMLElement: Element,
+                Node: Element,
+                addEventListener: (...args) => windowTarget.addEventListener(...args),
+                removeEventListener: (...args) => windowTarget.removeEventListener(...args),
+                dispatchEvent: (...args) => windowTarget.dispatchEvent(...args),
+              };
+              windowObject.window = windowObject;
+              windowObject.self = windowObject;
+              windowObject.globalThis = windowObject;
+              document.defaultView = windowObject;
+              document.location = windowObject.location;
+
+              const context = vm.createContext(windowObject);
+              context.document = document;
+              context.window = windowObject;
+              context.self = windowObject;
+              context.globalThis = windowObject;
+              context.localStorage = localStorage;
+              context.sessionStorage = sessionStorage;
+              context.navigator = windowObject.navigator;
+              context.location = windowObject.location;
+              context.Event = BasicEvent;
+              context.CustomEvent = BasicCustomEvent;
+              context.Element = Element;
+              context.HTMLElement = Element;
+              context.Node = Element;
+              context.console = console;
+              context.setTimeout = setTimeout;
+              context.clearTimeout = clearTimeout;
+              context.setInterval = setInterval;
+              context.clearInterval = clearInterval;
+              context.requestAnimationFrame = windowObject.requestAnimationFrame;
+              context.cancelAnimationFrame = windowObject.cancelAnimationFrame;
+              context.matchMedia = windowObject.matchMedia;
+              context.getComputedStyle = windowObject.getComputedStyle;
+              context.alert = windowObject.alert;
+              context.confirm = windowObject.confirm;
+              context.global = windowObject;
+
+              const failures = [];
+              process.on("uncaughtException", (error) => {
+                failures.push(error);
+              });
+
+              for (const script of payload.scripts || []) {
+                const body = String(script.content || "");
+                if (!body.trim()) {
+                  continue;
+                }
+                const source = new vm.Script(body, { filename: script.label || payload.path || "inline-script.js" });
+                source.runInContext(context, { timeout: 2000 });
+              }
+
+              document.dispatchEvent(new BasicEvent("DOMContentLoaded", { bubbles: true }));
+              windowObject.dispatchEvent(new BasicEvent("load"));
+
+              for (const element of document.elements) {
+                if (["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName)) {
+                  if (!element.value) {
+                    element.value = element.type === "checkbox" ? "dark" : "demo";
+                  }
+                  element.dispatchEvent(new BasicEvent("input", { bubbles: true, target: element }));
+                  element.dispatchEvent(new BasicEvent("change", { bubbles: true, target: element }));
+                }
+              }
+              for (const element of document.elements) {
+                if (element.tagName === "BUTTON") {
+                  element.dispatchEvent(new BasicEvent("click", { bubbles: true, target: element }));
+                }
+              }
+              for (const element of document.elements) {
+                if (element.tagName === "FORM") {
+                  element.dispatchEvent(new BasicEvent("submit", { bubbles: true, cancelable: true, target: element }));
+                }
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, 15));
+
+              if (failures.length > 0) {
+                throw failures[0];
+              }
+
+              const scriptCount = Array.isArray(payload.scripts) ? payload.scripts.length : 0;
+              console.log(`${payload.path}: runtime smoke passed; scripts executed: ${scriptCount}; synthetic events: DOMContentLoaded, load, input, change, click, submit.`);
+            }
+
+            main().catch((error) => {
+              const detail = error && error.stack ? error.stack : String(error);
+              console.error(detail);
+              process.exit(1);
+            });
+            """
+        ).strip()
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as payload_file:
+            payload_file.write(payload_text)
+            payload_path = payload_file.name
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".cjs", delete=False) as harness_file:
+            harness_file.write(harness)
+            harness_path = harness_file.name
+        try:
+            completed = subprocess.run(
+                [node_binary, harness_path, payload_path],
+                cwd=self.workspace.root,
+                text=True,
+                capture_output=True,
+                timeout=min(max(int(self.config.shell_timeout), 1), 12),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = str(exc.stdout or "")[-self.config.max_read_chars :]
+            stderr = str(exc.stderr or "")[-self.config.max_read_chars :]
+            return {
+                "success": False,
+                "stdout": stdout,
+                "stderr": stderr or "Runtime smoke timed out.",
+            }
+        finally:
+            Path(payload_path).unlink(missing_ok=True)
+            Path(harness_path).unlink(missing_ok=True)
+
+        return {
+            "success": completed.returncode == 0,
+            "stdout": str(completed.stdout or "")[-self.config.max_read_chars :].strip(),
+            "stderr": str(completed.stderr or "")[-self.config.max_read_chars :].strip(),
+        }
+
     def _normalized_web_token_space(self, parts) -> str:
         if not isinstance(parts, (list, tuple)):
             parts = list(parts)
@@ -616,6 +1240,7 @@ class _HTMLReferenceParser(HTMLParser):
 class _HTMLArtifactParser(_HTMLReferenceParser):
     def __init__(self) -> None:
         super().__init__()
+        self.elements: list[dict[str, object]] = []
         self.inline_scripts: list[str] = []
         self.visible_text: list[str] = []
         self.ids: list[str] = []
@@ -627,6 +1252,7 @@ class _HTMLArtifactParser(_HTMLReferenceParser):
 
     def reset_refs(self) -> None:
         super().reset_refs()
+        self.elements = []
         self.inline_scripts = []
         self.visible_text = []
         self.ids = []
@@ -645,6 +1271,18 @@ class _HTMLArtifactParser(_HTMLReferenceParser):
 
     def handle_starttag(self, tag: str, attrs) -> None:
         attrs_dict = {str(key): str(value) for key, value in attrs if value}
+        descriptor: dict[str, object] = {"tag": tag}
+        if attrs_dict.get("id"):
+            descriptor["id"] = attrs_dict["id"]
+        if attrs_dict.get("class"):
+            descriptor["classes"] = attrs_dict["class"].split()
+        if attrs_dict.get("name"):
+            descriptor["name"] = attrs_dict["name"]
+        if attrs_dict.get("type"):
+            descriptor["type"] = attrs_dict["type"]
+        if attrs_dict:
+            descriptor["attributes"] = attrs_dict
+        self.elements.append(descriptor)
         self.tags.append(tag)
         if attrs_dict.get("id"):
             self.ids.append(attrs_dict["id"])
