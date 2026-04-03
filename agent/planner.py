@@ -7299,6 +7299,102 @@ class Planner:
             )
         )
 
+    def _review_reported_missing_literal(
+        self,
+        *,
+        path: str,
+        issue: str,
+    ) -> str | None:
+        normalized_path = str(path or "").strip()
+        text = str(issue or "").strip()
+        if not normalized_path or not text:
+            return None
+        prefix = f"The exact requested literal is missing from {normalized_path}:"
+        if not text.startswith(prefix):
+            return None
+        literal = text[len(prefix) :].strip()
+        return literal or None
+
+    def _sanitize_model_backed_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        review: ProposedUpdateReview,
+    ) -> ProposedUpdateReview:
+        if review.safe_to_write or not review.blocking_issues:
+            return review
+        scope = _artifact_scoped_focus(
+            route,
+            session,
+            path,
+            current_content=current_content,
+        )
+        supported_literals = {
+            str(item or "").strip()
+            for item in scope.get("literal_constraints", [])
+            if str(item or "").strip()
+        }
+        retained_issues: list[str] = []
+        discarded_literals: list[str] = []
+        for issue in review.blocking_issues:
+            literal = self._review_reported_missing_literal(path=path, issue=issue)
+            if literal is None or literal in supported_literals:
+                retained_issues.append(issue)
+                continue
+            discarded_literals.append(literal)
+        if not discarded_literals:
+            return review
+
+        self._log(
+            "proposed_update_review_unsupported_literal_discarded",
+            path=path,
+            literals=discarded_literals[:4],
+            supported_literals=sorted(supported_literals)[:4],
+        )
+
+        lowered_discarded = [literal.lower() for literal in discarded_literals]
+        retained_hints = [
+            hint
+            for hint in review.repair_hints
+            if not (
+                "exact requested literal" in str(hint or "").lower()
+                or "placeholder values" in str(hint or "").lower()
+                or any(literal in str(hint or "").lower() for literal in lowered_discarded)
+            )
+        ]
+
+        if not retained_issues and not review.preservation_risks:
+            return ProposedUpdateReview(
+                safe_to_write=True,
+                summary=(
+                    "The proposed update passes the deterministic integrity checks; the model-backed review only "
+                    "reported unsupported literal obligations that are not hard source constraints for this file."
+                ),
+                confidence=max(0.51, min(float(review.confidence or 0.0), 0.74)),
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=retained_hints[:4]
+                or [
+                    "Keep the repair anchored to the evidenced behavior delta and preserve unrelated existing behavior.",
+                ],
+            )
+
+        summary = review.summary
+        lowered_summary = str(summary or "").lower()
+        if "literal constraint" in lowered_summary or "exact requested literal" in lowered_summary:
+            summary = "The model-backed review still found another concrete issue after unsupported literal findings were discarded."
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=summary,
+            confidence=review.confidence,
+            blocking_issues=retained_issues[:4],
+            preservation_risks=review.preservation_risks[:4],
+            repair_hints=retained_hints[:4],
+        )
+
     def _evidence_backed_behavior_adjustment_is_in_scope(
         self,
         *,
@@ -7913,6 +8009,13 @@ class Planner:
                     model=model_name,
                 )
                 continue
+            review = self._sanitize_model_backed_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                review=review,
+            )
 
             self._append_runtime_execution(
                 session,
