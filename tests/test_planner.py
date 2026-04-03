@@ -3485,6 +3485,138 @@ def test_artifact_scoped_focus_marks_runtime_cli_literal_as_nonbinding_example(t
     )
 
 
+def test_repair_route_requested_outcome_does_not_promote_failure_literal_into_request_anchor(tmp_path):
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package marker\n", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class DirectMainTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so python -m unittest tests.__init__ tests.test_normalize passes. "
+            "Inspect the failing direct main keep-case payload handling, change only normalize_cli.py, and rerun the test."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/__init__.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py", "tests/__init__.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_direct_main_flag (tests.test_normalize.DirectMainTests.test_direct_main_flag)\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: '--keep-case hello world' != 'Hello WORLD'\n"
+            "- --keep-case hello world\n"
+            "+ Hello WORLD\n"
+            "FAILED (failures=1)"
+        ),
+        failure_summary=(
+            "FAIL: test_direct_main_flag (tests.test_normalize.DirectMainTests.test_direct_main_flag)\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: '--keep-case hello world' != 'Hello WORLD'\n"
+            "- --keep-case hello world\n"
+            "+ Hello WORLD"
+        ),
+        repair_requirements=["Change normalize_cli.py so the failing runtime or test path can complete successfully."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py", "tests/__init__.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:repair-route-request-literal-scope",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        summary="Validation command exited with 1.",
+        excerpt=repair_context.excerpt,
+    )
+
+    repair_route = planner._repair_route_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    assert repair_route is not None
+    focus = _artifact_scoped_focus(
+        repair_route,
+        session,
+        "normalize_cli.py",
+        current_content=current_content,
+    )
+
+    assert "--keep-case hello world" not in focus["literal_constraints"]
+    assert not any(
+        item["value"] == "--keep-case hello world"
+        and item["source"] == "request_text"
+        and item["hard_source_constraint"] is True
+        for item in focus["literal_anchor_details"]
+    )
+    assert any(
+        item["value"] == "--keep-case hello world"
+        and item["source"] == "runtime_evidence"
+        and item["hard_source_constraint"] is False
+        for item in focus["literal_anchor_details"]
+    )
+
+
 def test_artifact_scoped_focus_keeps_required_validation_literal_as_hard_anchor(tmp_path):
     about = tmp_path / "about.html"
     about.write_text(

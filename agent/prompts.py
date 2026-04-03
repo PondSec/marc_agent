@@ -4399,11 +4399,15 @@ def _explicit_generation_constraints(
 
 def _request_text_for_literals(route: RouterOutput, session: SessionState | None) -> str:
     task_state = session.task_state if session is not None else None
-    parts = [
-        task_state.latest_user_turn if task_state is not None else "",
-        route.user_goal,
-        route.requested_outcome,
-    ]
+    parts: list[str] = []
+    if task_state is not None and task_state.latest_user_turn:
+        parts.append(task_state.latest_user_turn)
+    elif session is not None and session.task:
+        parts.append(session.task)
+    elif route.user_goal:
+        parts.append(route.user_goal)
+    elif route.requested_outcome:
+        parts.append(route.requested_outcome)
     return "\n".join(str(part or "").strip() for part in parts if str(part or "").strip())
 
 
