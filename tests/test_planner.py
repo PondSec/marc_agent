@@ -10603,7 +10603,7 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "Recognize those tokens verbatim" in prompt
     assert "derive the behavior from the remaining argv payload" in prompt
     assert "Treat the expected-versus-observed values as an output behavior contract" in prompt
-    assert "literal substring replacements" in prompt
+    assert "hardcoding sample output" in prompt
     assert "Expected semantics: Validation should produce: Hello WORLD" in prompt
     assert "Observed semantics: Validation currently produces: ''" in prompt
     assert "Minimal semantic delta:" in prompt
@@ -10859,7 +10859,7 @@ def test_compact_repair_retry_prompt_preserves_parseable_direct_main_contract_li
     assert "Recognize those tokens verbatim" in prompt
     assert "derive behavior from the remaining argv payload 'Hello', 'WORLD'" in prompt
     assert "Treat the expected-versus-observed values as an output behavior contract" in prompt
-    assert "literal substring replacements" in prompt
+    assert "hardcoding sample output" in prompt
     assert "Expected semantics: Validation should produce: Hello WORLD" in prompt
     assert "Observed semantics: Validation currently produces: hello world" in prompt
     assert "Minimal semantic delta:" in prompt
