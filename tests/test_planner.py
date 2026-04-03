@@ -11692,6 +11692,46 @@ def test_compact_repair_retry_prompt_preserves_parseable_direct_main_contract_li
     assert "Minimal semantic delta:" in prompt
 
 
+def test_targeted_runtime_prompt_hints_cover_direct_script_cli_contracts():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--prefix', 'Dr.']:\n"
+        "        print('Dr. ' + ' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context="",
+        targeted_context={
+            "command": "python prefix_cli.py --prefix Ms. jane DOE",
+            "failure_summary": (
+                "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+                "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+            ),
+            "excerpt": (
+                "--prefix Ms. jane DOE\n\n"
+                "AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'\n"
+                "- --prefix Ms. jane DOE\n"
+                "+ Ms. Jane Doe"
+            ),
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Ms. Jane Doe"],
+                "observed_semantics": ["Validation currently produces: --prefix Ms. jane DOE"],
+            },
+        },
+    )
+
+    assert any("exact option tokens like --prefix" in hint for hint in hints)
+    assert any("remaining runtime argv tail 'Ms.', 'jane', 'DOE'" in hint for hint in hints)
+    assert any("can actually match the exercised argv shape" in hint for hint in hints)
+    assert any("stop echoing that option token" in hint for hint in hints)
+
+
 def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repair(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()

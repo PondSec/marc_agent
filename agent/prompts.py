@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 import re
+import shlex
 
 from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
 from agent.task_state import TaskState
@@ -3311,6 +3312,51 @@ def _called_process_python_script_target(text: str) -> str | None:
     return None
 
 
+def _direct_python_script_runtime_contract(
+    command: str,
+    *,
+    target_path: str,
+    limit: int = 4,
+) -> tuple[list[str], list[str]]:
+    try:
+        tokens = shlex.split(str(command or "").strip())
+    except ValueError:
+        return [], []
+    if len(tokens) < 3:
+        return [], []
+
+    lowered = [token.lower() for token in tokens]
+    if lowered[0] not in {"python", "python3"} or lowered[1] == "-m":
+        return [], []
+
+    script_path = str(tokens[1] or "").strip().replace("\\", "/")
+    normalized_target = str(target_path or "").strip().replace("\\", "/")
+    if not script_path or not normalized_target:
+        return [], []
+    if script_path != normalized_target and not script_path.endswith(f"/{normalized_target}"):
+        return [], []
+
+    option_tokens: list[str] = []
+    tail_tokens: list[str] = []
+    saw_option = False
+    for token in tokens[2:]:
+        normalized = str(token or "").strip()
+        if not normalized:
+            continue
+        if normalized.startswith("-"):
+            saw_option = True
+            if normalized not in option_tokens:
+                option_tokens.append(normalized)
+            if len(option_tokens) >= limit and len(tail_tokens) >= limit:
+                break
+            continue
+        if saw_option and normalized not in tail_tokens:
+            tail_tokens.append(normalized)
+            if len(option_tokens) >= limit and len(tail_tokens) >= limit:
+                break
+    return option_tokens[:limit], tail_tokens[:limit]
+
+
 def _undefined_runtime_symbol_from_text(text: str) -> str | None:
     normalized = str(text or "")
     for pattern in UNDEFINED_RUNTIME_SYMBOL_PATTERNS:
@@ -3652,6 +3698,13 @@ def _targeted_runtime_prompt_hints(
     hints: list[str] = []
     direct_script_target = _called_process_python_script_target(failure_text)
     normalized_path = str(path or "").strip().replace("\\", "/")
+    command_option_tokens: list[str] = []
+    command_tail_tokens: list[str] = []
+    if targeted_context.get("command"):
+        command_option_tokens, command_tail_tokens = _direct_python_script_runtime_contract(
+            str(targeted_context.get("command") or ""),
+            target_path=normalized_path,
+        )
     if direct_script_target:
         normalized_target = str(direct_script_target or "").strip().replace("\\", "/")
         if normalized_target == normalized_path or normalized_target.endswith(f"/{normalized_path}"):
@@ -3668,6 +3721,39 @@ def _targeted_runtime_prompt_hints(
                 hints.append(
                     "If this file needs bootstrap help to reach workspace code, place it above the current top-level project import instead of editing only downstream logic."
                 )
+    repair_brief = targeted_context.get("repair_brief") or {}
+    if command_option_tokens:
+        option_preview = ", ".join(command_option_tokens[:3])
+        hints.append(
+            f"The failing validation command invokes this script directly and exercises exact option tokens like {option_preview}. Match those tokens against the real argv payload after the script path; do not treat the script path itself as part of argv."
+        )
+        if command_tail_tokens:
+            tail_preview = ", ".join(repr(token) for token in command_tail_tokens[:4])
+            hints.append(
+                f"After handling {option_preview}, derive behavior from the remaining runtime argv tail {tail_preview} instead of echoing the flag token into stdout or hardcoding the sample output."
+            )
+        hints.append(
+            "When matching argv prefixes, ensure the compared literal sequence can actually match the exercised argv shape; do not compare a longer slice against a shorter literal list or tuple that can never satisfy the branch."
+        )
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in repair_brief.get("expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        observed_values = [
+            _repair_semantic_value_text(item)
+            for item in repair_brief.get("observed_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if (
+            observed_values
+            and expected_values
+            and any(observed_values[0].startswith(token) for token in command_option_tokens)
+            and not any(expected_values[0].startswith(token) for token in command_option_tokens)
+        ):
+            hints.append(
+                f"If the observed output still starts with {option_preview}, stop echoing that option token in stdout. Those tokens should steer behavior for the exercised path, not become part of the emitted payload."
+            )
     stdout_capture_contract = any(
         marker in lowered_support or marker in lowered_failure
         for marker in (
@@ -3695,7 +3781,6 @@ def _targeted_runtime_prompt_hints(
             "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
         )
     option_tokens, positional_tokens = _direct_main_runtime_contract(supporting_context)
-    repair_brief = targeted_context.get("repair_brief") or {}
     has_semantic_contract = bool(
         repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics")
     )
