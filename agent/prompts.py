@@ -5385,10 +5385,11 @@ def _related_file_context(
             target_path=target_path,
         )
         if focused_line_hints:
+            focused_limit = excerpt_limit if is_test_like else max(excerpt_limit, 560)
             focused_excerpt = _line_focused_excerpt(
                 excerpt,
                 line_hints=focused_line_hints,
-                limit=excerpt_limit,
+                limit=focused_limit,
                 before_radius=1 if is_test_like else 2,
                 after_radius=0 if is_test_like else 4,
             )
