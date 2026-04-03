@@ -12698,6 +12698,8 @@ def test_review_guided_retry_prompt_surfaces_pre_interaction_initialization_hint
     assert "The failing interaction is asserted immediately after setup and before the first user event fires." in prompt
     assert "Do not use the first click or dispatched event to create the initial state." in prompt
     assert "Set the relevant attribute or property explicitly instead of relying on an undefined or implicit default." in prompt
+    assert "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring" in prompt
+    assert "Do not add new early-return branches, wrapper conditions, or API changes" in prompt
     assert "Treat the expected-versus-observed values as an interaction behavior contract." in prompt
 
 
@@ -12818,6 +12820,8 @@ def test_review_guided_retry_prompt_omits_pre_interaction_initialization_hints_w
 
     assert "The failing interaction is asserted immediately after setup and before the first user event fires." not in prompt
     assert "Do not use the first click or dispatched event to create the initial state." not in prompt
+    assert "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring" not in prompt
+    assert "Do not add new early-return branches, wrapper conditions, or API changes" not in prompt
 
 
 def test_planner_current_repair_context_pivots_back_to_provider_after_support_noop(tmp_path):

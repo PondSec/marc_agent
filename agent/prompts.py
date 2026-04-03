@@ -2855,6 +2855,8 @@ def _js_runtime_pre_event_state_hints(
         "The failing interaction is asserted immediately after setup and before the first user event fires. Establish the baseline state during setup so that the pre-interaction assertions already pass.",
         "Do not use the first click or dispatched event to create the initial state. The first interaction should toggle away from the initialized baseline, and the next interaction should toggle back.",
         "The current path leaves the exercised state unset at setup time. Set the relevant attribute or property explicitly instead of relying on an undefined or implicit default.",
+        "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring and keep the current toggle callback shape when it already covers the post-interaction transitions.",
+        "Do not add new early-return branches, wrapper conditions, or API changes unless the visible evidence shows a control-flow failure beyond the missing initial state.",
     ]
 
 
