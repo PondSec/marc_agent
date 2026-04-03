@@ -233,6 +233,15 @@ class ValidationPlanner:
         r"AssertionError:\s*(?P<expected>.+?)\s+not found in\s+(?P<observed>.+)",
         re.IGNORECASE,
     )
+    ASSERTION_NAMED_VALUE_PATTERN = re.compile(
+        r"^(?P<label>actual|expected)\s*:\s*(?P<value>.+)$",
+        re.IGNORECASE,
+    )
+    ASSERTION_DIFF_LABEL_PATTERN = re.compile(
+        r"^(?P<first_prefix>[+-])\s*(?P<first_label>actual|expected)\s+"
+        r"(?P<second_prefix>[+-])\s*(?P<second_label>actual|expected)\s*$",
+        re.IGNORECASE,
+    )
     UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
         re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
         re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -1541,18 +1550,28 @@ class ValidationPlanner:
         failure_summary: str,
         missing_features: list[str],
     ) -> str:
-        text = "\n".join(part for part in [failure_summary, excerpt, str(failed_run.summary or "").strip()] if part).lower()
+        text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                excerpt,
+                failure_summary,
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        )
+        lowered = text.lower()
         if missing_features and failed_run.verification_scope == "structural":
             return "structural_missing_feature"
-        if "assertionerror" in text and ("!=" in text or "not found in" in text):
+        if self._looks_like_assertion_mismatch(text):
             return "assertion_mismatch"
-        if "unrecognized arguments" in text:
+        if "unrecognized arguments" in lowered:
             return "runtime_argument_parsing"
-        if "filenotfounderror" in text or "no such file or directory" in text:
+        if "filenotfounderror" in lowered or "no such file or directory" in lowered:
             return "missing_artifact"
-        if any(pattern.search(text) for pattern in self.NO_TESTS_RAN_PATTERNS):
+        if any(pattern.search(lowered) for pattern in self.NO_TESTS_RAN_PATTERNS):
             return "test_discovery_gap"
-        if "importerror" in text or "modulenotfounderror" in text:
+        if "importerror" in lowered or "modulenotfounderror" in lowered:
             return "import_failure"
         if failed_run.verification_scope == "runtime":
             return "runtime_failure"
@@ -1566,7 +1585,16 @@ class ValidationPlanner:
         failure_summary: str,
         missing_features: list[str],
     ) -> tuple[list[str], list[str]]:
-        text = "\n".join(part for part in [excerpt, failure_summary, str(failed_run.summary or "").strip()] if part)
+        text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                excerpt,
+                failure_summary,
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        )
         expected: list[str] = []
         observed: list[str] = []
         for assertion_observed, assertion_expected in self._assertion_semantic_pairs(text)[:3]:
@@ -1609,21 +1637,18 @@ class ValidationPlanner:
             return []
 
         pairs: list[tuple[str | None, str | None]] = []
-        for index, raw in enumerate(lines):
-            stripped = raw.strip()
-            if not stripped.startswith("AssertionError:"):
-                continue
-            diff_lines = self._adjacent_assertion_diff_lines(lines, start_index=index)
-            observed = self._first_semantic_diff_value(diff_lines, prefix="-")
-            expected = self._first_semantic_diff_value(diff_lines, prefix="+")
-            line_observed, line_expected = self._assertion_line_pair(stripped)
+        for block in self._assertion_context_blocks(lines):
+            diff_observed, diff_expected = self._assertion_diff_pair(block)
+            named_observed, named_expected = self._assertion_named_value_pair(block)
+            line_observed, line_expected = self._assertion_line_values("\n".join(block))
+            observed = named_observed or diff_observed or line_observed
+            expected = named_expected or diff_expected or line_expected
             if observed is None:
-                observed = line_observed
+                observed = diff_observed or line_observed
             if expected is None:
-                expected = line_expected
-            if observed is None and expected is None:
-                continue
-            pairs.append((observed, expected))
+                expected = diff_expected or line_expected
+            if observed is not None or expected is not None:
+                pairs.append((observed, expected))
 
         if pairs:
             return self._unique_semantic_pairs(pairs)
@@ -1632,8 +1657,10 @@ class ValidationPlanner:
         parsed_observed, parsed_expected = self._assertion_line_pair(str(text or ""))
         if parsed_observed is not None or parsed_expected is not None:
             fallback_pairs.append((parsed_observed, parsed_expected))
-        diff_observed = self._first_semantic_diff_value(lines, prefix="-")
-        diff_expected = self._first_semantic_diff_value(lines, prefix="+")
+        named_observed, named_expected = self._assertion_named_value_pair(lines)
+        if named_observed is not None or named_expected is not None:
+            fallback_pairs.append((named_observed, named_expected))
+        diff_observed, diff_expected = self._assertion_diff_pair(lines)
         if diff_observed is not None or diff_expected is not None:
             fallback_pairs.append((diff_observed, diff_expected))
         return self._unique_semantic_pairs(fallback_pairs)
@@ -1643,6 +1670,103 @@ class ValidationPlanner:
         if pairs:
             return pairs[0]
         return None, None
+
+    def _looks_like_assertion_mismatch(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        if self._assertion_semantic_pairs(text):
+            return True
+        if "assertionerror" in lowered and ("!=" in text or "not found in" in lowered):
+            return True
+        if "expected values to be strictly equal" in lowered and (
+            "expected:" in lowered or "actual:" in lowered or "err_assertion" in lowered
+        ):
+            return True
+        return "err_assertion" in lowered and ("expected:" in lowered or "actual:" in lowered)
+
+    def _assertion_anchor_line(self, line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return False
+        return (
+            lowered.startswith("assertionerror:")
+            or lowered.startswith("expected values to be strictly equal:")
+            or lowered.startswith("name:") and "assertionerror" in lowered
+            or lowered.startswith("code:") and "err_assertion" in lowered
+        )
+
+    def _is_assertion_context_line(self, line: str) -> bool:
+        stripped = str(line or "").strip()
+        lowered = stripped.lower()
+        if not stripped:
+            return False
+        if self._assertion_anchor_line(stripped):
+            return True
+        if lowered.startswith("error:"):
+            return True
+        if lowered.startswith("operator:") and "equal" in lowered:
+            return True
+        if self.ASSERTION_NAMED_VALUE_PATTERN.match(stripped):
+            return True
+        if self.ASSERTION_DIFF_LABEL_PATTERN.match(stripped):
+            return True
+        return self._semantic_diff_value(stripped) is not None
+
+    def _assertion_context_blocks(self, lines: list[str]) -> list[list[str]]:
+        blocks: list[list[str]] = []
+        current: list[str] = []
+        for raw in lines:
+            stripped = str(raw or "").strip()
+            if not stripped:
+                if current:
+                    continue
+                continue
+            if self._is_assertion_context_line(stripped):
+                current.append(stripped)
+                continue
+            if current:
+                if any(self._assertion_anchor_line(line) for line in current):
+                    blocks.append(current[:])
+                current.clear()
+        if current and any(self._assertion_anchor_line(line) for line in current):
+            blocks.append(current[:])
+        return blocks
+
+    def _assertion_named_value_pair(self, lines: list[str]) -> tuple[str | None, str | None]:
+        observed: str | None = None
+        expected: str | None = None
+        for raw in lines:
+            match = self.ASSERTION_NAMED_VALUE_PATTERN.match(str(raw or "").strip())
+            if match is None:
+                continue
+            label = str(match.group("label") or "").strip().lower()
+            value = self._literal_or_text(match.group("value"))
+            if label == "actual" and observed is None:
+                observed = value
+            if label == "expected" and expected is None:
+                expected = value
+        return observed, expected
+
+    def _assertion_diff_prefixes(self, lines: list[str]) -> tuple[str, str]:
+        for raw in lines:
+            match = self.ASSERTION_DIFF_LABEL_PATTERN.match(str(raw or "").strip())
+            if match is None:
+                continue
+            mapping = {
+                str(match.group("first_label") or "").strip().lower(): str(match.group("first_prefix") or "").strip(),
+                str(match.group("second_label") or "").strip().lower(): str(match.group("second_prefix") or "").strip(),
+            }
+            observed_prefix = mapping.get("actual", "-")
+            expected_prefix = mapping.get("expected", "+")
+            return observed_prefix, expected_prefix
+        return "-", "+"
+
+    def _assertion_diff_pair(self, lines: list[str]) -> tuple[str | None, str | None]:
+        observed_prefix, expected_prefix = self._assertion_diff_prefixes(lines)
+        observed = self._first_semantic_diff_value(lines, prefix=observed_prefix)
+        expected = self._first_semantic_diff_value(lines, prefix=expected_prefix)
+        return observed, expected
 
     def _adjacent_assertion_diff_lines(
         self,
@@ -1697,6 +1821,8 @@ class ValidationPlanner:
     def _semantic_diff_value(self, line: str) -> str | None:
         stripped = str(line or "").strip()
         if not stripped or stripped[0] not in {"-", "+"}:
+            return None
+        if self.ASSERTION_DIFF_LABEL_PATTERN.match(stripped):
             return None
         value = stripped[1:].strip()
         if not value:
@@ -1779,8 +1905,7 @@ class ValidationPlanner:
             ]
             if part
         )
-        lowered = failure_text.lower()
-        if "assertionerror" not in lowered or ("!=" not in failure_text and "not found in" not in lowered):
+        if not self._looks_like_assertion_mismatch(failure_text):
             return None
         frames = traceback_frames if traceback_frames is not None else self._traceback_workspace_frames(session, failed_run)
         if any(path and not self._is_test_path(path) for path, _line in frames):
@@ -3562,6 +3687,10 @@ class ValidationPlanner:
             *(str(item.summary or "").strip() for item in diagnostics),
         ]:
             lines = self._evidence_lines_from_text(text)
+            for block in self._assertion_context_blocks(lines):
+                for line in block:
+                    if line not in focused_lines:
+                        focused_lines.append(line)
             for index, line in enumerate(lines):
                 if not self._line_contains_failure_evidence(line):
                     continue

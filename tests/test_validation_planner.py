@@ -1965,6 +1965,104 @@ def test_validation_planner_extracts_explicit_node_test_command_from_user_reques
     assert explicit.required is True
 
 
+def test_validation_planner_preserves_node_tap_assertion_context_for_runtime_repairs(tmp_path):
+    planner = ValidationPlanner()
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener('click', () => {});\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_menu_toggle.cjs"
+    test_path.write_text("const test = require('node:test');\n", encoding="utf-8")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=2,
+        language_counts={"javascript": 2},
+        top_directories=["tests"],
+        important_files=["app.js", "tests/test_menu_toggle.cjs"],
+        focus_files=["app.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_menu_toggle.cjs"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app.js"],
+        repo_map=[],
+        project_labels=["javascript"],
+        likely_commands=["node --test tests/test_menu_toggle.cjs"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small JavaScript interaction module with a focused node test.",
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="tests/test_menu_toggle.cjs", operation="modify"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="node --test tests/test_menu_toggle.cjs",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "TAP version 13\n"
+            "# Subtest: wireMenuToggle toggles panel state on each click\n"
+            "not ok 1 - wireMenuToggle toggles panel state on each click\n"
+            "  ---\n"
+            f"  location: '{test_path}:20:1'\n"
+            "  failureType: 'testCodeFailure'\n"
+            "  error: |-\n"
+            "    Expected values to be strictly equal:\n"
+            "    + actual - expected\n"
+            "\n"
+            "    + undefined\n"
+            "    - 'false'\n"
+            "  code: 'ERR_ASSERTION'\n"
+            "  name: 'AssertionError'\n"
+            "  expected: 'false'\n"
+            "  operator: 'strictEqual'\n"
+            "  stack: |-\n"
+            f"    TestContext.<anonymous> ({test_path}:24:10)\n"
+            "  ...\n"
+            "1..1\n"
+            "# tests 1\n"
+            "# pass 0\n"
+            "# fail 1\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.failure_type == "assertion_mismatch"
+    assert evidence.repair_brief.primary_target == "app.js"
+    assert evidence.repair_brief.expected_semantics == ["Validation should produce: false"]
+    assert evidence.repair_brief.observed_semantics == ["Validation currently produces: undefined"]
+    assert "Expected values to be strictly equal:" in evidence.excerpt
+    assert "+ actual - expected" in evidence.excerpt
+    assert "expected: 'false'" in evidence.excerpt
+    assert "Expected values to be strictly equal" in evidence.failure_summary
+    assert "app.js still produces the wrong behavior" in evidence.repair_brief.root_cause_summary
+
+
 def test_validation_planner_preserves_punctuation_in_expected_stdout_from_direct_python_cli_examples():
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(
