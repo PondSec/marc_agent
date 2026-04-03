@@ -703,6 +703,128 @@ def test_planner_skips_model_backed_semantic_review_for_small_standalone_web_pro
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
 
 
+def test_semantic_change_review_rejects_unbound_web_contracts_before_model_review(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"themeSwitcher\" aria-label=\"Toggle Theme\">Toggle Theme</button>\n"
+            "      <div id=\"statusMessage\" role=\"alert\"></div>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "document.body.appendChild(themeSwitcher);\n\n"
+            "const statusMessage = document.createElement('div');\n"
+            "document.body.appendChild(statusMessage);\n\n"
+            "function applyTheme(theme) {\n"
+            "  document.documentElement.style.colorScheme = theme;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            "body.dark-mode {\n"
+            "  background: #111;\n"
+            "  color: #f5f5f5;\n"
+            "}\n\n"
+            "body.dark-mode .panel {\n"
+            "  border-color: #f5f5f5;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "The changed implementation matches the requested behavior.",
+                "confidence": 0.9,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Add an accessible theme switcher with persistent state and a status message across the existing web files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        validation_status="passed",
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested multi-file web update."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the changed implementation."},
+        ],
+        target_paths=["app.js", "index.html", "styles.css"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Verify the generated web artifact.",
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="internal:web_artifact:[{\"path\":\"index.html\"}]",
+            kind="check",
+            verification_scope="structural",
+            status="passed",
+            edit_generation=0,
+            summary="Basic web artifact checks passed.",
+        )
+    )
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "failed"
+    assert "cross-file web contract" in (session.validation_runs[-1].summary or "").lower()
+    assert session.active_repair_context is not None
+    assert any("dark-mode" in item for item in session.active_repair_context.repair_requirements)
+
+
 def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -14806,6 +14928,121 @@ def test_pre_write_update_review_rejects_stdout_only_fix_when_direct_main_option
     assert review.safe_to_write is False
     assert "exact direct main([...]) option tokens" in review.summary
     assert any("--keep-case" in issue for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_rejects_css_root_state_without_completed_web_contract(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"themeSwitcher\" aria-label=\"Toggle Theme\">Toggle Theme</button>\n"
+            "      <div id=\"statusMessage\" role=\"alert\"></div>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "document.body.appendChild(themeSwitcher);\n\n"
+            "const statusMessage = document.createElement('div');\n"
+            "document.body.appendChild(statusMessage);\n\n"
+            "function applyTheme(theme) {\n"
+            "  document.documentElement.style.colorScheme = theme;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    current_content = ":root {\n  color-scheme: light;\n}\n"
+    (tmp_path / "styles.css").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Add a persistent accessible theme switcher across the current web files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested multi-file web update."},
+        ],
+        target_paths=["app.js", "index.html", "styles.css"],
+        target_name="styles.css",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    proposed_content = (
+        ":root {\n"
+        "  color-scheme: light;\n"
+        "}\n\n"
+        "body.dark-mode {\n"
+        "  background: #111;\n"
+        "  color: #f5f5f5;\n"
+        "}\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="styles.css",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "cross-file web contract" in review.summary.lower()
+    assert any("dark-mode" in issue for issue in review.blocking_issues)
 
 
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
