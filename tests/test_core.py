@@ -59,6 +59,25 @@ def test_core_can_switch_back_to_a1_memory_profile(tmp_path):
     assert isinstance(core._build_memory_store(session), RepoMemoryStore)
 
 
+def test_core_validation_decision_preserves_expected_stdout_contract(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+
+    decision = core._validation_decision(
+        "Run the CLI contract.",
+        ValidationCommand(
+            command="python normalize_cli.py --keep-case hello world",
+            kind="test",
+            verification_scope="runtime",
+            expected_stdout="hello world",
+        ),
+    )
+
+    assert decision.tool_args["command"] == "python normalize_cli.py --keep-case hello world"
+    assert decision.tool_args["expected_stdout"] == "hello world"
+
+
 def test_core_runtime_options_preserve_agent_profile_overrides(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

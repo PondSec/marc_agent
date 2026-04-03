@@ -387,6 +387,73 @@ def test_shell_marks_zero_test_unittest_run_as_insufficient_validation(monkeypat
     assert "Ran 0 tests" in result["stdout"]
 
 
+def test_shell_marks_stdout_contract_mismatch_as_failed_validation(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+    monkeypatch.setattr(
+        shell,
+        "_run_command",
+        lambda command, cwd, timeout: {
+            "success": True,
+            "message": "Command exited with 0.",
+            "risk_level": "low",
+            "stdout": "Hello World\n",
+            "stderr": "",
+            "exit_code": 0,
+            "command": command,
+        },
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command="python normalize_cli.py --keep-case hello world",
+            cwd=".",
+            expected_stdout="hello world",
+        )
+    )
+
+    assert result["success"] is False
+    assert result["stdout_contract_failed"] is True
+    assert "AssertionError: 'Hello World' != 'hello world'" in result["stderr"]
+    assert result["observed_stdout"] == "Hello World"
+    assert result["expected_stdout"] == "hello world"
+
+
+def test_shell_accepts_matching_stdout_contract_with_trailing_newline(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+    monkeypatch.setattr(
+        shell,
+        "_run_command",
+        lambda command, cwd, timeout: {
+            "success": True,
+            "message": "Command exited with 0.",
+            "risk_level": "low",
+            "stdout": "hello world\n",
+            "stderr": "",
+            "exit_code": 0,
+            "command": command,
+        },
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command="python normalize_cli.py --keep-case hello world",
+            cwd=".",
+            expected_stdout="hello world",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "Validation command exited with 0."
+
+
 def test_shell_runs_python_module_commands_with_current_runtime_interpreter(monkeypatch, tmp_path):
     config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
     config.ensure_state_dirs()

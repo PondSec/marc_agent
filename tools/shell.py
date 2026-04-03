@@ -47,6 +47,14 @@ class ShellTools:
         if args.command.startswith("internal:"):
             return self._run_internal_validation(args.command, args.cwd)
         result = self._run_command(args.command, args.cwd, args.timeout)
+        if result.get("success") and args.expected_stdout is not None:
+            stdout_mismatch = self._stdout_contract_mismatch_result(
+                args.command,
+                result=result,
+                expected_stdout=args.expected_stdout,
+            )
+            if stdout_mismatch is not None:
+                return stdout_mismatch
         insufficient_reason = self._insufficient_test_execution_reason(
             args.command,
             stdout=str(result.get("stdout") or ""),
@@ -69,6 +77,42 @@ class ShellTools:
             else result["message"]
         )
         return result
+
+    def _stdout_contract_mismatch_result(
+        self,
+        command: str,
+        *,
+        result: dict,
+        expected_stdout: str,
+    ) -> dict | None:
+        observed_stdout = self._normalized_runtime_stdout(str(result.get("stdout") or ""))
+        normalized_expected = self._normalized_runtime_stdout(str(expected_stdout or ""))
+        if observed_stdout == normalized_expected:
+            return None
+
+        stderr = str(result.get("stderr") or "").strip()
+        observed_display = observed_stdout or "''"
+        expected_display = normalized_expected or "''"
+        assertion_lines = [
+            f"AssertionError: {observed_stdout!r} != {normalized_expected!r}",
+            f"- {observed_display}",
+            f"+ {expected_display}",
+        ]
+        result["success"] = False
+        result["message"] = "Validation command stdout differed from the expected output."
+        result["stderr"] = (
+            f"{stderr}\n" + "\n".join(assertion_lines)
+            if stderr
+            else "\n".join(assertion_lines)
+        )
+        result["stdout_contract_failed"] = True
+        result["observed_stdout"] = observed_stdout
+        result["expected_stdout"] = normalized_expected
+        result["command"] = command
+        return result
+
+    def _normalized_runtime_stdout(self, stdout: str) -> str:
+        return str(stdout or "").replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
 
     def _run_internal_validation(self, command: str, cwd: str) -> dict:
         working_dir = self.workspace.resolve_directory(cwd)

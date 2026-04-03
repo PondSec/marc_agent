@@ -21783,6 +21783,67 @@ def test_planner_runs_validation_after_changes(tmp_path):
     assert decision.tool_args["command"] == "python -m pytest"
 
 
+def test_planner_reproduces_direct_cli_contract_with_expected_stdout(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["normalize_cli.py"],
+        focus_files=["normalize_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    user_turn = (
+        "Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+        "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+        "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "diagnose_issue", "reason": "Reproduce the CLI behavior before editing."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.validation_plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=[],
+        session=session,
+    )
+
+    decision = planner._diagnose_issue_decision(
+        session.router_result,
+        session,
+        ["normalize_cli.py"],
+        {"normalize_cli.py"},
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python normalize_cli.py --keep-case hello world"
+    assert decision.tool_args["expected_stdout"] == "hello world"
+
+
 def test_planner_plan_completion_criteria_uses_task_state_verification_target(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[

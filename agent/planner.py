@@ -2051,11 +2051,21 @@ class Planner:
 
         command = self._next_diagnostic_command(session)
         if command is not None and not self._command_already_ran(session, command):
+            command_spec = self._diagnostic_command_spec(session, command)
             return AgentDecision(
                 thought_summary="Reproduce the issue with the strongest available runtime or validation command before editing.",
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="run_tests",
-                tool_args={"command": command, "cwd": ".", "timeout": 120},
+                tool_args={
+                    "command": command,
+                    "cwd": ".",
+                    "timeout": 120,
+                    **(
+                        {"expected_stdout": command_spec.expected_stdout}
+                        if command_spec is not None and command_spec.expected_stdout is not None
+                        else {}
+                    ),
+                },
                 expected_outcome="Reproduce the reported issue and collect concrete diagnostics.",
                 final_response=None,
             )
@@ -3410,15 +3420,49 @@ class Planner:
         self,
         thought_summary: str,
         command: str,
+        *,
+        expected_stdout: str | None = None,
     ) -> AgentDecision:
         return AgentDecision(
             thought_summary=thought_summary,
             action_type=AgentActionType.CALL_TOOL,
             tool_name="run_tests",
-            tool_args={"command": command, "cwd": ".", "timeout": 120},
+            tool_args={
+                "command": command,
+                "cwd": ".",
+                "timeout": 120,
+                **({"expected_stdout": expected_stdout} if expected_stdout is not None else {}),
+            },
             expected_outcome="Run the next validation step for the current changes.",
             final_response=None,
         )
+
+    def _diagnostic_command_spec(
+        self,
+        session: SessionState,
+        command: str,
+    ) -> ValidationCommand | None:
+        identity = self.validation_planner.command_identity(command)
+        if not identity:
+            return None
+        for item in session.validation_plan:
+            if self.validation_planner.command_identity(item.command) == identity:
+                return item
+        snapshot = session.workspace_snapshot
+        if snapshot is not None:
+            validation_plan = self.validation_planner.build_plan(
+                session.task,
+                snapshot,
+                changed_files=[],
+                session=session,
+            )
+            for item in validation_plan:
+                if self.validation_planner.command_identity(item.command) == identity:
+                    return item
+        for item in self.validation_planner.build_diagnostic_plan(session):
+            if self.validation_planner.command_identity(item.command) == identity:
+                return item
+        return None
 
     def _pick_validation_command(self, session: SessionState) -> str | None:
         passed = {

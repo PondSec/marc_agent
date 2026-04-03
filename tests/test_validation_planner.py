@@ -1854,6 +1854,87 @@ def test_validation_planner_prefers_explicit_python_cli_example_over_generic_smo
     assert explicit.required is True
 
 
+def test_validation_planner_extracts_expected_stdout_from_direct_python_cli_examples():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["normalize_cli.py"],
+        focus_files=["normalize_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    user_turn = (
+        "Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+        "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+        "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the CLI behavior safely.",
+            active_goal="Fix the keep-case and default formatting output.",
+            goal_relation="continue",
+            output_expectation="Updated CLI output behavior.",
+            verification_target="Verify the requested CLI behavior.",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["normalize_cli.py"],
+        session=session,
+    )
+
+    keep_case = next(item for item in plan if item.command == "python normalize_cli.py --keep-case hello world")
+    default_case = next(item for item in plan if item.command == "python normalize_cli.py hello world")
+
+    assert keep_case.expected_stdout == "hello world"
+    assert default_case.expected_stdout == "Hello World"
+
+
+def test_validation_planner_prefers_richer_duplicate_cli_command_with_expected_stdout():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Repair the CLI output safely.",
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=(
+                "Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+                "soll exakt `hello world` ausgegeben werden."
+            ),
+            root_goal="Repair the CLI behavior safely.",
+            active_goal="Fix the keep-case output.",
+            goal_relation="continue",
+            output_expectation="Updated CLI behavior.",
+            verification_target="Fuehre python normalize_cli.py --keep-case hello world aus.",
+            next_action="debug",
+        ),
+    )
+
+    commands = planner._explicit_validation_commands(session)
+    keep_case = next(item for item in commands if item.command == "python normalize_cli.py --keep-case hello world")
+
+    assert keep_case.expected_stdout == "hello world"
+
+
 def test_validation_planner_deduplicates_nested_pytest_match_inside_python_module_request():
     planner = ValidationPlanner()
     session = SessionState(

@@ -258,6 +258,21 @@ class ValidationPlanner:
     EXCEPTION_EVIDENCE_PATTERN = re.compile(
         r"\b(?:[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)|SystemExit|CalledProcessError)\b"
     )
+    OUTPUT_VERB_PATTERN = (
+        r"(?:ausgibt|ausgeben|ausgegeben(?:\s+werden)?|outputs?|prints?|returns?|shows?|zeigt|liefert|produces?)"
+    )
+    OUTPUT_EXPECTATION_QUOTED_BEFORE_VERB_PATTERN = re.compile(
+        rf"(?P<quote>[`'\"])(?P<expected>.+?)(?P=quote)\s+{OUTPUT_VERB_PATTERN}\b",
+        re.IGNORECASE,
+    )
+    OUTPUT_EXPECTATION_QUOTED_AFTER_VERB_PATTERN = re.compile(
+        rf"{OUTPUT_VERB_PATTERN}\s+(?:exactly|genau|exakt|weiterhin|still\s+)?(?P<quote>[`'\"])(?P<expected>.+?)(?P=quote)",
+        re.IGNORECASE,
+    )
+    OUTPUT_EXPECTATION_INLINE_PATTERN = re.compile(
+        rf"(?:exactly|genau|exakt)\s+(?P<expected>[^`'\n.,;:!?]+?)\s+{OUTPUT_VERB_PATTERN}\b",
+        re.IGNORECASE,
+    )
 
     def build_plan(
         self,
@@ -586,6 +601,11 @@ class ValidationPlanner:
                             covered_pytest_signatures.add(suffix)
                         elif flavor == "pytest_binary" and suffix in covered_pytest_signatures:
                             continue
+                    expected_stdout = self._expected_stdout_for_explicit_validation_command(
+                        raw_text,
+                        match=match,
+                        command=command,
+                    )
                     extracted.append(
                         ValidationCommand(
                             command=command,
@@ -595,17 +615,64 @@ class ValidationPlanner:
                             priority=int(spec["priority"]),
                             reason="Explicit validation command requested in the active task.",
                             required=True,
+                            expected_stdout=expected_stdout,
                         )
                     )
-        unique: list[ValidationCommand] = []
-        seen: set[str] = set()
+        unique_by_identity: dict[str, ValidationCommand] = {}
+        order: list[str] = []
         for item in extracted:
             identity = self.command_identity(item.command)
-            if not identity or identity in seen:
+            if not identity:
                 continue
-            seen.add(identity)
-            unique.append(item)
-        return unique
+            existing = unique_by_identity.get(identity)
+            if existing is None:
+                unique_by_identity[identity] = item
+                order.append(identity)
+                continue
+            if existing.expected_stdout is None and item.expected_stdout is not None:
+                unique_by_identity[identity] = existing.model_copy(
+                    update={"expected_stdout": item.expected_stdout}
+                )
+        return [unique_by_identity[identity] for identity in order]
+
+    def _expected_stdout_for_explicit_validation_command(
+        self,
+        raw_text: str,
+        *,
+        match: re.Match[str],
+        command: str,
+    ) -> str | None:
+        if not self._is_explicit_python_script_command(command):
+            return None
+
+        raw_command = str(match.group("command") or "")
+        normalized_raw_command = " ".join(raw_command.strip().split())
+        inline_context = ""
+        if normalized_raw_command.startswith(command):
+            inline_context = normalized_raw_command[len(command) :]
+        tail_context = str(raw_text or "")[match.end() : match.end() + 240].lstrip(" \t`'\"")
+        context = " ".join(part.strip() for part in (inline_context, tail_context) if part.strip())
+        if not context:
+            return None
+
+        for pattern in (
+            self.OUTPUT_EXPECTATION_QUOTED_BEFORE_VERB_PATTERN,
+            self.OUTPUT_EXPECTATION_QUOTED_AFTER_VERB_PATTERN,
+            self.OUTPUT_EXPECTATION_INLINE_PATTERN,
+        ):
+            output_match = pattern.search(context)
+            if output_match is None:
+                continue
+            expected = self._normalized_expected_stdout(output_match.group("expected"))
+            if expected is not None:
+                return expected
+        return None
+
+    def _normalized_expected_stdout(self, raw: str | None) -> str | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        return text.rstrip(".,;:!?").strip() or None
 
     def _normalize_explicit_validation_command(self, raw: str) -> str | None:
         command = " ".join(str(raw or "").strip().split())
