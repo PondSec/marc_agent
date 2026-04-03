@@ -12833,8 +12833,10 @@ def test_review_guided_retry_prompt_keeps_boolean_semantic_delta_atomic_for_js_r
     assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
     assert "panel.hidden = !expanded;" in prompt
     assert "compute the next state once" in prompt
+    assert "derive every dependent update from it while preserving whether" in prompt
     assert "Do not mix one assignment derived from the pre-click state with another derived from the toggled state" in prompt
-    assert "update hidden/visible state from the same next-state boolean" in prompt
+    assert "opposite visibility meaning: expanded/open maps to visible" in prompt
+    assert "same next-state boolean" not in prompt
 
 
 def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):

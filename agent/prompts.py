@@ -2945,10 +2945,14 @@ def _render_interactive_runtime_toggle_delta(
     guidance = (
         "After the exercised interaction, the toggled state should produce "
         f"'{str(expected_value or '').strip()}' instead of '{str(observed_value or '').strip()}'. "
-        "Compute the next-state value once inside the handler and use that same toggled state for every dependent update."
+        "Compute the next-state value once inside the handler and derive every dependent update from it, preserving whether each property should mirror or invert that next state."
     )
     if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
-        guidance += " Keep aria-expanded and hidden/visible updates derived from the same next-state value."
+        guidance += (
+            " Keep aria-expanded and hidden/visible updates tied to the same next-state transition: "
+            "when aria-expanded becomes true/open after the click, hidden should become false/visible; "
+            "when aria-expanded becomes false/closed, hidden should become true/hidden."
+        )
     return guidance
 
 
@@ -3117,12 +3121,12 @@ def _js_runtime_toggle_consistency_hints(
         return []
 
     hints = [
-        "The failing assertion targets the interaction result. Read the current state once, compute the next state once, and apply that same toggled value to every dependent update in the handler.",
+        "The failing assertion targets the interaction result. Read the current state once, compute the next state once, and derive every dependent update from it while preserving whether each property should mirror or invert that next state.",
         "Do not mix one assignment derived from the pre-click state with another derived from the toggled state; that leaves paired UI state out of sync after the interaction.",
     ]
     if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
         hints.append(
-            "When aria-expanded changes in the handler, update hidden/visible state from the same next-state boolean so both outputs agree after each click."
+            "When aria-expanded changes in the handler, hidden/visible state should follow the same transition with the opposite visibility meaning: expanded/open maps to visible (hidden false), collapsed/closed maps to hidden true."
         )
     return hints
 
