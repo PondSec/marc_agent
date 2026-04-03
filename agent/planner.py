@@ -8857,6 +8857,158 @@ class Planner:
         expected_output = str(expected_values[0] or "").strip()
         return expected_output or None
 
+    def _direct_python_script_verbatim_option_payload_layout(
+        self,
+        *,
+        tail_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if len(tail_tokens) < 2:
+            return None
+        expected_output = self._direct_python_script_expected_output(repair_context)
+        if not expected_output:
+            return None
+
+        option_payload = str(tail_tokens[0] or "").strip()
+        remainder_tokens = [str(token or "").strip() for token in tail_tokens[1:] if str(token or "").strip()]
+        if not option_payload or not remainder_tokens:
+            return None
+
+        remainder_output = " ".join(remainder_tokens).strip()
+        candidates = (
+            ("prefix_tight", f"{option_payload}{remainder_output}"),
+            ("prefix_spaced", f"{option_payload} {remainder_output}".strip()),
+            ("suffix_tight", f"{remainder_output}{option_payload}"),
+            ("suffix_spaced", f"{remainder_output} {option_payload}".strip()),
+        )
+        for layout, candidate in candidates:
+            if candidate == expected_output:
+                return layout
+        return None
+
+    def _apply_direct_python_script_verbatim_option_payload_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+        tail_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if not option_tokens or len(tail_tokens) < 2:
+            return None
+
+        layout = self._direct_python_script_verbatim_option_payload_layout(
+            tail_tokens=tail_tokens,
+            repair_context=repair_context,
+        )
+        if layout is None:
+            return None
+
+        option_payload = str(tail_tokens[0] or "").strip()
+        if not option_payload:
+            return None
+
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = lines[start:end]
+        condition_pattern = re.compile(
+            r"^(?P<indent>\s*)if\s+(?:(?:len\((?P<len_arg>\w+)\)\s*>=\s*(?P<required>\d+)\s+and\s+))?"
+            r"(?P<arg>\w+)\s*\[\s*:\s*(?P<slice>\d+)\s*\]\s*==\s*(?P<literal>\[[^\n]+\])\s*:\s*$"
+        )
+        option_count = len(option_tokens)
+        required_len = option_count + 1
+
+        for index, raw_line in enumerate(block_lines):
+            match = condition_pattern.match(raw_line)
+            if match is None:
+                continue
+            try:
+                literal_value = ast.literal_eval(str(match.group("literal") or "").strip())
+            except (SyntaxError, ValueError):
+                continue
+            if not isinstance(literal_value, (list, tuple)):
+                continue
+
+            literal_tokens = [str(item) for item in literal_value]
+            slice_length = int(match.group("slice") or 0)
+            if slice_length != len(literal_tokens):
+                continue
+
+            explicit_required = int(match.group("required") or 0)
+            arg_name = str(match.group("arg") or "").strip()
+            len_arg_name = str(match.group("len_arg") or "").strip()
+            if not arg_name or (len_arg_name and len_arg_name != arg_name):
+                continue
+
+            dynamic_branch = literal_tokens == option_tokens
+            hardcoded_payload_branch = literal_tokens == [*option_tokens, option_payload]
+            if not dynamic_branch and not hardcoded_payload_branch:
+                continue
+
+            branch_indent = str(match.group("indent") or "")
+            branch_body_indent = branch_indent + "    "
+            branch_end = len(block_lines)
+            for candidate in range(index + 1, len(block_lines)):
+                line = block_lines[candidate]
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= len(branch_indent):
+                    branch_end = candidate
+                    break
+            branch_lines = block_lines[index + 1 : branch_end]
+            if not branch_lines:
+                continue
+
+            has_print = any("print(" in line for line in branch_lines)
+            has_return = any(line.lstrip().startswith("return") for line in branch_lines)
+            has_value_return = any(
+                line.lstrip().startswith("return") and line.strip() != "return"
+                for line in branch_lines
+            )
+            if not has_print and not has_value_return:
+                continue
+
+            effective_required_len = max(explicit_required, required_len)
+            payload_expr = f"{arg_name}[{option_count}]"
+            remainder_expr = f"' '.join({arg_name}[{option_count + 1}:])"
+            if layout == "prefix_tight":
+                output_expr = f"{payload_expr} + {remainder_expr}"
+            elif layout == "prefix_spaced":
+                output_expr = f"{payload_expr} + ' ' + {remainder_expr}"
+            elif layout == "suffix_spaced":
+                output_expr = f"{remainder_expr} + ' ' + {payload_expr}"
+            else:
+                output_expr = f"{remainder_expr} + {payload_expr}"
+
+            new_condition = (
+                f"{branch_indent}if len({arg_name}) >= {effective_required_len} and "
+                f"{arg_name}[:{option_count}] == {option_tokens!r}:\n"
+            )
+            replacement_lines = [new_condition]
+            if has_print:
+                replacement_lines.append(f"{branch_body_indent}print({output_expr})\n")
+                if has_return:
+                    replacement_lines.append(f"{branch_body_indent}return\n")
+            else:
+                replacement_lines.append(f"{branch_body_indent}return {output_expr}\n")
+
+            updated_lines = [
+                *lines[:start],
+                *block_lines[:index],
+                *replacement_lines,
+                *block_lines[branch_end:],
+                *lines[end:],
+            ]
+            updated_content = "".join(updated_lines)
+            if updated_content != current_content:
+                return updated_content
+        return None
+
     def _rewrite_direct_python_script_payload_branch(
         self,
         branch_lines: list[str],
@@ -9052,12 +9204,19 @@ class Planner:
         if not option_tokens or not tail_tokens:
             return None
 
-        patched_content = self._apply_direct_python_script_payload_literal_patch(
+        patched_content = self._apply_direct_python_script_verbatim_option_payload_patch(
             current_content=current_content,
             option_tokens=option_tokens,
             tail_tokens=tail_tokens,
             repair_context=repair_context,
         )
+        if patched_content is None:
+            patched_content = self._apply_direct_python_script_payload_literal_patch(
+            current_content=current_content,
+            option_tokens=option_tokens,
+            tail_tokens=tail_tokens,
+            repair_context=repair_context,
+            )
         if patched_content is None or patched_content == current_content:
             return None
         try:
