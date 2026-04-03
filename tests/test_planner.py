@@ -1774,6 +1774,27 @@ def test_planner_prefers_lightweight_model_for_small_empty_workspace_create(tmp_
     assert "Produce the full file content for exactly one file." in llm.generate_calls[0]["args"][0]
 
 
+def test_planner_bootstraps_task_state_generation_with_router_model_budget(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3:14b",
+            router_model_name="qwen3:8b",
+            model_candidates=("qwen3:14b",),
+            ollama_num_ctx=8192,
+            router_num_ctx=2048,
+            router_timeout=35,
+        )
+    )
+
+    planner = Planner(llm, "")
+
+    assert planner.task_state_updater.model_name == "qwen3:8b"
+    assert planner.task_state_updater.timeout == 35
+    assert planner.task_state_updater.num_ctx == 2048
+    assert planner.task_state_updater._model_candidates()[:2] == ["qwen3:8b", "qwen3:14b"]
+
+
 def test_planner_uses_compact_primary_prompt_for_low_risk_multi_file_create_when_lightweight_is_too_narrow(tmp_path):
     llm = ScriptedLLM(
         text_payloads=[
@@ -16521,7 +16542,7 @@ def test_planner_prefers_primary_model_for_validation_guided_repairs(tmp_path):
     assert model_name is None
 
 
-def test_planner_uses_primary_model_for_task_state_updates(tmp_path):
+def test_planner_uses_router_model_budget_for_task_state_updates(tmp_path):
     planner = Planner(
         ScriptedLLM(
             config=AppConfig(
@@ -16534,8 +16555,8 @@ def test_planner_uses_primary_model_for_task_state_updates(tmp_path):
         "",
     )
 
-    assert planner.task_state_updater.model_name == "qwen2.5-coder:14b"
-    assert planner.task_state_updater.num_ctx == 4096
+    assert planner.task_state_updater.model_name == "qwen2.5-coder:7b"
+    assert planner.task_state_updater.num_ctx == 2048
 
 
 def test_review_guided_retry_prefers_primary_model_for_validation_repairs(tmp_path, monkeypatch):

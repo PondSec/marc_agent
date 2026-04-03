@@ -214,9 +214,21 @@ class Planner:
         self.task_state_updater = TaskStateUpdater(
             llm,
             logger=logger,
-            model_name=getattr(llm_config, "model_name", None),
+            model_name=(
+                getattr(llm_config, "router_model_name", None)
+                or getattr(llm_config, "model_name", None)
+            ),
             timeout=max(int(getattr(llm_config, "router_timeout", self._llm_timeout(18))), 18),
-            num_ctx=max(int(getattr(llm_config, "ollama_num_ctx", self._llm_num_ctx(4096))), 1024),
+            num_ctx=max(
+                int(
+                    getattr(
+                        llm_config,
+                        "router_num_ctx",
+                        getattr(llm_config, "ollama_num_ctx", self._llm_num_ctx(4096)),
+                    )
+                ),
+                1024,
+            ),
         )
         self.decision_policy = ExecutionDecisionPolicy(logger=logger)
         self.validation_planner = ValidationPlanner()
