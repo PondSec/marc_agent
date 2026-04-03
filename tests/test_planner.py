@@ -1447,7 +1447,7 @@ def test_planner_falls_back_locally_after_compact_review_start_failure(tmp_path)
     assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is True
 
 
-def test_planner_uses_compact_primary_review_for_validation_guided_repairs(tmp_path):
+def test_planner_prefers_lightweight_compact_review_for_validation_guided_repairs(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
             {
@@ -1517,7 +1517,7 @@ def test_planner_uses_compact_primary_review_for_validation_guided_repairs(tmp_p
     prompt = llm.generate_json_calls[0]["args"][0]
 
     assert review.safe_to_write is True
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
     assert '"safe_to_write"' in prompt
