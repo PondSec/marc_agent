@@ -16715,6 +16715,201 @@ def test_review_guided_retry_uses_deterministic_direct_main_recovery_before_extr
     assert llm.generate_calls == []
 
 
+def test_review_guided_retry_uses_deterministic_direct_main_payload_echo_recovery_after_generic_review_failure(
+    tmp_path,
+):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep-case title-preservation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-payload-echo",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+            confidence=0.93,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to normalize_cli.py for runtime:assertion_mismatch:direct-main-payload-echo (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the locked repair target so the failing runtime behavior changes materially."],
+        ),
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "print(' '.join(args[1:]))" in result.content
+    assert "word.upper()" not in result.content
+    assert result.recovery_strategy == "deterministic_direct_main_contract"
+    assert result.capability_tier == "tier_d"
+    assert llm.generate_calls == []
+
+
+def test_deterministic_direct_main_payload_echo_recovery_skips_nonverbatim_expected_output(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello,', 'WORLD!'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep-case punctuation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO, WORLD!' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case punctuation path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-payload-echo-punctuation",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO, WORLD!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_main_runtime_recovery(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+            confidence=0.93,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to normalize_cli.py for runtime:assertion_mismatch:direct-main-payload-echo-punctuation (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the locked repair target so the failing runtime behavior changes materially."],
+        ),
+    )
+
+    assert result is None
+
+
 def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, monkeypatch):
     llm = ScriptedLLM(
         text_payloads=[

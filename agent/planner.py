@@ -30,6 +30,7 @@ from agent.prompts import (
     _artifact_scoped_focus,
     _direct_main_runtime_contract,
     _line_focused_excerpt,
+    _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
     choose_path_prompt,
@@ -8200,13 +8201,28 @@ class Planner:
             return None
 
         option_tokens, _ = self._direct_main_option_contract_details(session, repair_context)
+        _, positional_tokens = self._direct_main_option_contract_details(session, repair_context)
         if not option_tokens:
             return None
 
-        patched_content = self._apply_direct_main_contract_patch(
+        payload_echo_patch = self._apply_direct_main_payload_echo_patch(
             current_content=current_content,
             option_tokens=option_tokens,
+            positional_tokens=positional_tokens,
+            repair_context=repair_context,
         )
+        patched_content = payload_echo_patch
+        if patched_content is None:
+            if review_text and not any(
+                marker in review_text
+                for marker in ("direct main", "argv", "launcher", "option token")
+            ):
+                return None
+
+            patched_content = self._apply_direct_main_contract_patch(
+                current_content=current_content,
+                option_tokens=option_tokens,
+            )
         if patched_content is None or patched_content == current_content:
             return None
         try:
@@ -8229,6 +8245,105 @@ class Planner:
             review=review,
             recovery_strategy="deterministic_direct_main_contract",
         )
+
+    def _apply_direct_main_payload_echo_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+        positional_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        expected_output = self._direct_main_expected_payload_output(
+            repair_context,
+            positional_tokens=positional_tokens,
+        )
+        if expected_output is None:
+            return None
+
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = lines[start:end]
+        option_set = {str(token or "").strip() for token in option_tokens if str(token or "").strip()}
+        if not option_set:
+            return None
+
+        condition_index: int | None = None
+        branch_end_index: int | None = None
+        branch_arg_name = ""
+        branch_indent = ""
+        condition_pattern = re.compile(
+            r"^(?P<indent>\s*)if\s+(?P<arg>\w+)\s+and\s+(?P=arg)\s*\[\s*0\s*\]\s*==\s*(?P<quote>['\"])(?P<option>.+?)(?P=quote)\s*:\s*$"
+        )
+        for index, raw_line in enumerate(block_lines):
+            match = condition_pattern.match(raw_line)
+            if match is None:
+                continue
+            option_literal = str(match.group("option") or "").strip()
+            if option_literal not in option_set:
+                continue
+            condition_index = index
+            branch_arg_name = str(match.group("arg") or "").strip()
+            branch_indent = str(match.group("indent") or "")
+            branch_body_indent = branch_indent + "    "
+            branch_end_index = len(block_lines)
+            for candidate in range(index + 1, len(block_lines)):
+                line = block_lines[candidate]
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= len(branch_indent):
+                    branch_end_index = candidate
+                    break
+            branch_lines = block_lines[index + 1 : branch_end_index]
+            if not branch_lines:
+                return None
+            has_print = any("print(" in line for line in branch_lines)
+            has_return = any(line.lstrip().startswith("return") for line in branch_lines)
+            if not has_print and not has_return:
+                return None
+            replacement_lines = [block_lines[index]]
+            if has_print:
+                replacement_lines.append(f"{branch_body_indent}print(' '.join({branch_arg_name}[1:]))\n")
+                if has_return:
+                    replacement_lines.append(f"{branch_body_indent}return\n")
+            else:
+                replacement_lines.append(f"{branch_body_indent}return ' '.join({branch_arg_name}[1:])\n")
+            updated_lines = [*lines[: start + index], *replacement_lines, *lines[start + branch_end_index :]]
+            updated_content = "".join(updated_lines)
+            if updated_content == current_content:
+                return None
+            return updated_content
+        return None
+
+    def _direct_main_expected_payload_output(
+        self,
+        repair_context: ValidationFailureEvidence,
+        *,
+        positional_tokens: list[str],
+    ) -> str | None:
+        if repair_context.verification_scope != "runtime" or not positional_tokens:
+            return None
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if not expected_values:
+            return None
+        expected_output = str(expected_values[0] or "").strip()
+        payload_output = " ".join(str(token or "").strip() for token in positional_tokens if str(token or "").strip()).strip()
+        if not expected_output or not payload_output or expected_output != payload_output:
+            return None
+        return expected_output
 
     def _apply_direct_main_contract_patch(
         self,
