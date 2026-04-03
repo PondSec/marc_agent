@@ -14992,6 +14992,7 @@ def test_pre_write_update_review_rejects_css_root_state_without_completed_web_co
         changed_files=[
             FileChangeRecord(path="app.js", operation="modify"),
             FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
         ],
     )
     payload = route_payload(
@@ -15352,6 +15353,188 @@ def test_compact_retry_prompt_includes_orphan_hook_removal_direction_for_html_re
 
     assert "remove or rename the unconsumed id hook 'theme-switcher'" in prompt
     assert "Required corrections from the rejected draft:" in prompt
+
+
+def test_semantic_web_contract_review_prioritizes_file_local_hook_repair_hints(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"app-shell\">\n"
+            "      <p id=\"status-message\">Bereit.</p>\n"
+            "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+            "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+            "    </main>\n"
+            "    <script src=\"app.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+            "document.body.classList.toggle('dark-mode', false);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            ".app-shell { display: grid; }\n"
+            "body.dark-theme { color: white; }\n"
+            "body.light-theme { color: black; }\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Web-App mit einem Theme-Umschalter.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web contract."}],
+            target_paths=["app.js", "index.html", "styles.css"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+
+    review = planner._semantic_web_contract_review(session)
+
+    assert review is not None
+    assert any("theme-switcher" in issue for issue in review.suspicious_issues)
+    assert any("remove" in hint.lower() and "theme-switcher" in hint for hint in review.repair_hints)
+
+
+def test_semantic_review_failure_evidence_keeps_file_local_web_contract_repair_direction(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"app-shell\">\n"
+            "      <p id=\"status-message\">Bereit.</p>\n"
+            "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+            "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+            "    </main>\n"
+            "    <script src=\"app.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+            "document.body.classList.toggle('dark-mode', false);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            ".app-shell { display: grid; }\n"
+            "body.dark-theme { color: white; }\n"
+            "body.light-theme { color: black; }\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Web-App mit einem Theme-Umschalter.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web contract."}],
+            target_paths=["app.js", "index.html", "styles.css"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+
+    review = planner._semantic_web_contract_review(session)
+    assert review is not None
+
+    planner._record_semantic_change_review(session, review)
+
+    assert session.active_repair_context is not None
+    assert session.active_repair_context.verification_scope == "semantic"
+    assert any(
+        "remove or rename the unconsumed id hook 'theme-switcher'" in item
+        for item in session.active_repair_context.repair_requirements
+    )
 
 
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(

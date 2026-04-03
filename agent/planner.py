@@ -6331,9 +6331,29 @@ class Planner:
         )
 
     def _semantic_web_contract_review(self, session: SessionState) -> SemanticChangeReview | None:
-        findings, file_hints = self._web_contract_findings(session)
+        findings, file_hints, inventories = self._web_contract_analysis(session)
         if not findings:
             return None
+        repair_hints: list[str] = []
+        implicated_paths = file_hints or [item.path for item in session.changed_files[:4]]
+        for candidate in implicated_paths:
+            normalized_path = str(candidate or "").strip()
+            if not normalized_path:
+                continue
+            path_findings = [
+                item
+                for item in findings
+                if normalized_path in item.source_paths
+            ]
+            if not path_findings:
+                continue
+            repair_hints.extend(
+                self._web_contract_repair_hints(
+                    path=normalized_path,
+                    findings=path_findings,
+                    inventories=inventories,
+                )
+            )
         return SemanticChangeReview(
             requirements_satisfied=False,
             summary="The changed web artifacts still contain a cross-file web contract mismatch.",
@@ -6341,9 +6361,10 @@ class Planner:
             missing_requirements=[
                 "Resolve the introduced cross-file web contract mismatch across the changed HTML, CSS, and JS artifacts."
             ],
-            suspicious_issues=findings,
+            suspicious_issues=[item.summary for item in findings],
             file_hints=file_hints or [item.path for item in session.changed_files[:4]],
-            repair_hints=[
+            repair_hints=list(dict.fromkeys(repair_hints))[:4]
+            or [
                 "Wire the same ids, selectors, and root-state tokens through the relevant HTML, CSS, and JS files before declaring the task complete.",
                 "Remove duplicate or unused hooks instead of adding parallel DOM elements or selectors for the same behavior.",
             ],
