@@ -15045,6 +15045,113 @@ def test_pre_write_update_review_rejects_css_root_state_without_completed_web_co
     assert any("dark-mode" in issue for issue in review.blocking_issues)
 
 
+def test_pre_write_update_review_surfaces_consumed_sibling_web_hooks_in_repair_hints(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <h1>Board</h1>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "document.addEventListener('DOMContentLoaded', () => {\n"
+            "  const themeSwitch = document.createElement('button');\n"
+            "  themeSwitch.classList.add('theme-switch');\n"
+            "  themeSwitch.setAttribute('aria-label', 'Toggle theme');\n"
+            "  document.body.appendChild(themeSwitch);\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Add a keyboard-accessible theme switcher to the current web files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            language_counts={"html": 1, "javascript": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js"],
+            focus_files=["index.html", "app.js"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[FileChangeRecord(path="app.js", operation="modify")],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested multi-file web update."},
+        ],
+        target_paths=["app.js", "index.html"],
+        target_name="index.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=(tmp_path / "index.html").read_text(encoding="utf-8"),
+        proposed_content=(
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <h1>Board</h1>\n"
+            "    </main>\n"
+            "    <button id=\"theme-switch\" class=\"theme-switch\" aria-label=\"Toggle theme\" tabindex=\"0\">Toggle Theme</button>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert any("theme-switch" in issue for issue in review.blocking_issues)
+    assert any("theme-switch" in hint and "class" in hint.lower() for hint in review.repair_hints)
+
+
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
     tmp_path,
 ):
