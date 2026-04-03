@@ -11436,6 +11436,7 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "Observed semantics: Validation currently produces: ''" in prompt
     assert "Minimal semantic delta:" in prompt
     assert "Apply this exact semantic delta in the behavior produced by this file:" in prompt
+    assert "Change the setup-time behavior for this interaction" not in prompt
 
 
 def test_runtime_repair_prompts_keep_interactive_support_context_across_modes(tmp_path):
@@ -12701,6 +12702,8 @@ def test_review_guided_retry_prompt_surfaces_pre_interaction_initialization_hint
     assert "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring" in prompt
     assert "Do not add new early-return branches, wrapper conditions, or API changes" in prompt
     assert "Treat the expected-versus-observed values as an interaction behavior contract." in prompt
+    assert "Change the setup-time behavior for this interaction so the initialized state yields 'false'" in prompt
+    assert "Replace observed-only text 'undefined' with expected text 'false'" not in prompt
 
 
 def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):

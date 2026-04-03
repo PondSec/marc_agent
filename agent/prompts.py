@@ -1140,7 +1140,12 @@ def proposed_update_review_prompt(
             repair_context,
             target_path=path,
         )
-        semantic_deltas = _repair_semantic_delta_lines(repair_context, limit=2)
+        semantic_deltas = _repair_semantic_delta_lines(
+            repair_context,
+            limit=2,
+            path=path,
+            current_content=current_excerpt,
+        )
         if semantic_deltas:
             review_context["failure_evidence_behavior_deltas"] = semantic_deltas
     return "\n".join(
@@ -2094,7 +2099,12 @@ def _compact_repair_update_prompt(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(
+        repair_context,
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+    )
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2280,7 +2290,12 @@ def _compact_repair_retry_prompt(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(
+        repair_context,
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+    )
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2511,7 +2526,12 @@ def _focused_full_repair_update_prompt(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(
+        repair_context,
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+    )
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2810,6 +2830,9 @@ def _repair_semantic_delta_lines(
     repair_context: ValidationFailureEvidence,
     *,
     limit: int = 2,
+    path: str = "",
+    current_content: str = "",
+    supporting_context: str = "",
 ) -> list[str]:
     brief = getattr(repair_context, "repair_brief", None)
     if brief is None:
@@ -2828,6 +2851,18 @@ def _repair_semantic_delta_lines(
     if not expected_items or not observed_items:
         return []
 
+    behavioral_deltas = _interactive_runtime_semantic_delta_lines(
+        path=path,
+        current_content=current_content,
+        supporting_context=supporting_context,
+        repair_brief=brief,
+        observed_items=observed_items,
+        expected_items=expected_items,
+        limit=limit,
+    )
+    if behavioral_deltas:
+        return behavioral_deltas
+
     deltas: list[str] = []
     for observed_value, expected_value in zip(observed_items, expected_items):
         compared_observed, compared_expected = _first_mismatching_semantic_line_pair(
@@ -2841,6 +2876,59 @@ def _repair_semantic_delta_lines(
         if len(deltas) >= limit:
             break
     return deltas
+
+
+def _interactive_runtime_semantic_delta_lines(
+    *,
+    path: str,
+    current_content: str,
+    supporting_context: str,
+    repair_brief: object,
+    observed_items: list[str],
+    expected_items: list[str],
+    limit: int,
+) -> list[str]:
+    if Path(str(path or "")).suffix.lower() not in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        return []
+    brief_payload = {
+        "expected_semantics": list(getattr(repair_brief, "expected_semantics", []) or []),
+        "observed_semantics": list(getattr(repair_brief, "observed_semantics", []) or []),
+    }
+    if not _js_runtime_pre_event_state_hints(
+        current_content=current_content,
+        supporting_context=supporting_context,
+        repair_brief=brief_payload,
+    ):
+        return []
+
+    deltas: list[str] = []
+    for observed_value, expected_value in zip(observed_items, expected_items):
+        delta = _render_interactive_runtime_semantic_delta(observed_value, expected_value)
+        if not delta or delta in deltas:
+            continue
+        deltas.append(delta)
+        if len(deltas) >= limit:
+            break
+    return deltas
+
+
+def _render_interactive_runtime_semantic_delta(observed_value: str, expected_value: str) -> str | None:
+    observed = str(observed_value or "").strip()
+    expected = str(expected_value or "").strip()
+    if not observed or not expected or observed == expected:
+        return None
+
+    observed_summary = _trim_repair_delta_value(observed)
+    expected_summary = _trim_repair_delta_value(expected)
+    if observed.lower() in {"undefined", "null", "''", '""'}:
+        observed_clause = "staying unset at setup time"
+    else:
+        observed_clause = f"producing '{observed_summary}' at setup time"
+    return (
+        "Change the setup-time behavior for this interaction so the initialized state yields "
+        f"'{expected_summary}' before the first user event instead of {observed_clause}. "
+        "Repair initialization/state wiring rather than treating this as a literal source-text replacement."
+    )
 
 
 def _repair_semantic_value_text(raw: object) -> str:
@@ -3374,7 +3462,13 @@ def _mandatory_mutation_anchors(
     ):
         anchors.append(literal_anchor)
 
-    for delta in _repair_semantic_delta_lines(repair_context, limit=2):
+    for delta in _repair_semantic_delta_lines(
+        repair_context,
+        limit=2,
+        path=path,
+        current_content=current_content,
+        supporting_context=supporting_context,
+    ):
         anchors.append(
             "Apply this exact semantic delta in the behavior produced by this file: "
             + _trim_text(delta, 220)
