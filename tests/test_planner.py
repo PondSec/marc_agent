@@ -909,6 +909,199 @@ def test_planner_uses_local_review_fallback_for_compact_single_model_repairs(tmp
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
+def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_available(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+                "confidence": 0.9,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:14b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Fix the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:lightweight-repair-review",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_region_hint="greet_cli/__main__.py:line 5",
+            repair_constraints=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title}: {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title} {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    assert len(llm.generate_json_calls) == 1
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+    assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
+
+
+def test_planner_repair_review_escalates_to_primary_after_lightweight_timeout(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:14b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Fix the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:repair-review-escalation",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_region_hint="greet_cli/__main__.py:line 5",
+            repair_constraints=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    safe_review = {
+        "safe_to_write": True,
+        "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+        "confidence": 0.9,
+        "blocking_issues": [],
+        "preservation_risks": [],
+        "repair_hints": [],
+    }
+
+    def fake_generate_json(*args, **kwargs):
+        llm.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if len(llm.generate_json_calls) == 1:
+            raise OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 45.0 seconds",
+                reason="startup_timeout",
+                elapsed=45.0,
+                idle_for=45.0,
+                retryable=True,
+                model_name=kwargs.get("model"),
+                startup_timeout_seconds=45,
+                inactivity_timeout_seconds=25,
+                total_timeout_seconds=45,
+                first_output_received=False,
+            )
+        return safe_review
+
+    llm.generate_json = fake_generate_json
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title}: {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title} {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    assert len(llm.generate_json_calls) == 2
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
+    assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
+
+
 def test_planner_repair_target_scope_review_blocks_drift_before_ai_review(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
