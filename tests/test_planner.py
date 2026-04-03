@@ -3951,6 +3951,107 @@ def test_artifact_scoped_focus_marks_runtime_cli_literal_as_nonbinding_example(t
     )
 
 
+def test_artifact_scoped_focus_marks_request_cli_command_example_as_nonbinding_for_python_target(tmp_path):
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+            "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+            "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+        current_content=current_content,
+    )
+
+    assert "python normalize_cli.py --keep-case hello world" not in focus["literal_constraints"]
+    assert any(
+        item["value"] == "python normalize_cli.py --keep-case hello world"
+        and item["source"] == "request_text"
+        and item["type"] == "illustrative_runtime_cli_example"
+        and item["hard_source_constraint"] is False
+        for item in focus["literal_anchor_details"]
+    )
+
+
+def test_artifact_scoped_focus_keeps_request_cli_command_as_hard_anchor_when_target_already_contains_exact_literal(
+    tmp_path,
+):
+    current_content = (
+        "# CLI examples\n"
+        "python normalize_cli.py --keep-case hello world\n"
+    )
+    (tmp_path / "README.md").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Ergaenze README.md mit dem genauen Aufruf `python normalize_cli.py --keep-case hello world` "
+            "und erklaere den keep-case Pfad."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["README.md"],
+                "focus_files": ["README.md"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the requested command example."}],
+        target_paths=["README.md"],
+        target_name="README.md",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "README.md",
+        current_content=current_content,
+    )
+
+    assert "python normalize_cli.py --keep-case hello world" in focus["literal_constraints"]
+    assert any(
+        item["value"] == "python normalize_cli.py --keep-case hello world"
+        and item["source"] == "request_text"
+        and item["type"] == "must_source_anchor"
+        and item["hard_source_constraint"] is True
+        for item in focus["literal_anchor_details"]
+    )
+
+
 def test_repair_route_requested_outcome_does_not_promote_failure_literal_into_request_anchor(tmp_path):
     current_content = (
         "def main(argv=None):\n"
@@ -14657,6 +14758,111 @@ def test_pre_write_update_review_allows_evidence_backed_local_behavior_adjustmen
 
     assert review.safe_to_write is True
     assert "runtime failure evidence" in review.summary.lower()
+
+
+def test_pre_write_update_review_does_not_reject_safe_python_repair_for_request_cli_example_literal(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+            "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+            "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python normalize_cli.py --keep-case hello world",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py"],
+        summary="Validation command stdout differed from the expected output.",
+        excerpt=(
+            "AssertionError: '--keep-case hello world' != 'hello world'\n"
+            "- --keep-case hello world\n"
+            "+ hello world"
+        ),
+        failure_summary=(
+            "AssertionError: '--keep-case hello world' != 'hello world'\n"
+            "- --keep-case hello world\n"
+            "+ hello world"
+        ),
+        repair_requirements=["Change normalize_cli.py so the failing runtime path succeeds."],
+        file_hints=["normalize_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:request-cli-example-review",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: hello world"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=[],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.86,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    print(normalize_words(' '.join(source_tokens or ['Hello', 'WORLD']), keep_case=keep_case))\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert review.summary == "ok"
 
 
 def test_pre_write_update_review_keeps_scope_rejection_without_direct_failure_evidence(tmp_path, monkeypatch):

@@ -4543,6 +4543,17 @@ def _hard_request_literal_anchor_details(
     for candidate in _request_literal_candidates(request_text):
         if not _literal_matches_reference(candidate, current_tokens):
             continue
+        if _request_cli_literal_is_illustrative(candidate, reference=reference):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "request_text",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=request_text),
+                    "hard_source_constraint": False,
+                },
+            )
+            continue
         anchor_type = "must_source_anchor"
         if _python_call_literal_needs_path_scope(candidate, path):
             if _python_call_literal_contains_example_payload(candidate):
@@ -4888,6 +4899,19 @@ def _literal_matches_reference(candidate: str, reference_tokens: set[str]) -> bo
         return len(candidate_tokens & reference_tokens) >= 3
     identifier_tokens = _literal_identifier_tokens(normalized)
     return bool(identifier_tokens & reference_tokens)
+
+
+def _request_cli_literal_is_illustrative(candidate: str, *, reference: str) -> bool:
+    normalized = " ".join(str(candidate or "").split()).strip()
+    if not normalized:
+        return False
+    tokens = normalized.split()
+    if len(tokens) < 2 or tokens[0].startswith("--"):
+        return False
+    if not any(token.startswith("--") for token in tokens[1:]):
+        return False
+    normalized_reference = " ".join(str(reference or "").split()).strip()
+    return normalized not in normalized_reference
 
 
 def _literal_reference_tokens(text: str) -> set[str]:
