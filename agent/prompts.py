@@ -3176,6 +3176,11 @@ def _render_semantic_delta(observed_value: str, expected_value: str) -> str | No
     expected = str(expected_value or "")
     if not observed or not expected or observed == expected:
         return None
+    if _is_atomic_semantic_value(observed) and _is_atomic_semantic_value(expected):
+        return (
+            f"Make the produced value '{_trim_repair_delta_value(expected)}' "
+            f"instead of '{_trim_repair_delta_value(observed)}'."
+        )
 
     prefix_length = 0
     max_prefix = min(len(observed), len(expected))
@@ -3221,6 +3226,15 @@ def _render_semantic_delta(observed_value: str, expected_value: str) -> str | No
     if context_parts:
         return action + " between " + " and ".join(context_parts) + "."
     return action + "."
+
+
+def _is_atomic_semantic_value(value: str) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized or "\n" in normalized or len(normalized) > 24:
+        return False
+    if normalized in {"''", '""'}:
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9_./:@+-]+", normalized))
 
 
 def _trim_repair_delta_context(text: str, *, keep_tail: bool, limit: int = 40) -> str:

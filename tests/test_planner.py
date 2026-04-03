@@ -12706,6 +12706,132 @@ def test_review_guided_retry_prompt_surfaces_pre_interaction_initialization_hint
     assert "Replace observed-only text 'undefined' with expected text 'false'" not in prompt
 
 
+def test_review_guided_retry_prompt_keeps_boolean_semantic_delta_atomic_for_js_runtime_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test('wireMenuToggle toggles panel state on each click', () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "expected: false\n"
+            "actual: true\n"
+        ),
+        failure_summary="panel.hidden still reflects the wrong post-click state after the first interaction.",
+        repair_requirements=["Change app.js so the post-click runtime path flips panel.hidden together with aria-expanded."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-post-click-state",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: true"],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair changes the file, but not the lines tied to the failed runtime behavior.",
+        confidence=0.9,
+        blocking_issues=[
+            "The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"
+        ],
+        preservation_risks=[],
+        repair_hints=["Update the relevant function signature or behavior line that the failing traceback points to."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Make the produced value 'false' instead of 'true'." in prompt
+    assert "Replace observed-only text 'tru' with expected text 'fals'" not in prompt
+    assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
+
+
 def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     current_content = (
