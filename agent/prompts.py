@@ -3154,20 +3154,25 @@ def _direct_main_runtime_contract(
             continue
 
         saw_option = False
+        last_option_tail: list[str] = []
         for value in values:
             token = str(value or "").strip()
             if not token:
                 continue
             if token.startswith("-"):
                 saw_option = True
+                last_option_tail = []
                 if token not in option_tokens:
                     option_tokens.append(token)
-                    if len(option_tokens) >= limit:
+                    if len(option_tokens) >= limit and positional_tokens:
                         return option_tokens[:limit], positional_tokens[:limit]
                 continue
-            if not saw_option or token in positional_tokens:
+            if not saw_option:
                 continue
-            positional_tokens.append(token)
+            if token not in last_option_tail:
+                last_option_tail.append(token)
+        if last_option_tail:
+            positional_tokens = last_option_tail[:limit]
             if len(positional_tokens) >= limit:
                 return option_tokens[:limit], positional_tokens[:limit]
     return option_tokens[:limit], positional_tokens[:limit]
@@ -3786,21 +3791,25 @@ def _direct_python_script_runtime_contract(
     option_tokens: list[str] = []
     tail_tokens: list[str] = []
     saw_option = False
+    last_option_tail: list[str] = []
     for token in tokens[2:]:
         normalized = str(token or "").strip()
         if not normalized:
             continue
         if normalized.startswith("-"):
             saw_option = True
+            last_option_tail = []
             if normalized not in option_tokens:
                 option_tokens.append(normalized)
-            if len(option_tokens) >= limit and len(tail_tokens) >= limit:
+            if len(option_tokens) >= limit and tail_tokens:
                 break
             continue
-        if saw_option and normalized not in tail_tokens:
-            tail_tokens.append(normalized)
-            if len(option_tokens) >= limit and len(tail_tokens) >= limit:
+        if saw_option and normalized not in last_option_tail:
+            last_option_tail.append(normalized)
+            if len(option_tokens) >= limit and len(last_option_tail) >= limit:
                 break
+    if last_option_tail:
+        tail_tokens = last_option_tail[:limit]
     return option_tokens[:limit], tail_tokens[:limit]
 
 

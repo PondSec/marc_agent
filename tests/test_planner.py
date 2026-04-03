@@ -31,6 +31,8 @@ from agent.planner import (
     ValidationFailureEvidence,
 )
 from agent.prompts import (
+    _direct_main_runtime_contract,
+    _direct_python_script_runtime_contract,
     _artifact_scoped_focus,
     _repair_target_line_hints,
     _repair_required_literal_anchors,
@@ -11898,6 +11900,62 @@ def test_targeted_runtime_prompt_hints_cover_direct_script_cli_contracts():
     assert any("stop echoing that option token" in hint for hint in hints)
 
 
+def test_direct_main_runtime_contract_keeps_only_tail_after_last_option():
+    option_tokens, positional_tokens = _direct_main_runtime_contract(
+        "main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])",
+    )
+
+    assert option_tokens == ["--prefix", "--keep-case"]
+    assert positional_tokens == ["Hello", "WORLD"]
+
+
+def test_direct_python_script_runtime_contract_keeps_only_tail_after_last_option():
+    option_tokens, tail_tokens = _direct_python_script_runtime_contract(
+        "python prefix_cli.py --prefix Dr. --keep-case Hello WORLD",
+        target_path="prefix_cli.py",
+    )
+
+    assert option_tokens == ["--prefix", "--keep-case"]
+    assert tail_tokens == ["Hello", "WORLD"]
+
+
+def test_targeted_runtime_prompt_hints_ignore_interleaved_direct_main_option_values():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    prefix = ''\n"
+        "    if len(args) >= 2 and args[0] == '--prefix':\n"
+        "        prefix = args[1]\n"
+        "        args = args[2:]\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        return prefix + ' ' + ' '.join(args[1:])\n"
+        "    return ' '.join(args).title()\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from prefix_cli import main\n\n"
+            "def test_direct_main_prefix_keep_case():\n"
+            "    assert main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD']) == 'Dr. Hello WORLD'\n"
+        ),
+        targeted_context={
+            "failure_summary": "prefix_cli.py still formats the direct main prefix keep-case path incorrectly.",
+            "excerpt": "AssertionError: 'Dr.: WORLD' != 'Dr. Hello WORLD'",
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py", "tests/test_prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Dr. Hello WORLD"],
+                "observed_semantics": ["Validation currently produces: Dr.: WORLD"],
+            },
+        },
+    )
+
+    assert any("exact option tokens like --prefix, --keep-case" in hint for hint in hints)
+    assert any("remaining argv payload 'Hello', 'WORLD'" in hint for hint in hints)
+    assert not any("'Dr.', 'Hello', 'WORLD'" in hint for hint in hints)
+
+
 def test_direct_python_script_option_contract_review_rejects_impossible_prefix_slice(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(
@@ -20474,6 +20532,60 @@ def test_direct_main_option_contract_details_prefers_explicit_validation_command
     option_tokens, positional_tokens = planner._direct_main_option_contract_details(session, repair_context)
 
     assert option_tokens == ["--keep-case"]
+    assert positional_tokens == ["Hello", "WORLD"]
+
+
+def test_direct_main_option_contract_details_drop_interleaved_option_values(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package\n", encoding="utf-8")
+    (tests_dir / "test_prefix_cli.py").write_text(
+        "def test_direct_main_prefix_keep_case():\n"
+        "    main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair prefix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["prefix_cli.py", "tests/test_prefix_cli.py"],
+                "focus_files": ["prefix_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_prefix_cli.py"],
+                "entrypoints": ["prefix_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest -q tests/test_prefix_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py", "tests/test_prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: WORLD' != 'Dr. Hello WORLD'",
+        failure_summary="prefix_cli.py still formats the direct main prefix keep-case path incorrectly.",
+        repair_requirements=["Change prefix_cli.py so the direct main prefix keep-case path returns the expected output."],
+        file_hints=["prefix_cli.py", "tests/test_prefix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-prefix-keep-case-tail",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Dr. Hello WORLD"],
+            observed_semantics=["Validation currently produces: Dr.: WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    option_tokens, positional_tokens = planner._direct_main_option_contract_details(session, repair_context)
+
+    assert option_tokens == ["--prefix", "--keep-case"]
     assert positional_tokens == ["Hello", "WORLD"]
 
 

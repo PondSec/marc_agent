@@ -9749,32 +9749,19 @@ class Planner:
             excerpt = self._current_or_last_read_excerpt(session, path=candidate)
             if "main([" not in excerpt:
                 continue
-            for match in re.finditer(r"\bmain\(\s*(\[[^\]]*\])\s*\)", excerpt):
-                raw_argv = str(match.group(1) or "").strip()
-                if not raw_argv:
-                    continue
-                try:
-                    values = ast.literal_eval(raw_argv)
-                except (SyntaxError, ValueError):
-                    continue
-                if not isinstance(values, (list, tuple)):
-                    continue
-                saw_option = False
-                for value in values:
-                    token = str(value or "").strip()
-                    if token.startswith("-"):
-                        saw_option = True
-                        if token in tokens:
-                            continue
-                        tokens.append(token)
-                        if len(tokens) >= limit:
-                            return tokens[:limit], positional_tokens[:limit]
-                        continue
-                    if not saw_option or token in positional_tokens:
-                        continue
-                    positional_tokens.append(token)
-                    if len(positional_tokens) >= limit:
+            option_candidates, positional_candidates = _direct_main_runtime_contract(
+                excerpt,
+                limit=limit,
+            )
+            for token in option_candidates:
+                if token and token not in tokens:
+                    tokens.append(token)
+                    if len(tokens) >= limit and positional_tokens:
                         return tokens[:limit], positional_tokens[:limit]
+            if positional_candidates:
+                positional_tokens = positional_candidates[:limit]
+                if len(positional_tokens) >= limit:
+                    return tokens[:limit], positional_tokens[:limit]
         return tokens[:limit], positional_tokens[:limit]
 
     def _session_direct_main_option_contract_details(
