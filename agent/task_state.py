@@ -490,6 +490,8 @@ class TaskState(StrictModel):
         self.execution_outline = _compact_strings(self.execution_outline, limit=6)
         self.clarification_questions = _compact_strings(self.clarification_questions, limit=3)
         self.next_best_action = self.next_best_action or self.next_action
+        if self._should_infer_structured_confidence():
+            self.confidence = max(float(self.confidence or 0.0), 0.58)
         if self._should_clear_inconsistent_clarification():
             self.needs_clarification = False
             self.clarification_questions = []
@@ -541,6 +543,22 @@ class TaskState(StrictModel):
         if not self.output_expectation:
             raise ValueError("output_expectation is required")
         return self
+
+    def _should_infer_structured_confidence(self) -> bool:
+        if float(self.confidence or 0.0) > 0.0:
+            return False
+        if self.needs_clarification:
+            return False
+        if self.ambiguity_level != "low" or self.risk_level == "high":
+            return False
+        if (self.next_best_action or self.next_action) == "clarify":
+            return False
+        if self.execution_strategy is None and self.current_user_intent is None:
+            return False
+        artifacts = self.active_artifacts or self.target_artifacts
+        if any(str(item.path or item.name or "").strip() for item in artifacts):
+            return True
+        return bool(self.verification_target)
 
     def _should_clear_inconsistent_clarification(self) -> bool:
         if not self.needs_clarification:

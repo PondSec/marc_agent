@@ -2497,6 +2497,41 @@ def test_task_state_updater_accepts_string_active_artifact_shorthand(tmp_path):
     }
 
 
+def test_task_state_infers_confidence_for_structured_semantic_state_without_explicit_confidence(tmp_path):
+    payload = {
+        "latest_user_turn": "Ergaenze einen Theme-Umschalter.",
+        "root_goal": "Implement a theme switcher.",
+        "active_goal": "Implement a theme switcher.",
+        "goal_relation": "continue",
+        "output_expectation": "A working theme switcher.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "index.html, app.js, styles.css",
+        "target_artifacts": [
+            {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "app.js", "name": "app.js", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+        ],
+        "active_artifacts": ["index.html", "app.js", "styles.css"],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "needs_clarification": False,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        "Ergaenze einen Theme-Umschalter.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.confidence >= 0.58
+    assert route.needs_clarification is False
+    assert route.intent == RouteIntent.UPDATE
+
+
 def test_task_state_timeout_fallback_clarifies_vague_request_without_specialized_strategy(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
     session = SessionState(
