@@ -13532,6 +13532,187 @@ def test_proposed_update_review_prompt_marks_runtime_cli_literal_examples_as_non
     assert '"source": "runtime_evidence"' in prompt
     assert '"type": "illustrative_runtime_cli_example"' in prompt
     assert '"hard_source_constraint": false' in prompt
+    assert "A missing-literal blocker is valid only when the exact literal already appears in path_scope.literal_constraints" in prompt
+
+
+def test_compact_repair_prompt_marks_runtime_cli_literal_examples_as_nonbinding(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py so the direct main runtime path preserves keep-case output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:repair-prompt-literal-provenance",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Literal provenance: treat only hard file-local source obligations as exact source-text requirements." in prompt
+    assert "--keep-case hello world [runtime_evidence/illustrative_runtime_cli_example]" in prompt
+    assert "illustrative behavior evidence unless the active file scope separately marks them as hard source obligations" in prompt
+
+
+def test_compact_repair_retry_prompt_keeps_runtime_cli_literal_example_nonbinding(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py so the direct main runtime path preserves keep-case output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:retry-prompt-literal-provenance",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed update does not preserve an explicit literal constraint from the request.",
+        confidence=0.88,
+        blocking_issues=[
+            "The exact requested literal is missing from normalize_cli.py: --keep-case hello world",
+        ],
+        preservation_risks=[],
+        repair_hints=[
+            "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+        ],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Literal provenance: treat only hard file-local source obligations as exact source-text requirements." in prompt
+    assert "--keep-case hello world [runtime_evidence/illustrative_runtime_cli_example]" in prompt
+    assert "Previous proposal was rejected because: The exact requested literal is missing from normalize_cli.py: --keep-case hello world" in prompt
 
 
 def test_pre_write_update_review_allows_evidence_backed_local_behavior_adjustment_after_scope_rejection(

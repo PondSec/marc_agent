@@ -1146,6 +1146,7 @@ def proposed_update_review_prompt(
             "- Fail when a narrow request adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance unless the visible evidence clearly requires that extra content.",
             "- Treat explicit literal examples from the request as hard constraints when they are clearly part of the requested outcome; wrong placeholders, argument order, command shape, or snippet content are failures unless visible evidence contradicts them.",
             "- Use path_scope.literal_anchor_details to track provenance: only entries with hard_source_constraint=true are hard file-local source obligations.",
+            "- A missing-literal blocker is valid only when the exact literal already appears in path_scope.literal_constraints or in path_scope.literal_anchor_details with hard_source_constraint=true.",
             "- Do not promote repair_brief, runtime_evidence, validation_failure_evidence, or generation_relevant_constraint examples into new hard source literals on their own; they justify the fix but do not require copying the literal into the source.",
             "- Use path_scope.current_write_requirements as the hard requirements for this file when that list is non-empty.",
             "- Treat path_scope.other_pending_requirements as non-blocking for this file unless the proposal directly contradicts them or falsely claims to complete them here.",
@@ -1963,6 +1964,40 @@ def _compact_repair_file_focus(
     }
 
 
+def _repair_literal_provenance_guidance(file_focus: dict[str, object]) -> str:
+    hard_literals: list[str] = []
+    illustrative_literals: list[str] = []
+    for raw in file_focus.get("literal_anchor_details", [])[:6]:
+        value = _trim_text(str(raw.get("value") or "").strip(), 80)
+        source = str(raw.get("source") or "").strip()
+        anchor_type = str(raw.get("type") or "").strip()
+        if not value or not source:
+            continue
+        detail = value
+        if anchor_type:
+            detail += f" [{source}/{anchor_type}]"
+        else:
+            detail += f" [{source}]"
+        if bool(raw.get("hard_source_constraint")):
+            if detail not in hard_literals:
+                hard_literals.append(detail)
+            continue
+        if detail not in illustrative_literals:
+            illustrative_literals.append(detail)
+
+    sections = [
+        "Literal provenance: treat only hard file-local source obligations as exact source-text requirements.",
+    ]
+    if hard_literals:
+        sections.append("Hard source literals: " + " | ".join(hard_literals[:3]))
+    if illustrative_literals:
+        sections.append(
+            "Illustrative evidence literals do not need to be copied into source unless they also appear as hard source obligations: "
+            + " | ".join(illustrative_literals[:3])
+        )
+    return " ".join(sections)
+
+
 def _compact_repair_update_prompt(
     route: RouterOutput,
     session: SessionState,
@@ -2035,6 +2070,9 @@ def _compact_repair_update_prompt(
                 if str(item or "").strip()
             )
         )
+    literal_provenance = _repair_literal_provenance_guidance(file_focus)
+    if literal_provenance:
+        sections.append(literal_provenance)
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         target_summary = repair_brief.get("locked_target") or repair_brief.get("primary_target")
         sections.append(f"Primary repair target: {target_summary}")
@@ -2220,6 +2258,9 @@ def _compact_repair_retry_prompt(
                 if str(item or "").strip()
             )
         )
+    literal_provenance = _repair_literal_provenance_guidance(file_focus)
+    if literal_provenance:
+        sections.append(literal_provenance)
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         sections.append(
             "Primary repair target: "
@@ -2441,6 +2482,9 @@ def _focused_full_repair_update_prompt(
     file_requirement_summary = _file_local_requirement_summary(compact_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    literal_provenance = _repair_literal_provenance_guidance(file_focus)
+    if literal_provenance:
+        sections.append(literal_provenance)
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         sections.append(
             "Primary repair target: "
@@ -5230,7 +5274,8 @@ def _requirement_dedupe_key(text: str) -> str:
 def _repair_rules(repair_strategy: str | None) -> str:
     lines = [
         "Repair rules:",
-        "- Use the failed validation evidence as a hard constraint for this update.",
+        "- Use the failed validation evidence as a hard behavioral constraint for this update: close the observed-vs-expected delta tied to the active failure.",
+        "- Treat runtime_evidence, validation_failure_evidence, repair_brief, and generation_relevant_constraint literals as illustrative behavior evidence unless the active file scope separately marks them as hard source obligations.",
         "- Make a concrete mutation that addresses the failed verification scope directly.",
         "- Do not return equivalent content or formatting-only changes.",
         "- No-op changes are forbidden: do not change only whitespace, comments, metadata, or unrelated regions.",
