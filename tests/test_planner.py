@@ -4,6 +4,7 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 
+import agent.state_updater as state_updater_module
 import llm.runtime_resilience as runtime_resilience
 import pytest
 
@@ -1793,6 +1794,126 @@ def test_planner_bootstraps_task_state_generation_with_router_model_budget(tmp_p
     assert planner.task_state_updater.timeout == 35
     assert planner.task_state_updater.num_ctx == 2048
     assert planner.task_state_updater._model_candidates()[:2] == ["qwen3:8b", "qwen3:14b"]
+
+
+def test_task_state_recovery_ignores_larger_timeout_reserve_when_no_faster_model_exists(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen3:14b",
+                router_model_name="qwen3:8b",
+            )
+        ),
+        "",
+    )
+    failure = ExecutionFailure(
+        failure_class="total_timeout",
+        state="failed_total_timeout",
+        had_progress=True,
+        first_output_received=True,
+        model_identifier="qwen3:8b",
+        backend_identifier="ollama",
+        context_pressure_estimate="low",
+        retryable=True,
+        raw_reason="total_timeout",
+    )
+
+    recovery_model = planner.task_state_updater._recovery_model_for_failure(
+        primary_model="qwen3:8b",
+        reserve_models=["qwen3:14b"],
+        failure=failure,
+    )
+
+    assert recovery_model is None
+
+
+def test_task_state_update_refreshes_live_inventory_for_timeout_recovery(tmp_path, monkeypatch):
+    class LiveInventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [{"name": "qwen3:8b"}, {"name": "qwen2.5-coder:7b"}, {"name": "qwen3:14b"}]
+
+    llm = LiveInventoryLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3:14b",
+            router_model_name="qwen3:8b",
+            router_num_ctx=2048,
+        )
+    )
+    planner = Planner(llm, "")
+    updater = planner.task_state_updater
+    fallback_payload = updater._fallback_state("Repair normalize_cli.py").model_dump()
+    seen_models: list[str | None] = []
+
+    def fake_invoke_model(_invoke, **kwargs):
+        model_identifier = kwargs.get("model_identifier")
+        seen_models.append(model_identifier)
+        attempt = ExecutionAttemptRecord(
+            operation_name=kwargs["operation_name"],
+            task_class=kwargs["task_class"],
+            attempt_number=kwargs["attempt_number"],
+            capability_tier=kwargs["capability_tier"],
+            recovery_strategy=kwargs["recovery_strategy"],
+            prompt_variant=kwargs["prompt_variant"],
+            model_identifier=model_identifier,
+            backend_identifier=kwargs["backend_identifier"],
+            startup_timeout_seconds=kwargs.get("startup_timeout_seconds"),
+            inactivity_timeout_seconds=kwargs.get("inactivity_timeout_seconds"),
+            total_timeout_seconds=kwargs.get("total_timeout_seconds"),
+        )
+        if len(seen_models) == 1:
+            failure = ExecutionFailure(
+                failure_class="total_timeout",
+                state="failed_total_timeout",
+                had_progress=True,
+                first_output_received=True,
+                startup_timeout_seconds=kwargs.get("startup_timeout_seconds"),
+                inactivity_timeout_seconds=kwargs.get("inactivity_timeout_seconds"),
+                total_timeout_seconds=kwargs.get("total_timeout_seconds"),
+                elapsed_seconds=float(kwargs.get("total_timeout_seconds") or 0),
+                idle_seconds=0.1,
+                model_identifier=model_identifier,
+                backend_identifier=kwargs["backend_identifier"],
+                context_pressure_estimate="low",
+                retryable=True,
+                raw_reason="total_timeout",
+                detail="timed out waiting for completion",
+                characters=128,
+                activity_count=8,
+            )
+            attempt.state = failure.state
+            attempt.had_progress = True
+            attempt.first_output_received = True
+            attempt.output_characters = 128
+            attempt.activity_count = 8
+            attempt.failure = failure
+            return runtime_resilience.InvocationOutcome(
+                attempt=attempt,
+                exception=runtime_resilience.InvocationLifecycleTimeoutError(
+                    "timed out waiting for completion",
+                    reason="total_timeout",
+                    elapsed=float(kwargs.get("total_timeout_seconds") or 0),
+                    idle_for=0.1,
+                    characters=128,
+                    activity_count=8,
+                    model_name=model_identifier,
+                    backend_identifier=kwargs["backend_identifier"],
+                    startup_timeout_seconds=kwargs.get("startup_timeout_seconds"),
+                    inactivity_timeout_seconds=kwargs.get("inactivity_timeout_seconds"),
+                    total_timeout_seconds=kwargs.get("total_timeout_seconds"),
+                    first_output_received=True,
+                ),
+            )
+        attempt.state = "completed"
+        return runtime_resilience.InvocationOutcome(attempt=attempt, value=fallback_payload)
+
+    monkeypatch.setattr(state_updater_module, "invoke_model", fake_invoke_model)
+
+    state = updater.update_task_state("Repair normalize_cli.py")
+
+    assert seen_models[:2] == ["qwen3:8b", "qwen2.5-coder:7b"]
+    assert state.semantic_resolution == "reserve_model"
 
 
 def test_planner_uses_compact_primary_prompt_for_low_risk_multi_file_create_when_lightweight_is_too_narrow(tmp_path):

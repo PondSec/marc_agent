@@ -209,7 +209,7 @@ class TaskStateUpdater:
             error=str(outcome.exception),
             failure=failure.to_dict() if failure is not None else None,
         )
-        if failure is not None and failure.no_start_failure:
+        if failure is not None and failure.timeout_like:
             refreshed_candidates = self._model_candidates(refresh_live_inventory=True)
             if refreshed_candidates:
                 model_candidates = refreshed_candidates
@@ -898,7 +898,7 @@ class TaskStateUpdater:
         candidates = list(reserve_models or [])
         if failure is None:
             return candidates[0] if candidates else None
-        if failure.no_start_failure:
+        if failure.timeout_like:
             return availability_recovery_model(primary_model, candidates)
         return candidates[0] if candidates else None
 
