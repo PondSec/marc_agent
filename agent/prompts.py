@@ -2899,7 +2899,20 @@ def _interactive_runtime_semantic_delta_lines(
         supporting_context=supporting_context,
         repair_brief=brief_payload,
     ):
-        return []
+        toggle_deltas: list[str] = []
+        for observed_value, expected_value in zip(observed_items, expected_items):
+            delta = _render_interactive_runtime_toggle_delta(
+                current_content=current_content,
+                supporting_context=supporting_context,
+                observed_value=observed_value,
+                expected_value=expected_value,
+            )
+            if not delta or delta in toggle_deltas:
+                continue
+            toggle_deltas.append(delta)
+            if len(toggle_deltas) >= limit:
+                break
+        return toggle_deltas
 
     deltas: list[str] = []
     for observed_value, expected_value in zip(observed_items, expected_items):
@@ -2910,6 +2923,33 @@ def _interactive_runtime_semantic_delta_lines(
         if len(deltas) >= limit:
             break
     return deltas
+
+
+def _render_interactive_runtime_toggle_delta(
+    *,
+    current_content: str,
+    supporting_context: str,
+    observed_value: str,
+    expected_value: str,
+) -> str | None:
+    observed_bool = _normalized_boolean_semantic_value(observed_value)
+    expected_bool = _normalized_boolean_semantic_value(expected_value)
+    if observed_bool is None or expected_bool is None or observed_bool == expected_bool:
+        return None
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return None
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not any(_interaction_event_trigger_line(line) for line in support_lines):
+        return None
+    guidance = (
+        "After the exercised interaction, the toggled state should produce "
+        f"'{str(expected_value or '').strip()}' instead of '{str(observed_value or '').strip()}'. "
+        "Compute the next-state value once inside the handler and use that same toggled state for every dependent update."
+    )
+    if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
+        guidance += " Keep aria-expanded and hidden/visible updates derived from the same next-state value."
+    return guidance
 
 
 def _render_interactive_runtime_semantic_delta(observed_value: str, expected_value: str) -> str | None:
@@ -2929,6 +2969,16 @@ def _render_interactive_runtime_semantic_delta(observed_value: str, expected_val
         f"'{expected_summary}' before the first user event instead of {observed_clause}. "
         "Repair initialization/state wiring rather than treating this as a literal source-text replacement."
     )
+
+
+def _normalized_boolean_semantic_value(value: str) -> bool | None:
+    normalized = str(value or "").strip().strip("\"'")
+    lowered = normalized.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    return None
 
 
 def _repair_semantic_value_text(raw: object) -> str:
@@ -3032,6 +3082,49 @@ def _js_runtime_pre_event_state_hints(
         "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring and keep the current toggle callback shape when it already covers the post-interaction transitions.",
         "Do not add new early-return branches, wrapper conditions, or API changes unless the visible evidence shows a control-flow failure beyond the missing initial state.",
     ]
+
+
+def _js_runtime_toggle_consistency_hints(
+    *,
+    current_content: str,
+    supporting_context: str,
+    repair_brief: dict[str, object],
+) -> list[str]:
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return []
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not any(_interaction_event_trigger_line(line) for line in support_lines):
+        return []
+
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("observed_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("expected_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    if not observed_items or not expected_items:
+        return []
+    paired_bools = [
+        (_normalized_boolean_semantic_value(observed), _normalized_boolean_semantic_value(expected))
+        for observed, expected in zip(observed_items, expected_items)
+    ]
+    if not any(observed is not None and expected is not None and observed != expected for observed, expected in paired_bools):
+        return []
+
+    hints = [
+        "The failing assertion targets the interaction result. Read the current state once, compute the next state once, and apply that same toggled value to every dependent update in the handler.",
+        "Do not mix one assignment derived from the pre-click state with another derived from the toggled state; that leaves paired UI state out of sync after the interaction.",
+    ]
+    if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
+        hints.append(
+            "When aria-expanded changes in the handler, update hidden/visible state from the same next-state boolean so both outputs agree after each click."
+        )
+    return hints
 
 
 def _direct_main_runtime_contract(
@@ -4047,6 +4140,13 @@ def _targeted_runtime_prompt_hints(
     if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
         hints.extend(
             _js_runtime_pre_event_state_hints(
+                current_content=current_content,
+                supporting_context=supporting_context,
+                repair_brief=repair_brief,
+            )
+        )
+        hints.extend(
+            _js_runtime_toggle_consistency_hints(
                 current_content=current_content,
                 supporting_context=supporting_context,
                 repair_brief=repair_brief,

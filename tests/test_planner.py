@@ -11437,6 +11437,7 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "Minimal semantic delta:" in prompt
     assert "Apply this exact semantic delta in the behavior produced by this file:" in prompt
     assert "Change the setup-time behavior for this interaction" not in prompt
+    assert "compute the next state once" not in prompt
 
 
 def test_runtime_repair_prompts_keep_interactive_support_context_across_modes(tmp_path):
@@ -12827,10 +12828,13 @@ def test_review_guided_retry_prompt_keeps_boolean_semantic_delta_atomic_for_js_r
         mode="compact",
     )
 
-    assert "Make the produced value 'false' instead of 'true'." in prompt
+    assert "After the exercised interaction, the toggled state should produce 'false' instead of 'true'." in prompt
     assert "Replace observed-only text 'tru' with expected text 'fals'" not in prompt
     assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
     assert "panel.hidden = !expanded;" in prompt
+    assert "compute the next state once" in prompt
+    assert "Do not mix one assignment derived from the pre-click state with another derived from the toggled state" in prompt
+    assert "update hidden/visible state from the same next-state boolean" in prompt
 
 
 def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):
