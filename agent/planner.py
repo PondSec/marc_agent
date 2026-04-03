@@ -8644,7 +8644,16 @@ class Planner:
         if repair_context.verification_scope != "runtime":
             return [], []
 
-        candidate_paths = self._unique_paths(
+        command_paths = self._unique_paths(
+            [
+                str(candidate or "").strip()
+                for candidate in self.validation_planner._paths_from_explicit_test_command(
+                    str(getattr(repair_context, "command", "") or "").strip()
+                )
+                if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+            ]
+        )
+        fallback_paths = self._unique_paths(
             [
                 *[
                     str(candidate or "").strip()
@@ -8658,6 +8667,7 @@ class Planner:
                 ),
             ]
         )
+        candidate_paths = command_paths or fallback_paths
         if not candidate_paths:
             return [], []
 
