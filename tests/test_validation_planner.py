@@ -1910,6 +1910,62 @@ def test_validation_planner_extracts_expected_stdout_from_direct_python_cli_exam
     assert default_case.expected_stdout == "Hello World"
 
 
+def test_validation_planner_preserves_punctuation_in_expected_stdout_from_direct_python_cli_examples():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["suffix_cli.py"],
+        focus_files=["suffix_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["suffix_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    user_turn = (
+        "Wenn `python suffix_cli.py --suffix ! Hello WORLD` ausgefuehrt wird, "
+        "soll exakt `Hello WORLD!` ausgegeben werden. "
+        "Ohne Suffix soll `python suffix_cli.py hello world` weiterhin `Hello World` ausgeben."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the CLI behavior safely.",
+            active_goal="Fix the suffix and default formatting output.",
+            goal_relation="continue",
+            output_expectation="Updated CLI output behavior.",
+            verification_target="Verify the requested CLI behavior.",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["suffix_cli.py"],
+        session=session,
+    )
+
+    suffix_case = next(item for item in plan if item.command == "python suffix_cli.py --suffix ! Hello WORLD")
+    default_case = next(item for item in plan if item.command == "python suffix_cli.py hello world")
+
+    assert suffix_case.expected_stdout == "Hello WORLD!"
+    assert default_case.expected_stdout == "Hello World"
+
+
 def test_validation_planner_prefers_richer_duplicate_cli_command_with_expected_stdout():
     planner = ValidationPlanner()
     session = SessionState(

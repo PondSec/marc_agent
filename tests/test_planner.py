@@ -12106,6 +12106,77 @@ def test_deterministic_direct_python_script_runtime_recovery_generalizes_hardcod
     assert "word.capitalize() for word in args[2:]" in result.content
 
 
+def test_deterministic_direct_python_script_runtime_recovery_preserves_punctuated_expected_output(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--suffix', '!']:\n"
+        "        print(' '.join(word.capitalize() for word in args[2:]) + '!')\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).title())\n"
+    )
+    (tmp_path / "suffix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair suffix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["suffix_cli.py"],
+                "focus_files": ["suffix_cli.py"],
+                "entrypoints": ["suffix_cli.py"],
+                "symbol_index": {"suffix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["suffix_cli.py"],
+        target_name="suffix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python suffix_cli.py --suffix ! Hello WORLD")
+    repair_context = ValidationFailureEvidence(
+        command="python suffix_cli.py --suffix ! Hello WORLD",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["suffix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello World!' != 'Hello WORLD!'",
+        failure_summary="suffix_cli.py still produces the wrong output for the direct script suffix path.",
+        repair_requirements=["Change suffix_cli.py so the direct script runtime path preserves the requested suffix output."],
+        file_hints=["suffix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-suffix-deterministic-recovery",
+            primary_target="suffix_cli.py",
+            locked_target="suffix_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD!"],
+            observed_semantics=["Validation currently produces: Hello World!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="suffix_cli.py",
+            repair_constraints=["Keep the fix local to suffix_cli.py."],
+            allowed_files=["suffix_cli.py"],
+            forbidden_files=["tests/test_suffix_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_python_script_runtime_recovery(
+        session.router_result,
+        session,
+        path="suffix_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is not None
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
+    assert result.review.safe_to_write is True
+    assert "if len(args) >= 2 and args[:1] == ['--suffix']:" in result.content
+    assert "args[1]" in result.content
+    assert "['--suffix', '!']" not in result.content
+
+
 def test_deterministic_direct_python_script_runtime_recovery_skips_nonverbatim_payload_wraps(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     current_content = (

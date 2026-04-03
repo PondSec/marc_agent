@@ -672,7 +672,7 @@ class ValidationPlanner:
         text = str(raw or "").strip()
         if not text:
             return None
-        return text.rstrip(".,;:!?").strip() or None
+        return text or None
 
     def _normalize_explicit_validation_command(self, raw: str) -> str | None:
         command = " ".join(str(raw or "").strip().split())
