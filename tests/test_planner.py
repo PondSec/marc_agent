@@ -11840,6 +11840,60 @@ def test_direct_python_script_option_contract_review_rejects_payload_skip_withou
     assert any("args[2:]" in issue or "first runtime payload token" in issue for issue in review.blocking_issues)
 
 
+def test_direct_python_script_option_contract_review_rejects_hardcoded_sample_tail_token(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-hardcoded-tail",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-hardcoded-tail",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:2] == ['--prefix', 'Ms.']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "illustrative direct python script payload tokens" in review.summary
+    assert any("'Ms.'" in issue and "sample runtime payload token" in issue for issue in review.blocking_issues)
+
+
 def test_direct_python_script_option_contract_review_allows_explicit_first_tail_access(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(

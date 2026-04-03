@@ -9584,6 +9584,46 @@ class Planner:
         ]
         for contract in prefix_contracts:
             literal_preview = ", ".join(repr(token) for token in contract.literal_tokens)
+            if (
+                len(contract.literal_tokens) > len(option_tokens)
+                and list(contract.literal_tokens[: len(option_tokens)]) == option_tokens
+                and any(
+                    token in tail_tokens
+                    for token in contract.literal_tokens[len(option_tokens) :]
+                )
+            ):
+                extra_tokens = contract.literal_tokens[len(option_tokens) :]
+                extra_preview = ", ".join(repr(token) for token in extra_tokens[:3])
+                repair_hints = [
+                    f"Treat the direct script option prefix {option_preview} as the contract anchor in {path}; do not hardcode illustrative runtime payload tokens like {extra_preview} into the branch guard.",
+                ]
+                if tail_tokens:
+                    repair_hints.append(
+                        f"After recognizing {option_preview}, derive behavior from the remaining argv payload {tail_preview} instead of matching one sample payload token literally."
+                    )
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
+                )
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary=(
+                        "The proposed repair still hardcodes illustrative direct python script payload tokens into the exercised option-prefix branch."
+                    ),
+                    confidence=0.9,
+                    blocking_issues=[
+                        (
+                            f"The proposal guards {contract.variable_expression} with {literal_preview} in {path}, "
+                            f"which bakes the sample runtime payload token(s) {extra_preview} into the prefix match "
+                            "instead of treating them as data that should flow through the repaired path."
+                        )
+                    ],
+                    preservation_risks=[],
+                    repair_hints=repair_hints[:4],
+                )
             if contract.slice_length != len(contract.literal_tokens):
                 repair_hints = [
                     f"If you compare {contract.variable_expression}[:N] against a literal option sequence in {path}, keep the slice length aligned with the compared literal tokens.",
