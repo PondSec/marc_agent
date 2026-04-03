@@ -7775,6 +7775,14 @@ class Planner:
             return max(self._llm_timeout(90), 90), max(self._llm_timeout(420), 420)
         return max(self._llm_timeout(60), 60), max(self._llm_timeout(240), 240)
 
+    def _compact_reserve_review_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(25), 25)
+        # Compact reserve-model reviews still carry summarized artifact excerpts and
+        # often begin streaming close to the initial warm-start deadline on local CPU
+        # stacks. Keep the prompt compact, but give the completion enough room to
+        # finish so we do not escalate purely because the reviewer started late.
+        return timeout, max(timeout + 60, 90)
+
     def _review_generated_update(
         self,
         route: RouterOutput,
@@ -7956,12 +7964,7 @@ class Planner:
                         timeout = max(self._llm_timeout(60), 60)
                         total_timeout = max(self._llm_timeout(180), 180)
                 else:
-                    timeout = max(self._llm_timeout(25), 25)
-                    # Compact reserve-model reviews still summarize current content,
-                    # proposed content, and a diff excerpt. Give them enough total
-                    # runtime to finish on local CPU stacks instead of escalating to
-                    # a much heavier primary-model review after partial progress.
-                    total_timeout = max(timeout + 60, 90)
+                    timeout, total_timeout = self._compact_reserve_review_budget()
             else:
                 timeout = max(self._llm_timeout(18), 18)
                 total_timeout = max(timeout + 12, timeout * 2)
@@ -11921,7 +11924,10 @@ class Planner:
 
         for model_name, capability_tier, strategy, timeout, num_ctx, prompt_variant in review_attempts:
             prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
-            total_timeout = 40 if prompt_variant == "compact" else max(timeout + 20, timeout * 2)
+            if prompt_variant == "compact":
+                timeout, total_timeout = self._compact_reserve_review_budget()
+            else:
+                total_timeout = max(timeout + 20, timeout * 2)
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,

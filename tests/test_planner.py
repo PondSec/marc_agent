@@ -531,6 +531,9 @@ def test_planner_prefers_lightweight_semantic_review_for_small_validated_change_
 
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 25
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
     assert "adds unrequested new sections, paragraphs, examples, commands, tests, or guidance" in prompt
     assert "Treat explicit literal examples from the request as hard constraints" in prompt
     assert session.validation_runs[-1].verification_scope == "semantic"
@@ -756,7 +759,7 @@ def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path
     assert review.safe_to_write is True
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
     assert '"task_understanding"' not in prompt
     assert '"follow_up_context"' not in prompt
@@ -1523,7 +1526,7 @@ def test_planner_prefers_lightweight_compact_review_for_validation_guided_repair
     assert review.safe_to_write is True
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert '"safe_to_write"' in prompt
 
 
@@ -2762,7 +2765,7 @@ def test_planner_review_prompt_includes_recent_changed_file_evidence_for_cross_f
     review_prompt = llm.generate_json_calls[0]["args"][0]
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert "Supporting artifact evidence:" in review_prompt
     assert "Changed supporting artifacts already written:" in review_prompt
     assert "Recent supporting context (may still be pending updates):" in review_prompt
