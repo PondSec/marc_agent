@@ -3695,6 +3695,10 @@ def _targeted_runtime_prompt_hints(
             "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
         )
     option_tokens, positional_tokens = _direct_main_runtime_contract(supporting_context)
+    repair_brief = targeted_context.get("repair_brief") or {}
+    has_semantic_contract = bool(
+        repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics")
+    )
     if option_tokens:
         option_preview = ", ".join(option_tokens[:3])
         hints.append(
@@ -3705,14 +3709,15 @@ def _targeted_runtime_prompt_hints(
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
-    repair_brief = targeted_context.get("repair_brief") or {}
-    if (
-        not option_tokens
-        and (repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics"))
-    ):
-        hints.append(
-            "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source unless the current implementation already derives it directly."
-        )
+    if has_semantic_contract:
+        if option_tokens:
+            hints.append(
+                "Treat the expected-versus-observed values as an output behavior contract for the exercised direct main branch. Change the branch logic or transformation that produces that output; do not implement the delta by hardcoding sample output or by adding literal substring replacements unless the current implementation already derives that exact text in the exercised path."
+            )
+        else:
+            hints.append(
+                "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source or implement the delta through literal substring replacements unless the current implementation already derives that text directly."
+            )
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure
