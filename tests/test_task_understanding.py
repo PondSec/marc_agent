@@ -2452,6 +2452,51 @@ def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
     assert task_state.next_action == "modify"
 
 
+def test_task_state_updater_accepts_string_active_artifact_shorthand(tmp_path):
+    payload = {
+        "latest_user_turn": "Ergaenze einen Theme-Umschalter.",
+        "root_goal": "Implement a theme switcher.",
+        "active_goal": "Implement a theme switcher.",
+        "goal_relation": "continue",
+        "output_expectation": "A working theme switcher.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "A functional theme switcher.",
+        "target_artifacts": [
+            {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "app.js", "name": "app.js", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+        ],
+        "active_artifacts": ["index.html", "app.js", "styles.css"],
+        "constraints": ["No external libraries."],
+        "assumptions": ["The project uses index.html, app.js, and styles.css."],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.92,
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "execution_outline": ["Inspect existing files.", "Implement the theme switcher."],
+        "needs_clarification": False,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        "Ergaenze einen Theme-Umschalter.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert [artifact.path for artifact in task_state.active_artifacts[:3]] == [
+        "index.html",
+        "app.js",
+        "styles.css",
+    ]
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "app.js",
+        "styles.css",
+    }
+
+
 def test_task_state_timeout_fallback_clarifies_vague_request_without_specialized_strategy(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
     session = SessionState(
