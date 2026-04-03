@@ -8194,11 +8194,6 @@ class Planner:
             return None
 
         review_text = self._proposed_update_review_text(review_feedback) if review_feedback is not None else ""
-        if review_text and not any(
-            marker in review_text
-            for marker in ("direct main", "argv", "launcher", "option token")
-        ):
-            return None
 
         option_tokens, _ = self._direct_main_option_contract_details(session, repair_context)
         _, positional_tokens = self._direct_main_option_contract_details(session, repair_context)
