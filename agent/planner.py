@@ -46,6 +46,7 @@ from agent.prompts import (
     semantic_change_review_system_prompt,
 )
 from agent.router import IntentRouter
+from agent.semantic_runtime import availability_recovery_model
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
@@ -5296,10 +5297,11 @@ class Planner:
         *,
         history: list[ExecutionAttemptRecord] | None = None,
     ) -> list[GenerationRecoveryAttempt]:
+        recovery_model = self._lightweight_generation_model_name() or self._generation_recovery_model_name()
         policy = ExecutionRecoveryPolicy(
             task_class="content_generation",
             allow_same_backend_retry=True,
-            allow_smaller_faster_model=bool(self._lightweight_generation_model_name()),
+            allow_smaller_faster_model=bool(recovery_model),
             allow_resume_after_progress=True,
             allow_reduce_request_complexity=True,
             allow_deterministic_fallback=False,
@@ -5309,7 +5311,7 @@ class Planner:
         decisions = policy.plan_recovery(
             issue,
             primary_model=self._primary_generation_model_name(),
-            faster_model=self._lightweight_generation_model_name(),
+            faster_model=recovery_model,
             history=list(history or []),
         )
         attempts: list[GenerationRecoveryAttempt] = []
@@ -5361,7 +5363,7 @@ class Planner:
                 )
             )
         primary_model = self._primary_generation_model_name()
-        lightweight_model = self._lightweight_generation_model_name()
+        lightweight_model = recovery_model
         current_model = str(issue.model_identifier or "").strip()
         if (
             issue.no_start_failure
@@ -7166,6 +7168,42 @@ class Planner:
         if not candidate or candidate == primary:
             return None
         return candidate
+
+    def _live_generation_model_candidates(self) -> list[str]:
+        list_models = getattr(self.llm, "list_models_safe", None)
+        if not callable(list_models):
+            return []
+        try:
+            raw_models = list_models()
+        except Exception:
+            return []
+        candidates: list[str] = []
+        for item in raw_models or []:
+            if isinstance(item, dict):
+                text = str(item.get("name") or item.get("model") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        return candidates
+
+    def _generation_recovery_model_name(self) -> str | None:
+        primary = self._primary_generation_model_name()
+        config = getattr(self.llm, "config", None)
+        candidate_pool: list[str] = []
+        if config is not None:
+            raw_candidates = getattr(config, "model_candidates", ()) or ()
+            if isinstance(raw_candidates, str):
+                raw_candidates = [raw_candidates]
+            for raw in raw_candidates:
+                text = str(raw or "").strip()
+                if text and text not in candidate_pool:
+                    candidate_pool.append(text)
+        for candidate in self._live_generation_model_candidates():
+            if candidate not in candidate_pool:
+                candidate_pool.append(candidate)
+        recovery_model = availability_recovery_model(primary, candidate_pool)
+        return str(recovery_model or "").strip() or None
 
     def _task_state_semantics_limited(self, session: SessionState) -> bool:
         task_state = session.task_state
@@ -10415,7 +10453,7 @@ class Planner:
         retry_attempts: list[ExecutionAttemptRecord] = []
         last_review = review_feedback
         primary_model = self._primary_generation_model_name()
-        reserve_model = self._lightweight_generation_model_name()
+        reserve_model = self._generation_recovery_model_name() or self._lightweight_generation_model_name()
         prefer_compact_create_retry = current_content is None
         prefer_lightweight_retry = current_content is not None and self._should_prefer_lightweight_update_generation(
             route,
@@ -10540,6 +10578,18 @@ class Planner:
                     "full",
                 )
             )
+            if reserve_model is not None and reserve_model != primary_model:
+                retry_models.append(
+                    (
+                        reserve_model,
+                        "tier_b",
+                        "review_guided_fallback_model",
+                        followup_timeout_seconds,
+                        followup_total_timeout_seconds,
+                        min(self._llm_num_ctx(3072), 3072),
+                        "full",
+                    )
+                )
         elif prefer_lightweight_retry and reserve_model is not None:
             retry_models.append(
                 (
