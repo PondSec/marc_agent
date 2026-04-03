@@ -2057,10 +2057,6 @@ def _compact_repair_update_prompt(
         excerpt_limit=support_excerpt_limit,
         max_files=support_max_files,
     )
-    direct_main_option_contract = _path_exposes_direct_main_contract_target(
-        path,
-        current_content,
-    ) and _direct_main_option_contract_present(related_context)
     if compact_focus.get("current_write_requirements"):
         sections.append(
             "Repair-scoped requirements: "
@@ -2076,17 +2072,17 @@ def _compact_repair_update_prompt(
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         target_summary = repair_brief.get("locked_target") or repair_brief.get("primary_target")
         sections.append(f"Primary repair target: {target_summary}")
-    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
+    if repair_brief.get("expected_semantics"):
         sections.append(
             "Expected semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
         )
-    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
+    if repair_brief.get("observed_semantics"):
         sections.append(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(repair_context)
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2217,10 +2213,6 @@ def _compact_repair_retry_prompt(
         max_files=support_max_files,
     )
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
-    direct_main_option_contract = _path_exposes_direct_main_contract_target(
-        path,
-        current_content,
-    ) and _direct_main_option_contract_present(related_context)
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2266,17 +2258,17 @@ def _compact_repair_retry_prompt(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
+    if repair_brief.get("expected_semantics"):
         sections.append(
             "Expected semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("expected_semantics", [])[:3])
         )
-    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
+    if repair_brief.get("observed_semantics"):
         sections.append(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(repair_context)
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2490,17 +2482,17 @@ def _focused_full_repair_update_prompt(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
+    if repair_brief.get("expected_semantics"):
         sections.append(
             "Expected semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
         )
-    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
+    if repair_brief.get("observed_semantics"):
         sections.append(
             "Observed semantics: "
             + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
         )
-    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(repair_context)
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -3101,7 +3093,6 @@ def _mandatory_mutation_anchors(
     supporting_context: str = "",
 ) -> list[str]:
     anchors: list[str] = []
-    direct_main_option_contract = _direct_main_option_contract_present(supporting_context)
     direct_script_anchor = _direct_python_script_execution_anchor(
         path=path,
         current_content=current_content,
@@ -3165,12 +3156,11 @@ def _mandatory_mutation_anchors(
     ):
         anchors.append(literal_anchor)
 
-    if not direct_main_option_contract:
-        for delta in _repair_semantic_delta_lines(repair_context, limit=2):
-            anchors.append(
-                "Apply this exact semantic delta in the behavior produced by this file: "
-                + _trim_text(delta, 220)
-            )
+    for delta in _repair_semantic_delta_lines(repair_context, limit=2):
+        anchors.append(
+            "Apply this exact semantic delta in the behavior produced by this file: "
+            + _trim_text(delta, 220)
+        )
 
     if review_feedback is not None:
         if review_feedback.blocking_issues:
