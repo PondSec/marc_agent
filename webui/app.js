@@ -3132,12 +3132,14 @@ function renderTopBar() {
         <div class="thread-topbar-copy">
           <div class="thread-topbar-title-row">
             <h1 class="thread-topbar-title">${escapeHtml(shell.title || APP_BRAND_NAME)}</h1>
-            ${renderStatusBadge(shell.statusText, shell.statusTone, {
-              compact: true,
-              live: shell.running,
-            })}
           </div>
           <div class="thread-topbar-meta-line">
+            <span class="thread-topbar-status-wrap">
+              ${renderStatusBadge(shell.statusText, shell.statusTone, {
+                compact: true,
+                live: shell.running,
+              })}
+            </span>
             ${shell.metaItems.map(renderTopbarMetaItem).join("")}
           </div>
         </div>
