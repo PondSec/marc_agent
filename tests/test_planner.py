@@ -17129,10 +17129,6 @@ def test_direct_main_option_contract_details_prefers_explicit_validation_command
             forbidden_files=["tests/test_normalize.py", "tests/test_greet_cli.py"],
         ),
     )
-    session.last_read_text_by_path["tests/__init__.py"] = (tests_dir / "__init__.py").read_text(encoding="utf-8")
-    session.last_read_text_by_path["tests/test_normalize.py"] = (tests_dir / "test_normalize.py").read_text(encoding="utf-8")
-    session.last_read_text_by_path["tests/test_greet_cli.py"] = (tests_dir / "test_greet_cli.py").read_text(encoding="utf-8")
-
     option_tokens, positional_tokens = planner._direct_main_option_contract_details(session, repair_context)
 
     assert option_tokens == ["--keep-case"]
@@ -17191,9 +17187,6 @@ def test_direct_main_option_contract_review_ignores_unrelated_test_option_tokens
             forbidden_files=["tests/test_normalize.py", "tests/test_greet_cli.py"],
         ),
     )
-    session.last_read_text_by_path["tests/__init__.py"] = (tests_dir / "__init__.py").read_text(encoding="utf-8")
-    session.last_read_text_by_path["tests/test_normalize.py"] = (tests_dir / "test_normalize.py").read_text(encoding="utf-8")
-    session.last_read_text_by_path["tests/test_greet_cli.py"] = (tests_dir / "test_greet_cli.py").read_text(encoding="utf-8")
     current_content = (
         "def main(argv=None):\n"
         "    args = list(argv or [])\n"
