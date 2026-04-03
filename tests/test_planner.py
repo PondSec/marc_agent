@@ -11438,6 +11438,170 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "Apply this exact semantic delta in the behavior produced by this file:" in prompt
 
 
+def test_runtime_repair_prompts_keep_interactive_support_context_across_modes(tmp_path):
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_content = (
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n"
+    )
+    (tests_dir / "test_menu_toggle.cjs").write_text(test_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 1},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll einen interaktiven Menu-Button korrekt auf "
+            "und zu toggeln: aria-expanded und panel.hidden muessen sich bei jedem Klick gegenseitig spiegeln. "
+            "Fuehre danach node --test tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "app.js"},
+                success=True,
+                summary="Read app.js.",
+                output_excerpt=app_path.read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=test_content,
+            ),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "AssertionError: Expected values to be strictly equal:\n"
+            "+ actual - expected\n\n"
+            "+ undefined\n"
+            "- 'false'"
+        ),
+        failure_summary="app.js still produces the wrong behavior for the menu toggle runtime path.",
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        line_hints=[24],
+        repair_requirements=[
+            "Change app.js so the menu toggle initializes aria-expanded and mirrors panel.hidden correctly across clicks."
+        ],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-prompt-context",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: 'false'"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    compact_prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+    full_prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="full",
+    )
+
+    assert "button.click();" in compact_prompt
+    assert 'assert.equal(button.getAttribute("aria-expanded"), "true");' in compact_prompt
+    assert "Minimal semantic delta:" in compact_prompt
+    assert "Failure focus:" in compact_prompt
+    assert "Supporting file hints:" in compact_prompt
+
+    assert "Supporting file hints:" in full_prompt
+    assert "Minimal semantic delta:" in full_prompt
+    assert "Failure focus:" in full_prompt
+    assert "Primary repair target: app.js" in full_prompt
+    assert "Current file content:" in full_prompt
+
+
 def test_compact_repair_prompt_prioritizes_test_line_hints_for_stdout_contract(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()

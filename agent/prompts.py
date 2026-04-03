@@ -635,6 +635,17 @@ def generate_content_prompt(
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
+    if current_content is not None and repair_context is not None:
+        return _focused_full_repair_update_prompt(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
+            review_feedback=review_feedback,
+        )
+
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     related_context = _related_file_context(session, path)
     runtime_hints = _targeted_runtime_prompt_hints(
@@ -2831,7 +2842,28 @@ def _preserve_runtime_contract_excerpt(
     preserve_direct_main = _direct_main_option_contract_present(full_text) and not _direct_main_option_contract_present(
         compact_text
     )
-    if not preserve_direct_main:
+    interactive_pattern = re.compile(
+        r"\b(?:assert\.(?:equal|strictEqual|deepStrictEqual|ok)|expect\(|click\(\)|dispatchEvent\(|fireEvent\.|userEvent\.)"
+    )
+    full_interactive_lines = [
+        index
+        for index, raw_line in enumerate(full_text.splitlines(), start=1)
+        if interactive_pattern.search(str(raw_line or "").strip())
+    ]
+    compact_interactive_lines = [
+        index
+        for index, raw_line in enumerate(compact_text.splitlines(), start=1)
+        if interactive_pattern.search(str(raw_line or "").strip())
+    ]
+    preserve_interactive_contract = (
+        bool(full_interactive_lines)
+        and (
+            len(full_interactive_lines) > len(compact_interactive_lines)
+            or any("click()" in str(raw_line or "") for raw_line in full_text.splitlines())
+            and not any("click()" in str(raw_line or "") for raw_line in compact_text.splitlines())
+        )
+    )
+    if not preserve_direct_main and not preserve_interactive_contract:
         return compact_text
 
     contract_line_hints: list[int] = []
@@ -2841,7 +2873,12 @@ def _preserve_runtime_contract_excerpt(
             continue
         if re.search(r"(?:__main__\.)?main\(\s*\[[^\n]*\]\s*\)", line):
             contract_line_hints.append(index)
-        if len(contract_line_hints) >= 4:
+        if re.search(
+            r"\b(?:assert\.(?:equal|strictEqual|deepStrictEqual|ok)|expect\(|click\(\)|dispatchEvent\(|fireEvent\.|userEvent\.)",
+            line,
+        ):
+            contract_line_hints.append(index)
+        if len(contract_line_hints) >= 8:
             break
     if not contract_line_hints:
         return compact_text
@@ -2851,7 +2888,7 @@ def _preserve_runtime_contract_excerpt(
         line_hints=contract_line_hints,
         limit=max(excerpt_limit, 220),
         before_radius=1,
-        after_radius=0,
+        after_radius=1,
     )
     if not contract_excerpt:
         return compact_text
