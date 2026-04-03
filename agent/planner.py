@@ -4588,17 +4588,6 @@ class Planner:
                         strategy=repair_strategy,
                         review=review,
                     )
-                    if recorded_noop_review:
-                        return ContentGenerationResult(
-                            source="failed",
-                            failure=self._build_update_review_failure(
-                                session,
-                                path,
-                                review,
-                                current_content=current_content,
-                            ),
-                            repair_strategy_used=repair_strategy,
-                        )
                     review_retry = self._retry_update_after_review_failure(
                         route,
                         session,
@@ -4742,17 +4731,6 @@ class Planner:
                     ),
                     review=review,
                 )
-                if recorded_noop_review:
-                    return ContentGenerationResult(
-                        source="failed",
-                        failure=self._build_update_review_failure(
-                            session,
-                            path,
-                            review,
-                            current_content=current_content,
-                        ),
-                        repair_strategy_used=repair_strategy,
-                    )
                 review_retry = self._retry_update_after_review_failure(
                     route,
                     session,

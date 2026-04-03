@@ -5981,6 +5981,140 @@ def test_planner_escalates_after_no_effective_validation_guided_repair(tmp_path)
     assert session.repair_history[1].result == "mutation_planned"
 
 
+def test_generate_file_content_retries_after_initial_noop_pre_write_review(tmp_path, monkeypatch):
+    target = tmp_path / "normalize_cli.py"
+    original = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).upper())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    repaired = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        words = args[1:]\n"
+        "        if words:\n"
+        "            head, *tail = words\n"
+        "            print(' '.join([head.title(), *tail]))\n"
+        "        else:\n"
+        "            print('')\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(text_payloads=[original, repaired])
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the keep-case title-preservation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the failing entrypoint."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the smallest repair that fixes the runtime failure."},
+        ],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_direct_main_flag (tests.test_normalize.DirectMainTests.test_direct_main_flag)\n"
+            "AssertionError: 'HELLO WORLD' != 'Hello WORLD'\n"
+            "- HELLO WORLD\n"
+            "+ Hello WORLD\n"
+        ),
+        failure_summary=(
+            "normalize_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Hello WORLD but observed Validation currently produces: HELLO WORLD."
+        ),
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        line_hints=[13],
+        repair_requirements=[
+            "Change normalize_cli.py so the failing runtime path prints Hello WORLD for keep-case argv input."
+        ],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:noop-review-retry",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=[
+                "Change normalize_cli.py so the failing runtime path prints Hello WORLD for keep-case argv input."
+            ],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+    safe_review = ProposedUpdateReview(
+        safe_to_write=True,
+        summary="The retry proposal makes a real local behavior change.",
+        confidence=0.84,
+        blocking_issues=[],
+        preservation_risks=[],
+        repair_hints=[],
+    )
+
+    def fake_pre_write_review(*_args, proposed_content: str, **_kwargs):
+        if proposed_content.strip() == original.strip():
+            review = planner._repair_no_effective_change_review(
+                path="normalize_cli.py",
+                current_content=original,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+            assert review is not None
+            return review
+        return safe_review
+
+    monkeypatch.setattr(planner, "_pre_write_update_review", fake_pre_write_review)
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=original,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+    )
+
+    assert result.failure is None
+    assert result.content.strip() == repaired.strip()
+    assert result.repair_strategy_used == "validation_escalated"
+    assert len(llm.generate_calls) == 2
+    assert "A previous repair attempt produced no effective change." in llm.generate_calls[1]["args"][0]
+    assert session.repair_history[0].result == "no_effective_change"
+    assert session.repair_history[0].strategy == "validation_targeted"
+
+
 def test_planner_rejects_equivalent_repair_after_escalation(tmp_path):
     target = tmp_path / "snake_game.html"
     original = "<html><body><h1>Snake</h1></body></html>\n"
@@ -6057,7 +6191,7 @@ def test_planner_rejects_equivalent_repair_after_escalation(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert session.stop_reason == "no_effective_change"
-    assert len(llm.generate_calls) == 2
+    assert len(llm.generate_calls) >= 2
     assert any(item.result == "no_effective_change" for item in session.repair_history)
     assert session.blockers
     assert "did not produce a substantive repair change" in session.blockers[-1]
