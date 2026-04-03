@@ -8838,6 +8838,249 @@ class Planner:
             recovery_strategy="deterministic_direct_main_contract",
         )
 
+    def _direct_python_script_expected_output(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if repair_context.verification_scope != "runtime":
+            return None
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if not expected_values:
+            return None
+        expected_output = str(expected_values[0] or "").strip()
+        return expected_output or None
+
+    def _rewrite_direct_python_script_payload_branch(
+        self,
+        branch_lines: list[str],
+        *,
+        indent: str,
+        arg_name: str,
+        payload_index: int,
+        payload_literal: str,
+    ) -> list[str] | None:
+        if not branch_lines:
+            return None
+        wrapper_source = "def _codex_branch():\n" + "".join(branch_lines)
+        try:
+            tree = ast.parse(wrapper_source)
+        except SyntaxError:
+            return None
+        function = tree.body[0] if tree.body else None
+        if not isinstance(function, ast.FunctionDef):
+            return None
+
+        def _payload_access() -> ast.Subscript:
+            return ast.Subscript(
+                value=ast.Name(id=arg_name, ctx=ast.Load()),
+                slice=ast.Constant(value=payload_index),
+                ctx=ast.Load(),
+            )
+
+        class PayloadLiteralTransformer(ast.NodeTransformer):
+            def __init__(self) -> None:
+                self.changed = False
+
+            def visit_Constant(self, node: ast.Constant) -> ast.AST:
+                value = node.value
+                if not isinstance(value, str):
+                    return node
+                if value == payload_literal:
+                    self.changed = True
+                    return ast.copy_location(_payload_access(), node)
+                if value == f"{payload_literal} ":
+                    self.changed = True
+                    return ast.copy_location(
+                        ast.BinOp(
+                            left=_payload_access(),
+                            op=ast.Add(),
+                            right=ast.Constant(value=" "),
+                        ),
+                        node,
+                    )
+                if value == f" {payload_literal}":
+                    self.changed = True
+                    return ast.copy_location(
+                        ast.BinOp(
+                            left=ast.Constant(value=" "),
+                            op=ast.Add(),
+                            right=_payload_access(),
+                        ),
+                        node,
+                    )
+                return node
+
+        transformer = PayloadLiteralTransformer()
+        transformed = transformer.visit(tree)
+        if not transformer.changed:
+            return None
+        ast.fix_missing_locations(transformed)
+        function = transformed.body[0] if transformed.body else None
+        if not isinstance(function, ast.FunctionDef):
+            return None
+        rewritten_lines: list[str] = []
+        for statement in function.body:
+            statement_code = ast.unparse(statement)
+            rewritten_lines.extend(
+                f"{indent}{line}\n" if line else "\n"
+                for line in statement_code.splitlines()
+            )
+        return rewritten_lines or None
+
+    def _apply_direct_python_script_payload_literal_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+        tail_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if not option_tokens or not tail_tokens:
+            return None
+        expected_output = self._direct_python_script_expected_output(repair_context)
+        first_tail_token = str(tail_tokens[0] or "").strip()
+        if not expected_output or not first_tail_token or first_tail_token not in expected_output:
+            return None
+
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = lines[start:end]
+        condition_pattern = re.compile(
+            r"^(?P<indent>\s*)if\s+(?P<arg>\w+)\s*\[\s*:\s*(?P<slice>\d+)\s*\]\s*==\s*(?P<literal>\[[^\n]+\])\s*:\s*$"
+        )
+        option_count = len(option_tokens)
+        required_len = option_count + 1
+
+        for index, raw_line in enumerate(block_lines):
+            match = condition_pattern.match(raw_line)
+            if match is None:
+                continue
+            try:
+                literal_value = ast.literal_eval(str(match.group("literal") or "").strip())
+            except (SyntaxError, ValueError):
+                continue
+            if not isinstance(literal_value, (list, tuple)):
+                continue
+            literal_tokens = [str(item) for item in literal_value]
+            slice_length = int(match.group("slice") or 0)
+            if (
+                slice_length != len(literal_tokens)
+                or len(literal_tokens) != required_len
+                or literal_tokens[:option_count] != option_tokens
+            ):
+                continue
+
+            payload_literal = str(literal_tokens[option_count] or "").strip()
+            if not payload_literal:
+                continue
+
+            branch_indent = str(match.group("indent") or "")
+            branch_body_indent = branch_indent + "    "
+            arg_name = str(match.group("arg") or "").strip()
+            if not arg_name:
+                continue
+
+            branch_end = len(block_lines)
+            for candidate in range(index + 1, len(block_lines)):
+                line = block_lines[candidate]
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= len(branch_indent):
+                    branch_end = candidate
+                    break
+            branch_lines = block_lines[index + 1 : branch_end]
+            rewritten_body = self._rewrite_direct_python_script_payload_branch(
+                branch_lines,
+                indent=branch_body_indent,
+                arg_name=arg_name,
+                payload_index=option_count,
+                payload_literal=payload_literal,
+            )
+            if rewritten_body is None:
+                continue
+
+            new_condition = (
+                f"{branch_indent}if len({arg_name}) >= {required_len} and "
+                f"{arg_name}[:{option_count}] == {option_tokens!r}:\n"
+            )
+            updated_lines = [
+                *lines[:start],
+                *block_lines[:index],
+                new_condition,
+                *rewritten_body,
+                *block_lines[branch_end:],
+                *lines[end:],
+            ]
+            updated_content = "".join(updated_lines)
+            if updated_content != current_content:
+                return updated_content
+        return None
+
+    def _deterministic_direct_python_script_runtime_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        option_tokens, tail_tokens = self._direct_python_script_option_contract_details(
+            repair_context,
+            path=path,
+        )
+        if not option_tokens or not tail_tokens:
+            return None
+
+        patched_content = self._apply_direct_python_script_payload_literal_patch(
+            current_content=current_content,
+            option_tokens=option_tokens,
+            tail_tokens=tail_tokens,
+            repair_context=repair_context,
+        )
+        if patched_content is None or patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_direct_python_script_contract",
+        )
+
     def _deterministic_runtime_repair_decision(
         self,
         route: RouterOutput,
@@ -8857,6 +9100,14 @@ class Planner:
             repair_context=repair_context,
         )
         if recovery is None:
+            recovery = self._deterministic_direct_python_script_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
             return None
         mutation = self._assess_effective_mutation(path, current_content, recovery.content)
         if not mutation.effective:
@@ -8872,7 +9123,7 @@ class Planner:
             "content_generation_recovery_finished",
             path=path,
             strategy=recovery.recovery_strategy,
-            source="deterministic_direct_main_contract",
+            source=recovery.recovery_strategy,
         )
         self._record_repair_attempt(
             session,
@@ -10031,6 +10282,15 @@ class Planner:
             repair_context=repair_context,
             review_feedback=review_feedback,
         )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_direct_python_script_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
         if deterministic_recovery is not None:
             effective_repair_strategy = self._review_retry_repair_strategy(
                 repair_strategy,
@@ -10048,7 +10308,7 @@ class Planner:
                 "content_generation_recovery_finished",
                 path=path,
                 strategy=deterministic_recovery.recovery_strategy,
-                source="deterministic_direct_main_contract",
+                source=deterministic_recovery.recovery_strategy,
             )
             return UpdateReviewRetryResult(
                 content=deterministic_recovery.content,

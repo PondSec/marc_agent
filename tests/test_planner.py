@@ -12022,6 +12022,155 @@ def test_pre_write_update_review_rejects_direct_script_contract_before_generated
     assert "direct python script argv prefix contract" in review.summary
 
 
+def test_deterministic_direct_python_script_runtime_recovery_generalizes_hardcoded_payload_literal(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--prefix', 'Dr.']:\n"
+        "        print('Dr. ' + ' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "prefix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair prefix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["prefix_cli.py"],
+                "focus_files": ["prefix_cli.py"],
+                "entrypoints": ["prefix_cli.py"],
+                "symbol_index": {"prefix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["prefix_cli.py"],
+        target_name="prefix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python prefix_cli.py --prefix Ms. jane DOE")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary="prefix_cli.py still produces the wrong output for the direct script prefix path.",
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path formats the prefixed name correctly."],
+        file_hints=["prefix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-deterministic-recovery",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_python_script_runtime_recovery(
+        session.router_result,
+        session,
+        path="prefix_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still misstates the direct python script argv prefix contract exercised by the failed runtime path.",
+            confidence=0.9,
+            blocking_issues=[
+                "The proposal compares args[:2] against '--prefix' in prefix_cli.py, but that branch can never match because the slice length and literal token count differ."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "If you compare args[:N] against a literal option sequence in prefix_cli.py, keep the slice length aligned with the compared literal tokens."
+            ],
+        ),
+    )
+
+    assert result is not None
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
+    assert result.review.safe_to_write is True
+    assert "if len(args) >= 2 and args[:1] == ['--prefix']:" in result.content
+    assert "print(args[1] + ' ' + ' '.join(" in result.content
+    assert "word.capitalize() for word in args[2:]" in result.content
+
+
+def test_deterministic_direct_python_script_runtime_recovery_skips_nonverbatim_payload_wraps(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--wrap', '*']:\n"
+        "        print('* ' + ' '.join(args[2:]) + ' *')\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "wrap_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair wrap_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["wrap_cli.py"],
+                "focus_files": ["wrap_cli.py"],
+                "entrypoints": ["wrap_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["wrap_cli.py"],
+        target_name="wrap_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python wrap_cli.py --wrap [] hello world")
+    repair_context = ValidationFailureEvidence(
+        command="python wrap_cli.py --wrap [] hello world",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["wrap_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '* hello world *' != '[hello world]'",
+        failure_summary="wrap_cli.py still formats the direct script wrap path incorrectly.",
+        repair_requirements=["Change wrap_cli.py so the direct script runtime path formats the wrapped output correctly."],
+        file_hints=["wrap_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-wrap-nonverbatim",
+            primary_target="wrap_cli.py",
+            locked_target="wrap_cli.py",
+            expected_semantics=["Validation should produce: [hello world]"],
+            observed_semantics=["Validation currently produces: * hello world *"],
+            implicated_symbols=["main"],
+            implicated_region_hint="wrap_cli.py",
+            repair_constraints=["Keep the fix local to wrap_cli.py."],
+            allowed_files=["wrap_cli.py"],
+            forbidden_files=["tests/test_wrap_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_python_script_runtime_recovery(
+        session.router_result,
+        session,
+        path="wrap_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is None
+
+
 def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repair(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
@@ -18684,6 +18833,95 @@ def test_review_guided_retry_uses_deterministic_direct_main_payload_echo_recover
     assert "print(' '.join(args[1:]))" in result.content
     assert "word.upper()" not in result.content
     assert result.recovery_strategy == "deterministic_direct_main_contract"
+    assert result.capability_tier == "tier_d"
+    assert llm.generate_calls == []
+
+
+def test_review_guided_retry_uses_deterministic_direct_python_script_recovery_before_extra_model_retry(
+    tmp_path,
+):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--prefix', 'Dr.']:\n"
+        "        print('Dr. ' + ' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "prefix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair prefix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["prefix_cli.py"],
+                "focus_files": ["prefix_cli.py"],
+                "entrypoints": ["prefix_cli.py"],
+                "symbol_index": {"prefix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI behavior."}],
+        target_paths=["prefix_cli.py"],
+        target_name="prefix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python prefix_cli.py --prefix Ms. jane DOE")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary="prefix_cli.py still produces the wrong behavior for the direct python script prefix path.",
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path formats the prefixed name correctly."],
+        file_hints=["prefix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-retry-recovery",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="prefix_cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still misstates the direct python script argv prefix contract exercised by the failed runtime path.",
+            confidence=0.9,
+            blocking_issues=[
+                "The proposal compares args[:2] against '--prefix' in prefix_cli.py, but that branch can never match because the slice length and literal token count differ."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "If you compare args[:N] against a literal option sequence in prefix_cli.py, keep the slice length aligned with the compared literal tokens."
+            ],
+        ),
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "if len(args) >= 2 and args[:1] == ['--prefix']:" in result.content
+    assert "print(args[1] + ' ' + ' '.join(" in result.content
+    assert "word.capitalize() for word in args[2:]" in result.content
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
     assert result.capability_tier == "tier_d"
     assert llm.generate_calls == []
 
