@@ -3457,6 +3457,7 @@ def _mandatory_mutation_anchors(
                 )
     review_anchor = _review_feedback_mutation_anchor(
         path=path,
+        current_content=current_content,
         review_feedback=review_feedback,
     )
     if review_anchor:
@@ -3507,6 +3508,7 @@ def _mandatory_mutation_anchors(
 def _review_feedback_mutation_anchor(
     *,
     path: str,
+    current_content: str,
     review_feedback: ProposedUpdateReview | None,
 ) -> str | None:
     unchanged_anchors = _unchanged_identifier_anchor_list(review_feedback)
@@ -3515,7 +3517,15 @@ def _review_feedback_mutation_anchor(
     rendered = ", ".join(_trim_text(anchor, 80) for anchor in unchanged_anchors[:4])
     if not rendered:
         return None
-    return f"Change at least one of these previously unchanged anchors in {path}: {rendered}"
+    anchor = f"Change at least one of these previously unchanged anchors in {path}: {rendered}"
+    line_excerpt = _review_feedback_implicated_line_excerpt(
+        current_content=current_content,
+        review_feedback=review_feedback,
+        limit=220,
+    )
+    if line_excerpt:
+        anchor += "\n" + line_excerpt
+    return anchor
 
 
 def _direct_python_script_execution_anchor(

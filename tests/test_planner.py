@@ -12830,6 +12830,7 @@ def test_review_guided_retry_prompt_keeps_boolean_semantic_delta_atomic_for_js_r
     assert "Make the produced value 'false' instead of 'true'." in prompt
     assert "Replace observed-only text 'tru' with expected text 'fals'" not in prompt
     assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
+    assert "panel.hidden = !expanded;" in prompt
 
 
 def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):
