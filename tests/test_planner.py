@@ -12806,6 +12806,103 @@ def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_wi
         "The next draft must change at least one of these currently unchanged anchors: panel.hidden, wireMenuToggle."
         in prompt
     )
+    assert "Implicated current lines that must change:" in prompt
+    assert '2:   button.addEventListener("click", () => {' in prompt
+    assert '5:     panel.hidden = !expanded;' in prompt
+
+
+def test_review_guided_retry_prompt_recovers_implicated_lines_from_near_anchor_without_line_hints(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "import argparse\nfrom .cli import greet\n\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser(description='Greet someone by name.')\n"
+        "    parser.add_argument('name', nargs='?', default='world')\n"
+        "    args = parser.parse_args()\n"
+        "    print(greet(args.name))\n"
+    )
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text(current_content, encoding="utf-8")
+    (pkg / "cli.py").write_text("def greet(name):\n    return f'Hello, {name}!'\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("from greet_cli import __main__\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Fix the failing CLI unittest.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["greet_cli/__main__.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["greet_cli/__main__.py"],
+                "symbol_index": {"greet_cli/__main__.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "usage: python [-h] [name]\n"
+            "python: error: unrecognized arguments: -m Ada\n"
+            '  File "/tmp/greet_cli/__main__.py", line 7, in main\n'
+            "    args = parser.parse_args()\n"
+            "SystemExit: 2\n"
+        ),
+        failure_summary="The CLI entrypoint rejects the patched python -m style argv.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:near-anchor-followup",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should accept the patched python -m style argv."],
+            observed_semantics=["Validation currently rejects the patched python -m style argv."],
+            implicated_symbols=["main"],
+            implicated_region_hint="greet_cli/__main__.py",
+            repair_constraints=["Keep the fix local to greet_cli/__main__.py."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair leaves the implicated identifier lines unchanged.",
+        confidence=0.91,
+        blocking_issues=[
+            "The proposal leaves the implicated identifier lines unchanged: main near args = parser.parse_args()"
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the implicated callable instead of editing unrelated helper code."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "Implicated current lines that must change:" in prompt
+    assert "4: def main():" in prompt
+    assert "7:     args = parser.parse_args()" in prompt
 
 
 def test_review_guided_retry_prompt_omits_pre_interaction_initialization_hints_without_pre_event_assertions(tmp_path):

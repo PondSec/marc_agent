@@ -2407,17 +2407,24 @@ def _focused_full_repair_update_prompt(
     ) and _direct_main_option_contract_present(related_context)
     implicated_line_excerpt = ""
     if noop_followup:
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
         implicated_line_excerpt = _line_focused_excerpt(
             current_content,
-            line_hints=_repair_target_line_hints(
-                path=path,
-                current_content=current_content,
-                repair_context=repair_context,
-            ),
+            line_hints=line_hints,
             limit=220,
             before_radius=0,
             after_radius=0,
         )
+        if not implicated_line_excerpt:
+            implicated_line_excerpt = _review_feedback_implicated_line_excerpt(
+                current_content=current_content,
+                review_feedback=review_feedback,
+                limit=220,
+            )
 
     sections = [
         "Produce the full file content for exactly one file.",
@@ -2715,6 +2722,53 @@ def _unchanged_identifier_anchor_list(review: ProposedUpdateReview | None) -> li
         if anchors:
             return anchors[:4]
     return []
+
+
+def _review_feedback_implicated_line_excerpt(
+    *,
+    current_content: str,
+    review_feedback: ProposedUpdateReview | None,
+    limit: int = 220,
+) -> str:
+    anchors = _unchanged_identifier_anchor_list(review_feedback)
+    if not anchors:
+        return ""
+    search_terms: list[str] = []
+    for anchor in anchors[:4]:
+        text = str(anchor or "").strip()
+        if not text:
+            continue
+        search_terms.append(text)
+        prefix, separator, suffix = text.partition(" near ")
+        if separator:
+            if prefix.strip():
+                search_terms.append(prefix.strip())
+            if suffix.strip():
+                search_terms.append(suffix.strip())
+    normalized_terms: list[str] = []
+    for term in search_terms:
+        cleaned = str(term or "").strip()
+        if not cleaned or cleaned in normalized_terms:
+            continue
+        normalized_terms.append(cleaned)
+    if not normalized_terms:
+        return ""
+    line_hints: list[int] = []
+    for index, raw in enumerate(str(current_content or "").splitlines(), start=1):
+        line = str(raw or "").rstrip()
+        if not line.strip():
+            continue
+        if any(term in line for term in normalized_terms):
+            line_hints.append(index)
+    if not line_hints:
+        return ""
+    return _line_focused_excerpt(
+        current_content,
+        line_hints=line_hints[:6],
+        limit=limit,
+        before_radius=0,
+        after_radius=0,
+    )
 
 
 def _direct_review_corrections(review: ProposedUpdateReview) -> str:
