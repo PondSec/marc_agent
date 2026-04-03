@@ -885,6 +885,15 @@ class Planner:
                 target,
                 repair_context,
             )
+        deterministic_repair_decision = self._deterministic_runtime_repair_decision(
+            route,
+            session,
+            path=target,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_repair_decision is not None:
+            return deterministic_repair_decision
         strategies = self._repair_generation_strategies(session, repair_context, target)
         if repair_context is not None and not strategies:
             final_failure_reason = (
@@ -8239,6 +8248,60 @@ class Planner:
             content=patched_content,
             review=review,
             recovery_strategy="deterministic_direct_main_contract",
+        )
+
+    def _deterministic_runtime_repair_decision(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> AgentDecision | None:
+        if current_content is None or repair_context is None:
+            return None
+        recovery = self._deterministic_direct_main_runtime_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if recovery is None:
+            return None
+        mutation = self._assess_effective_mutation(path, current_content, recovery.content)
+        if not mutation.effective:
+            return None
+        self._log(
+            "content_generation_recovery_started",
+            path=path,
+            strategy=recovery.recovery_strategy,
+            failure_class="validation_repair_runtime_direct",
+            models=[],
+        )
+        self._log(
+            "content_generation_recovery_finished",
+            path=path,
+            strategy=recovery.recovery_strategy,
+            source="deterministic_direct_main_contract",
+        )
+        self._record_repair_attempt(
+            session,
+            repair_context,
+            target=path,
+            strategy=recovery.recovery_strategy,
+            result="mutation_planned",
+            reason=mutation.reason,
+            mutation=mutation,
+        )
+        return AgentDecision(
+            thought_summary=f"Apply the deterministic runtime repair for {path}.",
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="write_file",
+            tool_args={"path": path, "content": recovery.content},
+            expected_outcome="Apply the targeted repair derived directly from the failed runtime evidence.",
+            final_response=None,
         )
 
     def _apply_direct_main_payload_echo_patch(
