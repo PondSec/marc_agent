@@ -1098,6 +1098,9 @@ def test_planner_repair_review_escalates_to_primary_after_lightweight_timeout(tm
     assert len(llm.generate_json_calls) == 2
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
     assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 210
     assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 

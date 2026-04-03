@@ -7939,7 +7939,7 @@ class Planner:
             same_model_compact_review = (
                 use_compact_prompt
                 and capability_tier == "tier_a"
-                and reserve_model is None
+                and normalized_model == str(primary_model or "").strip()
             )
             if use_compact_prompt:
                 # Primary-model compact reviews still pay the full local startup cost on
