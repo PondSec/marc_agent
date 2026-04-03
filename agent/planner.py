@@ -7957,7 +7957,11 @@ class Planner:
                         total_timeout = max(self._llm_timeout(180), 180)
                 else:
                     timeout = max(self._llm_timeout(25), 25)
-                    total_timeout = max(timeout + 20, 45)
+                    # Compact reserve-model reviews still summarize current content,
+                    # proposed content, and a diff excerpt. Give them enough total
+                    # runtime to finish on local CPU stacks instead of escalating to
+                    # a much heavier primary-model review after partial progress.
+                    total_timeout = max(timeout + 60, 90)
             else:
                 timeout = max(self._llm_timeout(18), 18)
                 total_timeout = max(timeout + 12, timeout * 2)

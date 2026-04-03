@@ -992,6 +992,7 @@ def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_availa
     assert len(llm.generate_json_calls) == 1
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
     assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
