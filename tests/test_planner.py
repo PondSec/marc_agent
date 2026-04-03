@@ -9221,6 +9221,155 @@ def test_compact_create_retry_prompt_marks_other_requested_files_out_of_scope(tm
     assert "tests/test_wordfreq.py" in prompt
 
 
+def test_compact_retry_prompt_uses_task_focused_related_file_hints_for_multi_file_web_updates(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button class=\"theme-switcher\" aria-label=\"Toggle Theme\">Toggle Theme</button>\n"
+            "      <p id=\"status-message\" role=\"alert\" style=\"display: none;\"></p>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "console.log(\"board ready\");\n\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.setAttribute('aria-label', 'Toggle Theme');\n"
+            "themeSwitcher.classList.add('theme-switcher');\n\n"
+            "document.querySelector('.shell').appendChild(themeSwitcher);\n\n"
+            "let currentTheme = localStorage.getItem('theme') || 'light';\n\n"
+            "function applyTheme(theme) {\n"
+            "  document.documentElement.style.colorScheme = theme;\n"
+            "}\n\n"
+            "applyTheme(currentTheme);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            ":root {\n"
+            "  color-scheme: light;\n"
+            "}\n\n"
+            "body {\n"
+            "  margin: 0;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Ergaenze einen keyboard-accessible Theme-Umschalter mit persistenter localStorage-Auswahl und Statusmeldung.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+    )
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="update",
+            action_plan=[
+                {"step": 1, "action": "read_relevant_files", "reason": "Inspect the current implementation."},
+                {"step": 2, "action": "update_artifact", "reason": "Apply the requested update."},
+            ],
+            target_paths=["app.js", "index.html", "styles.css"],
+            target_name="styles.css",
+        )
+    )
+    session.router_result = route
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Theme switcher with persistent state",
+        active_goal="Update the web theme switcher across app.js, index.html, and styles.css",
+        goal_relation="continue",
+        output_expectation="Accessible theme switcher with localStorage and visible status message",
+        verification_target="app.js, index.html, styles.css",
+        next_action="modify",
+        target_artifacts=[
+            {"path": "app.js", "kind": "file", "role": "primary_target", "confidence": 0.9},
+            {"path": "index.html", "kind": "file", "role": "primary_target", "confidence": 0.9},
+            {"path": "styles.css", "kind": "file", "role": "primary_target", "confidence": 0.9},
+        ],
+        constraints=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.92,
+        next_best_action=None,
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "app.js"},
+                success=True,
+                summary="Read app.js.",
+                output_excerpt=(tmp_path / "app.js").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Read index.html.",
+                output_excerpt=(tmp_path / "index.html").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Read styles.css.",
+                output_excerpt=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+            ),
+        ]
+    )
+
+    prompt = generate_content_retry_prompt(
+        route,
+        session,
+        path="styles.css",
+        current_content=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The previous CSS draft was inconsistent with the current JavaScript theme behavior.",
+            confidence=0.91,
+            blocking_issues=["The CSS draft assumes dark-theme classes that app.js does not apply."],
+            preservation_risks=[],
+            repair_hints=["Keep styles aligned with the actual theme application logic in app.js."],
+        ),
+        mode="compact",
+    )
+
+    assert "document.documentElement.style.colorScheme = theme;" in prompt
+    assert "role=\"alert\"" in prompt
+
+
 def test_targeted_runtime_prompt_hints_detect_launcher_failure_even_when_supporting_excerpt_is_truncated():
     hints = _targeted_runtime_prompt_hints(
         path="greet_cli/__main__.py",

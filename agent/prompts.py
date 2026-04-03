@@ -5378,25 +5378,23 @@ def _related_file_context(
         excerpt = str(latest_excerpts.get(path) or "").strip()
         if not excerpt:
             continue
-        if _related_context_is_test_like(path):
-            focused_line_hints = _related_context_task_line_hints(
+        is_test_like = _related_context_is_test_like(path)
+        focused_line_hints = _related_context_task_line_hints(
+            excerpt,
+            session=session,
+            target_path=target_path,
+        )
+        if focused_line_hints:
+            focused_excerpt = _line_focused_excerpt(
                 excerpt,
-                session=session,
-                target_path=target_path,
+                line_hints=focused_line_hints,
+                limit=excerpt_limit,
+                before_radius=1 if is_test_like else 2,
+                after_radius=0 if is_test_like else 4,
             )
-            if focused_line_hints:
-                focused_excerpt = _line_focused_excerpt(
-                    excerpt,
-                    line_hints=focused_line_hints,
-                    limit=excerpt_limit,
-                    before_radius=1,
-                    after_radius=0,
-                )
-            else:
-                focused_excerpt = _trim_balanced_text(excerpt, excerpt_limit)
         else:
-            focused_excerpt = excerpt[:excerpt_limit]
-        if _related_context_is_test_like(path):
+            focused_excerpt = _trim_balanced_text(excerpt, excerpt_limit)
+        if is_test_like:
             focused_excerpt = _preserve_runtime_contract_excerpt(
                 excerpt,
                 focused_excerpt=focused_excerpt,
