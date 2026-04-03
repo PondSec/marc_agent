@@ -14290,6 +14290,118 @@ def test_pre_write_update_review_discards_unsupported_runtime_literal_blocker_fr
     assert llm.generate_json_calls
 
 
+def test_pre_write_update_review_sanitizes_unsupported_literal_blocker_from_any_review_source(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    source = ' '.join(source_tokens or ['Hello', 'WORLD'])\n"
+        "    print(normalize_words(source, keep_case=keep_case))\n"
+    )
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct main runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:keep-case-cli-any-source",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed update does not preserve an explicit literal constraint from the request.",
+            confidence=0.88,
+            blocking_issues=[
+                "The exact requested literal is missing from normalize_cli.py: --keep-case hello world",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+            ],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert review.blocking_issues == []
+
+
 def test_model_backed_review_sanitizer_keeps_supported_hard_literal_blocker(tmp_path):
     current_content = "<!doctype html>\n<html><body><header class='about-hero'></header></body></html>\n"
     planner = Planner(ScriptedLLM(), "")

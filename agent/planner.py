@@ -8149,6 +8149,13 @@ class Planner:
                 proposed_content=proposed_content,
             )
             review_from_generated = True
+        review = self._sanitize_model_backed_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            review=review,
+        )
         if (
             review_from_generated
             and
@@ -8873,6 +8880,13 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
             )
+        review = self._sanitize_model_backed_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            review=review,
+        )
         return review
 
     def _retry_update_after_review_failure(
