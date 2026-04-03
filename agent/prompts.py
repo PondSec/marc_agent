@@ -1145,6 +1145,8 @@ def proposed_update_review_prompt(
             "- Fail when the proposal broadens scope without evidence, or removes working behavior, imports, config handling, startup code, public interfaces, commands, docs, or tests that the request did not ask to remove.",
             "- Fail when a narrow request adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance unless the visible evidence clearly requires that extra content.",
             "- Treat explicit literal examples from the request as hard constraints when they are clearly part of the requested outcome; wrong placeholders, argument order, command shape, or snippet content are failures unless visible evidence contradicts them.",
+            "- Use path_scope.literal_anchor_details to track provenance: only entries with hard_source_constraint=true are hard file-local source obligations.",
+            "- Do not promote repair_brief, runtime_evidence, validation_failure_evidence, or generation_relevant_constraint examples into new hard source literals on their own; they justify the fix but do not require copying the literal into the source.",
             "- Use path_scope.current_write_requirements as the hard requirements for this file when that list is non-empty.",
             "- Treat path_scope.other_pending_requirements as non-blocking for this file unless the proposal directly contradicts them or falsely claims to complete them here.",
             "- Fail when names, config keys, selectors, imports, commands, or interfaces change without the visible evidence showing the required dependent updates.",
@@ -3886,7 +3888,7 @@ def _artifact_scoped_focus(
             if requirement and requirement not in current_requirements:
                 current_requirements.append(requirement)
 
-    literal_constraints = _target_literal_constraints(
+    literal_anchor_details = _literal_anchor_details(
         route,
         session,
         path=path,
@@ -3894,6 +3896,11 @@ def _artifact_scoped_focus(
         current_markers=current_markers,
         other_markers=other_markers,
     )
+    literal_constraints = [
+        str(item.get("value") or "").strip()
+        for item in literal_anchor_details
+        if bool(item.get("hard_source_constraint")) and str(item.get("value") or "").strip()
+    ]
     for candidate in literal_constraints:
         if candidate not in current_requirements:
             current_requirements.append(candidate)
@@ -3936,6 +3943,7 @@ def _artifact_scoped_focus(
         "artifact_kind": current_artifact_kind,
         "artifact_role": current_artifact_role,
         "literal_constraints": literal_constraints[:4],
+        "literal_anchor_details": literal_anchor_details[:6],
         "current_write_requirements": current_requirements[:4],
         "other_pending_requirements": other_requirements[:4],
         "general_constraints": general_constraints[:4],
@@ -4404,6 +4412,261 @@ def _python_call_argument_contains_example_payload(argument: ast.AST) -> bool:
     if isinstance(argument, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Starred)):
         return True
     return any(_python_call_argument_contains_example_payload(child) for child in ast.iter_child_nodes(argument))
+
+
+def _literal_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None = None,
+    current_markers: set[str] | None = None,
+    other_markers: set[str] | None = None,
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for detail in _hard_request_literal_anchor_details(
+        route,
+        session,
+        path=path,
+        current_content=current_content,
+    ):
+        _append_literal_anchor_detail(details, detail)
+    for detail in _generation_literal_anchor_details(
+        route,
+        session,
+        current_markers=current_markers or set(),
+        other_markers=other_markers or set(),
+    ):
+        _append_literal_anchor_detail(details, detail)
+    repair_context = session.active_repair_context if session is not None else None
+    if repair_context is not None:
+        for detail in _repair_literal_anchor_details(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        ):
+            _append_literal_anchor_detail(details, detail)
+    return details[:8]
+
+
+def _append_literal_anchor_detail(
+    details: list[dict[str, object]],
+    detail: dict[str, object],
+) -> None:
+    value = str(detail.get("value") or "").strip()
+    source = str(detail.get("source") or "").strip()
+    anchor_type = str(detail.get("type") or "").strip()
+    if not value or not source or not anchor_type:
+        return
+    hard_source_constraint = bool(detail.get("hard_source_constraint"))
+    key = (value, source)
+    for existing in details:
+        if (str(existing.get("value") or "").strip(), str(existing.get("source") or "").strip()) != key:
+            continue
+        if hard_source_constraint and not bool(existing.get("hard_source_constraint")):
+            existing["hard_source_constraint"] = True
+            existing["type"] = anchor_type
+        return
+    details.append(
+        {
+            "value": value,
+            "source": source,
+            "type": anchor_type,
+            "hard_source_constraint": hard_source_constraint,
+        }
+    )
+
+
+def _hard_request_literal_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None = None,
+) -> list[dict[str, object]]:
+    reference = str(current_content or "").strip()
+    if not reference and session is not None:
+        reference = _last_read_excerpt(session, path)
+    if not reference:
+        return []
+
+    current_tokens = _literal_reference_tokens(reference)
+    if not current_tokens:
+        return []
+
+    details: list[dict[str, object]] = []
+    request_text = _request_text_for_literals(route, session)
+    other_paths = _literal_scope_other_artifacts(route, session, path)
+    for candidate in _request_literal_candidates(request_text):
+        if not _literal_matches_reference(candidate, current_tokens):
+            continue
+        anchor_type = "must_source_anchor"
+        if _python_call_literal_needs_path_scope(candidate, path):
+            if _python_call_literal_contains_example_payload(candidate):
+                continue
+            if not _call_literal_scopes_to_current_artifact(
+                candidate,
+                request_text=request_text,
+                current_path=path,
+                other_paths=other_paths,
+                reference=reference,
+            ):
+                continue
+            anchor_type = "api_signature_anchor"
+        scoped_candidate = _scoped_literal_constraint(candidate, path)
+        if not scoped_candidate:
+            continue
+        _append_literal_anchor_detail(
+            details,
+            {
+                "value": scoped_candidate,
+                "source": "request_text",
+                "type": anchor_type,
+                "hard_source_constraint": True,
+            },
+        )
+    return details[:4]
+
+
+def _generation_literal_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    current_markers: set[str],
+    other_markers: set[str],
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for constraint in _generation_relevant_constraints(route, session, limit=8):
+        current_score = _scope_relevance_score(constraint, current_markers)
+        other_score = _scope_relevance_score(constraint, other_markers)
+        if other_score > current_score and other_score > 0:
+            continue
+        for candidate in _request_literal_candidates(constraint):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "generation_relevant_constraint",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=constraint),
+                    "hard_source_constraint": False,
+                },
+            )
+    return details[:3]
+
+
+def _repair_literal_anchor_details(
+    *,
+    path: str,
+    current_content: str | None,
+    repair_context: ValidationFailureEvidence,
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        for item in [*getattr(brief, "expected_semantics", []), *getattr(brief, "observed_semantics", [])]:
+            text = _repair_semantic_value_text(item)
+            if not text:
+                continue
+            for candidate in _request_literal_candidates(text):
+                _append_literal_anchor_detail(
+                    details,
+                    {
+                        "value": candidate,
+                        "source": "repair_brief",
+                        "type": _evidence_literal_anchor_type(candidate, context_text=text),
+                        "hard_source_constraint": False,
+                    },
+                )
+
+    for text in [str(repair_context.failure_summary or "").strip(), str(repair_context.summary or "").strip()]:
+        if not text:
+            continue
+        for candidate in _request_literal_candidates(text):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "validation_failure_evidence",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=text),
+                    "hard_source_constraint": False,
+                },
+            )
+
+    runtime_inputs = [
+        str(repair_context.excerpt or "").strip(),
+        *(
+            _targeted_runtime_failure_focus_lines(
+                "\n".join(
+                    part
+                    for part in [
+                        str(repair_context.excerpt or "").strip(),
+                        str(repair_context.failure_summary or "").strip(),
+                        str(repair_context.summary or "").strip(),
+                    ]
+                    if part
+                ),
+                target_path=path,
+                other_paths=_repair_other_paths(repair_context, target_path=path),
+                limit=6,
+            )
+        ),
+    ]
+    for text in runtime_inputs:
+        if not text:
+            continue
+        for candidate in _request_literal_candidates(text):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "runtime_evidence",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=text),
+                    "hard_source_constraint": False,
+                },
+            )
+
+    for anchor in _repair_required_literal_anchors(
+        path=path,
+        current_content=str(current_content or ""),
+        repair_context=repair_context,
+    ):
+        for literal in _repair_required_anchor_literals(anchor):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": literal,
+                    "source": "repair_required_literal_anchor",
+                    "type": "must_source_anchor",
+                    "hard_source_constraint": True,
+                },
+            )
+    return details[:6]
+
+
+def _repair_required_anchor_literals(anchor: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(
+        r"exact required literal (?P<literal>'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")",
+        str(anchor or ""),
+    ):
+        literal = _literal_validation_token(match.group("literal"))
+        if literal and literal not in values:
+            values.append(literal)
+    return values[:2]
+
+
+def _evidence_literal_anchor_type(candidate: str, *, context_text: str) -> str:
+    normalized = str(candidate or "").strip()
+    lowered_context = str(context_text or "").strip().lower()
+    if normalized.startswith("--") or re.search(r"\s--[a-z0-9][\w-]*", normalized, re.IGNORECASE):
+        return "illustrative_runtime_cli_example"
+    if normalized.startswith(("[", "{", "(")) and normalized.endswith(("]", "}", ")")):
+        return "illustrative_runtime_payload_example"
+    if any(token in lowered_context for token in ("assert", "traceback", "not found", "validation command", "failure")):
+        return "repro_failure_description"
+    if "(" in normalized and ")" in normalized:
+        return "api_signature_anchor"
+    return "repro_failure_description"
 
 
 def _target_literal_constraints(
