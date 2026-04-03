@@ -100,6 +100,12 @@ class ValidationPlanner:
             "kind": "test",
             "verification_scope": "runtime",
             "priority": 7,
+            "pattern": re.compile(r"(?P<command>node\s+--test\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 7,
             "pattern": re.compile(
                 r"(?P<command>(?:npm|pnpm|yarn)\s+(?:test|run\s+(?:test|lint|build|typecheck))\b[^`\n]*)",
                 re.IGNORECASE,
@@ -704,6 +710,7 @@ class ValidationPlanner:
                 "mypy",
                 "pyright",
                 "node --check",
+                "node --test",
                 "npm test",
                 "npm run test",
                 "npm run lint",

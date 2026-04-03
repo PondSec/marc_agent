@@ -1910,6 +1910,61 @@ def test_validation_planner_extracts_expected_stdout_from_direct_python_cli_exam
     assert default_case.expected_stdout == "Hello World"
 
 
+def test_validation_planner_extracts_explicit_node_test_command_from_user_request(monkeypatch):
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"javascript": 1},
+        top_directories=[],
+        important_files=["app.js", "tests/test_menu_toggle.cjs"],
+        focus_files=["app.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_menu_toggle.cjs"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app.js"],
+        repo_map=[],
+        project_labels=["javascript"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small JavaScript interaction module with a focused node test.",
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+    user_turn = (
+        "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+        "bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the menu toggle behavior safely.",
+            active_goal="Fix the JS interaction and rerun the targeted node test.",
+            goal_relation="continue",
+            output_expectation="Updated JS interaction behavior plus a passing node test.",
+            verification_target="node --test tests/test_menu_toggle.cjs",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["app.js", "tests/test_menu_toggle.cjs"],
+        session=session,
+    )
+
+    explicit = next(item for item in plan if item.command == "node --test tests/test_menu_toggle.cjs")
+
+    assert explicit.verification_scope == "runtime"
+    assert explicit.required is True
+
+
 def test_validation_planner_preserves_punctuation_in_expected_stdout_from_direct_python_cli_examples():
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(
