@@ -60,6 +60,15 @@ class ValidationPlanner:
         {
             "kind": "test",
             "verification_scope": "runtime",
+            "priority": 5,
+            "pattern": re.compile(
+                r"(?P<command>python(?:3)?\s+(?!-m\b)[^`\n]*?\.py\b[^`\n]*)",
+                re.IGNORECASE,
+            ),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
             "priority": 6,
             "pattern": re.compile(r"(?P<command>pytest\b[^`\n]*)", re.IGNORECASE),
         },
@@ -123,6 +132,23 @@ class ValidationPlanner:
         r")\b.*$"
     )
     EXPLICIT_COMMAND_SENTENCE_BOUNDARY = re.compile(r"(?<=[\w)\]'\"])[.!?]\s+(?=[A-ZÄÖÜ])")
+    PYTHON_SCRIPT_COMMAND_BOUNDARY_WORDS = {
+        "ausgibt",
+        "exactly",
+        "genau",
+        "liefert",
+        "output",
+        "outputs",
+        "print",
+        "prints",
+        "produce",
+        "produces",
+        "return",
+        "returns",
+        "show",
+        "shows",
+        "zeigt",
+    }
     WEB_FEATURE_KEYWORDS = {
         "menu": ("menu", "menue", "menü", "navigation", "nav"),
         "highscore": ("highscore", "high score", "scoreboard", "leaderboard", "best score", "bestenliste"),
@@ -259,6 +285,7 @@ class ValidationPlanner:
             for item in snapshot.likely_commands
         ]
         commands = self._merge_explicit_validation_commands(commands, session=session)
+        commands = self._prefer_explicit_python_runtime_over_cli_smoke(commands)
         commands = self._replace_generic_unittest_commands(
             commands,
             snapshot=snapshot,
@@ -449,6 +476,42 @@ class ValidationPlanner:
             merged.append(item)
         return merged
 
+    def _prefer_explicit_python_runtime_over_cli_smoke(
+        self,
+        commands: list[ValidationCommand],
+    ) -> list[ValidationCommand]:
+        explicit_python_targets = {
+            path
+            for command in commands
+            if command.source in {"task_state", "user_request"}
+            and command.verification_scope == "runtime"
+            and self._is_explicit_python_script_command(command.command)
+            for path in self._paths_from_validation_command(command.command)
+        }
+        if not explicit_python_targets:
+            return commands
+
+        filtered: list[ValidationCommand] = []
+        for command in commands:
+            if not command.command.startswith("internal:python_cli_smoke:"):
+                filtered.append(command)
+                continue
+            command_paths = set(self._paths_from_validation_command(command.command))
+            if command_paths & explicit_python_targets:
+                continue
+            filtered.append(command)
+        return filtered
+
+    def _is_explicit_python_script_command(self, command: str) -> bool:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return False
+        if len(tokens) < 2:
+            return False
+        lowered = [token.lower() for token in tokens]
+        return lowered[0] in {"python", "python3"} and lowered[1] != "-m" and tokens[1].endswith(".py")
+
     def _explicit_validation_commands(
         self,
         session: SessionState | None,
@@ -507,6 +570,7 @@ class ValidationPlanner:
             command = sentence_split[0].strip()
         command = self.EXPLICIT_COMMAND_TRAILING_STOPWORDS.sub("", command).strip()
         command = self._trim_python_test_command_tokens(command)
+        command = self._trim_python_script_command(command)
         command = command.rstrip(".,;:!?")
         if not command:
             return None
@@ -550,6 +614,26 @@ class ValidationPlanner:
         ):
             return command
         return None
+
+    def _trim_python_script_command(self, command: str) -> str:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return command
+        if len(tokens) < 2:
+            return command
+
+        lowered = [token.lower() for token in tokens]
+        if lowered[0] not in {"python", "python3"} or lowered[1] == "-m":
+            return command
+
+        trimmed = tokens[:2]
+        for token in tokens[2:]:
+            cleaned = str(token or "").strip().rstrip(".,;:!?").lower()
+            if cleaned in self.PYTHON_SCRIPT_COMMAND_BOUNDARY_WORDS:
+                break
+            trimmed.append(token)
+        return " ".join(trimmed) if trimmed else command
 
     def _trim_python_test_command_tokens(self, command: str) -> str:
         try:
@@ -3224,6 +3308,9 @@ class ValidationPlanner:
         if not tokens:
             return []
         lowered = [token.lower() for token in tokens]
+        if lowered[0] in {"python", "python3"} and len(tokens) >= 2 and lowered[1] != "-m":
+            candidate = str(tokens[1] or "").strip().replace("\\", "/").removeprefix("./")
+            return [candidate] if candidate.endswith(".py") else []
         if len(tokens) >= 3 and lowered[:3] in (["python", "-m", "unittest"], ["python3", "-m", "unittest"]):
             return self._unittest_targets_to_paths(tokens[3:])
         if len(tokens) >= 3 and lowered[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):

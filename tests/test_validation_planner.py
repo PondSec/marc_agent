@@ -1785,6 +1785,75 @@ def test_validation_planner_includes_explicit_user_requested_validation_command(
     assert plan[0].required is True
 
 
+def test_validation_planner_trims_direct_python_cli_example_from_user_request():
+    planner = ValidationPlanner()
+
+    command = planner._normalize_explicit_validation_command(
+        "python main.py --keep-case hello world genau hello world ausgibt."
+    )
+
+    assert command == "python main.py --keep-case hello world"
+
+
+def test_validation_planner_prefers_explicit_python_cli_example_over_generic_smoke():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["main.py"],
+        focus_files=["main.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["main.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    session = SessionState(
+        task=(
+            "Aktualisiere main.py. Fuege die Option --keep-case hinzu, sodass "
+            "python main.py --keep-case hello world genau hello world ausgibt."
+        ),
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=(
+                "Aktualisiere main.py. Fuege die Option --keep-case hinzu, sodass "
+                "python main.py --keep-case hello world genau hello world ausgibt."
+            ),
+            root_goal="Extend the CLI safely.",
+            active_goal="Add the new option and keep existing behavior.",
+            goal_relation="continue",
+            output_expectation="Updated CLI behavior.",
+            verification_target="Verify the requested CLI behavior.",
+            next_action="modify",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["main.py"],
+        session=session,
+    )
+
+    commands = [item.command for item in plan]
+
+    assert "python main.py --keep-case hello world" in commands
+    assert not any(command.startswith('internal:python_cli_smoke:["main.py"]') for command in commands)
+    explicit = next(item for item in plan if item.command == "python main.py --keep-case hello world")
+    assert explicit.verification_scope == "runtime"
+    assert explicit.required is True
+
+
 def test_validation_planner_targets_changed_unittest_module_instead_of_generic_command():
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(
