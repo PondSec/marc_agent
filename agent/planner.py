@@ -202,12 +202,23 @@ class MutationAssessment:
 @dataclass(slots=True)
 class WebContractInventory:
     html_ids: set[str] = field(default_factory=set)
+    html_id_classes: dict[str, set[str]] = field(default_factory=dict)
     html_root_classes: set[str] = field(default_factory=set)
     css_id_selectors: set[str] = field(default_factory=set)
+    css_class_selectors: set[str] = field(default_factory=set)
     css_root_state_classes: set[str] = field(default_factory=set)
     js_id_refs: set[str] = field(default_factory=set)
     js_declared_ids: set[str] = field(default_factory=set)
+    js_class_tokens: set[str] = field(default_factory=set)
     js_root_state_classes: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
+class WebContractFinding:
+    kind: str
+    token: str
+    source_paths: tuple[str, ...]
+    summary: str
 
 
 class Planner:
@@ -5918,6 +5929,24 @@ class Planner:
         suffix = Path(path).suffix.lower()
 
         if suffix in WEB_CONTRACT_HTML_SUFFIXES:
+            for tag_match in re.finditer(r"<[A-Za-z][^>]*>", content):
+                tag_text = str(tag_match.group(0) or "")
+                id_match = re.search(r"\bid\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
+                class_match = re.search(r"\bclass\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
+                normalized_id = None
+                if id_match is not None:
+                    normalized_id = self._normalize_web_hook_token(str(id_match.group(2) or ""))
+                    if normalized_id is not None:
+                        inventory.html_ids.add(normalized_id)
+                if normalized_id is None or class_match is None:
+                    continue
+                class_tokens: set[str] = set()
+                for token in str(class_match.group(2) or "").split():
+                    normalized = self._normalize_web_hook_token(token)
+                    if normalized is not None:
+                        class_tokens.add(normalized)
+                if class_tokens:
+                    inventory.html_id_classes.setdefault(normalized_id, set()).update(class_tokens)
             for _, raw_value in re.findall(r"\bid\s*=\s*(['\"])([^'\"]+)\1", content, flags=re.IGNORECASE):
                 normalized = self._normalize_web_hook_token(raw_value)
                 if normalized is not None:
@@ -5939,6 +5968,10 @@ class Planner:
                     normalized = self._normalize_web_hook_token(raw_value)
                     if normalized is not None:
                         inventory.css_id_selectors.add(normalized)
+                for raw_value in re.findall(r"\.([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.css_class_selectors.add(normalized)
                 for raw_value in re.findall(
                     r"(?:^|[\s>+~,])(?:html|body|:root)\.([A-Za-z_][\w-]*)",
                     selector_text,
@@ -5961,6 +5994,10 @@ class Planner:
                     normalized = self._normalize_web_hook_token(raw_value)
                     if normalized is not None:
                         inventory.js_id_refs.add(normalized)
+                for raw_value in re.findall(r"\.([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.js_class_tokens.add(normalized)
             for raw_value in re.findall(r"\.id\s*=\s*['\"]([^'\"]+)['\"]", content):
                 normalized = self._normalize_web_hook_token(raw_value)
                 if normalized is not None:
@@ -5979,6 +6016,13 @@ class Planner:
                 normalized = self._normalize_web_hook_token(raw_value)
                 if normalized is not None:
                     inventory.js_root_state_classes.add(normalized)
+            for raw_value in re.findall(
+                r"\.classList\.(?:add|remove|toggle|replace|contains)\(\s*['\"]([^'\"]+)['\"]",
+                content,
+            ):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_class_tokens.add(normalized)
 
         return inventory
 
@@ -6022,21 +6066,21 @@ class Planner:
         }
         return relevant_paths, pending_paths
 
-    def _web_contract_findings(
+    def _web_contract_analysis(
         self,
         session: SessionState,
         *,
         route: RouterOutput | None = None,
         current_path: str | None = None,
         proposed_content: str | None = None,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[WebContractFinding], list[str], dict[str, WebContractInventory]]:
         relevant_paths, pending_paths = self._web_contract_paths(
             session,
             route=route,
             current_path=current_path,
         )
         if len(relevant_paths) < 2:
-            return [], []
+            return [], [], {}
 
         contents_by_path: dict[str, str] = {}
         for candidate in relevant_paths:
@@ -6047,13 +6091,13 @@ class Planner:
             if isinstance(content, str) and content.strip():
                 contents_by_path[candidate] = content
         if len(contents_by_path) < 2:
-            return [], []
+            return [], [], {}
 
         has_html = any(self._path_is_web_contract_html(path) for path in contents_by_path)
         has_css = any(self._path_is_web_contract_css(path) for path in contents_by_path)
         has_script = any(self._path_is_web_contract_script(path) for path in contents_by_path)
         if not has_html or not (has_css or has_script):
-            return [], []
+            return [], [], {}
 
         scope_paths = {
             str(item.path or "").strip()
@@ -6063,7 +6107,7 @@ class Planner:
         if current_path is not None:
             scope_paths.add(current_path)
         if not scope_paths:
-            return [], []
+            return [], [], {}
 
         inventories: dict[str, WebContractInventory] = {
             path: self._web_contract_inventory(path, content)
@@ -6106,7 +6150,7 @@ class Planner:
         pending_css = any(self._path_is_web_contract_css(path) for path in pending_paths)
         pending_script = any(self._path_is_web_contract_script(path) for path in pending_paths)
 
-        findings: list[str] = []
+        findings: list[WebContractFinding] = []
         file_hints: set[str] = set()
 
         for token, paths in sorted(source_css_root_state_classes.items()):
@@ -6116,7 +6160,14 @@ class Planner:
                 continue
             source_preview = ", ".join(sorted(paths)[:2])
             findings.append(
-                f"{source_preview} introduces the root state selector '{token}', but no current sibling HTML or JS provides or toggles that state."
+                WebContractFinding(
+                    kind="css_root_state",
+                    token=token,
+                    source_paths=tuple(sorted(paths)),
+                    summary=(
+                        f"{source_preview} introduces the root state selector '{token}', but no current sibling HTML or JS provides or toggles that state."
+                    ),
+                )
             )
             file_hints.update(paths)
 
@@ -6128,7 +6179,14 @@ class Planner:
                     continue
                 source_preview = ", ".join(sorted(paths)[:2])
                 findings.append(
-                    f"{source_preview} introduces the id hook '{token}', but no current sibling CSS or JS consumes it."
+                    WebContractFinding(
+                        kind="html_id_hook",
+                        token=token,
+                        source_paths=tuple(sorted(paths)),
+                        summary=(
+                            f"{source_preview} introduces the id hook '{token}', but no current sibling CSS or JS consumes it."
+                        ),
+                    )
                 )
                 file_hints.update(paths)
 
@@ -6139,7 +6197,14 @@ class Planner:
                 continue
             source_preview = ", ".join(sorted(paths)[:2])
             findings.append(
-                f"{source_preview} references the id selector '#{token}', but no current sibling HTML or JS declares that hook."
+                WebContractFinding(
+                    kind="css_id_selector",
+                    token=token,
+                    source_paths=tuple(sorted(paths)),
+                    summary=(
+                        f"{source_preview} references the id selector '#{token}', but no current sibling HTML or JS declares that hook."
+                    ),
+                )
             )
             file_hints.update(paths)
 
@@ -6150,13 +6215,89 @@ class Planner:
                 continue
             source_preview = ", ".join(sorted(paths)[:2])
             findings.append(
-                f"{source_preview} looks up the id hook '{token}', but no current sibling HTML or JS declares it."
+                WebContractFinding(
+                    kind="js_id_lookup",
+                    token=token,
+                    source_paths=tuple(sorted(paths)),
+                    summary=(
+                        f"{source_preview} looks up the id hook '{token}', but no current sibling HTML or JS declares it."
+                    ),
+                )
             )
             file_hints.update(paths)
 
         if not findings:
-            return [], []
-        return findings[:4], sorted(file_hints)[:6]
+            return [], [], inventories
+        return findings[:4], sorted(file_hints)[:6], inventories
+
+    def _web_contract_findings(
+        self,
+        session: SessionState,
+        *,
+        route: RouterOutput | None = None,
+        current_path: str | None = None,
+        proposed_content: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        findings, file_hints, _ = self._web_contract_analysis(
+            session,
+            route=route,
+            current_path=current_path,
+            proposed_content=proposed_content,
+        )
+        return [item.summary for item in findings], file_hints
+
+    def _web_contract_repair_hints(
+        self,
+        *,
+        path: str,
+        findings: list[WebContractFinding],
+        inventories: dict[str, WebContractInventory],
+    ) -> list[str]:
+        current_inventory = inventories.get(path)
+        sibling_class_tokens: set[str] = set()
+        for sibling_path, inventory in inventories.items():
+            if sibling_path == path:
+                continue
+            sibling_class_tokens.update(inventory.css_class_selectors)
+            sibling_class_tokens.update(inventory.js_class_tokens)
+
+        hints: list[str] = []
+        for finding in findings:
+            if finding.kind == "html_id_hook":
+                related_classes = (
+                    current_inventory.html_id_classes.get(finding.token, set())
+                    if current_inventory is not None
+                    else set()
+                )
+                consumed_classes = sorted(token for token in related_classes if token in sibling_class_tokens)
+                if consumed_classes:
+                    class_preview = ", ".join(consumed_classes[:2])
+                    hints.append(
+                        f"Reuse the existing class-based hook {class_preview} in {path} and remove the unconsumed id hook '{finding.token}' unless sibling CSS or JS also consumes that id."
+                    )
+                hints.append(
+                    f"If you are repairing only {path}, remove or rename the unconsumed id hook '{finding.token}' instead of returning it unchanged."
+                )
+                continue
+            if finding.kind == "css_root_state":
+                hints.append(
+                    f"Do not introduce the root-state token '{finding.token}' in {path} until sibling HTML or JS actually provides or toggles it."
+                )
+                continue
+            if finding.kind == "css_id_selector":
+                hints.append(
+                    f"Drop or rename the selector '#{finding.token}' in {path} unless sibling HTML or JS declares that hook."
+                )
+                continue
+            if finding.kind == "js_id_lookup":
+                hints.append(
+                    f"Remove the lookup for '{finding.token}' in {path} or declare that id in the shared HTML or JS contract before using it."
+                )
+
+        hints.append(
+            "Keep one shared contract across HTML, CSS, and JS instead of introducing parallel hooks that describe the same UI behavior in different ways."
+        )
+        return list(dict.fromkeys(hints))[:4]
 
     def _pre_write_web_contract_review(
         self,
@@ -6166,7 +6307,7 @@ class Planner:
         path: str,
         proposed_content: str,
     ) -> ProposedUpdateReview | None:
-        findings, _ = self._web_contract_findings(
+        findings, _, inventories = self._web_contract_analysis(
             session,
             route=route,
             current_path=path,
@@ -6180,12 +6321,13 @@ class Planner:
                 "The proposed update introduces a cross-file web contract that is not yet wired through the sibling HTML, CSS, and JS artifacts."
             ),
             confidence=0.92,
-            blocking_issues=findings,
+            blocking_issues=[item.summary for item in findings],
             preservation_risks=[],
-            repair_hints=[
-                f"Only introduce a new DOM hook, selector, or root-state token in {path} when the sibling web artifacts already provide or consume the same contract.",
-                "Keep one shared contract across HTML, CSS, and JS instead of introducing parallel hooks that describe the same UI behavior in different ways.",
-            ],
+            repair_hints=self._web_contract_repair_hints(
+                path=path,
+                findings=findings,
+                inventories=inventories,
+            ),
         )
 
     def _semantic_web_contract_review(self, session: SessionState) -> SemanticChangeReview | None:

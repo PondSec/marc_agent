@@ -15151,6 +15151,208 @@ def test_pre_write_update_review_surfaces_consumed_sibling_web_hooks_in_repair_h
     assert any("theme-switch" in issue for issue in review.blocking_issues)
     assert any("theme-switch" in hint and "class" in hint.lower() for hint in review.repair_hints)
 
+def test_pre_write_update_review_tells_html_repairs_to_remove_unconsumed_id_hooks(
+    tmp_path,
+    monkeypatch,
+):
+    current_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main class=\"app-shell\">\n"
+        "      <p id=\"status-message\">Bereit.</p>\n"
+        "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+        "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+        "    </main>\n"
+        "    <script src=\"app.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    (tmp_path / "index.html").write_text(current_content, encoding="utf-8")
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(".app-shell { display: grid; }\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Update the existing mini web app with an accessible theme switcher.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[FileChangeRecord(path="app.js", operation="modify")],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the web contract mismatch."}],
+            target_paths=["index.html", "app.js"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert any("theme-switcher" in issue for issue in review.blocking_issues)
+    assert any("remove" in hint.lower() and "theme-switcher" in hint for hint in review.repair_hints)
+
+
+def test_compact_retry_prompt_includes_orphan_hook_removal_direction_for_html_repairs(tmp_path):
+    current_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main class=\"app-shell\">\n"
+        "      <p id=\"status-message\">Bereit.</p>\n"
+        "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+        "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+        "    </main>\n"
+        "    <script src=\"app.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    (tmp_path / "index.html").write_text(current_content, encoding="utf-8")
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Web-App in index.html und app.js mit einem Theme-Umschalter.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            language_counts={"html": 1, "javascript": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js"],
+            focus_files=["index.html", "app.js"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[FileChangeRecord(path="app.js", operation="modify")],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the web contract mismatch."}],
+            target_paths=["index.html", "app.js"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+    review_feedback = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=None,
+    )
+    repair_context = ValidationFailureEvidence(
+        command='internal:semantic_review:[{"path":"app.js"},{"path":"index.html"}]',
+        verification_scope="semantic",
+        status="failed",
+        artifact_paths=["index.html", "app.js"],
+        summary="Semantic review found a cross-file web contract mismatch.",
+        excerpt="index.html introduces the id hook 'theme-switcher', but no current sibling CSS or JS consumes it.",
+        failure_summary="Missing requirements: Resolve the introduced cross-file web contract mismatch across the changed HTML, CSS, and JS artifacts.",
+        repair_requirements=["Repair index.html so the failed semantic validation passes."],
+        repair_brief=RepairBrief(
+            failure_type="semantic_contract_mismatch",
+            failure_signature="semantic:web-contract:index-html-retry-prompt",
+            primary_target="index.html",
+            locked_target="index.html",
+            repair_constraints=["Keep the repair focused on the shared web contract."],
+            allowed_files=["index.html", "app.js"],
+        ),
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "remove or rename the unconsumed id hook 'theme-switcher'" in prompt
+    assert "Required corrections from the rejected draft:" in prompt
+
 
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
     tmp_path,
