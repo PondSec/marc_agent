@@ -12572,6 +12572,254 @@ def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repai
     assert "remaining argv payload 'Hello', 'WORLD'" in prompt
 
 
+def test_review_guided_retry_prompt_surfaces_pre_interaction_initialization_hints_for_js_runtime_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test('wireMenuToggle toggles panel state on each click', () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        repair_requirements=["Change app.js so the failing runtime path initializes and toggles the menu state correctly."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-init-state",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed change introduces a new return statement that was not requested.",
+        confidence=0.9,
+        blocking_issues=[
+            "The proposal broadens scope without evidence, adding a new return statement that was not explicitly requested."
+        ],
+        preservation_risks=[],
+        repair_hints=[],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "The failing interaction is asserted immediately after setup and before the first user event fires." in prompt
+    assert "Do not use the first click or dispatched event to create the initial state." in prompt
+    assert "Set the relevant attribute or property explicitly instead of relying on an undefined or implicit default." in prompt
+    assert "Treat the expected-versus-observed values as an interaction behavior contract." in prompt
+
+
+def test_review_guided_retry_prompt_omits_pre_interaction_initialization_hints_without_pre_event_assertions(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test('wireMenuToggle toggles panel state after clicks', () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repair app.js so the menu toggle still works after clicks.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'true'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: true "
+            "but observed Validation currently produces: undefined."
+        ),
+        repair_requirements=["Change app.js so the failing runtime path toggles the menu state correctly after interaction."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-post-click",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: true"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is still a no-op.",
+            confidence=0.9,
+            blocking_issues=["The proposal does not change the failing behavior."],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+        mode="full",
+    )
+
+    assert "The failing interaction is asserted immediately after setup and before the first user event fires." not in prompt
+    assert "Do not use the first click or dispatched event to create the initial state." not in prompt
+
+
 def test_planner_current_repair_context_pivots_back_to_provider_after_support_noop(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()

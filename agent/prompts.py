@@ -2772,6 +2772,92 @@ def _repair_semantic_value_text(raw: object) -> str:
     return text
 
 
+def _interaction_assertion_line(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "assert.equal(",
+            "assert.strictequal(",
+            "assert.deepstrictequal(",
+            "expect(",
+            ".tobe(",
+            ".toequal(",
+            ".tostrictequal(",
+            ".tohaveattribute(",
+            ".tohaveproperty(",
+        )
+    )
+
+
+def _interaction_event_trigger_line(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    compact = re.sub(r"^\d+:\s*", "", lowered).strip()
+    if re.match(r"^[a-z_$][\w$]*\s*\([^)]*\)\s*\{", compact):
+        return False
+    return any(
+        marker in compact
+        for marker in (
+            ".click()",
+            "fireevent.",
+            "userevent.",
+            "dispatchevent(",
+            ".trigger(",
+        )
+    )
+
+
+def _pre_event_interaction_asserted(supporting_context: str) -> bool:
+    lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not lines:
+        return False
+    first_assertion_index = next((index for index, line in enumerate(lines) if _interaction_assertion_line(line)), -1)
+    if first_assertion_index <= 0:
+        return False
+    return not any(_interaction_event_trigger_line(line) for line in lines[:first_assertion_index])
+
+
+def _js_runtime_pre_event_state_hints(
+    *,
+    current_content: str,
+    supporting_context: str,
+    repair_brief: dict[str, object],
+) -> list[str]:
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return []
+    if not _pre_event_interaction_asserted(supporting_context):
+        return []
+
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("observed_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("expected_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    if not observed_items or not expected_items:
+        return []
+
+    lowered_observed = {item.strip().lower() for item in observed_items if item.strip()}
+    unset_observed = {"undefined", "null", "''", '""'}
+    if not lowered_observed.intersection(unset_observed):
+        return []
+
+    return [
+        "The failing interaction is asserted immediately after setup and before the first user event fires. Establish the baseline state during setup so that the pre-interaction assertions already pass.",
+        "Do not use the first click or dispatched event to create the initial state. The first interaction should toggle away from the initialized baseline, and the next interaction should toggle back.",
+        "The current path leaves the exercised state unset at setup time. Set the relevant attribute or property explicitly instead of relying on an undefined or implicit default.",
+    ]
+
+
 def _direct_main_runtime_contract(
     supporting_context: str,
     *,
@@ -3703,16 +3789,14 @@ def _targeted_runtime_prompt_hints(
     supporting_context: str,
     targeted_context: dict[str, object],
 ) -> list[str]:
-    normalized_path = str(path or "").strip().lower()
-    if not normalized_path.endswith(".py"):
-        return []
-
+    normalized_path = str(path or "").strip()
+    suffix = Path(normalized_path).suffix.lower()
     lowered_current = str(current_content or "").lower()
-    has_argparse_runtime = any(
-        token in lowered_current for token in ("parse_args(", "parse_known_args(", "argparse.argumentparser")
-    )
-
     lowered_support = str(supporting_context or "").lower()
+    repair_brief = targeted_context.get("repair_brief") or {}
+    has_semantic_contract = bool(
+        repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics")
+    )
     focus_text = "\n".join(
         str(item or "")
         for item in targeted_context.get("failure_focus", [])
@@ -3733,8 +3817,29 @@ def _targeted_runtime_prompt_hints(
     lowered_failure = failure_text.lower()
 
     hints: list[str] = []
+    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        hints.extend(
+            _js_runtime_pre_event_state_hints(
+                current_content=current_content,
+                supporting_context=supporting_context,
+                repair_brief=repair_brief,
+            )
+        )
+        if has_semantic_contract:
+            hints.append(
+                "Treat the expected-versus-observed values as an interaction behavior contract. Repair the setup and handler logic that produces that state; do not hardcode the expected literal into the source."
+            )
+        return hints[:6]
+
+    if suffix != ".py":
+        return []
+
+    has_argparse_runtime = any(
+        token in lowered_current for token in ("parse_args(", "parse_known_args(", "argparse.argumentparser")
+    )
+
     direct_script_target = _called_process_python_script_target(failure_text)
-    normalized_path = str(path or "").strip().replace("\\", "/")
+    normalized_path = normalized_path.replace("\\", "/")
     command_option_tokens: list[str] = []
     command_tail_tokens: list[str] = []
     if targeted_context.get("command"):
@@ -3818,9 +3923,6 @@ def _targeted_runtime_prompt_hints(
             "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
         )
     option_tokens, positional_tokens = _direct_main_runtime_contract(supporting_context)
-    has_semantic_contract = bool(
-        repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics")
-    )
     if option_tokens:
         option_preview = ", ".join(option_tokens[:3])
         hints.append(
