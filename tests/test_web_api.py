@@ -1107,6 +1107,29 @@ def test_clear_workspace_contents_removes_files_but_keeps_workspace(tmp_path):
     assert list(workspace_root.iterdir()) == []
 
 
+def test_clear_workspace_contents_preserves_internal_state_dir(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    nested_dir = workspace_root / "src"
+    nested_dir.mkdir()
+    (nested_dir / "main.py").write_text("print('ready')\n", encoding="utf-8")
+    state_dir = workspace_root / config.state_dir_name
+    (state_dir / "sessions").mkdir(parents=True)
+    (state_dir / "sessions" / "keep.json").write_text("{}", encoding="utf-8")
+
+    response = client.post(f"/api/workspaces/{workspace['id']}/clear")
+
+    assert response.status_code == 204
+    assert workspace_root.exists()
+    assert sorted(item.name for item in workspace_root.iterdir()) == [config.state_dir_name]
+    assert (state_dir / "sessions" / "keep.json").exists()
+
+
 def test_workspaces_are_recovered_from_workspace_root_when_store_is_empty(tmp_path):
     alpha = tmp_path / "alpha-project"
     beta = tmp_path / "beta-project"
