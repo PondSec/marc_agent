@@ -3478,7 +3478,7 @@ def test_artifact_scoped_focus_marks_runtime_cli_literal_as_nonbinding_example(t
     assert "--keep-case hello world" not in focus["literal_constraints"]
     assert any(
         item["value"] == "--keep-case hello world"
-        and item["source"] == "repair_brief"
+        and item["source"] == "runtime_evidence"
         and item["type"] == "illustrative_runtime_cli_example"
         and item["hard_source_constraint"] is False
         for item in focus["literal_anchor_details"]
@@ -13395,7 +13395,7 @@ def test_proposed_update_review_prompt_marks_runtime_cli_literal_examples_as_non
     )
 
     assert "--keep-case hello world" in prompt
-    assert '"source": "repair_brief"' in prompt
+    assert '"source": "runtime_evidence"' in prompt
     assert '"type": "illustrative_runtime_cli_example"' in prompt
     assert '"hard_source_constraint": false' in prompt
 
