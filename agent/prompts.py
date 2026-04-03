@@ -2647,6 +2647,7 @@ def _review_feedback_indicates_noop_repair(review: ProposedUpdateReview | None) 
             "equivalent content",
             "same failing state",
             "implicated lines unchanged",
+            "implicated identifier lines unchanged",
         )
     )
 
@@ -2692,6 +2693,30 @@ def _mandatory_mutation_rules(anchors: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _unchanged_identifier_anchor_list(review: ProposedUpdateReview | None) -> list[str]:
+    if review is None:
+        return []
+    for issue in review.blocking_issues:
+        text = str(issue or "").strip()
+        if not text:
+            continue
+        match = re.search(
+            r"leaves the implicated identifier lines unchanged:\s*(?P<anchors>.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        anchors = [
+            str(item or "").strip()
+            for item in str(match.group("anchors") or "").split(",")
+            if str(item or "").strip()
+        ]
+        if anchors:
+            return anchors[:4]
+    return []
+
+
 def _direct_review_corrections(review: ProposedUpdateReview) -> str:
     lines = ["Required corrections from the rejected draft:"]
     for issue in review.blocking_issues[:2]:
@@ -2701,7 +2726,7 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
     for hint in review.repair_hints[:2]:
         text = _trim_text(hint, 220)
         if text:
-            lines.append(f"- Repair direction: {text}")
+            lines.append(f"- Required repair direction: {text}")
     combined = " ".join(review.blocking_issues + review.repair_hints).lower()
     if "sys.argv" in combined:
         lines.append("- If the updated file references sys.argv, add import sys before using it.")
@@ -2716,6 +2741,13 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
     if undefined_symbol:
         lines.append(
             f"- Either import or otherwise bind '{undefined_symbol}' before its current use, or remove that failing use if it is unnecessary."
+        )
+    unchanged_anchors = _unchanged_identifier_anchor_list(review)
+    if unchanged_anchors:
+        lines.append(
+            "- The next draft must change at least one of these currently unchanged anchors: "
+            + ", ".join(unchanged_anchors)
+            + ". Re-emitting the same anchor lines will be rejected again."
         )
     return "\n".join(lines)
 
@@ -3267,6 +3299,12 @@ def _mandatory_mutation_anchors(
                     "Resolve the failure focus tied to this file: "
                     + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
                 )
+    review_anchor = _review_feedback_mutation_anchor(
+        path=path,
+        review_feedback=review_feedback,
+    )
+    if review_anchor:
+        anchors.append(review_anchor)
     undefined_symbol_anchor = _undefined_runtime_symbol_anchor(
         path=path,
         current_content=current_content,
@@ -3300,7 +3338,22 @@ def _mandatory_mutation_anchors(
                 + _trim_text(review_feedback.repair_hints[0], 220)
             )
 
-    return anchors[:3]
+    limit = 4 if review_anchor else 3
+    return anchors[:limit]
+
+
+def _review_feedback_mutation_anchor(
+    *,
+    path: str,
+    review_feedback: ProposedUpdateReview | None,
+) -> str | None:
+    unchanged_anchors = _unchanged_identifier_anchor_list(review_feedback)
+    if not unchanged_anchors:
+        return None
+    rendered = ", ".join(_trim_text(anchor, 80) for anchor in unchanged_anchors[:4])
+    if not rendered:
+        return None
+    return f"Change at least one of these previously unchanged anchors in {path}: {rendered}"
 
 
 def _direct_python_script_execution_anchor(

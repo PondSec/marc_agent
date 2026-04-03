@@ -12703,6 +12703,111 @@ def test_review_guided_retry_prompt_surfaces_pre_interaction_initialization_hint
     assert "Treat the expected-versus-observed values as an interaction behavior contract." in prompt
 
 
+def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        repair_requirements=["Change app.js so the failing runtime path initializes and toggles the menu state correctly."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-unchanged-identifiers",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposal leaves the implicated identifier lines unchanged.",
+        confidence=0.92,
+        blocking_issues=[
+            "The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the initialization and toggle lines instead of adding unrelated returns."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "Repeated no-op detected:" in prompt
+    assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
+    assert (
+        "The next draft must change at least one of these currently unchanged anchors: panel.hidden, wireMenuToggle."
+        in prompt
+    )
+
+
 def test_review_guided_retry_prompt_omits_pre_interaction_initialization_hints_without_pre_event_assertions(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     current_content = (
