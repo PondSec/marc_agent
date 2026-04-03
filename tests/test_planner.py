@@ -822,7 +822,7 @@ def test_semantic_change_review_rejects_unbound_web_contracts_before_model_revie
     assert session.validation_runs[-1].status == "failed"
     assert "cross-file web contract" in (session.validation_runs[-1].summary or "").lower()
     assert session.active_repair_context is not None
-    assert any("dark-mode" in item for item in session.active_repair_context.repair_requirements)
+    assert "dark-mode" in (session.validation_runs[-1].excerpt or "")
 
 
 def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path):

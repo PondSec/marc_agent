@@ -128,6 +128,14 @@ MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES = 6
 MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE = 0.72
 MIN_COMPACT_PRIMARY_UPDATE_CONFIDENCE = 0.55
 DEFERRED_UPDATE_TARGET_NOTE_PREFIX = "deferred_update_target:"
+WEB_CONTRACT_HTML_SUFFIXES = {".html", ".htm"}
+WEB_CONTRACT_CSS_SUFFIXES = {".css", ".less", ".scss"}
+WEB_CONTRACT_SCRIPT_SUFFIXES = {".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"}
+WEB_CONTRACT_SUFFIXES = (
+    WEB_CONTRACT_HTML_SUFFIXES
+    | WEB_CONTRACT_CSS_SUFFIXES
+    | WEB_CONTRACT_SCRIPT_SUFFIXES
+)
 
 
 @dataclass(slots=True)
@@ -189,6 +197,17 @@ class MutationAssessment:
     after_hash: str
     change_labels: list[str] = field(default_factory=list)
     changed_line_count: int = 0
+
+
+@dataclass(slots=True)
+class WebContractInventory:
+    html_ids: set[str] = field(default_factory=set)
+    html_root_classes: set[str] = field(default_factory=set)
+    css_id_selectors: set[str] = field(default_factory=set)
+    css_root_state_classes: set[str] = field(default_factory=set)
+    js_id_refs: set[str] = field(default_factory=set)
+    js_declared_ids: set[str] = field(default_factory=set)
+    js_root_state_classes: set[str] = field(default_factory=set)
 
 
 class Planner:
@@ -5876,6 +5895,318 @@ class Planner:
             return pending_content
         return self._current_file_content(session, path)
 
+    def _path_is_web_contract_artifact(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_SUFFIXES
+
+    def _path_is_web_contract_html(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_HTML_SUFFIXES
+
+    def _path_is_web_contract_css(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_CSS_SUFFIXES
+
+    def _path_is_web_contract_script(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_SCRIPT_SUFFIXES
+
+    def _normalize_web_hook_token(self, token: str) -> str | None:
+        candidate = str(token or "").strip()
+        if not candidate or not re.fullmatch(r"[A-Za-z_][\w-]*", candidate):
+            return None
+        return candidate
+
+    def _web_contract_inventory(self, path: str, content: str) -> WebContractInventory:
+        inventory = WebContractInventory()
+        suffix = Path(path).suffix.lower()
+
+        if suffix in WEB_CONTRACT_HTML_SUFFIXES:
+            for _, raw_value in re.findall(r"\bid\s*=\s*(['\"])([^'\"]+)\1", content, flags=re.IGNORECASE):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.html_ids.add(normalized)
+            for _, raw_value in re.findall(
+                r"<(?:html|body)\b[^>]*\bclass\s*=\s*(['\"])([^'\"]+)\1",
+                content,
+                flags=re.IGNORECASE,
+            ):
+                for token in raw_value.split():
+                    normalized = self._normalize_web_hook_token(token)
+                    if normalized is not None:
+                        inventory.html_root_classes.add(normalized)
+
+        if suffix in WEB_CONTRACT_CSS_SUFFIXES:
+            selector_source = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+            for selector_text in re.findall(r"(?s)([^{}]+)\{", selector_source):
+                for raw_value in re.findall(r"#([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.css_id_selectors.add(normalized)
+                for raw_value in re.findall(
+                    r"(?:^|[\s>+~,])(?:html|body|:root)\.([A-Za-z_][\w-]*)",
+                    selector_text,
+                ):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.css_root_state_classes.add(normalized)
+
+        if suffix in WEB_CONTRACT_SCRIPT_SUFFIXES:
+            for raw_value in re.findall(r"getElementById\(\s*['\"]([^'\"]+)['\"]\s*\)", content):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_id_refs.add(normalized)
+            for _, selector_text in re.findall(
+                r"(?:querySelector|querySelectorAll|closest|matches)\(\s*(['\"])(.*?)\1\s*\)",
+                content,
+                flags=re.DOTALL,
+            ):
+                for raw_value in re.findall(r"#([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.js_id_refs.add(normalized)
+            for raw_value in re.findall(r"\.id\s*=\s*['\"]([^'\"]+)['\"]", content):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_declared_ids.add(normalized)
+            for raw_value in re.findall(
+                r"setAttribute\(\s*['\"]id['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)",
+                content,
+            ):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_declared_ids.add(normalized)
+            for raw_value in re.findall(
+                r"document\.(?:body|documentElement)\.classList\.(?:add|remove|toggle|replace|contains)\(\s*['\"]([^'\"]+)['\"]",
+                content,
+            ):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_root_state_classes.add(normalized)
+
+        return inventory
+
+    def _web_contract_paths(
+        self,
+        session: SessionState,
+        *,
+        route: RouterOutput | None = None,
+        current_path: str | None = None,
+    ) -> tuple[list[str], set[str]]:
+        resolved_route = route or session.router_result
+        candidates: list[str] = []
+        if resolved_route is not None:
+            candidates.extend(self._explicit_target_paths(resolved_route, session))
+        candidates.extend(str(item.path or "").strip() for item in session.changed_files)
+        if current_path:
+            candidates.append(current_path)
+        relevant_paths = [
+            candidate
+            for candidate in self._unique_paths(candidates)
+            if candidate and self._path_is_web_contract_artifact(candidate)
+        ]
+        if resolved_route is None:
+            return relevant_paths, set()
+
+        if resolved_route.intent == RouteIntent.CREATE:
+            deferred_targets = self._active_deferred_create_targets(resolved_route, session)
+        else:
+            deferred_targets = self._active_deferred_update_targets(session)
+        changed_paths = {str(item.path or "").strip() for item in session.changed_files if str(item.path or "").strip()}
+        pending_paths = {
+            candidate
+            for candidate in self._explicit_target_paths(resolved_route, session)
+            if (
+                candidate
+                and candidate != current_path
+                and candidate not in changed_paths
+                and candidate not in deferred_targets
+                and self._path_is_web_contract_artifact(candidate)
+            )
+        }
+        return relevant_paths, pending_paths
+
+    def _web_contract_findings(
+        self,
+        session: SessionState,
+        *,
+        route: RouterOutput | None = None,
+        current_path: str | None = None,
+        proposed_content: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        relevant_paths, pending_paths = self._web_contract_paths(
+            session,
+            route=route,
+            current_path=current_path,
+        )
+        if len(relevant_paths) < 2:
+            return [], []
+
+        contents_by_path: dict[str, str] = {}
+        for candidate in relevant_paths:
+            if current_path is not None and candidate == current_path:
+                content = proposed_content
+            else:
+                content = self._session_or_current_file_content(session, candidate)
+            if isinstance(content, str) and content.strip():
+                contents_by_path[candidate] = content
+        if len(contents_by_path) < 2:
+            return [], []
+
+        has_html = any(self._path_is_web_contract_html(path) for path in contents_by_path)
+        has_css = any(self._path_is_web_contract_css(path) for path in contents_by_path)
+        has_script = any(self._path_is_web_contract_script(path) for path in contents_by_path)
+        if not has_html or not (has_css or has_script):
+            return [], []
+
+        scope_paths = {
+            str(item.path or "").strip()
+            for item in session.changed_files
+            if str(item.path or "").strip() in contents_by_path
+        }
+        if current_path is not None:
+            scope_paths.add(current_path)
+        if not scope_paths:
+            return [], []
+
+        inventories: dict[str, WebContractInventory] = {
+            path: self._web_contract_inventory(path, content)
+            for path, content in contents_by_path.items()
+        }
+
+        def collect_by_token(
+            paths: set[str],
+            extractor,
+        ) -> dict[str, set[str]]:
+            index: dict[str, set[str]] = {}
+            for path in paths:
+                inventory = inventories.get(path)
+                if inventory is None:
+                    continue
+                for token in extractor(inventory):
+                    index.setdefault(token, set()).add(path)
+            return index
+
+        all_html_ids = set().union(*(item.html_ids for item in inventories.values()))
+        all_html_root_classes = set().union(*(item.html_root_classes for item in inventories.values()))
+        all_css_id_selectors = set().union(*(item.css_id_selectors for item in inventories.values()))
+        all_js_id_refs = set().union(*(item.js_id_refs for item in inventories.values()))
+        all_js_declared_ids = set().union(*(item.js_declared_ids for item in inventories.values()))
+        all_js_root_state_classes = set().union(*(item.js_root_state_classes for item in inventories.values()))
+        all_declared_ids = all_html_ids | all_js_declared_ids
+
+        source_html_paths = {path for path in scope_paths if self._path_is_web_contract_html(path)}
+        source_css_paths = {path for path in scope_paths if self._path_is_web_contract_css(path)}
+        source_script_paths = {path for path in scope_paths if self._path_is_web_contract_script(path)}
+        source_html_ids = collect_by_token(source_html_paths, lambda inventory: inventory.html_ids)
+        source_css_id_selectors = collect_by_token(source_css_paths, lambda inventory: inventory.css_id_selectors)
+        source_css_root_state_classes = collect_by_token(
+            source_css_paths,
+            lambda inventory: inventory.css_root_state_classes,
+        )
+        source_js_id_refs = collect_by_token(source_script_paths, lambda inventory: inventory.js_id_refs)
+
+        pending_html = any(self._path_is_web_contract_html(path) for path in pending_paths)
+        pending_css = any(self._path_is_web_contract_css(path) for path in pending_paths)
+        pending_script = any(self._path_is_web_contract_script(path) for path in pending_paths)
+
+        findings: list[str] = []
+        file_hints: set[str] = set()
+
+        for token, paths in sorted(source_css_root_state_classes.items()):
+            if token in all_html_root_classes or token in all_js_root_state_classes:
+                continue
+            if pending_html or pending_script:
+                continue
+            source_preview = ", ".join(sorted(paths)[:2])
+            findings.append(
+                f"{source_preview} introduces the root state selector '{token}', but no current sibling HTML or JS provides or toggles that state."
+            )
+            file_hints.update(paths)
+
+        if has_script:
+            for token, paths in sorted(source_html_ids.items()):
+                if token in all_js_id_refs or token in all_css_id_selectors:
+                    continue
+                if pending_css or pending_script:
+                    continue
+                source_preview = ", ".join(sorted(paths)[:2])
+                findings.append(
+                    f"{source_preview} introduces the id hook '{token}', but no current sibling CSS or JS consumes it."
+                )
+                file_hints.update(paths)
+
+        for token, paths in sorted(source_css_id_selectors.items()):
+            if token in all_declared_ids:
+                continue
+            if pending_html or pending_script:
+                continue
+            source_preview = ", ".join(sorted(paths)[:2])
+            findings.append(
+                f"{source_preview} references the id selector '#{token}', but no current sibling HTML or JS declares that hook."
+            )
+            file_hints.update(paths)
+
+        for token, paths in sorted(source_js_id_refs.items()):
+            if token in all_declared_ids:
+                continue
+            if pending_html or pending_script:
+                continue
+            source_preview = ", ".join(sorted(paths)[:2])
+            findings.append(
+                f"{source_preview} looks up the id hook '{token}', but no current sibling HTML or JS declares it."
+            )
+            file_hints.update(paths)
+
+        if not findings:
+            return [], []
+        return findings[:4], sorted(file_hints)[:6]
+
+    def _pre_write_web_contract_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        findings, _ = self._web_contract_findings(
+            session,
+            route=route,
+            current_path=path,
+            proposed_content=proposed_content,
+        )
+        if not findings:
+            return None
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed update introduces a cross-file web contract that is not yet wired through the sibling HTML, CSS, and JS artifacts."
+            ),
+            confidence=0.92,
+            blocking_issues=findings,
+            preservation_risks=[],
+            repair_hints=[
+                f"Only introduce a new DOM hook, selector, or root-state token in {path} when the sibling web artifacts already provide or consume the same contract.",
+                "Keep one shared contract across HTML, CSS, and JS instead of introducing parallel hooks that describe the same UI behavior in different ways.",
+            ],
+        )
+
+    def _semantic_web_contract_review(self, session: SessionState) -> SemanticChangeReview | None:
+        findings, file_hints = self._web_contract_findings(session)
+        if not findings:
+            return None
+        return SemanticChangeReview(
+            requirements_satisfied=False,
+            summary="The changed web artifacts still contain a cross-file web contract mismatch.",
+            confidence=0.93,
+            missing_requirements=[
+                "Resolve the introduced cross-file web contract mismatch across the changed HTML, CSS, and JS artifacts."
+            ],
+            suspicious_issues=findings,
+            file_hints=file_hints or [item.path for item in session.changed_files[:4]],
+            repair_hints=[
+                "Wire the same ids, selectors, and root-state tokens through the relevant HTML, CSS, and JS files before declaring the task complete.",
+                "Remove duplicate or unused hooks instead of adding parallel DOM elements or selectors for the same behavior.",
+            ],
+        )
+
     def _clarification_response(self, route: RouterOutput, *, session: SessionState | None = None) -> str:
         language = self._session_language(session) if session is not None else self._language_for_text(route.user_goal)
         questions = route.clarification_questions[:3]
@@ -8136,6 +8467,13 @@ class Planner:
                 repair_context=repair_context,
             )
         if review is None:
+            review = self._pre_write_web_contract_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
+        if review is None:
             review = self._validation_repair_relevance_review(
                 path=path,
                 current_content=current_content,
@@ -9074,6 +9412,13 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
+            )
+        if review is None:
+            review = self._pre_write_web_contract_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
             )
         if review is None:
             review = self._validation_repair_relevance_review(
@@ -11827,6 +12172,27 @@ class Planner:
         if not session.changed_files or self.validation_planner.has_semantic_review(session):
             return
 
+        deterministic_web_review = self._semantic_web_contract_review(session)
+        if deterministic_web_review is not None:
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="semantic_change_review",
+                    task_class="semantic_change_review",
+                    final_state="completed",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_web_contract_review",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="A deterministic cross-file web contract review found unresolved DOM or selector mismatches before model-backed semantic review.",
+                    attempts=[],
+                ),
+            )
+            self._record_semantic_change_review(session, deterministic_web_review)
+            return
+
         artifacts = self._semantic_review_artifacts(session)
         primary_model = self._primary_generation_model_name()
         reserve_model = self._lightweight_generation_model_name()
@@ -12197,6 +12563,9 @@ class Planner:
                 repair_hints=["Complete the explicitly requested file updates before declaring the task done."],
                 file_hints=pending_snapshot_targets[:6],
             )
+        deterministic_web_review = self._semantic_web_contract_review(session)
+        if deterministic_web_review is not None:
+            return deterministic_web_review
         if self.validation_planner.web_structural_proxy_sufficient(session):
             return SemanticChangeReview(
                 requirements_satisfied=True,
