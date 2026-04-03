@@ -263,6 +263,7 @@ class ValidationPlanner:
             commands,
             snapshot=snapshot,
             changed_files=changed_paths,
+            session=session,
         )
         if changed_paths and not any(self.command_scope(command) == "runtime" for command in commands):
             commands.extend(self._default_commands(snapshot, changed_paths, task=task))
@@ -2737,6 +2738,7 @@ class ValidationPlanner:
         *,
         snapshot: WorkspaceSnapshot,
         changed_files: list[str],
+        session: SessionState | None,
     ) -> list[ValidationCommand]:
         generic_indexes: list[int] = []
         command_prefix = "python"
@@ -2756,6 +2758,7 @@ class ValidationPlanner:
         modules = self._targeted_unittest_modules(
             changed_files=changed_files,
             snapshot=snapshot,
+            session=session,
         )
         if not modules:
             return commands
@@ -2776,12 +2779,20 @@ class ValidationPlanner:
         *,
         changed_files: list[str],
         snapshot: WorkspaceSnapshot,
+        session: SessionState | None,
     ) -> list[str]:
         candidate_paths = [
             path
             for path in changed_files
             if self._is_test_path(path) and Path(path).suffix.lower() == ".py"
         ]
+        if not candidate_paths and session is not None:
+            candidate_paths = [
+                path
+                for command in self._explicit_validation_commands(session)
+                for path in self._paths_from_explicit_test_command(command.command)
+                if self._is_test_path(path) and Path(path).suffix.lower() == ".py"
+            ]
         if not candidate_paths:
             candidate_paths = [
                 path

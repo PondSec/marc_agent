@@ -6511,6 +6511,119 @@ def test_planner_skips_generic_unittest_after_targeted_module_passes(tmp_path):
     assert planner._pick_validation_command(session) is None
 
 
+def test_validation_plan_prefers_explicit_unittest_targets_over_snapshot_test_files(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "focus_files": ["normalize_cli.py"],
+            "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "likely_commands": ["python -m unittest"],
+            "validation_commands": [
+                ValidationCommand(
+                    command="python -m unittest",
+                    kind="test",
+                    verification_scope="runtime",
+                    source="python-test-files",
+                )
+            ],
+        }
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+
+    plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["normalize_cli.py"],
+        session=session,
+    )
+
+    unittest_commands = [
+        item.command
+        for item in plan
+        if item.command.startswith("python -m unittest")
+    ]
+
+    assert unittest_commands == ["python -m unittest tests.__init__ tests.test_normalize"]
+
+
+def test_planner_does_not_requeue_snapshot_unittest_targets_after_explicit_targeted_pass(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "focus_files": ["normalize_cli.py"],
+            "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "likely_commands": ["python -m unittest"],
+            "validation_commands": [
+                ValidationCommand(
+                    command="python -m unittest",
+                    kind="test",
+                    verification_scope="runtime",
+                    source="python-test-files",
+                )
+            ],
+        }
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        edit_generation=1,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+    session.changed_files.append(FileChangeRecord(path="normalize_cli.py", operation="write"))
+    session.validation_plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["normalize_cli.py"],
+        session=session,
+    )
+    session.verification_commands = [item.command for item in session.validation_plan]
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.__init__ tests.test_normalize",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+            edit_generation=1,
+            iteration=5,
+            summary="Validation command exited with 0.",
+        )
+    )
+
+    assert planner._pick_validation_command(session) is None
+
+
 def test_planner_blocks_instead_of_reverifying_when_failed_validation_has_no_repair_target(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
