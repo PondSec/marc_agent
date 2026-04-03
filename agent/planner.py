@@ -8151,12 +8151,6 @@ class Planner:
             return False
         if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
             return False
-        direct_script_option_tokens, _ = self._direct_python_script_option_contract_details(
-            repair_context,
-            path=normalized_path,
-        )
-        if direct_script_option_tokens:
-            return False
         if self._repair_update_is_evidence_backed_behavior_adjustment(
             path=normalized_path,
             current_content=current_content,
