@@ -8524,8 +8524,12 @@ class Planner:
                 ),
                 mode="compact",
             )
-        reserve_model = self._lightweight_generation_model_name()
         primary_model = self._primary_generation_model_name()
+        reserve_model = self._lightweight_generation_model_name()
+        if reserve_model is None and repair_review:
+            reserve_model = self._generation_recovery_model_name()
+            if reserve_model == primary_model:
+                reserve_model = None
         local_review_reason: str | None = None
         if focused_compact_review and not repair_review and reserve_model is None:
             local_review_reason = "single_model_compact_update"

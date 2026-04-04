@@ -16469,6 +16469,109 @@ def test_primary_compact_repair_review_uses_compact_repair_runtime_budget(tmp_pa
     assert kwargs["strict_timeouts"] is False
 
 
+def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(tmp_path, monkeypatch):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    llm = InventoryLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The focused repair changes the implicated runtime path and stays scoped.",
+                "confidence": 0.92,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+            model_candidates=("qwen2.5-coder:7b",),
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["app.js"],
+        target_name="app.js",
+    )
+    session = SessionState(
+        task="Repair the runtime output without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: false !== true",
+        failure_summary="The toggle path still leaves panel.hidden out of sync with aria-expanded.",
+        repair_requirements=["Change app.js so the runtime toggle path matches the test contract."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:review-recovery-model",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: true"],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the repair on app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    monkeypatch.setattr(planner, "_should_skip_model_backed_repair_review", lambda *_args, **_kwargs: False)
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener(\"click\", () => {\n"
+            "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+            "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+            "    panel.hidden = !expanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+        proposed_content=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener(\"click\", () => {\n"
+            "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+            "    const nextExpanded = !expanded;\n"
+            "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+            "    panel.hidden = !nextExpanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    kwargs = llm.generate_json_calls[0]["kwargs"]
+    assert kwargs["model"] == "qwen3:8b"
+    assert kwargs["num_ctx"] == 2048
+    assert kwargs["timeout"] >= 25
+    assert kwargs["total_timeout"] >= 90
+    assert kwargs["strict_timeouts"] is True
+    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+
+
 def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
