@@ -20524,6 +20524,130 @@ def test_generate_file_content_retries_after_identical_task_backed_update_withou
     assert "no-op or only an equivalent restatement" in retry_prompt or "does not make a productive change" in retry_prompt
 
 
+def test_generate_file_content_uses_reserve_model_after_duplicate_compact_retry_prompt_without_repair_context(
+    tmp_path,
+):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    initial_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repaired_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    const nextExpanded = !expanded;\n"
+        "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+        "    panel.hidden = !nextExpanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    llm = InventoryLLM(
+        text_payloads=[
+            initial_draft,
+            initial_draft,
+            repaired_draft,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    test_content = (
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n"
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+                "focus_files": ["app.js"],
+                "test_files": ["tests/test_menu_toggle.cjs"],
+                "entrypoints": ["app.js"],
+                "language_counts": {"javascript": 2},
+                "project_labels": ["javascript"],
+            }
+        ),
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=test_content,
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=initial_draft,
+    )
+
+    assert result.failure is None
+    assert result.content == repaired_draft.strip()
+    assert llm.generate_calls[0]["kwargs"]["model"] is None
+    assert [call["kwargs"]["model"] for call in llm.generate_calls[1:]] == [
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+    ]
+    assert llm.generate_calls[-1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[-1]["kwargs"]["timeout"] >= 90
+    assert llm.generate_calls[-1]["kwargs"]["total_timeout"] >= 420
+    assert session.runtime_executions[-1]["recovery_strategy"] == "review_guided_fallback_model"
+
+
 def test_review_guided_retry_uses_deterministic_direct_main_recovery_before_extra_model_retry(
     tmp_path,
 ):

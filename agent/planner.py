@@ -10649,6 +10649,7 @@ class Planner:
                 )
             )
         elif keep_compact_update_retry:
+            followup_timeout_seconds, followup_total_timeout_seconds = self._repair_followup_retry_budget()
             retry_models.append(
                 (
                     primary_model,
@@ -10671,6 +10672,18 @@ class Planner:
                     "compact",
                 )
             )
+            if reserve_model is not None and reserve_model != primary_model:
+                retry_models.append(
+                    (
+                        reserve_model,
+                        "tier_b",
+                        "review_guided_fallback_model",
+                        followup_timeout_seconds,
+                        followup_total_timeout_seconds,
+                        min(self._llm_num_ctx(2048), 2048),
+                        "compact",
+                    )
+                )
         if prefer_lightweight_retry and reserve_model is not None and keep_compact_update_retry:
             retry_models.append(
                 (
