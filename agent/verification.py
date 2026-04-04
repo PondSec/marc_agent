@@ -783,6 +783,9 @@ class ValidationPlanner:
         if lowered[:1] == ["pytest"]:
             trimmed = self._trim_pytest_command_tokens(tokens, prefix_len=1)
             return " ".join(trimmed) if trimmed else command
+        if lowered[:2] == ["node", "--test"]:
+            trimmed = self._trim_node_test_command_tokens(tokens)
+            return " ".join(trimmed) if trimmed else command
         return command
 
     def _trim_unittest_command_tokens(self, tokens: list[str]) -> list[str]:
@@ -869,6 +872,56 @@ class ValidationPlanner:
             or "/" in normalized
             or "\\" in normalized
             or "::" in normalized
+            or lowered in {".", "tests", "test"}
+        )
+
+    def _trim_node_test_command_tokens(self, tokens: list[str]) -> list[str]:
+        if len(tokens) <= 2:
+            return tokens
+
+        option_value_flags = {
+            "--import",
+            "--loader",
+            "--require",
+            "--test-concurrency",
+            "--test-name-pattern",
+            "--test-reporter",
+            "--test-reporter-destination",
+            "--watch-path",
+        }
+        trimmed = tokens[:2]
+        saw_target = False
+        expect_option_value = False
+        for token in tokens[2:]:
+            lowered = token.lower()
+            if expect_option_value:
+                trimmed.append(token)
+                expect_option_value = False
+                continue
+            if token.startswith("-"):
+                trimmed.append(token)
+                if lowered in option_value_flags:
+                    expect_option_value = True
+                continue
+            if self._looks_like_node_test_target(token):
+                trimmed.append(token)
+                saw_target = True
+                continue
+            if saw_target:
+                break
+            break
+        return trimmed
+
+    def _looks_like_node_test_target(self, token: str) -> bool:
+        cleaned = str(token or "").strip()
+        normalized = cleaned.rstrip(".,;:!?")
+        if not normalized or normalized.startswith("-"):
+            return False
+        lowered = normalized.lower()
+        return (
+            normalized.endswith((".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"))
+            or "/" in normalized
+            or "\\" in normalized
             or lowered in {".", "tests", "test"}
         )
 

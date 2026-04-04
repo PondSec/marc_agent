@@ -1965,6 +1965,81 @@ def test_validation_planner_extracts_explicit_node_test_command_from_user_reques
     assert explicit.required is True
 
 
+def test_validation_planner_strips_trailing_passes_token_from_inline_node_test_command():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "node --test tests/test_menu_toggle.cjs passes"
+    )
+
+    assert normalized == "node --test tests/test_menu_toggle.cjs"
+
+
+def test_validation_planner_keeps_node_test_flags_while_trimming_following_prose():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "node --test --test-name-pattern toggle tests/test_menu_toggle.cjs passes."
+    )
+
+    assert normalized == "node --test --test-name-pattern toggle tests/test_menu_toggle.cjs"
+
+
+def test_validation_planner_build_plan_trims_trailing_prose_from_explicit_node_test_command(monkeypatch):
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"javascript": 1},
+        top_directories=[],
+        important_files=["app.js", "tests/test_menu_toggle.cjs"],
+        focus_files=["app.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_menu_toggle.cjs"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app.js"],
+        repo_map=[],
+        project_labels=["javascript"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small JavaScript interaction module with a focused node test.",
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+    user_turn = (
+        "Fix app.js so node --test tests/test_menu_toggle.cjs passes. "
+        "Keep wireMenuToggle as the exported function."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the menu toggle behavior safely.",
+            active_goal="Fix the JS interaction and rerun the targeted node test.",
+            goal_relation="continue",
+            output_expectation="Updated JS interaction behavior plus a passing node test.",
+            verification_target="Verify the requested JS behavior.",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["app.js", "tests/test_menu_toggle.cjs"],
+        session=session,
+    )
+
+    explicit = next(item for item in plan if item.command == "node --test tests/test_menu_toggle.cjs")
+
+    assert explicit.verification_scope == "runtime"
+    assert explicit.required is True
+
+
 def test_validation_planner_preserves_node_tap_assertion_context_for_runtime_repairs(tmp_path):
     planner = ValidationPlanner()
     app_path = tmp_path / "app.js"
