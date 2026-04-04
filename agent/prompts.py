@@ -2089,15 +2089,16 @@ def _compact_repair_update_prompt(
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         target_summary = repair_brief.get("locked_target") or repair_brief.get("primary_target")
         sections.append(f"Primary repair target: {target_summary}")
-    if repair_brief.get("expected_semantics"):
+    expected_semantics, observed_semantics = _repair_semantic_display_items(repair_context)
+    if expected_semantics:
         sections.append(
             "Expected semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in expected_semantics[:3])
         )
-    if repair_brief.get("observed_semantics"):
+    if observed_semantics:
         sections.append(
             "Observed semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in observed_semantics[:3])
         )
     semantic_deltas = _repair_semantic_delta_lines(
         repair_context,
@@ -2280,15 +2281,16 @@ def _compact_repair_retry_prompt(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if repair_brief.get("expected_semantics"):
+    expected_semantics, observed_semantics = _repair_semantic_display_items(repair_context)
+    if expected_semantics:
         sections.append(
             "Expected semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("expected_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in expected_semantics[:3])
         )
-    if repair_brief.get("observed_semantics"):
+    if observed_semantics:
         sections.append(
             "Observed semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("observed_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in observed_semantics[:3])
         )
     semantic_deltas = _repair_semantic_delta_lines(
         repair_context,
@@ -2516,15 +2518,16 @@ def _focused_full_repair_update_prompt(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if repair_brief.get("expected_semantics"):
+    expected_semantics, observed_semantics = _repair_semantic_display_items(repair_context)
+    if expected_semantics:
         sections.append(
             "Expected semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in expected_semantics[:3])
         )
-    if repair_brief.get("observed_semantics"):
+    if observed_semantics:
         sections.append(
             "Observed semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in observed_semantics[:3])
         )
     semantic_deltas = _repair_semantic_delta_lines(
         repair_context,
@@ -2838,16 +2841,7 @@ def _repair_semantic_delta_lines(
     if brief is None:
         return []
 
-    expected_items = [
-        _repair_semantic_value_text(item)
-        for item in getattr(brief, "expected_semantics", [])
-        if _repair_semantic_value_text(item)
-    ]
-    observed_items = [
-        _repair_semantic_value_text(item)
-        for item in getattr(brief, "observed_semantics", [])
-        if _repair_semantic_value_text(item)
-    ]
+    expected_items, observed_items = _repair_semantic_values(repair_context)
     if not expected_items or not observed_items:
         return []
 
@@ -2998,6 +2992,99 @@ def _repair_semantic_value_text(raw: object) -> str:
         if text.startswith(prefix):
             return text[len(prefix) :].strip()
     return text
+
+
+def _repair_semantic_values(
+    repair_context: ValidationFailureEvidence,
+) -> tuple[list[str], list[str]]:
+    brief = getattr(repair_context, "repair_brief", None)
+    return _repair_semantic_values_from_sources(
+        repair_brief=brief,
+        evidence_texts=[
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ],
+    )
+
+
+def _repair_semantic_display_items(
+    repair_context: ValidationFailureEvidence,
+) -> tuple[list[str], list[str]]:
+    brief = getattr(repair_context, "repair_brief", None)
+    expected_items = [str(item or "").strip() for item in getattr(brief, "expected_semantics", []) or [] if str(item or "").strip()]
+    observed_items = [str(item or "").strip() for item in getattr(brief, "observed_semantics", []) or [] if str(item or "").strip()]
+    if expected_items or observed_items:
+        return expected_items[:4], observed_items[:4]
+
+    expected_values, observed_values = _repair_semantic_values_from_sources(
+        repair_brief=brief,
+        evidence_texts=[
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ],
+    )
+    expected_display = [f"Validation should produce: {item}" for item in expected_values]
+    observed_display = [f"Validation currently produces: {item}" for item in observed_values]
+    return expected_display[:4], observed_display[:4]
+
+
+def _repair_semantic_values_from_sources(
+    *,
+    repair_brief: object | None,
+    evidence_texts: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    if isinstance(repair_brief, dict):
+        raw_expected = repair_brief.get("expected_semantics", []) or []
+        raw_observed = repair_brief.get("observed_semantics", []) or []
+    else:
+        raw_expected = getattr(repair_brief, "expected_semantics", []) or []
+        raw_observed = getattr(repair_brief, "observed_semantics", []) or []
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in raw_expected
+        if _repair_semantic_value_text(item)
+    ]
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in raw_observed
+        if _repair_semantic_value_text(item)
+    ]
+    if expected_items and observed_items:
+        return expected_items[:4], observed_items[:4]
+
+    fallback_expected, fallback_observed = _repair_semantic_values_from_texts(evidence_texts)
+    if not expected_items:
+        expected_items = fallback_expected
+    if not observed_items:
+        observed_items = fallback_observed
+    return expected_items[:4], observed_items[:4]
+
+
+def _repair_semantic_values_from_texts(
+    texts: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    quoted_pair_pattern = re.compile(
+        r"AssertionError:\s*(?:assert\s*)?(?P<observed>'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")\s*(?:==|!=)\s*(?P<expected>'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")"
+    )
+    for raw_text in texts:
+        text = str(raw_text or "").strip()
+        if not text:
+            continue
+        match = quoted_pair_pattern.search(text)
+        if match is None:
+            continue
+        try:
+            observed_value = ast.literal_eval(str(match.group("observed") or ""))
+            expected_value = ast.literal_eval(str(match.group("expected") or ""))
+        except (SyntaxError, ValueError):
+            continue
+        observed_text = str(observed_value or "").strip()
+        expected_text = str(expected_value or "").strip()
+        if observed_text and expected_text:
+            return [expected_text], [observed_text]
+    return [], []
 
 
 def _interaction_assertion_line(text: str) -> bool:
@@ -4127,9 +4214,14 @@ def _targeted_runtime_prompt_hints(
     lowered_current = str(current_content or "").lower()
     lowered_support = str(supporting_context or "").lower()
     repair_brief = targeted_context.get("repair_brief") or {}
-    has_semantic_contract = bool(
-        repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics")
+    expected_semantics, observed_semantics = _repair_semantic_values_from_sources(
+        repair_brief=repair_brief,
+        evidence_texts=[
+            str(targeted_context.get("excerpt") or "").strip(),
+            str(targeted_context.get("failure_summary") or "").strip(),
+        ],
     )
+    has_semantic_contract = bool(expected_semantics or observed_semantics)
     focus_text = "\n".join(
         str(item or "")
         for item in targeted_context.get("failure_focus", [])

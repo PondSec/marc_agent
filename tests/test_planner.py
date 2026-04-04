@@ -11442,6 +11442,103 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "compute the next state once" not in prompt
 
 
+def test_runtime_repair_prompt_derives_semantic_delta_from_assertion_evidence_when_brief_semantics_missing(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_cli = (
+        "def main(argv=None):\n"
+        "    greeting = 'Hello, Ada!'\n"
+        "    title = 'Dr.'\n"
+        "    if title:\n"
+        "        greeting = f\"{title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+    cli_path = tmp_path / "greet_cli.py"
+    cli_path.write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from greet_cli import main\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["greet_cli.py", "tests/test_cli.py"],
+            "focus_files": ["greet_cli.py"],
+            "test_files": ["tests/test_cli.py"],
+            "entrypoints": ["greet_cli.py"],
+            "symbol_index": {"greet_cli.py": ["main"]},
+        }
+    )
+    session = SessionState(
+        task="Repair greet_cli.py so titled greetings no longer insert the extra punctuation.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the greeting formatting."}],
+        target_paths=["greet_cli.py", "tests/test_cli.py"],
+        target_name="greet_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest -q tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest -q tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli.py so the failing runtime path can complete successfully."],
+        file_hints=["greet_cli.py", "tests/test_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:greet-cli-derived-semantics",
+            primary_target="greet_cli.py",
+            locked_target="greet_cli.py",
+            implicated_symbols=["main"],
+            implicated_region_hint="greet_cli.py",
+            repair_constraints=["Keep the fix local to greet_cli.py."],
+            allowed_files=["greet_cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+        confidence=0.9,
+        blocking_issues=[
+            "The proposed repair does not make a productive change to greet_cli.py for runtime:assertion_mismatch:greet-cli-derived-semantics (file hash unchanged)."
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the locked repair target so the failing greeting output changes materially."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="greet_cli.py",
+        current_content=current_cli,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "Expected semantics: Validation should produce: Dr. Hello, Ada!" in prompt
+    assert "Observed semantics: Validation currently produces: Dr.: Hello, Ada!" in prompt
+    assert (
+        "Minimal semantic delta: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+    assert (
+        "Apply this exact semantic delta in the behavior produced by this file: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+    assert "Treat expected-versus-observed values as a behavior contract." in prompt
+
+
 def test_runtime_repair_prompts_keep_interactive_support_context_across_modes(tmp_path):
     app_path = tmp_path / "app.js"
     app_path.write_text(
