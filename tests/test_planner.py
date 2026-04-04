@@ -11787,6 +11787,173 @@ def test_generate_content_prompt_keeps_callable_requirement_sentence_intact_for_
     assert "wireMenuToggle(button; panel)" not in prompt
 
 
+def test_generate_content_prompt_derives_test_backed_toggle_contract_hints_without_repair_context(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=(tests_dir / "test_menu_toggle.cjs").read_text(encoding="utf-8"),
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "The supporting test already defines the post-interaction state contract." in prompt
+    assert "Read the current state once, compute the next state once" in prompt
+    assert "The supporting test exercises the interaction more than once." in prompt
+    assert "When aria-expanded changes in the handler, hidden/visible state should follow the same transition" in prompt
+
+
+def test_generate_content_prompt_skips_test_backed_toggle_contract_hints_without_boolean_post_event_assertions(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    panel.hidden = !panel.hidden;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle registers one click handler\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.listenerCount, 1);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js so der Klick-Handler korrekt registriert bleibt.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=(tests_dir / "test_menu_toggle.cjs").read_text(encoding="utf-8"),
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the click handler registration."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "The supporting test already defines the post-interaction state contract." not in prompt
+    assert "The supporting test exercises the interaction more than once." not in prompt
+
+
 def test_compact_repair_prompt_prioritizes_test_line_hints_for_stdout_contract(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()

@@ -3126,6 +3126,24 @@ def _interaction_event_trigger_line(text: str) -> bool:
     )
 
 
+def _interaction_asserted_boolean_value(text: str) -> bool | None:
+    compact = re.sub(r"^\d+:\s*", "", str(text or "").strip())
+    if not compact:
+        return None
+    patterns = (
+        r"assert\.(?:equal|strictequal|deepstrictequal)\([^,\n]+,\s*(?P<expected>true|false|'true'|'false'|\"true\"|\"false\")\s*\)",
+        r"\.to(?:be|equal|strictequal)\(\s*(?P<expected>true|false|'true'|'false'|\"true\"|\"false\")\s*\)",
+        r"\.tohaveattribute\([^,\n]+,\s*(?P<expected>'true'|'false'|\"true\"|\"false\")\s*\)",
+        r"\.tohaveproperty\([^,\n]+,\s*(?P<expected>true|false)\s*\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match is None:
+            continue
+        return _normalized_boolean_semantic_value(str(match.group("expected") or ""))
+    return None
+
+
 def _pre_event_interaction_asserted(supporting_context: str) -> bool:
     lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
     if not lines:
@@ -3173,6 +3191,50 @@ def _js_runtime_pre_event_state_hints(
         "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring and keep the current toggle callback shape when it already covers the post-interaction transitions.",
         "Do not add new early-return branches, wrapper conditions, or API changes unless the visible evidence shows a control-flow failure beyond the missing initial state.",
     ]
+
+
+def _js_test_backed_toggle_contract_hints(
+    *,
+    current_content: str,
+    supporting_context: str,
+) -> list[str]:
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return []
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    event_count = sum(1 for line in support_lines if _interaction_event_trigger_line(line))
+    if event_count == 0:
+        return []
+
+    saw_event = False
+    post_event_boolean_values: list[bool] = []
+    for line in support_lines:
+        if _interaction_event_trigger_line(line):
+            saw_event = True
+            continue
+        if not saw_event or not _interaction_assertion_line(line):
+            continue
+        expected_bool = _interaction_asserted_boolean_value(line)
+        if expected_bool is None:
+            continue
+        post_event_boolean_values.append(expected_bool)
+
+    if len(post_event_boolean_values) < 2 or len(set(post_event_boolean_values)) < 2:
+        return []
+
+    hints = [
+        "The supporting test already defines the post-interaction state contract. Make the handler produce those asserted states directly instead of preserving the current assignments unchanged.",
+        "Read the current state once, compute the next state once, and derive every dependent update from that same next state.",
+    ]
+    if event_count >= 2:
+        hints.append(
+            "The supporting test exercises the interaction more than once. The later interaction should move back to the opposite boolean state instead of repeating the first result."
+        )
+    if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
+        hints.append(
+            "When aria-expanded changes in the handler, hidden/visible state should follow the same transition with the opposite visibility meaning: expanded/open maps to visible (hidden false), collapsed/closed maps to hidden true."
+        )
+    return hints
 
 
 def _js_runtime_toggle_consistency_hints(
@@ -4257,6 +4319,13 @@ def _targeted_runtime_prompt_hints(
                 repair_brief=repair_brief,
             )
         )
+        if not has_semantic_contract:
+            hints.extend(
+                _js_test_backed_toggle_contract_hints(
+                    current_content=current_content,
+                    supporting_context=supporting_context,
+                )
+            )
         if has_semantic_contract:
             hints.append(
                 "Treat the expected-versus-observed values as an interaction behavior contract. Repair the setup and handler logic that produces that state; do not hardcode the expected literal into the source."
