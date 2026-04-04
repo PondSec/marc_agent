@@ -13384,7 +13384,9 @@ def test_review_guided_retry_prompt_keeps_boolean_semantic_delta_atomic_for_js_r
         mode="compact",
     )
 
-    assert "After the exercised interaction, the toggled state should produce 'false' instead of 'true'." in prompt
+    assert "Match the supporting interaction contract exactly." in prompt
+    assert "After the first interaction, aria-expanded should be 'true' and panel.hidden should be false." in prompt
+    assert "After the second interaction, aria-expanded should be 'false' and panel.hidden should be true." in prompt
     assert "Replace observed-only text 'tru' with expected text 'fals'" not in prompt
     assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
     assert "panel.hidden = !expanded;" in prompt

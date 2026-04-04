@@ -2893,6 +2893,16 @@ def _interactive_runtime_semantic_delta_lines(
         supporting_context=supporting_context,
         repair_brief=brief_payload,
     ):
+        contract_lines = _interaction_post_event_contract_lines(
+            supporting_context,
+            limit_events=limit,
+        )
+        if contract_lines:
+            toggle_deltas = [
+                "Match the supporting interaction contract exactly. " + contract_lines[0]
+            ]
+            toggle_deltas.extend(contract_lines[1:limit])
+            return toggle_deltas[:limit]
         toggle_deltas: list[str] = []
         for observed_value, expected_value in zip(observed_items, expected_items):
             delta = _render_interactive_runtime_toggle_delta(
@@ -2936,11 +2946,15 @@ def _render_interactive_runtime_toggle_delta(
     support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
     if not any(_interaction_event_trigger_line(line) for line in support_lines):
         return None
-    guidance = (
-        "After the exercised interaction, the toggled state should produce "
-        f"'{str(expected_value or '').strip()}' instead of '{str(observed_value or '').strip()}'. "
-        "Compute the next-state value once inside the handler and derive every dependent update from it, preserving whether each property should mirror or invert that next state."
-    )
+    contract_lines = _interaction_post_event_contract_lines(supporting_context)
+    if contract_lines:
+        return "Match the supporting interaction contract exactly. " + " ".join(contract_lines[:2])
+    else:
+        guidance = (
+            "After the exercised interaction, the toggled state should produce "
+            f"'{str(expected_value or '').strip()}' instead of '{str(observed_value or '').strip()}'. "
+            "Compute the next-state value once inside the handler and derive every dependent update from it, preserving whether each property should mirror or invert that next state."
+        )
     if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
         guidance += (
             " Keep aria-expanded and hidden/visible updates tied to the same next-state transition: "
@@ -3142,6 +3156,113 @@ def _interaction_asserted_boolean_value(text: str) -> bool | None:
             continue
         return _normalized_boolean_semantic_value(str(match.group("expected") or ""))
     return None
+
+
+def _interaction_assertion_contract(text: str) -> tuple[str, str] | None:
+    compact = re.sub(r"^\d+:\s*", "", str(text or "").strip())
+    if not compact:
+        return None
+    patterns = (
+        r"assert\.(?:equal|strictequal|deepstrictequal)\(\s*(?P<subject>[^,\n]+?)\s*,\s*(?P<expected>true|false|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*\)",
+        r"expect\(\s*(?P<subject>[^)\n]+?)\s*\)\.to(?:be|equal|strictequal)\(\s*(?P<expected>true|false|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match is None:
+            continue
+        subject = _interaction_contract_subject(str(match.group("subject") or "").strip())
+        expected = _interaction_expected_literal_text(str(match.group("expected") or "").strip())
+        if subject and expected:
+            return subject, expected
+    return None
+
+
+def _interaction_contract_subject(raw: str) -> str:
+    subject = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not subject:
+        return ""
+    attribute_match = re.search(r"getattribute\(\s*['\"]([^'\"]+)['\"]\s*\)", subject, re.IGNORECASE)
+    if attribute_match is not None:
+        return str(attribute_match.group(1) or "").strip() or subject
+    return subject
+
+
+def _interaction_expected_literal_text(raw: str) -> str:
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    lowered = token.lower()
+    if lowered in {"true", "false"}:
+        return lowered
+    try:
+        value = ast.literal_eval(token)
+    except (SyntaxError, ValueError):
+        value = token
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return repr(value)
+    return str(value).strip()
+
+
+def _interaction_post_event_contract_lines(
+    supporting_context: str,
+    *,
+    limit_events: int = 2,
+    limit_assertions_per_event: int = 3,
+) -> list[str]:
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not support_lines:
+        return []
+
+    contracts: list[list[tuple[str, str]]] = []
+    active_contract: list[tuple[str, str]] = []
+    saw_event = False
+    for line in support_lines:
+        if _interaction_event_trigger_line(line):
+            if saw_event and active_contract:
+                contracts.append(active_contract)
+                if len(contracts) >= limit_events:
+                    break
+            saw_event = True
+            active_contract = []
+            continue
+        if not saw_event or not _interaction_assertion_line(line):
+            continue
+        contract = _interaction_assertion_contract(line)
+        if contract is None or contract in active_contract:
+            continue
+        active_contract.append(contract)
+        if len(active_contract) >= limit_assertions_per_event:
+            continue
+    if saw_event and active_contract and len(contracts) < limit_events:
+        contracts.append(active_contract)
+
+    rendered: list[str] = []
+    for index, contract_items in enumerate(contracts[:limit_events], start=1):
+        statements = [f"{subject} should be {expected}" for subject, expected in contract_items[:limit_assertions_per_event]]
+        if not statements:
+            continue
+        if len(statements) == 1:
+            body = statements[0]
+        elif len(statements) == 2:
+            body = f"{statements[0]} and {statements[1]}"
+        else:
+            body = ", ".join(statements[:-1]) + f", and {statements[-1]}"
+        rendered.append(f"After the {_ordinal_step_word(index)} interaction, {body}.")
+    return rendered
+
+
+def _ordinal_step_word(index: int) -> str:
+    ordinals = {
+        1: "first",
+        2: "second",
+        3: "third",
+        4: "fourth",
+        5: "fifth",
+    }
+    normalized = max(int(index), 1)
+    return ordinals.get(normalized, f"{normalized}th")
 
 
 def _pre_event_interaction_asserted(supporting_context: str) -> bool:
@@ -3355,25 +3476,28 @@ def _preserve_runtime_contract_excerpt(
     preserve_direct_main = _direct_main_option_contract_present(full_text) and not _direct_main_option_contract_present(
         compact_text
     )
-    interactive_pattern = re.compile(
-        r"\b(?:assert\.(?:equal|strictEqual|deepStrictEqual|ok)|expect\(|click\(\)|dispatchEvent\(|fireEvent\.|userEvent\.)"
-    )
     full_interactive_lines = [
         index
         for index, raw_line in enumerate(full_text.splitlines(), start=1)
-        if interactive_pattern.search(str(raw_line or "").strip())
+        if (
+            _interaction_assertion_line(str(raw_line or "").strip())
+            or _interaction_event_trigger_line(str(raw_line or "").strip())
+        )
     ]
     compact_interactive_lines = [
         index
         for index, raw_line in enumerate(compact_text.splitlines(), start=1)
-        if interactive_pattern.search(str(raw_line or "").strip())
+        if (
+            _interaction_assertion_line(str(raw_line or "").strip())
+            or _interaction_event_trigger_line(str(raw_line or "").strip())
+        )
     ]
     preserve_interactive_contract = (
         bool(full_interactive_lines)
         and (
             len(full_interactive_lines) > len(compact_interactive_lines)
-            or any("click()" in str(raw_line or "") for raw_line in full_text.splitlines())
-            and not any("click()" in str(raw_line or "") for raw_line in compact_text.splitlines())
+            or any(_interaction_event_trigger_line(str(raw_line or "").strip()) for raw_line in full_text.splitlines())
+            and not any(_interaction_event_trigger_line(str(raw_line or "").strip()) for raw_line in compact_text.splitlines())
         )
     )
     if not preserve_direct_main and not preserve_interactive_contract:
@@ -3386,10 +3510,7 @@ def _preserve_runtime_contract_excerpt(
             continue
         if re.search(r"(?:__main__\.)?main\(\s*\[[^\n]*\]\s*\)", line):
             contract_line_hints.append(index)
-        if re.search(
-            r"\b(?:assert\.(?:equal|strictEqual|deepStrictEqual|ok)|expect\(|click\(\)|dispatchEvent\(|fireEvent\.|userEvent\.)",
-            line,
-        ):
+        if _interaction_assertion_line(line) or _interaction_event_trigger_line(line):
             contract_line_hints.append(index)
         if len(contract_line_hints) >= 8:
             break
@@ -3399,9 +3520,10 @@ def _preserve_runtime_contract_excerpt(
     contract_excerpt = _line_focused_excerpt(
         full_text,
         line_hints=contract_line_hints,
-        limit=max(excerpt_limit, 220),
-        before_radius=1,
-        after_radius=1,
+        limit=max(excerpt_limit, 620 if preserve_interactive_contract else 220),
+        max_hints=8 if preserve_interactive_contract else 6,
+        before_radius=0 if preserve_interactive_contract else 1,
+        after_radius=0 if preserve_interactive_contract else 1,
     )
     if not contract_excerpt:
         return compact_text
@@ -6620,6 +6742,7 @@ def _line_focused_excerpt(
     *,
     line_hints: list[int],
     limit: int,
+    max_hints: int = 6,
     radius: int = 1,
     before_radius: int | None = None,
     after_radius: int | None = None,
@@ -6645,7 +6768,7 @@ def _line_focused_excerpt(
         return _trim_balanced_text(normalized, limit)
 
     selected_indexes: set[int] = set()
-    for hint in hinted_lines[:6]:
+    for hint in hinted_lines[: max(int(max_hints or 0), 1)]:
         start = max(hint - 1 - leading_radius, 0)
         end = min(hint + trailing_radius, len(lines))
         selected_indexes.update(range(start, end))
