@@ -337,13 +337,17 @@ def test_login_migrates_legacy_auth_schema(tmp_path):
     assert "auth_events" in table_names
 
 
-def test_protected_api_stays_401_when_auth_db_disappears_after_startup(tmp_path):
+def test_setup_recovers_when_auth_db_disappears_after_startup(tmp_path):
     config = build_test_config(tmp_path)
     app = create_app(config)
     client = build_test_client(app)
 
     config.auth_db_path.unlink()
 
+    setup_response = client.get("/api/setup/status")
     response = client.get("/api/workspaces")
 
-    assert response.status_code == 401
+    assert setup_response.status_code == 200
+    assert setup_response.json()["required"] is True
+    assert setup_response.json()["reason"] == "missing_initial_admin"
+    assert response.status_code == 503
