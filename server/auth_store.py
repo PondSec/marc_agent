@@ -554,10 +554,17 @@ class AuthStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            # Opening a connection is enough because _connect() now enforces
-            # the current schema idempotently on every reconnect.
-            connection.execute("SELECT 1")
+        try:
+            with self._connect() as connection:
+                # Opening a connection is enough because _connect() now enforces
+                # the current schema idempotently on every reconnect.
+                connection.execute("SELECT 1")
+        except sqlite3.DatabaseError as exc:
+            if not self._is_corrupt_database_error(exc):
+                raise
+            self._quarantine_database_artifacts()
+            with self._connect() as connection:
+                connection.execute("SELECT 1")
 
     def _configure_connection(self, connection: sqlite3.Connection) -> None:
         try:
@@ -596,6 +603,29 @@ class AuthStore:
         connection.execute(
             f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
         )
+
+    def _is_corrupt_database_error(self, exc: sqlite3.DatabaseError) -> bool:
+        text = str(exc).strip().lower()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "file is not a database",
+                "malformed",
+                "disk image is malformed",
+                "database corruption",
+            )
+        )
+
+    def _quarantine_database_artifacts(self) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        for suffix in ("", "-wal", "-shm"):
+            target = Path(f"{self.target}{suffix}")
+            if not target.exists():
+                continue
+            backup = self.target.parent / f"{target.name}.corrupt-{stamp}.bak"
+            target.replace(backup)
 
     @staticmethod
     def _user_from_row(row: sqlite3.Row | None) -> AuthUserRecord | None:
