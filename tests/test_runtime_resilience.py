@@ -53,6 +53,55 @@ def test_no_start_recovery_prefers_full_retry_then_full_reserve_before_minimal_g
     ]
 
 
+def test_progress_timeout_recovery_prefers_resume_even_without_partial_text():
+    policy = ExecutionRecoveryPolicy(
+        task_class="task_state_generation",
+        allow_same_backend_retry=True,
+        allow_resume_after_progress=True,
+        allow_smaller_faster_model=True,
+        allow_reduce_request_complexity=True,
+        allow_deterministic_fallback=False,
+        max_same_backend_retries=1,
+        max_total_attempts=4,
+    )
+    failure = ExecutionFailure(
+        failure_class="total_timeout",
+        state="failed_total_timeout",
+        had_progress=True,
+        first_output_received=True,
+        model_identifier="qwen2.5-coder:7b",
+        backend_identifier="ollama",
+        context_pressure_estimate="low",
+        retryable=True,
+        raw_reason="total_timeout",
+        characters=248,
+        activity_count=70,
+        partial_text="",
+    )
+
+    decisions = policy.plan_recovery(
+        failure,
+        primary_model="qwen2.5-coder:7b",
+        faster_model="qwen3:8b",
+        history=[],
+    )
+    accepted = [
+        (
+            decision.candidate.strategy,
+            decision.candidate.prompt_variant,
+            decision.candidate.model_identifier,
+        )
+        for decision in decisions
+        if decision.accepted
+    ]
+
+    assert accepted[:3] == [
+        ("resume_after_progress", "resume", "qwen2.5-coder:7b"),
+        ("switch_to_faster_model", "full", "qwen3:8b"),
+        ("honest_block", "blocked", None),
+    ]
+
+
 class FakeClock:
     def __init__(self) -> None:
         self._value = 0.0

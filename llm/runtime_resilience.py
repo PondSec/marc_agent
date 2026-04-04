@@ -355,7 +355,7 @@ class ExecutionRecoveryPolicy:
                     reason="accepted",
                 )
         elif failure.failed_after_progress:
-            if self.allow_resume_after_progress and failure.partial_text:
+            if self.allow_resume_after_progress:
                 _accept(
                     RecoveryCandidate(
                         "resume_after_progress",

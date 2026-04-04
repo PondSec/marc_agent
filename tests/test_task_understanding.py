@@ -125,6 +125,32 @@ class ProgressTimeoutThenSuccessLLM(ScriptedLLM):
         return super().generate_json(*args, **kwargs)
 
 
+class ProgressTimeoutWithoutPartialThenSuccessLLM(ScriptedLLM):
+    def __init__(self, payload: dict, *, config=None):
+        super().__init__(json_payloads=[payload])
+        self.config = config
+        self._raised = False
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if not self._raised:
+            self._raised = True
+            raise OllamaGenerationError(
+                "timed out waiting for model completion after 72.0 seconds",
+                reason="total_timeout",
+                retryable=True,
+                model_name=str(kwargs.get("model") or "") or None,
+                startup_timeout_seconds=72,
+                inactivity_timeout_seconds=18,
+                total_timeout_seconds=72,
+                partial_text="",
+                first_output_received=True,
+                characters=248,
+                activity_count=70,
+            )
+        return super().generate_json(*args, **kwargs)
+
+
 class SelectiveStartupTimeoutLLM(ScriptedLLM):
     def __init__(
         self,
@@ -3349,6 +3375,64 @@ def test_task_state_resumes_after_progress_timeout_before_blocking(tmp_path):
     assert resume_call["kwargs"]["num_ctx"] == 2048
     assert "Partial JSON from the timed-out attempt" in resume_call["args"][0]
     assert '"goal_relation": "new_task"' in resume_call["args"][0]
+
+
+def test_task_state_retries_same_model_after_progress_timeout_without_partial_text(tmp_path):
+    payload = {
+        "latest_user_turn": "Repair app.js menu toggle behavior.",
+        "root_goal": "Repair the menu toggle behavior.",
+        "active_goal": "Fix app.js so the menu toggle updates both interaction states correctly.",
+        "goal_relation": "continue",
+        "output_expectation": "A repaired app.js plus a passing node test.",
+        "current_user_intent": "repair",
+        "execution_strategy": "debug_repair",
+        "verification_target": "node --test tests/test_menu_toggle.cjs",
+        "target_artifacts": [
+            {
+                "path": "app.js",
+                "name": "app.js",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.92,
+            }
+        ],
+        "constraints": ["Keep the change local to app.js."],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "confidence": 0.84,
+        "next_action": "modify",
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen2.5-coder:7b",
+        model_candidates=("qwen2.5-coder:7b", "qwen3:8b", "qwen3:14b"),
+    )
+    llm = ProgressTimeoutWithoutPartialThenSuccessLLM(payload, config=config)
+    updater = TaskStateUpdater(llm, timeout=18, num_ctx=4096)
+    session = SessionState(
+        task="Repair app.js menu toggle behavior.",
+        workspace_root=str(tmp_path),
+    )
+
+    task_state = updater.update_task_state(
+        "Repair app.js menu toggle behavior.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.next_action == "modify"
+    assert len(llm.generate_json_calls) >= 2
+    first_call = llm.generate_json_calls[0]["kwargs"]
+    resume_call = llm.generate_json_calls[-1]
+    assert first_call["model"] == "qwen2.5-coder:7b"
+    assert resume_call["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert resume_call["kwargs"]["total_timeout"] == 114
+    assert resume_call["kwargs"]["strict_timeouts"] is False
+    assert "Partial JSON from the timed-out attempt" not in resume_call["args"][0]
 
 
 def test_task_state_contract_handles_backend_correction():

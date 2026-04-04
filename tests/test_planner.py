@@ -2172,10 +2172,12 @@ def test_task_state_update_refreshes_live_inventory_for_timeout_recovery(tmp_pat
     updater = planner.task_state_updater
     fallback_payload = updater._fallback_state("Repair normalize_cli.py").model_dump()
     seen_models: list[str | None] = []
+    seen_strategies: list[str] = []
 
     def fake_invoke_model(_invoke, **kwargs):
         model_identifier = kwargs.get("model_identifier")
         seen_models.append(model_identifier)
+        seen_strategies.append(str(kwargs.get("recovery_strategy") or ""))
         attempt = ExecutionAttemptRecord(
             operation_name=kwargs["operation_name"],
             task_class=kwargs["task_class"],
@@ -2239,8 +2241,9 @@ def test_task_state_update_refreshes_live_inventory_for_timeout_recovery(tmp_pat
 
     state = updater.update_task_state("Repair normalize_cli.py")
 
-    assert seen_models[:2] == ["qwen3:8b", "qwen2.5-coder:7b"]
-    assert state.semantic_resolution == "reserve_model"
+    assert seen_models[:2] == ["qwen3:8b", "qwen3:8b"]
+    assert seen_strategies[:2] == ["primary_model_generation", "resume_after_progress"]
+    assert state.semantic_resolution == "full_model"
 
 
 def test_planner_uses_compact_primary_prompt_for_low_risk_multi_file_create_when_lightweight_is_too_narrow(tmp_path):
