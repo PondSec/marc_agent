@@ -123,6 +123,48 @@ LIGHTWEIGHT_UPDATE_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+EXACT_TEXT_CONTRACT_SUFFIXES = {
+    ".conf",
+    ".cfg",
+    ".csv",
+    ".env",
+    ".ini",
+    ".log",
+    ".text",
+    ".tsv",
+    ".txt",
+}
+EXACT_LINE_COUNT_HINTS = {
+    "1": 1,
+    "one": 1,
+    "eins": 1,
+    "eine": 1,
+    "einen": 1,
+    "einem": 1,
+    "einer": 1,
+    "2": 2,
+    "two": 2,
+    "zwei": 2,
+    "3": 3,
+    "three": 3,
+    "drei": 3,
+    "4": 4,
+    "four": 4,
+    "vier": 4,
+    "5": 5,
+    "five": 5,
+    "fuenf": 5,
+    "fünf": 5,
+    "6": 6,
+    "six": 6,
+    "sechs": 6,
+    "7": 7,
+    "seven": 7,
+    "sieben": 7,
+    "8": 8,
+    "eight": 8,
+    "acht": 8,
+}
 MAX_LIGHTWEIGHT_UPDATE_CHARS = 8_000
 MAX_LIGHTWEIGHT_UPDATE_LINES = 260
 MAX_LIGHTWEIGHT_UPDATE_TARGETS = 6
@@ -11594,6 +11636,15 @@ class Planner:
                     ],
                 )
 
+        text_contract_review = self._explicit_text_line_contract_review(
+            route,
+            session,
+            path=path,
+            proposed_content=proposed_content,
+        )
+        if text_contract_review is not None:
+            return text_contract_review
+
         if Path(path).suffix.lower() == ".md":
             added_headings = self._unexpected_markdown_headings(
                 route,
@@ -11676,6 +11727,15 @@ class Planner:
                     ],
                 )
 
+        text_contract_review = self._explicit_text_line_contract_review(
+            route,
+            session,
+            path=path,
+            proposed_content=proposed_content,
+        )
+        if text_contract_review is not None:
+            return text_contract_review
+
         if Path(path).suffix.lower() == ".md":
             echoed_instruction = self._markdown_instruction_echo(
                 route,
@@ -11699,6 +11759,226 @@ class Planner:
                 )
 
         return None
+
+    def _explicit_text_line_contract_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return None
+        mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=proposed_content,
+        )
+        if mismatch is None:
+            return None
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed text content does not match the exact requested line sequence.",
+            confidence=0.99,
+            blocking_issues=[mismatch],
+            preservation_risks=[],
+            repair_hints=[
+                f"Write {path} with exactly the requested lines and no trailing spaces or extra text.",
+            ],
+        )
+
+    def _requested_exact_text_lines(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> list[str]:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        if suffix not in EXACT_TEXT_CONTRACT_SUFFIXES:
+            return []
+        candidate_sources: list[str] = []
+        task_state = session.task_state
+        for raw in (
+            str(getattr(task_state, "latest_user_turn", "") or "").strip(),
+            str(session.task or "").strip(),
+            str(route.user_goal or "").strip(),
+            str(route.requested_outcome or "").strip(),
+        ):
+            if raw and raw not in candidate_sources:
+                candidate_sources.append(raw)
+        for source in candidate_sources:
+            extracted = self._extract_requested_exact_text_lines(source)
+            if extracted:
+                return extracted
+        return []
+
+    def _extract_requested_exact_text_lines(self, text: str) -> list[str]:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return []
+        pattern = re.compile(
+            r"(?P<prefix>[^:\n]{0,180}?(?:line|lines|zeile|zeilen)[^:\n]{0,120})\s*:\s*(?P<body>[^\n]+(?:\n[^\n]+){0,7})",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(normalized):
+            prefix = str(match.group("prefix") or "").strip()
+            if not self._looks_like_exact_line_request(prefix):
+                continue
+            expected_count = self._exact_line_count_hint(prefix)
+            extracted = self._parse_exact_line_contract_body(
+                str(match.group("body") or ""),
+                expected_count=expected_count,
+            )
+            if extracted:
+                return extracted
+        return []
+
+    def _looks_like_exact_line_request(self, prefix: str) -> bool:
+        lowered = f" {str(prefix or '').lower()} "
+        if not any(token in lowered for token in (" line ", " lines ", " zeile ", " zeilen ")):
+            return False
+        return any(
+            token in lowered
+            for token in (
+                " exact ",
+                " exactly ",
+                " exakt ",
+                " genau ",
+                " these ",
+                " these",
+                " diesen ",
+                " diese ",
+                " folgenden ",
+                " following ",
+                " nothing else ",
+                " sonst nichts ",
+            )
+        )
+
+    def _exact_line_count_hint(self, prefix: str) -> int | None:
+        tokens = re.findall(r"[0-9A-Za-zÄÖÜäöüß]+", str(prefix or "").lower())
+        for index, token in enumerate(tokens):
+            if token not in {"line", "lines", "zeile", "zeilen"}:
+                continue
+            start = max(index - 4, 0)
+            for candidate in reversed(tokens[start:index]):
+                hinted = EXACT_LINE_COUNT_HINTS.get(candidate)
+                if hinted is not None:
+                    return hinted
+        return None
+
+    def _parse_exact_line_contract_body(
+        self,
+        text: str,
+        *,
+        expected_count: int | None,
+    ) -> list[str]:
+        segment = str(text or "").strip()
+        if not segment:
+            return []
+
+        lines: list[str] = []
+        current: list[str] = []
+        trailing_remainder = ""
+        index = 0
+        while index < len(segment):
+            char = segment[index]
+            if char in {",", ";", "\n"}:
+                candidate = self._clean_exact_line_item("".join(current), terminal=False)
+                if not candidate:
+                    return []
+                lines.append(candidate)
+                current = []
+                index += 1
+                while index < len(segment) and segment[index].isspace() and segment[index] != "\n":
+                    index += 1
+                if expected_count is not None and len(lines) >= expected_count:
+                    trailing_remainder = segment[index:]
+                    break
+                continue
+            if char in ".!?" and self._line_contract_sentence_break(segment, index):
+                trailing_remainder = segment[index + 1 :]
+                break
+            current.append(char)
+            index += 1
+
+        tail = self._clean_exact_line_item("".join(current), terminal=True)
+        if tail:
+            lines.append(tail)
+
+        if expected_count is not None and len(lines) != expected_count:
+            return []
+        if not 2 <= len(lines) <= 8:
+            return []
+        if trailing_remainder and not self._line_contract_remainder_looks_like_followup(trailing_remainder):
+            return []
+        return lines
+
+    def _clean_exact_line_item(self, raw: str, *, terminal: bool) -> str:
+        candidate = str(raw or "").strip()
+        if not candidate:
+            return ""
+        if terminal:
+            candidate = re.sub(r"[.!?]+$", "", candidate).strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"', "`"}:
+            candidate = candidate[1:-1].strip()
+        if not candidate or len(candidate) > 120:
+            return ""
+        return candidate
+
+    def _line_contract_sentence_break(self, text: str, index: int) -> bool:
+        if index >= len(text) - 1:
+            return True
+        remainder = str(text[index + 1 :] or "")
+        stripped = remainder.lstrip()
+        if not stripped:
+            return True
+        first = stripped[0]
+        if first in {'"', "'", "`"} and len(stripped) > 1:
+            first = stripped[1]
+        return first.isupper()
+
+    def _line_contract_remainder_looks_like_followup(self, remainder: str) -> bool:
+        normalized = str(remainder or "").strip()
+        if not normalized:
+            return True
+        first = normalized[0]
+        if first in {'"', "'", "`"} and len(normalized) > 1:
+            first = normalized[1]
+        if first.isupper():
+            return True
+        return len(re.findall(r"[0-9A-Za-zÄÖÜäöüß]+", normalized)) >= 2
+
+    def _exact_text_line_mismatch(
+        self,
+        *,
+        path: str,
+        expected_lines: list[str],
+        content: str,
+    ) -> str | None:
+        normalized_content = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+        if normalized_content.endswith("\n"):
+            normalized_content = normalized_content[:-1]
+        actual_lines = normalized_content.split("\n") if normalized_content else []
+        if actual_lines == expected_lines:
+            return None
+        if len(actual_lines) != len(expected_lines):
+            return (
+                f"{path} should contain exactly {len(expected_lines)} lines, but the current content has "
+                f"{len(actual_lines)}."
+            )
+        for index, (actual_line, expected_line) in enumerate(zip(actual_lines, expected_lines), start=1):
+            if actual_line == expected_line:
+                continue
+            if actual_line.rstrip() == expected_line:
+                return (
+                    f"Line {index} in {path} has trailing whitespace. Expected {expected_line!r}, got {actual_line!r}."
+                )
+            return f"Line {index} in {path} should be {expected_line!r}, but is {actual_line!r}."
+        return f"{path} does not match the exact requested line sequence."
 
     def _markdown_instruction_echo(
         self,
@@ -13488,6 +13768,61 @@ class Planner:
             return "(no diff)"
         return self._review_excerpt(diff, limit=limit)
 
+    def _deterministic_exact_text_create_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> SemanticChangeReview | None:
+        if route.intent != RouteIntent.CREATE or len(session.changed_files) != 1:
+            return None
+        if self._has_pending_explicit_create_targets(route, session):
+            return None
+        if self.validation_planner.runtime_verification_required(session):
+            return None
+        if self.validation_planner.web_functional_verification_required(session):
+            return None
+
+        change = session.changed_files[0]
+        if str(change.operation or "").strip().lower() != "create":
+            return None
+        path = str(change.path or "").strip()
+        if not path:
+            return None
+
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return None
+        content = self._session_or_current_file_content(session, path)
+        if content is None:
+            return SemanticChangeReview(
+                requirements_satisfied=False,
+                summary="The explicit text artifact has not been created yet.",
+                confidence=0.97,
+                missing_requirements=[f"Create {path} with the exact requested line sequence."],
+                repair_hints=[f"Write {path} with exactly the requested lines before finishing."],
+                file_hints=[path],
+            )
+        mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=content,
+        )
+        if mismatch is not None:
+            return SemanticChangeReview(
+                requirements_satisfied=False,
+                summary="The created text artifact does not yet match the exact requested line sequence.",
+                confidence=0.98,
+                missing_requirements=[mismatch],
+                repair_hints=[f"Rewrite {path} so it contains exactly the requested lines and nothing extra."],
+                file_hints=[path],
+            )
+        return SemanticChangeReview(
+            requirements_satisfied=True,
+            summary="The created text artifact matches the exact requested line sequence without requiring a second model review hop.",
+            confidence=0.93,
+            file_hints=[path],
+        )
+
     def _run_semantic_change_review(self, route: RouterOutput, session: SessionState) -> None:
         if not session.changed_files or self.validation_planner.has_semantic_review(session):
             return
@@ -13511,6 +13846,27 @@ class Planner:
                 ),
             )
             self._record_semantic_change_review(session, deterministic_web_review)
+            return
+
+        deterministic_text_create_review = self._deterministic_exact_text_create_review(route, session)
+        if deterministic_text_create_review is not None:
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="semantic_change_review",
+                    task_class="semantic_change_review",
+                    final_state="completed",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_exact_text_create_review",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="A deterministic exact-text review confirmed the created artifact already satisfies the explicit line-level request.",
+                    attempts=[],
+                ),
+            )
+            self._record_semantic_change_review(session, deterministic_text_create_review)
             return
 
         artifacts = self._semantic_review_artifacts(session)
@@ -13899,6 +14255,13 @@ class Planner:
                 repair_hints=["Complete the explicitly requested file updates before declaring the task done."],
                 file_hints=pending_snapshot_targets[:6],
             )
+        if session.router_result is not None:
+            deterministic_text_create_review = self._deterministic_exact_text_create_review(
+                session.router_result,
+                session,
+            )
+            if deterministic_text_create_review is not None:
+                return deterministic_text_create_review
         deterministic_web_review = self._semantic_web_contract_review(session)
         if deterministic_web_review is not None:
             return deterministic_web_review

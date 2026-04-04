@@ -787,13 +787,13 @@ def test_small_single_model_semantic_review_uses_compact_primary_attempt_for_sim
         target_name="smoke_live_run_01.txt",
     )
     session = SessionState(
-        task="Create smoke_live_run_01.txt with exactly three short lines of text.",
+        task="Create smoke_live_run_01.txt with a short smoke-test status note.",
         workspace_root=str(tmp_path),
         workspace_snapshot=empty_snapshot(tmp_path),
         changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
     )
     commit_task_state_and_route(planner, session, payload)
-    (tmp_path / "smoke_live_run_01.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    (tmp_path / "smoke_live_run_01.txt").write_text("smoke test ready\n", encoding="utf-8")
 
     planner._run_semantic_change_review(session.router_result, session)
 
@@ -805,6 +805,127 @@ def test_small_single_model_semantic_review_uses_compact_primary_attempt_for_sim
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert session.validation_runs[-1].verification_scope == "semantic"
     assert session.validation_runs[-1].status == "passed"
+
+
+def test_explicit_create_constraint_review_blocks_exact_text_line_mismatch(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_01.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._explicit_create_constraint_review(
+        session.router_result,
+        session,
+        path="smoke_live_run_01.txt",
+        proposed_content="alpha  \nbeta  \ngamma",
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "exact requested line sequence" in review.summary.lower()
+    assert any("trailing whitespace" in issue.lower() for issue in review.blocking_issues)
+
+
+def test_planner_skips_model_backed_semantic_review_for_exact_text_create_contract(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "Unused model review payload.",
+                "confidence": 0.5,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_01.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_01.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_create_review"
+
+
+def test_planner_deterministic_exact_text_create_review_flags_mismatched_lines(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_01.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_01.txt").write_text("alpha  \nbeta  \ngamma", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "failed"
+    assert session.active_repair_context is not None
+    assert "trailing whitespace" in (session.active_repair_context.failure_summary or "").lower()
 
 
 def test_semantic_change_review_rejects_unbound_web_contracts_before_model_review(tmp_path):
