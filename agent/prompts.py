@@ -4438,21 +4438,19 @@ def _targeted_runtime_prompt_hints(
 
     hints: list[str] = []
     if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
-        hints.extend(
-            _js_runtime_pre_event_state_hints(
-                current_content=current_content,
-                supporting_context=supporting_context,
-                repair_brief=repair_brief,
-            )
+        pre_event_hints = _js_runtime_pre_event_state_hints(
+            current_content=current_content,
+            supporting_context=supporting_context,
+            repair_brief=repair_brief,
         )
-        hints.extend(
-            _js_runtime_toggle_consistency_hints(
-                current_content=current_content,
-                supporting_context=supporting_context,
-                repair_brief=repair_brief,
-            )
+        toggle_consistency_hints = _js_runtime_toggle_consistency_hints(
+            current_content=current_content,
+            supporting_context=supporting_context,
+            repair_brief=repair_brief,
         )
-        if not has_semantic_contract:
+        hints.extend(pre_event_hints)
+        hints.extend(toggle_consistency_hints)
+        if not has_semantic_contract or (not pre_event_hints and not toggle_consistency_hints):
             hints.extend(
                 _js_test_backed_toggle_contract_hints(
                     current_content=current_content,
