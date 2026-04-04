@@ -16536,6 +16536,92 @@ def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(
     assert "When active runtime failure evidence for this file includes observed-vs-expected behavior deltas" in prompt
 
 
+def test_proposed_update_review_prompt_includes_runtime_interaction_hints_for_js_toggle_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix app.js so the menu toggle keeps aria-expanded and panel.hidden in sync.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: expected panel.hidden to be false after the first click, but observed true.",
+        failure_summary="app.js leaves panel.hidden out of sync with aria-expanded in the exercised toggle path.",
+        repair_requirements=["Change app.js so the toggle keeps aria-expanded and panel.hidden aligned across repeated clicks."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:toggle-review-hints",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=[
+                "Validation should produce: false",
+                "Validation should produce: true",
+            ],
+            observed_semantics=[
+                "Validation currently produces: true",
+                "Validation currently produces: false",
+            ],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        supporting_artifact_context=(
+            "tests/test_menu_toggle.cjs:\n"
+            "20:   button.click();\n"
+            "21:   assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+            "22:   assert.equal(panel.hidden, false);\n"
+            "23:   button.click();\n"
+            "24:   assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+            "25:   assert.equal(panel.hidden, true);\n"
+        ),
+        current_excerpt=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener('click', () => {\n"
+            "    const expanded = button.getAttribute('aria-expanded') === 'true';\n"
+            "    button.setAttribute('aria-expanded', expanded ? 'false' : 'true');\n"
+            "    panel.hidden = !expanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+        proposed_excerpt=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener('click', () => {\n"
+            "    const expanded = button.getAttribute('aria-expanded') === 'true';\n"
+            "    const nextExpanded = !expanded;\n"
+            "    button.setAttribute('aria-expanded', nextExpanded ? 'true' : 'false');\n"
+            "    panel.hidden = !nextExpanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert '"failure_evidence_runtime_hints"' in prompt
+    assert "Read the current state once, compute the next state once" in prompt
+    assert "hidden/visible state should follow the same transition with the opposite visibility meaning" in prompt
+    assert "Do not call a proposal regressive merely because it computes the required next-state behavior from a different local formulation" in prompt
+
+
 def test_proposed_update_review_prompt_marks_runtime_cli_literal_examples_as_nonbinding(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

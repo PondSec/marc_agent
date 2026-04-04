@@ -1136,10 +1136,11 @@ def proposed_update_review_prompt(
         review_context["diagnostics"] = _compact_recent_diagnostics(session)
         review_context["follow_up_context"] = _compact_follow_up_context(session)
     if repair_context is not None:
-        review_context["active_repair"] = _targeted_compact_repair_context(
+        targeted_repair_context = _targeted_compact_repair_context(
             repair_context,
             target_path=path,
         )
+        review_context["active_repair"] = targeted_repair_context
         semantic_deltas = _repair_semantic_delta_lines(
             repair_context,
             limit=2,
@@ -1148,6 +1149,14 @@ def proposed_update_review_prompt(
         )
         if semantic_deltas:
             review_context["failure_evidence_behavior_deltas"] = semantic_deltas
+        runtime_hints = _targeted_runtime_prompt_hints(
+            path=path,
+            current_content=current_excerpt,
+            supporting_context=supporting_artifact_context,
+            targeted_context=targeted_repair_context,
+        )
+        if runtime_hints:
+            review_context["failure_evidence_runtime_hints"] = runtime_hints[:4]
     return "\n".join(
         [
             "Review the proposed file update before it is written to disk.",
@@ -1158,6 +1167,8 @@ def proposed_update_review_prompt(
             "- Approve only when the proposal is tightly aligned with the explicit request and keeps unrelated existing behavior intact.",
             "- Do not treat an explicitly requested behavior change for this file as scope broadening just because the current implementation behaves differently.",
             "- When active runtime failure evidence for this file includes observed-vs-expected behavior deltas, treat the smallest local change that closes those deltas as in scope for this write.",
+            "- When failure_evidence_runtime_hints is present, use those state-transition or interaction-contract hints to judge whether the proposal closes the evidenced behavior delta.",
+            "- Do not call a proposal regressive merely because it computes the required next-state behavior from a different local formulation, such as deriving one dependent assignment from the prior state and another from the computed next state, when the resulting interaction contract still matches the evidence.",
             "- Do not call an evidence-backed local repair broadening solely because it changes current default behavior, as long as the diff stays local to the implicated responsibility and does not introduce extra semantics beyond the evidenced fix.",
             "- Fail when the proposal broadens scope without evidence, or removes working behavior, imports, config handling, startup code, public interfaces, commands, docs, or tests that the request did not ask to remove.",
             "- Fail when a narrow request adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance unless the visible evidence clearly requires that extra content.",
