@@ -22,14 +22,17 @@ TEST_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
 
 def build_test_config(root, **overrides) -> AppConfig:
+    values = {
+        "workspace_root": str(root),
+        "ollama_host": "http://127.0.0.1:9",
+        "auth_secret_key": TEST_AUTH_SECRET,
+        "auth_initial_admin_email": TEST_ADMIN_EMAIL,
+        "auth_initial_admin_password": TEST_ADMIN_PASSWORD,
+        "auth_cookie_secure": True,
+    }
+    values.update(overrides)
     return AppConfig(
-        workspace_root=str(root),
-        ollama_host="http://127.0.0.1:9",
-        auth_secret_key=TEST_AUTH_SECRET,
-        auth_initial_admin_email=TEST_ADMIN_EMAIL,
-        auth_initial_admin_password=TEST_ADMIN_PASSWORD,
-        auth_cookie_secure=True,
-        **overrides,
+        **values,
     )
 
 
@@ -351,3 +354,26 @@ def test_setup_recovers_when_auth_db_disappears_after_startup(tmp_path):
     assert setup_response.json()["required"] is True
     assert setup_response.json()["reason"] == "missing_initial_admin"
     assert response.status_code == 503
+
+
+def test_setup_recovers_from_corrupt_auth_db_on_startup(tmp_path):
+    config = build_test_config(
+        tmp_path,
+        auth_initial_admin_email=None,
+        auth_initial_admin_password=None,
+    )
+    config.ensure_state_dirs()
+    config.auth_db_path.write_bytes(b"this is not sqlite")
+
+    app = create_app(config)
+    client = build_test_client(app)
+
+    setup_response = client.get("/api/setup/status")
+    blocked_response = client.get("/api/workspaces")
+    backup_files = sorted(config.auth_db_path.parent.glob("auth.db*.corrupt-*.bak"))
+
+    assert setup_response.status_code == 200
+    assert setup_response.json()["required"] is True
+    assert setup_response.json()["reason"] == "missing_initial_admin"
+    assert blocked_response.status_code == 503
+    assert backup_files
