@@ -13062,7 +13062,96 @@ class Planner:
             identifier,
             current_content=current_content,
             proposed_content=proposed_content,
+        ) or self._python_implicated_statement_changed(
+            identifier,
+            current_content=current_content,
+            proposed_content=proposed_content,
         )
+
+    def _python_implicated_statement_changed(
+        self,
+        identifier: str,
+        *,
+        current_content: str,
+        proposed_content: str,
+    ) -> bool:
+        target = str(identifier or "").strip()
+        if not target:
+            return False
+        try:
+            current_module = ast.parse(str(current_content or ""))
+            proposed_module = ast.parse(str(proposed_content or ""))
+        except SyntaxError:
+            return False
+
+        current_lines = [
+            index
+            for index, raw in enumerate(str(current_content or "").splitlines(), start=1)
+            if target in raw
+        ]
+        if not current_lines:
+            return False
+
+        current_statements = self._python_smallest_statements_for_lines(
+            current_module,
+            line_numbers=current_lines,
+        )
+        proposed_statements = self._python_smallest_statements_for_lines(
+            proposed_module,
+            line_numbers=current_lines,
+        )
+        if not current_statements or not proposed_statements:
+            return False
+
+        current_dump = [ast.dump(node, include_attributes=False) for node in current_statements]
+        proposed_dump = [ast.dump(node, include_attributes=False) for node in proposed_statements]
+        return current_dump != proposed_dump
+
+    def _python_smallest_statements_for_lines(
+        self,
+        module: ast.AST,
+        *,
+        line_numbers: list[int],
+    ) -> list[ast.stmt]:
+        selected: list[ast.stmt] = []
+        seen: set[tuple[int, int, str]] = set()
+        for line_number in line_numbers:
+            candidate = self._python_smallest_statement_covering_line(module, line_number=line_number)
+            if candidate is None:
+                continue
+            key = (
+                int(getattr(candidate, "lineno", 0) or 0),
+                int(getattr(candidate, "end_lineno", 0) or 0),
+                candidate.__class__.__name__,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(candidate)
+        return selected
+
+    def _python_smallest_statement_covering_line(
+        self,
+        module: ast.AST,
+        *,
+        line_number: int,
+    ) -> ast.stmt | None:
+        best: ast.stmt | None = None
+        best_span: tuple[int, int] | None = None
+        for node in ast.walk(module):
+            if not isinstance(node, ast.stmt) or isinstance(node, ast.Module):
+                continue
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", None)
+            if start is None or end is None:
+                continue
+            if not (start <= line_number <= end):
+                continue
+            span = (int(end) - int(start), int(start))
+            if best is None or best_span is None or span < best_span:
+                best = node
+                best_span = span
+        return best
 
     def _python_named_block_changed(
         self,

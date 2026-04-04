@@ -17234,6 +17234,166 @@ def test_pre_write_update_review_rejects_stdout_only_fix_when_direct_main_option
     assert any("--keep-case" in issue for issue in review.blocking_issues)
 
 
+def test_validation_repair_relevance_review_accepts_literal_anchor_when_implicated_python_branch_changes(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize_cli.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeCliTests(unittest.TestCase):\n"
+        "    def test_direct_main_keep_case_preserves_payload(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Der direct-main CLI-Pfad mit --keep-case soll die Payload exakt erhalten. "
+            "Fuehre danach python3 -m unittest tests.test_normalize_cli aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python3 -m unittest tests.test_normalize_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:literal-anchor-python-branch-change",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=[],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize_cli.py"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
+
+
+def test_validation_repair_relevance_review_still_rejects_literal_anchor_when_implicated_python_branch_is_unchanged(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Der direct-main CLI-Pfad mit --keep-case soll die Payload exakt erhalten. "
+            "Fuehre danach python3 -m unittest tests.test_normalize_cli aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python3 -m unittest tests.test_normalize_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:literal-anchor-python-branch-unchanged",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=[],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=[],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert any("--keep-case" in issue for issue in review.blocking_issues)
+
+
 def test_pre_write_update_review_rejects_css_root_state_without_completed_web_contract(
     tmp_path,
     monkeypatch,
