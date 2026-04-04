@@ -5668,7 +5668,7 @@ def _split_requirement_clauses(text: str) -> list[str]:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip(" .")
     if not normalized:
         return []
-    if re.search(r"[\"'`<>]", normalized):
+    if re.search(r"[\"'`<>]", normalized) or _contains_structured_symbol_reference(normalized):
         return [normalized]
     fragments = re.split(r",\s+|\s+(?:and|und)\s+", normalized)
     clauses: list[str] = []
@@ -5679,6 +5679,13 @@ def _split_requirement_clauses(text: str) -> list[str]:
             continue
         clauses.append(cleaned)
     return clauses or [normalized]
+
+
+def _contains_structured_symbol_reference(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    return bool(re.search(r"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,200}\)", normalized))
 
 
 def _last_read_excerpt(session: SessionState, path: str) -> str:

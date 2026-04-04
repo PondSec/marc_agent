@@ -36,6 +36,7 @@ from agent.prompts import (
     _artifact_scoped_focus,
     _repair_target_line_hints,
     _repair_required_literal_anchors,
+    _split_requirement_clauses,
     _targeted_runtime_failure_focus_lines,
     _targeted_runtime_prompt_hints,
     generate_content_prompt,
@@ -11701,6 +11702,86 @@ def test_runtime_repair_prompts_keep_interactive_support_context_across_modes(tm
     assert "Failure focus:" in full_prompt
     assert "Primary repair target: app.js" in full_prompt
     assert "Current file content:" in full_prompt
+
+
+def test_split_requirement_clauses_keeps_callable_behavior_sentence_intact():
+    sentence = (
+        "wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+        "bei jedem Klick korrekt gegeneinander umschalten"
+    )
+
+    assert _split_requirement_clauses(sentence) == [sentence]
+
+
+def test_generate_content_prompt_keeps_callable_requirement_sentence_intact_for_js_toggle_requests(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert (
+        "wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt gegeneinander umschalten"
+        in prompt
+    )
+    assert "wireMenuToggle(button; panel)" not in prompt
 
 
 def test_compact_repair_prompt_prioritizes_test_line_hints_for_stdout_contract(tmp_path):
