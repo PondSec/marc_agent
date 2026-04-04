@@ -756,6 +756,57 @@ def test_planner_skips_model_backed_semantic_review_for_small_standalone_web_pro
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
 
 
+def test_small_single_model_semantic_review_uses_compact_primary_attempt_for_simple_change(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "The changed artifact satisfies the explicit request.",
+                "confidence": 0.78,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 3, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task="Create smoke_live_run_01.txt with exactly three short lines of text.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_01.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert len(llm.generate_json_calls) == 1
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 35
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 120
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+
+
 def test_semantic_change_review_rejects_unbound_web_contracts_before_model_review(tmp_path):
     (tmp_path / "index.html").write_text(
         (

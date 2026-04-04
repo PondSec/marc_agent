@@ -7822,9 +7822,6 @@ class Planner:
         *,
         artifacts: list[dict[str, object]],
     ) -> bool:
-        lightweight = self._lightweight_generation_model_name()
-        if lightweight is None:
-            return False
         if route.needs_clarification or not route.safe_to_execute:
             return False
         if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.CREATE}:
@@ -7833,7 +7830,14 @@ class Planner:
             return False
         if len(artifacts) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
             return False
-        if session.validation_status != "passed" and not self.validation_planner.has_runtime_success(session):
+        runtime_review_required = self.validation_planner.runtime_verification_required(
+            session
+        ) or self.validation_planner.web_functional_verification_required(session)
+        if (
+            runtime_review_required
+            and session.validation_status != "passed"
+            and not self.validation_planner.has_runtime_success(session)
+        ):
             return False
 
         target_paths = self._actionable_explicit_target_paths(route, session)
@@ -8463,6 +8467,13 @@ class Planner:
         # stacks. Keep the prompt compact, but give the completion enough room to
         # finish so we do not escalate purely because the reviewer started late.
         return timeout, max(timeout + 60, 90)
+
+    def _compact_primary_semantic_review_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(35), 35)
+        # Single-model deployments still benefit from the compact review path, but
+        # they need a slightly larger warm-start window because there is no faster
+        # reserve model to absorb the first semantic-review hop.
+        return timeout, max(timeout + 75, 120)
 
     def _review_generated_update(
         self,
@@ -13556,17 +13567,30 @@ class Planner:
             )
 
         review_attempts: list[tuple[str | None, str, str, int, int, str]] = []
-        if prefer_lightweight and reserve_model is not None:
-            review_attempts.append(
-                (
-                    reserve_model,
-                    "tier_b",
-                    "reserve_model_generation",
-                    max(self._llm_timeout(18), 18),
-                    min(self._llm_num_ctx(2048), 2048),
-                    "compact",
+        if prefer_lightweight:
+            if reserve_model is not None:
+                review_attempts.append(
+                    (
+                        reserve_model,
+                        "tier_b",
+                        "reserve_model_generation",
+                        max(self._llm_timeout(18), 18),
+                        min(self._llm_num_ctx(2048), 2048),
+                        "compact",
+                    )
                 )
-            )
+            else:
+                compact_timeout, _ = self._compact_primary_semantic_review_budget()
+                review_attempts.append(
+                    (
+                        primary_model,
+                        "tier_a",
+                        "primary_model_compact_generation",
+                        compact_timeout,
+                        min(self._llm_num_ctx(2048), 2048),
+                        "compact",
+                    )
+                )
         review_attempts.append(
             (
                 primary_model,
@@ -13600,7 +13624,10 @@ class Planner:
         for model_name, capability_tier, strategy, timeout, num_ctx, prompt_variant in review_attempts:
             prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
             if prompt_variant == "compact":
-                timeout, total_timeout = self._compact_reserve_review_budget()
+                if strategy == "primary_model_compact_generation":
+                    timeout, total_timeout = self._compact_primary_semantic_review_budget()
+                else:
+                    timeout, total_timeout = self._compact_reserve_review_budget()
             else:
                 total_timeout = max(timeout + 20, timeout * 2)
             outcome = invoke_model(
