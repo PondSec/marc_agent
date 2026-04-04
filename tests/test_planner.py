@@ -46,6 +46,7 @@ from agent.prompts import (
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
 from agent.memory import RepoMemoryStore
+from agent.decision import ExecutionDecisionPolicy
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
 from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure
@@ -190,6 +191,55 @@ def test_choose_create_path_prefers_index_html_for_empty_workspace_web_requests(
     )
 
     assert planner._choose_create_path(route, session) == "index.html"
+
+
+def test_execution_decision_prefers_explicit_file_target_name_over_generic_primary_artifact(tmp_path):
+    task_state = TaskState(
+        latest_user_turn=(
+            "Erstelle im aktuellen Workspace eine kleine Datei namens smoke_live_run_01.txt "
+            "mit genau drei kurzen Zeilen Text."
+        ),
+        root_goal="Erstelle die angeforderte Textdatei.",
+        active_goal="Erstelle die angeforderte Textdatei.",
+        goal_relation="new_task",
+        output_expectation="Create a small runnable implementation with a conventional default artifact and minimal scope.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        verification_target="Create the initial implementation and run the most relevant validation or entry command.",
+        target_artifacts=[
+            TaskArtifact(
+                path=None,
+                name="im aktuellen workspace datei",
+                kind="artifact",
+                role="primary_target",
+                confidence=0.66,
+            ),
+            TaskArtifact(
+                path=None,
+                name="smoke_live_run_01.txt",
+                kind="file",
+                role="primary_target",
+                confidence=1.0,
+            ),
+        ],
+        confidence=1.0,
+        next_action="create",
+        next_best_action="create",
+        ambiguity_level="low",
+        risk_level="low",
+        assumptions=["A conventional default artifact is acceptable unless the workspace strongly suggests another entrypoint."],
+        execution_outline=[
+            "Choose the smallest conventional artifact or scaffold that fits the request.",
+            "Implement the requested behavior in minimal runnable scope.",
+            "Validate the created artifact with the most relevant command if available.",
+        ],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_name == "smoke_live_run_01.txt"
+    assert route.safe_to_execute is True
 
 
 def test_next_update_target_stays_on_locked_repair_target_before_other_explicit_targets(tmp_path):
