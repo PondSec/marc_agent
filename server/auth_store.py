@@ -8,6 +8,83 @@ from pathlib import Path
 from typing import Any
 
 
+USERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    totp_secret TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    password_changed_at TEXT NOT NULL,
+    last_login_at TEXT,
+    previous_login_at TEXT
+)
+"""
+
+SESSIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    csrf_token TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    idle_expires_at TEXT NOT NULL,
+    rotated_from_session_id TEXT,
+    revoked_at TEXT,
+    ip_address TEXT,
+    user_agent TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+)
+"""
+
+RATE_LIMITS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    ip_address TEXT,
+    failure_count INTEGER NOT NULL,
+    first_failure_at TEXT NOT NULL,
+    last_failure_at TEXT NOT NULL,
+    locked_until TEXT
+)
+"""
+
+AUTH_EVENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS auth_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    email TEXT,
+    user_id TEXT,
+    ip_address TEXT,
+    details TEXT NOT NULL
+)
+"""
+
+AUTH_INDEX_STATEMENTS: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at, idle_expires_at, revoked_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rate_limits_last_failure ON rate_limits(last_failure_at)",
+    "CREATE INDEX IF NOT EXISTS idx_auth_events_created_at ON auth_events(created_at)",
+)
+
+AUTH_MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
+    "users": {
+        "previous_login_at": "TEXT",
+    },
+    "sessions": {
+        "rotated_from_session_id": "TEXT",
+    },
+}
+
+
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -468,82 +545,57 @@ class AuthStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
+        self.target.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.target, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
+        self._configure_connection(connection)
+        self._ensure_schema(connection)
         return connection
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id TEXT PRIMARY KEY,
-                    email TEXT NOT NULL UNIQUE,
-                    display_name TEXT NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    totp_secret TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    password_changed_at TEXT NOT NULL,
-                    last_login_at TEXT,
-                    previous_login_at TEXT
-                );
+            # Opening a connection is enough because _connect() now enforces
+            # the current schema idempotently on every reconnect.
+            connection.execute("SELECT 1")
 
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    csrf_token TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    idle_expires_at TEXT NOT NULL,
-                    rotated_from_session_id TEXT,
-                    revoked_at TEXT,
-                    ip_address TEXT,
-                    user_agent TEXT,
-                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-                );
+    def _configure_connection(self, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            # Some environments briefly expose the DB on filesystems where WAL
+            # cannot be enabled. Reads should still keep working on the default mode.
+            pass
+        try:
+            connection.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.OperationalError:
+            pass
 
-                CREATE INDEX IF NOT EXISTS idx_sessions_user_id
-                    ON sessions(user_id);
+    def _ensure_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(USERS_TABLE_SQL)
+        connection.execute(SESSIONS_TABLE_SQL)
+        connection.execute(RATE_LIMITS_TABLE_SQL)
+        connection.execute(AUTH_EVENTS_TABLE_SQL)
+        for statement in AUTH_INDEX_STATEMENTS:
+            connection.execute(statement)
+        for table_name, columns in AUTH_MIGRATION_COLUMNS.items():
+            for column_name, column_type in columns.items():
+                self._ensure_column(connection, table_name, column_name, column_type)
 
-                CREATE INDEX IF NOT EXISTS idx_sessions_expiry
-                    ON sessions(expires_at, idle_expires_at, revoked_at);
-
-                CREATE TABLE IF NOT EXISTS rate_limits (
-                    key TEXT PRIMARY KEY,
-                    scope TEXT NOT NULL,
-                    identifier TEXT NOT NULL,
-                    ip_address TEXT,
-                    failure_count INTEGER NOT NULL,
-                    first_failure_at TEXT NOT NULL,
-                    last_failure_at TEXT NOT NULL,
-                    locked_until TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_rate_limits_last_failure
-                    ON rate_limits(last_failure_at);
-
-                CREATE TABLE IF NOT EXISTS auth_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    email TEXT,
-                    user_id TEXT,
-                    ip_address TEXT,
-                    details TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_auth_events_created_at
-                    ON auth_events(created_at);
-                """
-            )
+    def _ensure_column(
+        self,
+        connection: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_type: str,
+    ) -> None:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        known_columns = {str(row["name"]) for row in rows}
+        if column_name in known_columns:
+            return
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+        )
 
     @staticmethod
     def _user_from_row(row: sqlite3.Row | None) -> AuthUserRecord | None:

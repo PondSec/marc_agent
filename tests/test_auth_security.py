@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 import time
+from datetime import datetime, timezone
 
 import pyotp
 import pytest
+from argon2 import PasswordHasher
+from argon2.low_level import Type
 from fastapi.testclient import TestClient
 
 from config.settings import AppConfig
@@ -27,6 +31,80 @@ def build_test_config(root, **overrides) -> AppConfig:
         auth_cookie_secure=True,
         **overrides,
     )
+
+
+def seed_legacy_auth_db(config: AppConfig, *, create_user: bool = False) -> None:
+    config.ensure_state_dirs()
+    config.auth_db_path.unlink(missing_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    password_hash = PasswordHasher(
+        time_cost=3,
+        memory_cost=65536,
+        parallelism=4,
+        hash_len=32,
+        salt_len=16,
+        type=Type.ID,
+    ).hash(TEST_ADMIN_PASSWORD)
+    with sqlite3.connect(config.auth_db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                totp_secret TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                password_changed_at TEXT NOT NULL,
+                last_login_at TEXT
+            );
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                csrf_token TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                idle_expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+        if create_user:
+            connection.execute(
+                """
+                INSERT INTO users (
+                    id,
+                    email,
+                    display_name,
+                    password_hash,
+                    role,
+                    is_active,
+                    totp_secret,
+                    created_at,
+                    updated_at,
+                    password_changed_at,
+                    last_login_at
+                )
+                VALUES (?, ?, ?, ?, 'admin', 1, NULL, ?, ?, ?, NULL)
+                """,
+                (
+                    "legacy-admin",
+                    TEST_ADMIN_EMAIL,
+                    "Legacy Admin",
+                    password_hash,
+                    now,
+                    now,
+                    now,
+                ),
+            )
 
 
 def current_csrf_token(client: TestClient) -> str:
@@ -222,6 +300,50 @@ def test_idle_timeout_expires_session(tmp_path):
 
     assert login(client).status_code == 200
     time.sleep(1.2)
+    response = client.get("/api/workspaces")
+
+    assert response.status_code == 401
+
+
+def test_login_migrates_legacy_auth_schema(tmp_path):
+    config = build_test_config(tmp_path)
+    seed_legacy_auth_db(config, create_user=True)
+    app = create_app(config)
+    client = build_test_client(app)
+
+    login_response = login(client)
+    workspaces_response = client.get("/api/workspaces")
+
+    assert login_response.status_code == 200
+    assert workspaces_response.status_code == 200
+
+    with sqlite3.connect(config.auth_db_path) as connection:
+        user_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        session_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        table_names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "previous_login_at" in user_columns
+    assert "rotated_from_session_id" in session_columns
+    assert "rate_limits" in table_names
+    assert "auth_events" in table_names
+
+
+def test_protected_api_stays_401_when_auth_db_disappears_after_startup(tmp_path):
+    config = build_test_config(tmp_path)
+    app = create_app(config)
+    client = build_test_client(app)
+
+    config.auth_db_path.unlink()
+
     response = client.get("/api/workspaces")
 
     assert response.status_code == 401
