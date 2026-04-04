@@ -4374,6 +4374,12 @@ def _targeted_runtime_prompt_hints(
             hints.append(
                 "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source or implement the delta through literal substring replacements unless the current implementation already derives that text directly."
             )
+        separator_hint = _separator_only_output_behavior_hint(
+            observed_values=observed_semantics,
+            expected_values=expected_semantics,
+        )
+        if separator_hint:
+            hints.append(separator_hint)
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure
@@ -4412,6 +4418,32 @@ def _targeted_runtime_prompt_hints(
             "Do not just ignore unknown flags if the module name would still become the positional argument; keep the explicit-name greeting and the default greeting both correct."
         )
     return hints[:6]
+
+
+def _separator_only_output_behavior_hint(
+    *,
+    observed_values: Sequence[str],
+    expected_values: Sequence[str],
+) -> str | None:
+    for observed_value, expected_value in zip(observed_values, expected_values):
+        observed = str(observed_value or "").strip()
+        expected = str(expected_value or "").strip()
+        if not observed or not expected or observed == expected:
+            continue
+        observed_tokens = re.findall(r"[A-Za-z0-9_]+", observed)
+        expected_tokens = re.findall(r"[A-Za-z0-9_]+", expected)
+        if not observed_tokens or observed_tokens != expected_tokens:
+            continue
+        observed_non_token = re.sub(r"[A-Za-z0-9_]+", "", observed)
+        expected_non_token = re.sub(r"[A-Za-z0-9_]+", "", expected)
+        if observed_non_token == expected_non_token:
+            continue
+        return (
+            "The remaining mismatch is only punctuation or spacing between already-correct output parts. "
+            f"Adjust the final formatting or joining expression so it emits '{_trim_repair_delta_value(expected)}' "
+            f"instead of '{_trim_repair_delta_value(observed)}', and keep the already-correct data selection and transformation intact."
+        )
+    return None
 
 
 def _runtime_support_file_prompt_hints(

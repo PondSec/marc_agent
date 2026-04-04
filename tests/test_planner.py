@@ -12053,6 +12053,83 @@ def test_targeted_runtime_prompt_hints_ignore_interleaved_direct_main_option_val
     assert not any("'Dr.', 'Hello', 'WORLD'" in hint for hint in hints)
 
 
+def test_targeted_runtime_prompt_hints_call_out_separator_only_runtime_deltas():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    prefix = ''\n"
+        "    keep_case = False\n"
+        "    i = 0\n"
+        "    while i < len(args):\n"
+        "        if args[i] == '--prefix':\n"
+        "            prefix = args[i + 1]\n"
+        "            i += 2\n"
+        "        elif args[i] == '--keep-case':\n"
+        "            keep_case = True\n"
+        "            i += 1\n"
+        "        else:\n"
+        "            break\n"
+        "    text = ' '.join(args[i:]).title() if not keep_case else ' '.join(args[i:])\n"
+        "    return f\"{prefix}: {text}\" if prefix else text\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from prefix_cli import main\n\n"
+            "def test_direct_main_prefix_keep_case():\n"
+            "    assert main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD']) == 'Dr. Hello WORLD'\n"
+        ),
+        targeted_context={
+            "failure_summary": "prefix_cli.py still leaves an extra separator in the keep-case branch output.",
+            "excerpt": "AssertionError: 'Dr.: Hello WORLD' != 'Dr. Hello WORLD'",
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py", "tests/test_prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Dr. Hello WORLD"],
+                "observed_semantics": ["Validation currently produces: Dr.: Hello WORLD"],
+            },
+        },
+    )
+
+    assert any("only punctuation or spacing between already-correct output parts" in hint for hint in hints)
+    assert any("keep the already-correct data selection and transformation intact" in hint for hint in hints)
+
+
+def test_targeted_runtime_prompt_hints_do_not_misclassify_payload_mismatches_as_separator_only():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context="",
+        targeted_context={
+            "command": "python prefix_cli.py --prefix Ms. jane DOE",
+            "failure_summary": (
+                "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+                "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+            ),
+            "excerpt": (
+                "--prefix Ms. jane DOE\n\n"
+                "AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'\n"
+                "- --prefix Ms. jane DOE\n"
+                "+ Ms. Jane Doe"
+            ),
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Ms. Jane Doe"],
+                "observed_semantics": ["Validation currently produces: --prefix Ms. jane DOE"],
+            },
+        },
+    )
+
+    assert not any("only punctuation or spacing between already-correct output parts" in hint for hint in hints)
+
+
 def test_direct_python_script_option_contract_review_rejects_impossible_prefix_slice(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(
