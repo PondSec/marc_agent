@@ -16566,8 +16566,8 @@ def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(t
     kwargs = llm.generate_json_calls[0]["kwargs"]
     assert kwargs["model"] == "qwen3:8b"
     assert kwargs["num_ctx"] == 2048
-    assert kwargs["timeout"] >= 25
-    assert kwargs["total_timeout"] >= 90
+    assert kwargs["timeout"] == 60
+    assert kwargs["total_timeout"] == 210
     assert kwargs["strict_timeouts"] is True
     assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
 

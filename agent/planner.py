@@ -8639,6 +8639,15 @@ class Planner:
                     else:
                         timeout = max(self._llm_timeout(60), 60)
                         total_timeout = max(self._llm_timeout(180), 180)
+                elif repair_review and capability_tier == "tier_b":
+                    # Recovery-model repair reviews on local CPU stacks can warm up almost
+                    # as slowly as the generation hop they are validating. Reuse the
+                    # compact repair generation budget so the stronger reviewer can
+                    # actually start before we fall back to the weaker primary model.
+                    timeout, total_timeout = self._content_generation_time_budget(
+                        prompt_variant="compact",
+                        repair_context=session.active_repair_context,
+                    )
                 else:
                     timeout, total_timeout = self._compact_reserve_review_budget()
             else:
