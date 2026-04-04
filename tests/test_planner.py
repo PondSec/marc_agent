@@ -20580,6 +20580,159 @@ def test_planner_review_retry_uses_live_reserve_model_after_same_model_noop_runt
     assert result.recovery_strategy == "review_guided_fallback_model"
 
 
+def test_planner_review_retry_prefers_reserve_after_initial_primary_noop_runtime_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    initial_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repaired_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    const nextExpanded = !expanded;\n"
+        "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+        "    panel.hidden = !nextExpanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    llm = InventoryLLM(
+        text_payloads=[
+            initial_draft,
+            repaired_draft,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Fix app.js", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing JS runtime behavior."}],
+        target_paths=["app.js"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review_responses = iter(
+        [
+            ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposal still leaves the exercised JS state lines unchanged.",
+                confidence=0.91,
+                blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+                preservation_risks=[],
+                repair_hints=["Change the implicated current lines in app.js."],
+            ),
+            ProposedUpdateReview(
+                safe_to_write=True,
+                summary="ok",
+                confidence=0.9,
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=[],
+            ),
+        ]
+    )
+    monkeypatch.setattr(planner, "_pre_write_update_review", lambda *_args, **_kwargs: next(review_responses))
+
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: false !== true",
+        failure_summary="wireMenuToggle does not initialize and toggle aria-expanded and panel.hidden correctly.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        line_hints=[],
+        action_hints=["Prefer a targeted fix over broad refactors."],
+        repair_requirements=["Change app.js so the setup path starts closed and the click path toggles correctly."],
+        evidence_signature="sig-js-runtime-initial-noop",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:js-runtime-initial-primary-noop",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["The initial observed state should be closed before the first click."],
+            observed_semantics=["The initial observed state stays open before the first click."],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    prior_attempts = [
+        ExecutionAttemptRecord(
+            operation_name="content_generation",
+            task_class="content_generation",
+            attempt_number=1,
+            capability_tier="tier_a",
+            recovery_strategy="primary_model",
+            prompt_variant="compact",
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            state="completed",
+            had_progress=True,
+            first_output_received=True,
+            output_characters=len(initial_draft),
+        )
+    ]
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=initial_draft,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal leaves the implicated JS state lines unchanged.",
+            confidence=0.88,
+            blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+            preservation_risks=[],
+            repair_hints=["Change the implicated current lines in app.js."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=prior_attempts,
+    )
+
+    assert result.content == repaired_draft.strip()
+    assert len(llm.generate_calls) == 2
+    assert [call["kwargs"]["model"] for call in llm.generate_calls] == [
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+    ]
+    assert llm.generate_calls[-1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_calls[-1]["kwargs"]["num_ctx"] == 3072
+    assert result.recovery_strategy == "review_guided_fallback_model"
+
+
 def test_generate_file_content_retries_after_identical_task_backed_update_without_repair_context(tmp_path):
     initial_draft = (
         "function wireMenuToggle(button, panel) {\n"

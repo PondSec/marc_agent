@@ -1705,6 +1705,27 @@ class Planner:
             return ESCALATED_REPAIR_STRATEGY
         return repair_strategy
 
+    def _prefer_reserve_after_initial_primary_noop(
+        self,
+        *,
+        review_feedback: ProposedUpdateReview,
+        repair_context: ValidationFailureEvidence | None,
+        primary_model: str | None,
+        reserve_model: str | None,
+        prior_attempts: list[ExecutionAttemptRecord],
+    ) -> bool:
+        primary = str(primary_model or "").strip()
+        reserve = str(reserve_model or "").strip()
+        if (
+            repair_context is None
+            or not primary
+            or not reserve
+            or reserve == primary
+            or not self._review_feedback_is_noop(review_feedback)
+        ):
+            return False
+        return any(str(item.model_identifier or "").strip() == primary for item in prior_attempts)
+
     def _record_noop_review_attempt(
         self,
         session: SessionState,
@@ -10508,6 +10529,13 @@ class Planner:
             current_content=current_content,
         )
         prefer_primary_repair_retry = repair_context is not None
+        prefer_reserve_after_initial_noop = self._prefer_reserve_after_initial_primary_noop(
+            review_feedback=review_feedback,
+            repair_context=repair_context,
+            primary_model=primary_model,
+            reserve_model=reserve_model,
+            prior_attempts=prior_attempts,
+        )
         keep_compact_update_retry = (
             repair_context is None
             and current_content is not None
@@ -10613,29 +10641,43 @@ class Planner:
                     "compact",
                 )
             )
-            retry_models.append(
-                (
-                    primary_model,
-                    "tier_a",
-                    "review_guided_retry_followup",
-                    followup_timeout_seconds,
-                    followup_total_timeout_seconds,
-                    min(self._llm_num_ctx(4096), 4096),
-                    "full",
-                )
-            )
-            if reserve_model is not None and reserve_model != primary_model:
+            if prefer_reserve_after_initial_noop:
+                if reserve_model is not None and reserve_model != primary_model:
+                    retry_models.append(
+                        (
+                            reserve_model,
+                            "tier_b",
+                            "review_guided_fallback_model",
+                            followup_timeout_seconds,
+                            followup_total_timeout_seconds,
+                            min(self._llm_num_ctx(3072), 3072),
+                            "full",
+                        )
+                    )
+            else:
                 retry_models.append(
                     (
-                        reserve_model,
-                        "tier_b",
-                        "review_guided_fallback_model",
+                        primary_model,
+                        "tier_a",
+                        "review_guided_retry_followup",
                         followup_timeout_seconds,
                         followup_total_timeout_seconds,
-                        min(self._llm_num_ctx(3072), 3072),
+                        min(self._llm_num_ctx(4096), 4096),
                         "full",
                     )
                 )
+                if reserve_model is not None and reserve_model != primary_model:
+                    retry_models.append(
+                        (
+                            reserve_model,
+                            "tier_b",
+                            "review_guided_fallback_model",
+                            followup_timeout_seconds,
+                            followup_total_timeout_seconds,
+                            min(self._llm_num_ctx(3072), 3072),
+                            "full",
+                        )
+                    )
         elif prefer_lightweight_retry and reserve_model is not None:
             retry_models.append(
                 (
