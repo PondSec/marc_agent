@@ -888,6 +888,9 @@ def _current_setup_state(bundle: RuntimeBundle) -> tuple[bool, str | None]:
             return True, "missing_runtime_env"
         return True, bundle.setup_reason or "missing_auth_secret_key"
 
+    if not has_users:
+        return True, "missing_initial_admin"
+
     if bundle.setup_required:
         return True, bundle.setup_reason
 
