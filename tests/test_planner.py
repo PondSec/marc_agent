@@ -19270,6 +19270,102 @@ def test_pre_write_update_review_keeps_scope_rejection_for_too_broad_evidence_ba
     assert "broadens scope" in review.summary.lower()
 
 
+def test_pre_write_update_review_allows_local_js_toggle_behavior_fix_despite_model_semantic_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix app.js so the menu toggle keeps aria-expanded and panel.hidden aligned.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: expected panel.hidden to be false after the first click, but observed true.",
+        failure_summary="wireMenuToggle leaves panel.hidden out of sync with aria-expanded in the exercised toggle path.",
+        repair_requirements=["Change app.js so the toggle keeps aria-expanded and panel.hidden aligned across repeated clicks."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-review-misread",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=[
+                "After the first interaction, aria-expanded should be 'true' and panel.hidden should be false.",
+                "After the second interaction, aria-expanded should be 'false' and panel.hidden should be true.",
+            ],
+            observed_semantics=[
+                "After the first interaction, aria-expanded becomes 'true' while panel.hidden stays true."
+            ],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed change flips the logic for setting panel.hidden, which does not align with the intended behavior based on the test evidence.",
+            confidence=0.84,
+            blocking_issues=[
+                "The proposed change would cause the panel to be hidden when it should be shown, and vice versa."
+            ],
+            preservation_risks=[],
+            repair_hints=["Review the logic for setting panel.hidden to ensure it matches the intended interaction contract."],
+        ),
+    )
+
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    proposed_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert "runtime failure evidence" in review.summary.lower()
+
+
 def test_validation_repair_relevance_review_allows_python_body_change_with_same_function_signature(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(

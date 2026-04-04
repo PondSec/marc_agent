@@ -8011,6 +8011,7 @@ class Planner:
     def _evidence_backed_behavior_adjustment_is_in_scope(
         self,
         *,
+        route: RouterOutput,
         session: SessionState,
         path: str,
         current_content: str,
@@ -8020,8 +8021,6 @@ class Planner:
     ) -> bool:
         if review.safe_to_write:
             return False
-        if not self._review_rejection_looks_like_scope_broadening(review):
-            return False
         if self._supporting_runtime_contract_requires_stdout_emission(
             session,
             repair_context=repair_context,
@@ -8030,12 +8029,22 @@ class Planner:
             proposed_content=proposed_content,
         ):
             return False
-        return self._repair_update_is_evidence_backed_behavior_adjustment(
+        if not self._repair_update_is_evidence_backed_behavior_adjustment(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        ):
+            return False
+        local_review = self._local_pre_write_update_review(
+            route,
+            session,
             path=path,
             current_content=current_content,
             proposed_content=proposed_content,
             repair_context=repair_context,
         )
+        return local_review.safe_to_write
 
     def _supporting_runtime_contract_requires_stdout_emission(
         self,
@@ -8869,6 +8878,7 @@ class Planner:
             and
             not review.safe_to_write
             and self._evidence_backed_behavior_adjustment_is_in_scope(
+                route=route,
                 session=session,
                 path=path,
                 current_content=current_content,
