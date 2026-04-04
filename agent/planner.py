@@ -8283,6 +8283,65 @@ class Planner:
             ],
         )
 
+    def _task_backed_no_effective_change_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is not None:
+            return None
+        if not self._supports_update_style_existing_artifact(route, current_content=current_content):
+            return None
+
+        mutation = self._assess_effective_mutation(path, current_content, proposed_content)
+        if mutation.effective:
+            return None
+
+        target_paths = self._actionable_explicit_target_paths(route, session)
+        normalized_path = str(path or "").strip()
+        if target_paths and normalized_path not in target_paths:
+            return None
+
+        focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        raw_requirements = focus.get("current_write_requirements") or []
+        write_requirements = [
+            str(item or "").strip()
+            for item in raw_requirements
+            if str(item or "").strip()
+        ]
+        verification_target = str(getattr(session.task_state, "verification_target", "") or "").strip()
+        if not write_requirements and not verification_target:
+            return None
+
+        repair_hints: list[str] = []
+        for requirement in write_requirements[:2]:
+            repair_hints.append(f"Make a real change in {normalized_path} that addresses: {requirement}.")
+        if verification_target:
+            repair_hints.append(
+                f"Anchor the next draft to the exercised path checked by {verification_target} instead of resubmitting equivalent code."
+            )
+        repair_hints.append(
+            "Do not resubmit equivalent content; change the code lines that control the requested behavior or output."
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed update is a no-op or only an equivalent restatement, so writing it would preserve "
+                "the same current behavior."
+            ),
+            confidence=0.9,
+            blocking_issues=[
+                f"The proposal for {normalized_path} does not make a productive change ({mutation.reason})."
+            ],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
+
     def _semantic_delta_noop_repair_hints(
         self,
         *,
@@ -10937,6 +10996,16 @@ class Planner:
         if review is not None:
             return review
         review = self._repair_no_effective_change_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        )
+        if review is not None:
+            return review
+        review = self._task_backed_no_effective_change_review(
+            route,
+            session,
             path=path,
             current_content=current_content,
             proposed_content=proposed_content,
