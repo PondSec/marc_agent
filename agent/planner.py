@@ -13089,7 +13089,12 @@ class Planner:
             for index, raw in enumerate(str(current_content or "").splitlines(), start=1)
             if target in raw
         ]
-        if not current_lines:
+        proposed_lines = [
+            index
+            for index, raw in enumerate(str(proposed_content or "").splitlines(), start=1)
+            if target in raw
+        ]
+        if not current_lines or not proposed_lines:
             return False
 
         current_statements = self._python_smallest_statements_for_lines(
@@ -13098,7 +13103,7 @@ class Planner:
         )
         proposed_statements = self._python_smallest_statements_for_lines(
             proposed_module,
-            line_numbers=current_lines,
+            line_numbers=proposed_lines,
         )
         if not current_statements or not proposed_statements:
             return False
