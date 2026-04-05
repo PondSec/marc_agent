@@ -13326,6 +13326,180 @@ def test_deterministic_direct_python_script_runtime_recovery_preserves_punctuate
     assert "['--suffix', '!']" not in result.content
 
 
+def test_deterministic_runtime_literal_delta_recovery_rewrites_explicit_runtime_literal_mismatch(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    tasks = TASKS\n"
+        "    if owner:\n"
+        "        tasks = [task for task in tasks if task['owner'] == owner]\n"
+        "    return tasks\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner', type=str)\n"
+        "    return parser\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the taskboard no-match output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["render_tasks", "build_parser"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'",
+        failure_summary="taskboard/cli.py still returns the generic no-match message.",
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[17],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=["render_tasks"],
+            implicated_region_hint="taskboard/cli.py:line 17",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is not None
+    assert result.recovery_strategy == "deterministic_runtime_literal_delta"
+    assert "No tasks found for owner zoe." in result.content
+    assert "build_parser" in result.content
+
+
+def test_retry_update_after_review_failure_uses_deterministic_runtime_literal_delta_recovery(tmp_path):
+    llm = ScriptedLLM(text_payloads=["__should_not_run__"])
+    planner = Planner(llm, "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the taskboard no-match output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["render_tasks"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'",
+        failure_summary="taskboard/cli.py still returns the generic no-match message.",
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[4],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match-retry",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=["render_tasks"],
+            implicated_region_hint="taskboard/cli.py:line 4",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so writing it would only repeat the same failing state.",
+            confidence=0.93,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to taskboard/cli.py for runtime:assertion_mismatch:taskboard-owner-no-match-retry (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Change the locked repair target in a way that alters the failing behavior instead of resubmitting an equivalent file."
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert llm.generate_calls == []
+
+
 def test_retry_update_after_review_failure_uses_verbatim_direct_python_script_recovery_for_dynamic_suffix_branch(
     tmp_path,
 ):

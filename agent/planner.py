@@ -4678,6 +4678,41 @@ class Planner:
                 source="deterministic_exact_text_contract",
                 repair_strategy_used=repair_strategy,
             )
+        deterministic_literal_delta = self._deterministic_runtime_literal_delta_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_literal_delta is not None:
+            self._log(
+                "content_generation_skipped",
+                path=path,
+                update=current_content is not None,
+                reason="deterministic_runtime_literal_delta",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="completed",
+                    capability_tier=deterministic_literal_delta.capability_tier,
+                    recovery_strategy=deterministic_literal_delta.recovery_strategy,
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(deterministic_literal_delta.content),
+                    validation_possible=True,
+                    summary="Artifact generation used a deterministic runtime literal delta recovery.",
+                    attempts=[],
+                ),
+            )
+            return ContentGenerationResult(
+                content=deterministic_literal_delta.content,
+                source="deterministic_runtime_literal_delta",
+                repair_strategy_used=repair_strategy,
+            )
 
         model_name = self._content_generation_model_name(
             route,
@@ -9495,6 +9530,124 @@ class Planner:
             recovery_strategy="deterministic_direct_python_script_contract",
         )
 
+    def _deterministic_runtime_literal_delta_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        lines = str(current_content or "").splitlines(keepends=True)
+        focused_indexes = [
+            hint - 1
+            for hint in line_hints
+            if isinstance(hint, int) and 0 < hint <= len(lines)
+        ]
+
+        replacement_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        mismatch_patterns = (
+            re.compile(r"assert ['\"](?P<observed>.+?)['\"] == ['\"](?P<expected>.+?)['\"]"),
+            re.compile(r"AssertionError:\s*['\"](?P<observed>.+?)['\"] != ['\"](?P<expected>.+?)['\"]"),
+        )
+        evidence_texts = [
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ]
+        for evidence_text in evidence_texts:
+            if not evidence_text:
+                continue
+            for pattern in mismatch_patterns:
+                for match in pattern.finditer(evidence_text):
+                    observed = str(match.group("observed") or "")
+                    expected = str(match.group("expected") or "")
+                    if not observed or not expected or observed == expected:
+                        continue
+                    pair = (observed, expected)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    replacement_pairs.append(pair)
+        for delta in _repair_semantic_delta_lines(
+            repair_context,
+            limit=2,
+            path=path,
+            current_content=current_content,
+        ):
+            text = str(delta or "").strip()
+            if not text:
+                continue
+            replace_match = re.search(
+                r"Replace observed-only text ['\"](?P<observed>.+?)['\"] with expected text ['\"](?P<expected>.+?)['\"]",
+                text,
+            )
+            if replace_match is None:
+                continue
+            observed = str(replace_match.group("observed") or "").strip()
+            expected = str(replace_match.group("expected") or "").strip()
+            if not observed or not expected or observed == expected:
+                continue
+            pair = (observed, expected)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            replacement_pairs.append(pair)
+
+        for observed, expected in replacement_pairs:
+
+            patched_content: str | None = None
+            if focused_indexes:
+                updated_lines = list(lines)
+                changed = False
+                for index in focused_indexes:
+                    line = updated_lines[index]
+                    if observed not in line:
+                        continue
+                    updated_lines[index] = line.replace(observed, expected)
+                    changed = True
+                if changed:
+                    patched_content = "".join(updated_lines)
+            if patched_content is None and current_content.count(observed) == 1:
+                patched_content = current_content.replace(observed, expected, 1)
+
+            if patched_content is None or patched_content == current_content:
+                continue
+            if Path(path).suffix.lower() in {".py", ".pyi"}:
+                try:
+                    ast.parse(patched_content)
+                except SyntaxError:
+                    continue
+
+            review = self._local_pre_write_update_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=patched_content,
+                repair_context=repair_context,
+            )
+            if not review.safe_to_write:
+                continue
+            return DeterministicUpdateRecovery(
+                content=patched_content,
+                review=review,
+                recovery_strategy="deterministic_runtime_literal_delta",
+            )
+        return None
+
     def _deterministic_runtime_repair_decision(
         self,
         route: RouterOutput,
@@ -9515,6 +9668,14 @@ class Planner:
         )
         if recovery is None:
             recovery = self._deterministic_direct_python_script_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
+            recovery = self._deterministic_runtime_literal_delta_recovery(
                 route,
                 session,
                 path=path,
@@ -10690,6 +10851,14 @@ class Planner:
             current_content=current_content,
             repair_context=repair_context,
         )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_runtime_literal_delta_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
         if deterministic_recovery is None:
             deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
                 route,
