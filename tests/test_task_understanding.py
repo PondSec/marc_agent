@@ -2008,6 +2008,50 @@ def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_
     assert route.entities.target_paths[0] == "smoke.ini"
 
 
+def test_task_state_updater_accepts_null_clarification_questions_without_blocking_create(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen und sonst nichts: [smoke], enabled=true, level=2.",
+        "root_goal": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen und sonst nichts: [smoke], enabled=true, level=2.",
+        "active_goal": "Erstelle die Datei smoke.ini.",
+        "goal_relation": "continue",
+        "output_expectation": "Pfad der erstellten Datei und eine knappe Validierung.",
+        "current_user_intent": "implement",
+        "execution_strategy": None,
+        "verification_target": None,
+        "target_artifacts": [
+            {
+                "path": "smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 1.0,
+            }
+        ],
+        "constraints": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 1.0,
+        "next_action": "create",
+        "needs_clarification": False,
+        "clarification_questions": None,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.needs_clarification is False
+    assert task_state.clarification_questions == []
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.target_artifacts[0].path == "smoke.ini"
+    assert route.intent == RouteIntent.CREATE
+    assert route.needs_clarification is False
+
+
 def test_task_state_updater_clears_spurious_clarification_from_confident_executable_payload(tmp_path):
     payload = {
         "latest_user_turn": "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, and run python -m unittest tests.test_normalize before finishing.",

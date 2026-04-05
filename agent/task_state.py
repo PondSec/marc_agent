@@ -446,6 +446,20 @@ class TaskState(StrictModel):
         if not isinstance(value, dict):
             return value
         payload = dict(value)
+        for field in (
+            "target_artifacts",
+            "active_artifacts",
+            "evidence",
+            "supplied_evidence",
+            "relevant_context",
+            "constraints",
+            "assumptions",
+            "missing_info",
+            "execution_outline",
+            "clarification_questions",
+        ):
+            if payload.get(field) is None:
+                payload[field] = []
         if "goal_relation" in payload:
             normalized = _normalize_alias(payload.get("goal_relation"), GOAL_RELATION_ALIASES)
             if normalized:
