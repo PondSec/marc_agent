@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 import re
+import shlex
 
 from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
 from agent.task_state import TaskState
@@ -634,6 +635,17 @@ def generate_content_prompt(
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
+    if current_content is not None and repair_context is not None:
+        return _focused_full_repair_update_prompt(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+            repair_strategy=repair_strategy,
+            review_feedback=review_feedback,
+        )
+
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     related_context = _related_file_context(session, path)
     runtime_hints = _targeted_runtime_prompt_hints(
@@ -1124,13 +1136,27 @@ def proposed_update_review_prompt(
         review_context["diagnostics"] = _compact_recent_diagnostics(session)
         review_context["follow_up_context"] = _compact_follow_up_context(session)
     if repair_context is not None:
-        review_context["active_repair"] = _targeted_compact_repair_context(
+        targeted_repair_context = _targeted_compact_repair_context(
             repair_context,
             target_path=path,
         )
-        semantic_deltas = _repair_semantic_delta_lines(repair_context, limit=2)
+        review_context["active_repair"] = targeted_repair_context
+        semantic_deltas = _repair_semantic_delta_lines(
+            repair_context,
+            limit=2,
+            path=path,
+            current_content=current_excerpt,
+        )
         if semantic_deltas:
             review_context["failure_evidence_behavior_deltas"] = semantic_deltas
+        runtime_hints = _targeted_runtime_prompt_hints(
+            path=path,
+            current_content=current_excerpt,
+            supporting_context=supporting_artifact_context,
+            targeted_context=targeted_repair_context,
+        )
+        if runtime_hints:
+            review_context["failure_evidence_runtime_hints"] = runtime_hints[:4]
     return "\n".join(
         [
             "Review the proposed file update before it is written to disk.",
@@ -1141,10 +1167,15 @@ def proposed_update_review_prompt(
             "- Approve only when the proposal is tightly aligned with the explicit request and keeps unrelated existing behavior intact.",
             "- Do not treat an explicitly requested behavior change for this file as scope broadening just because the current implementation behaves differently.",
             "- When active runtime failure evidence for this file includes observed-vs-expected behavior deltas, treat the smallest local change that closes those deltas as in scope for this write.",
+            "- When failure_evidence_runtime_hints is present, use those state-transition or interaction-contract hints to judge whether the proposal closes the evidenced behavior delta.",
+            "- Do not call a proposal regressive merely because it computes the required next-state behavior from a different local formulation, such as deriving one dependent assignment from the prior state and another from the computed next state, when the resulting interaction contract still matches the evidence.",
             "- Do not call an evidence-backed local repair broadening solely because it changes current default behavior, as long as the diff stays local to the implicated responsibility and does not introduce extra semantics beyond the evidenced fix.",
             "- Fail when the proposal broadens scope without evidence, or removes working behavior, imports, config handling, startup code, public interfaces, commands, docs, or tests that the request did not ask to remove.",
             "- Fail when a narrow request adds unrequested new sections, explanatory prose, examples, commands, tests, or guidance unless the visible evidence clearly requires that extra content.",
             "- Treat explicit literal examples from the request as hard constraints when they are clearly part of the requested outcome; wrong placeholders, argument order, command shape, or snippet content are failures unless visible evidence contradicts them.",
+            "- Use path_scope.literal_anchor_details to track provenance: only entries with hard_source_constraint=true are hard file-local source obligations.",
+            "- A missing-literal blocker is valid only when the exact literal already appears in path_scope.literal_constraints or in path_scope.literal_anchor_details with hard_source_constraint=true.",
+            "- Do not promote repair_brief, runtime_evidence, validation_failure_evidence, or generation_relevant_constraint examples into new hard source literals on their own; they justify the fix but do not require copying the literal into the source.",
             "- Use path_scope.current_write_requirements as the hard requirements for this file when that list is non-empty.",
             "- Treat path_scope.other_pending_requirements as non-blocking for this file unless the proposal directly contradicts them or falsely claims to complete them here.",
             "- Fail when names, config keys, selectors, imports, commands, or interfaces change without the visible evidence showing the required dependent updates.",
@@ -1961,6 +1992,40 @@ def _compact_repair_file_focus(
     }
 
 
+def _repair_literal_provenance_guidance(file_focus: dict[str, object]) -> str:
+    hard_literals: list[str] = []
+    illustrative_literals: list[str] = []
+    for raw in file_focus.get("literal_anchor_details", [])[:6]:
+        value = _trim_text(str(raw.get("value") or "").strip(), 80)
+        source = str(raw.get("source") or "").strip()
+        anchor_type = str(raw.get("type") or "").strip()
+        if not value or not source:
+            continue
+        detail = value
+        if anchor_type:
+            detail += f" [{source}/{anchor_type}]"
+        else:
+            detail += f" [{source}]"
+        if bool(raw.get("hard_source_constraint")):
+            if detail not in hard_literals:
+                hard_literals.append(detail)
+            continue
+        if detail not in illustrative_literals:
+            illustrative_literals.append(detail)
+
+    sections = [
+        "Literal provenance: treat only hard file-local source obligations as exact source-text requirements.",
+    ]
+    if hard_literals:
+        sections.append("Hard source literals: " + " | ".join(hard_literals[:3]))
+    if illustrative_literals:
+        sections.append(
+            "Illustrative evidence literals do not need to be copied into source unless they also appear as hard source obligations: "
+            + " | ".join(illustrative_literals[:3])
+        )
+    return " ".join(sections)
+
+
 def _compact_repair_update_prompt(
     route: RouterOutput,
     session: SessionState,
@@ -2020,10 +2085,6 @@ def _compact_repair_update_prompt(
         excerpt_limit=support_excerpt_limit,
         max_files=support_max_files,
     )
-    direct_main_option_contract = _path_exposes_direct_main_contract_target(
-        path,
-        current_content,
-    ) and _direct_main_option_contract_present(related_context)
     if compact_focus.get("current_write_requirements"):
         sections.append(
             "Repair-scoped requirements: "
@@ -2033,20 +2094,29 @@ def _compact_repair_update_prompt(
                 if str(item or "").strip()
             )
         )
+    literal_provenance = _repair_literal_provenance_guidance(file_focus)
+    if literal_provenance:
+        sections.append(literal_provenance)
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         target_summary = repair_brief.get("locked_target") or repair_brief.get("primary_target")
         sections.append(f"Primary repair target: {target_summary}")
-    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
+    expected_semantics, observed_semantics = _repair_semantic_display_items(repair_context)
+    if expected_semantics:
         sections.append(
             "Expected semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in expected_semantics[:3])
         )
-    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
+    if observed_semantics:
         sections.append(
             "Observed semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in observed_semantics[:3])
         )
-    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(
+        repair_context,
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+    )
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2177,10 +2247,6 @@ def _compact_repair_retry_prompt(
         max_files=support_max_files,
     )
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
-    direct_main_option_contract = _path_exposes_direct_main_contract_target(
-        path,
-        current_content,
-    ) and _direct_main_option_contract_present(related_context)
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2218,22 +2284,31 @@ def _compact_repair_retry_prompt(
                 if str(item or "").strip()
             )
         )
+    literal_provenance = _repair_literal_provenance_guidance(file_focus)
+    if literal_provenance:
+        sections.append(literal_provenance)
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         sections.append(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
+    expected_semantics, observed_semantics = _repair_semantic_display_items(repair_context)
+    if expected_semantics:
         sections.append(
             "Expected semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("expected_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in expected_semantics[:3])
         )
-    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
+    if observed_semantics:
         sections.append(
             "Observed semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in repair_brief.get("observed_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 140) for item in observed_semantics[:3])
         )
-    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(
+        repair_context,
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+    )
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2360,17 +2435,24 @@ def _focused_full_repair_update_prompt(
     ) and _direct_main_option_contract_present(related_context)
     implicated_line_excerpt = ""
     if noop_followup:
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
         implicated_line_excerpt = _line_focused_excerpt(
             current_content,
-            line_hints=_repair_target_line_hints(
-                path=path,
-                current_content=current_content,
-                repair_context=repair_context,
-            ),
+            line_hints=line_hints,
             limit=220,
             before_radius=0,
             after_radius=0,
         )
+        if not implicated_line_excerpt:
+            implicated_line_excerpt = _review_feedback_implicated_line_excerpt(
+                current_content=current_content,
+                review_feedback=review_feedback,
+                limit=220,
+            )
 
     sections = [
         "Produce the full file content for exactly one file.",
@@ -2439,22 +2521,31 @@ def _focused_full_repair_update_prompt(
     file_requirement_summary = _file_local_requirement_summary(compact_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    literal_provenance = _repair_literal_provenance_guidance(file_focus)
+    if literal_provenance:
+        sections.append(literal_provenance)
     if repair_brief.get("locked_target") or repair_brief.get("primary_target"):
         sections.append(
             "Primary repair target: "
             + str(repair_brief.get("locked_target") or repair_brief.get("primary_target") or "").strip()
         )
-    if not direct_main_option_contract and repair_brief.get("expected_semantics"):
+    expected_semantics, observed_semantics = _repair_semantic_display_items(repair_context)
+    if expected_semantics:
         sections.append(
             "Expected semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("expected_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in expected_semantics[:3])
         )
-    if not direct_main_option_contract and repair_brief.get("observed_semantics"):
+    if observed_semantics:
         sections.append(
             "Observed semantics: "
-            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in repair_brief.get("observed_semantics", [])[:3])
+            + " | ".join(_trim_text(str(item or "").strip(), 160) for item in observed_semantics[:3])
         )
-    semantic_deltas = [] if direct_main_option_contract else _repair_semantic_delta_lines(repair_context)
+    semantic_deltas = _repair_semantic_delta_lines(
+        repair_context,
+        path=path,
+        current_content=current_content,
+        supporting_context=related_context,
+    )
     if semantic_deltas:
         sections.append(
             "Minimal semantic delta: "
@@ -2597,6 +2688,7 @@ def _review_feedback_indicates_noop_repair(review: ProposedUpdateReview | None) 
             "equivalent content",
             "same failing state",
             "implicated lines unchanged",
+            "implicated identifier lines unchanged",
         )
     )
 
@@ -2642,6 +2734,77 @@ def _mandatory_mutation_rules(anchors: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _unchanged_identifier_anchor_list(review: ProposedUpdateReview | None) -> list[str]:
+    if review is None:
+        return []
+    for issue in review.blocking_issues:
+        text = str(issue or "").strip()
+        if not text:
+            continue
+        match = re.search(
+            r"leaves the implicated identifier lines unchanged:\s*(?P<anchors>.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        anchors = [
+            str(item or "").strip()
+            for item in str(match.group("anchors") or "").split(",")
+            if str(item or "").strip()
+        ]
+        if anchors:
+            return anchors[:4]
+    return []
+
+
+def _review_feedback_implicated_line_excerpt(
+    *,
+    current_content: str,
+    review_feedback: ProposedUpdateReview | None,
+    limit: int = 220,
+) -> str:
+    anchors = _unchanged_identifier_anchor_list(review_feedback)
+    if not anchors:
+        return ""
+    search_terms: list[str] = []
+    for anchor in anchors[:4]:
+        text = str(anchor or "").strip()
+        if not text:
+            continue
+        search_terms.append(text)
+        prefix, separator, suffix = text.partition(" near ")
+        if separator:
+            if prefix.strip():
+                search_terms.append(prefix.strip())
+            if suffix.strip():
+                search_terms.append(suffix.strip())
+    normalized_terms: list[str] = []
+    for term in search_terms:
+        cleaned = str(term or "").strip()
+        if not cleaned or cleaned in normalized_terms:
+            continue
+        normalized_terms.append(cleaned)
+    if not normalized_terms:
+        return ""
+    line_hints: list[int] = []
+    for index, raw in enumerate(str(current_content or "").splitlines(), start=1):
+        line = str(raw or "").rstrip()
+        if not line.strip():
+            continue
+        if any(term in line for term in normalized_terms):
+            line_hints.append(index)
+    if not line_hints:
+        return ""
+    return _line_focused_excerpt(
+        current_content,
+        line_hints=line_hints[:6],
+        limit=limit,
+        before_radius=0,
+        after_radius=0,
+    )
+
+
 def _direct_review_corrections(review: ProposedUpdateReview) -> str:
     lines = ["Required corrections from the rejected draft:"]
     for issue in review.blocking_issues[:2]:
@@ -2651,7 +2814,7 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
     for hint in review.repair_hints[:2]:
         text = _trim_text(hint, 220)
         if text:
-            lines.append(f"- Repair direction: {text}")
+            lines.append(f"- Required repair direction: {text}")
     combined = " ".join(review.blocking_issues + review.repair_hints).lower()
     if "sys.argv" in combined:
         lines.append("- If the updated file references sys.argv, add import sys before using it.")
@@ -2667,6 +2830,13 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
         lines.append(
             f"- Either import or otherwise bind '{undefined_symbol}' before its current use, or remove that failing use if it is unnecessary."
         )
+    unchanged_anchors = _unchanged_identifier_anchor_list(review)
+    if unchanged_anchors:
+        lines.append(
+            "- The next draft must change at least one of these currently unchanged anchors: "
+            + ", ".join(unchanged_anchors)
+            + ". Re-emitting the same anchor lines will be rejected again."
+        )
     return "\n".join(lines)
 
 
@@ -2674,23 +2844,29 @@ def _repair_semantic_delta_lines(
     repair_context: ValidationFailureEvidence,
     *,
     limit: int = 2,
+    path: str = "",
+    current_content: str = "",
+    supporting_context: str = "",
 ) -> list[str]:
     brief = getattr(repair_context, "repair_brief", None)
     if brief is None:
         return []
 
-    expected_items = [
-        _repair_semantic_value_text(item)
-        for item in getattr(brief, "expected_semantics", [])
-        if _repair_semantic_value_text(item)
-    ]
-    observed_items = [
-        _repair_semantic_value_text(item)
-        for item in getattr(brief, "observed_semantics", [])
-        if _repair_semantic_value_text(item)
-    ]
+    expected_items, observed_items = _repair_semantic_values(repair_context)
     if not expected_items or not observed_items:
         return []
+
+    behavioral_deltas = _interactive_runtime_semantic_delta_lines(
+        path=path,
+        current_content=current_content,
+        supporting_context=supporting_context,
+        repair_brief=brief,
+        observed_items=observed_items,
+        expected_items=expected_items,
+        limit=limit,
+    )
+    if behavioral_deltas:
+        return behavioral_deltas
 
     deltas: list[str] = []
     for observed_value, expected_value in zip(observed_items, expected_items):
@@ -2707,6 +2883,127 @@ def _repair_semantic_delta_lines(
     return deltas
 
 
+def _interactive_runtime_semantic_delta_lines(
+    *,
+    path: str,
+    current_content: str,
+    supporting_context: str,
+    repair_brief: object,
+    observed_items: list[str],
+    expected_items: list[str],
+    limit: int,
+) -> list[str]:
+    if Path(str(path or "")).suffix.lower() not in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        return []
+    brief_payload = {
+        "expected_semantics": list(getattr(repair_brief, "expected_semantics", []) or []),
+        "observed_semantics": list(getattr(repair_brief, "observed_semantics", []) or []),
+    }
+    if not _js_runtime_pre_event_state_hints(
+        current_content=current_content,
+        supporting_context=supporting_context,
+        repair_brief=brief_payload,
+    ):
+        contract_lines = _interaction_post_event_contract_lines(
+            supporting_context,
+            limit_events=limit,
+        )
+        if contract_lines:
+            toggle_deltas = [
+                "Match the supporting interaction contract exactly. " + contract_lines[0]
+            ]
+            toggle_deltas.extend(contract_lines[1:limit])
+            return toggle_deltas[:limit]
+        toggle_deltas: list[str] = []
+        for observed_value, expected_value in zip(observed_items, expected_items):
+            delta = _render_interactive_runtime_toggle_delta(
+                current_content=current_content,
+                supporting_context=supporting_context,
+                observed_value=observed_value,
+                expected_value=expected_value,
+            )
+            if not delta or delta in toggle_deltas:
+                continue
+            toggle_deltas.append(delta)
+            if len(toggle_deltas) >= limit:
+                break
+        return toggle_deltas
+
+    deltas: list[str] = []
+    for observed_value, expected_value in zip(observed_items, expected_items):
+        delta = _render_interactive_runtime_semantic_delta(observed_value, expected_value)
+        if not delta or delta in deltas:
+            continue
+        deltas.append(delta)
+        if len(deltas) >= limit:
+            break
+    return deltas
+
+
+def _render_interactive_runtime_toggle_delta(
+    *,
+    current_content: str,
+    supporting_context: str,
+    observed_value: str,
+    expected_value: str,
+) -> str | None:
+    observed_bool = _normalized_boolean_semantic_value(observed_value)
+    expected_bool = _normalized_boolean_semantic_value(expected_value)
+    if observed_bool is None or expected_bool is None or observed_bool == expected_bool:
+        return None
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return None
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not any(_interaction_event_trigger_line(line) for line in support_lines):
+        return None
+    contract_lines = _interaction_post_event_contract_lines(supporting_context)
+    if contract_lines:
+        return "Match the supporting interaction contract exactly. " + " ".join(contract_lines[:2])
+    else:
+        guidance = (
+            "After the exercised interaction, the toggled state should produce "
+            f"'{str(expected_value or '').strip()}' instead of '{str(observed_value or '').strip()}'. "
+            "Compute the next-state value once inside the handler and derive every dependent update from it, preserving whether each property should mirror or invert that next state."
+        )
+    if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
+        guidance += (
+            " Keep aria-expanded and hidden/visible updates tied to the same next-state transition: "
+            "when aria-expanded becomes true/open after the click, hidden should become false/visible; "
+            "when aria-expanded becomes false/closed, hidden should become true/hidden."
+        )
+    return guidance
+
+
+def _render_interactive_runtime_semantic_delta(observed_value: str, expected_value: str) -> str | None:
+    observed = str(observed_value or "").strip()
+    expected = str(expected_value or "").strip()
+    if not observed or not expected or observed == expected:
+        return None
+
+    observed_summary = _trim_repair_delta_value(observed)
+    expected_summary = _trim_repair_delta_value(expected)
+    if observed.lower() in {"undefined", "null", "''", '""'}:
+        observed_clause = "staying unset at setup time"
+    else:
+        observed_clause = f"producing '{observed_summary}' at setup time"
+    return (
+        "Change the setup-time behavior for this interaction so the initialized state yields "
+        f"'{expected_summary}' before the first user event instead of {observed_clause}. "
+        "Repair initialization/state wiring rather than treating this as a literal source-text replacement."
+    )
+
+
+def _normalized_boolean_semantic_value(value: str) -> bool | None:
+    normalized = str(value or "").strip().strip("\"'")
+    lowered = normalized.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    return None
+
+
 def _repair_semantic_value_text(raw: object) -> str:
     text = str(raw or "").strip()
     if not text:
@@ -2720,6 +3017,399 @@ def _repair_semantic_value_text(raw: object) -> str:
         if text.startswith(prefix):
             return text[len(prefix) :].strip()
     return text
+
+
+def _repair_semantic_values(
+    repair_context: ValidationFailureEvidence,
+) -> tuple[list[str], list[str]]:
+    brief = getattr(repair_context, "repair_brief", None)
+    return _repair_semantic_values_from_sources(
+        repair_brief=brief,
+        evidence_texts=[
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ],
+    )
+
+
+def _repair_semantic_display_items(
+    repair_context: ValidationFailureEvidence,
+) -> tuple[list[str], list[str]]:
+    brief = getattr(repair_context, "repair_brief", None)
+    expected_items = [str(item or "").strip() for item in getattr(brief, "expected_semantics", []) or [] if str(item or "").strip()]
+    observed_items = [str(item or "").strip() for item in getattr(brief, "observed_semantics", []) or [] if str(item or "").strip()]
+    if expected_items or observed_items:
+        return expected_items[:4], observed_items[:4]
+
+    expected_values, observed_values = _repair_semantic_values_from_sources(
+        repair_brief=brief,
+        evidence_texts=[
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ],
+    )
+    expected_display = [f"Validation should produce: {item}" for item in expected_values]
+    observed_display = [f"Validation currently produces: {item}" for item in observed_values]
+    return expected_display[:4], observed_display[:4]
+
+
+def _repair_semantic_values_from_sources(
+    *,
+    repair_brief: object | None,
+    evidence_texts: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    if isinstance(repair_brief, dict):
+        raw_expected = repair_brief.get("expected_semantics", []) or []
+        raw_observed = repair_brief.get("observed_semantics", []) or []
+    else:
+        raw_expected = getattr(repair_brief, "expected_semantics", []) or []
+        raw_observed = getattr(repair_brief, "observed_semantics", []) or []
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in raw_expected
+        if _repair_semantic_value_text(item)
+    ]
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in raw_observed
+        if _repair_semantic_value_text(item)
+    ]
+    if expected_items and observed_items:
+        return expected_items[:4], observed_items[:4]
+
+    fallback_expected, fallback_observed = _repair_semantic_values_from_texts(evidence_texts)
+    if not expected_items:
+        expected_items = fallback_expected
+    if not observed_items:
+        observed_items = fallback_observed
+    return expected_items[:4], observed_items[:4]
+
+
+def _repair_semantic_values_from_texts(
+    texts: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    quoted_pair_pattern = re.compile(
+        r"AssertionError:\s*(?:assert\s*)?(?P<observed>'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")\s*(?:==|!=)\s*(?P<expected>'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")"
+    )
+    for raw_text in texts:
+        text = str(raw_text or "").strip()
+        if not text:
+            continue
+        match = quoted_pair_pattern.search(text)
+        if match is None:
+            continue
+        try:
+            observed_value = ast.literal_eval(str(match.group("observed") or ""))
+            expected_value = ast.literal_eval(str(match.group("expected") or ""))
+        except (SyntaxError, ValueError):
+            continue
+        observed_text = str(observed_value or "").strip()
+        expected_text = str(expected_value or "").strip()
+        if observed_text and expected_text:
+            return [expected_text], [observed_text]
+    return [], []
+
+
+def _interaction_assertion_line(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "assert.equal(",
+            "assert.strictequal(",
+            "assert.deepstrictequal(",
+            "expect(",
+            ".tobe(",
+            ".toequal(",
+            ".tostrictequal(",
+            ".tohaveattribute(",
+            ".tohaveproperty(",
+        )
+    )
+
+
+def _interaction_event_trigger_line(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    compact = re.sub(r"^\d+:\s*", "", lowered).strip()
+    if re.match(r"^[a-z_$][\w$]*\s*\([^)]*\)\s*\{", compact):
+        return False
+    return any(
+        marker in compact
+        for marker in (
+            ".click()",
+            "fireevent.",
+            "userevent.",
+            "dispatchevent(",
+            ".trigger(",
+        )
+    )
+
+
+def _interaction_asserted_boolean_value(text: str) -> bool | None:
+    compact = re.sub(r"^\d+:\s*", "", str(text or "").strip())
+    if not compact:
+        return None
+    patterns = (
+        r"assert\.(?:equal|strictequal|deepstrictequal)\([^,\n]+,\s*(?P<expected>true|false|'true'|'false'|\"true\"|\"false\")\s*\)",
+        r"\.to(?:be|equal|strictequal)\(\s*(?P<expected>true|false|'true'|'false'|\"true\"|\"false\")\s*\)",
+        r"\.tohaveattribute\([^,\n]+,\s*(?P<expected>'true'|'false'|\"true\"|\"false\")\s*\)",
+        r"\.tohaveproperty\([^,\n]+,\s*(?P<expected>true|false)\s*\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match is None:
+            continue
+        return _normalized_boolean_semantic_value(str(match.group("expected") or ""))
+    return None
+
+
+def _interaction_assertion_contract(text: str) -> tuple[str, str] | None:
+    compact = re.sub(r"^\d+:\s*", "", str(text or "").strip())
+    if not compact:
+        return None
+    patterns = (
+        r"assert\.(?:equal|strictequal|deepstrictequal)\(\s*(?P<subject>[^,\n]+?)\s*,\s*(?P<expected>true|false|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*\)",
+        r"expect\(\s*(?P<subject>[^)\n]+?)\s*\)\.to(?:be|equal|strictequal)\(\s*(?P<expected>true|false|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact, re.IGNORECASE)
+        if match is None:
+            continue
+        subject = _interaction_contract_subject(str(match.group("subject") or "").strip())
+        expected = _interaction_expected_literal_text(str(match.group("expected") or "").strip())
+        if subject and expected:
+            return subject, expected
+    return None
+
+
+def _interaction_contract_subject(raw: str) -> str:
+    subject = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not subject:
+        return ""
+    attribute_match = re.search(r"getattribute\(\s*['\"]([^'\"]+)['\"]\s*\)", subject, re.IGNORECASE)
+    if attribute_match is not None:
+        return str(attribute_match.group(1) or "").strip() or subject
+    return subject
+
+
+def _interaction_expected_literal_text(raw: str) -> str:
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    lowered = token.lower()
+    if lowered in {"true", "false"}:
+        return lowered
+    try:
+        value = ast.literal_eval(token)
+    except (SyntaxError, ValueError):
+        value = token
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return repr(value)
+    return str(value).strip()
+
+
+def _interaction_post_event_contract_lines(
+    supporting_context: str,
+    *,
+    limit_events: int = 2,
+    limit_assertions_per_event: int = 3,
+) -> list[str]:
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not support_lines:
+        return []
+
+    contracts: list[list[tuple[str, str]]] = []
+    active_contract: list[tuple[str, str]] = []
+    saw_event = False
+    for line in support_lines:
+        if _interaction_event_trigger_line(line):
+            if saw_event and active_contract:
+                contracts.append(active_contract)
+                if len(contracts) >= limit_events:
+                    break
+            saw_event = True
+            active_contract = []
+            continue
+        if not saw_event or not _interaction_assertion_line(line):
+            continue
+        contract = _interaction_assertion_contract(line)
+        if contract is None or contract in active_contract:
+            continue
+        active_contract.append(contract)
+        if len(active_contract) >= limit_assertions_per_event:
+            continue
+    if saw_event and active_contract and len(contracts) < limit_events:
+        contracts.append(active_contract)
+
+    rendered: list[str] = []
+    for index, contract_items in enumerate(contracts[:limit_events], start=1):
+        statements = [f"{subject} should be {expected}" for subject, expected in contract_items[:limit_assertions_per_event]]
+        if not statements:
+            continue
+        if len(statements) == 1:
+            body = statements[0]
+        elif len(statements) == 2:
+            body = f"{statements[0]} and {statements[1]}"
+        else:
+            body = ", ".join(statements[:-1]) + f", and {statements[-1]}"
+        rendered.append(f"After the {_ordinal_step_word(index)} interaction, {body}.")
+    return rendered
+
+
+def _ordinal_step_word(index: int) -> str:
+    ordinals = {
+        1: "first",
+        2: "second",
+        3: "third",
+        4: "fourth",
+        5: "fifth",
+    }
+    normalized = max(int(index), 1)
+    return ordinals.get(normalized, f"{normalized}th")
+
+
+def _pre_event_interaction_asserted(supporting_context: str) -> bool:
+    lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not lines:
+        return False
+    first_assertion_index = next((index for index, line in enumerate(lines) if _interaction_assertion_line(line)), -1)
+    if first_assertion_index <= 0:
+        return False
+    return not any(_interaction_event_trigger_line(line) for line in lines[:first_assertion_index])
+
+
+def _js_runtime_pre_event_state_hints(
+    *,
+    current_content: str,
+    supporting_context: str,
+    repair_brief: dict[str, object],
+) -> list[str]:
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return []
+    if not _pre_event_interaction_asserted(supporting_context):
+        return []
+
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("observed_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("expected_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    if not observed_items or not expected_items:
+        return []
+
+    lowered_observed = {item.strip().lower() for item in observed_items if item.strip()}
+    unset_observed = {"undefined", "null", "''", '""'}
+    if not lowered_observed.intersection(unset_observed):
+        return []
+
+    return [
+        "The failing interaction is asserted immediately after setup and before the first user event fires. Establish the baseline state during setup so that the pre-interaction assertions already pass.",
+        "Do not use the first click or dispatched event to create the initial state. The first interaction should toggle away from the initialized baseline, and the next interaction should toggle back.",
+        "The current path leaves the exercised state unset at setup time. Set the relevant attribute or property explicitly instead of relying on an undefined or implicit default.",
+        "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring and keep the current toggle callback shape when it already covers the post-interaction transitions.",
+        "Do not add new early-return branches, wrapper conditions, or API changes unless the visible evidence shows a control-flow failure beyond the missing initial state.",
+    ]
+
+
+def _js_test_backed_toggle_contract_hints(
+    *,
+    current_content: str,
+    supporting_context: str,
+) -> list[str]:
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return []
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    event_count = sum(1 for line in support_lines if _interaction_event_trigger_line(line))
+    if event_count == 0:
+        return []
+
+    saw_event = False
+    post_event_boolean_values: list[bool] = []
+    for line in support_lines:
+        if _interaction_event_trigger_line(line):
+            saw_event = True
+            continue
+        if not saw_event or not _interaction_assertion_line(line):
+            continue
+        expected_bool = _interaction_asserted_boolean_value(line)
+        if expected_bool is None:
+            continue
+        post_event_boolean_values.append(expected_bool)
+
+    if len(post_event_boolean_values) < 2 or len(set(post_event_boolean_values)) < 2:
+        return []
+
+    hints = [
+        "The supporting test already defines the post-interaction state contract. Make the handler produce those asserted states directly instead of preserving the current assignments unchanged.",
+        "Read the current state once, compute the next state once, and derive every dependent update from that same next state.",
+    ]
+    if event_count >= 2:
+        hints.append(
+            "The supporting test exercises the interaction more than once. The later interaction should move back to the opposite boolean state instead of repeating the first result."
+        )
+    if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
+        hints.append(
+            "When aria-expanded changes in the handler, hidden/visible state should follow the same transition with the opposite visibility meaning: expanded/open maps to visible (hidden false), collapsed/closed maps to hidden true."
+        )
+    return hints
+
+
+def _js_runtime_toggle_consistency_hints(
+    *,
+    current_content: str,
+    supporting_context: str,
+    repair_brief: dict[str, object],
+) -> list[str]:
+    lowered_current = str(current_content or "").lower()
+    if not any(marker in lowered_current for marker in ("addeventlistener(", ".onclick", ".addlistener(", ".on(")):
+        return []
+    support_lines = [str(line or "").strip() for line in str(supporting_context or "").splitlines() if str(line or "").strip()]
+    if not any(_interaction_event_trigger_line(line) for line in support_lines):
+        return []
+
+    observed_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("observed_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    expected_items = [
+        _repair_semantic_value_text(item)
+        for item in repair_brief.get("expected_semantics", [])
+        if _repair_semantic_value_text(item)
+    ]
+    if not observed_items or not expected_items:
+        return []
+    paired_bools = [
+        (_normalized_boolean_semantic_value(observed), _normalized_boolean_semantic_value(expected))
+        for observed, expected in zip(observed_items, expected_items)
+    ]
+    if not any(observed is not None and expected is not None and observed != expected for observed, expected in paired_bools):
+        return []
+
+    hints = [
+        "The failing assertion targets the interaction result. Read the current state once, compute the next state once, and derive every dependent update from it while preserving whether each property should mirror or invert that next state.",
+        "Do not mix one assignment derived from the pre-click state with another derived from the toggled state; that leaves paired UI state out of sync after the interaction.",
+    ]
+    if "aria-expanded" in lowered_current and ".hidden" in lowered_current:
+        hints.append(
+            "When aria-expanded changes in the handler, hidden/visible state should follow the same transition with the opposite visibility meaning: expanded/open maps to visible (hidden false), collapsed/closed maps to hidden true."
+        )
+    return hints
 
 
 def _direct_main_runtime_contract(
@@ -2745,20 +3435,25 @@ def _direct_main_runtime_contract(
             continue
 
         saw_option = False
+        last_option_tail: list[str] = []
         for value in values:
             token = str(value or "").strip()
             if not token:
                 continue
             if token.startswith("-"):
                 saw_option = True
+                last_option_tail = []
                 if token not in option_tokens:
                     option_tokens.append(token)
-                    if len(option_tokens) >= limit:
+                    if len(option_tokens) >= limit and positional_tokens:
                         return option_tokens[:limit], positional_tokens[:limit]
                 continue
-            if not saw_option or token in positional_tokens:
+            if not saw_option:
                 continue
-            positional_tokens.append(token)
+            if token not in last_option_tail:
+                last_option_tail.append(token)
+        if last_option_tail:
+            positional_tokens = last_option_tail[:limit]
             if len(positional_tokens) >= limit:
                 return option_tokens[:limit], positional_tokens[:limit]
     return option_tokens[:limit], positional_tokens[:limit]
@@ -2792,7 +3487,31 @@ def _preserve_runtime_contract_excerpt(
     preserve_direct_main = _direct_main_option_contract_present(full_text) and not _direct_main_option_contract_present(
         compact_text
     )
-    if not preserve_direct_main:
+    full_interactive_lines = [
+        index
+        for index, raw_line in enumerate(full_text.splitlines(), start=1)
+        if (
+            _interaction_assertion_line(str(raw_line or "").strip())
+            or _interaction_event_trigger_line(str(raw_line or "").strip())
+        )
+    ]
+    compact_interactive_lines = [
+        index
+        for index, raw_line in enumerate(compact_text.splitlines(), start=1)
+        if (
+            _interaction_assertion_line(str(raw_line or "").strip())
+            or _interaction_event_trigger_line(str(raw_line or "").strip())
+        )
+    ]
+    preserve_interactive_contract = (
+        bool(full_interactive_lines)
+        and (
+            len(full_interactive_lines) > len(compact_interactive_lines)
+            or any(_interaction_event_trigger_line(str(raw_line or "").strip()) for raw_line in full_text.splitlines())
+            and not any(_interaction_event_trigger_line(str(raw_line or "").strip()) for raw_line in compact_text.splitlines())
+        )
+    )
+    if not preserve_direct_main and not preserve_interactive_contract:
         return compact_text
 
     contract_line_hints: list[int] = []
@@ -2802,7 +3521,9 @@ def _preserve_runtime_contract_excerpt(
             continue
         if re.search(r"(?:__main__\.)?main\(\s*\[[^\n]*\]\s*\)", line):
             contract_line_hints.append(index)
-        if len(contract_line_hints) >= 4:
+        if _interaction_assertion_line(line) or _interaction_event_trigger_line(line):
+            contract_line_hints.append(index)
+        if len(contract_line_hints) >= 8:
             break
     if not contract_line_hints:
         return compact_text
@@ -2810,9 +3531,10 @@ def _preserve_runtime_contract_excerpt(
     contract_excerpt = _line_focused_excerpt(
         full_text,
         line_hints=contract_line_hints,
-        limit=max(excerpt_limit, 220),
-        before_radius=1,
-        after_radius=0,
+        limit=max(excerpt_limit, 620 if preserve_interactive_contract else 220),
+        max_hints=8 if preserve_interactive_contract else 6,
+        before_radius=0 if preserve_interactive_contract else 1,
+        after_radius=0 if preserve_interactive_contract else 1,
     )
     if not contract_excerpt:
         return compact_text
@@ -2838,6 +3560,11 @@ def _render_semantic_delta(observed_value: str, expected_value: str) -> str | No
     expected = str(expected_value or "")
     if not observed or not expected or observed == expected:
         return None
+    if _is_atomic_semantic_value(observed) and _is_atomic_semantic_value(expected):
+        return (
+            f"Make the produced value '{_trim_repair_delta_value(expected)}' "
+            f"instead of '{_trim_repair_delta_value(observed)}'."
+        )
 
     prefix_length = 0
     max_prefix = min(len(observed), len(expected))
@@ -2883,6 +3610,15 @@ def _render_semantic_delta(observed_value: str, expected_value: str) -> str | No
     if context_parts:
         return action + " between " + " and ".join(context_parts) + "."
     return action + "."
+
+
+def _is_atomic_semantic_value(value: str) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized or "\n" in normalized or len(normalized) > 24:
+        return False
+    if normalized in {"''", '""'}:
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9_./:@+-]+", normalized))
 
 
 def _trim_repair_delta_context(text: str, *, keep_tail: bool, limit: int = 40) -> str:
@@ -3055,7 +3791,6 @@ def _mandatory_mutation_anchors(
     supporting_context: str = "",
 ) -> list[str]:
     anchors: list[str] = []
-    direct_main_option_contract = _direct_main_option_contract_present(supporting_context)
     direct_script_anchor = _direct_python_script_execution_anchor(
         path=path,
         current_content=current_content,
@@ -3104,6 +3839,13 @@ def _mandatory_mutation_anchors(
                     "Resolve the failure focus tied to this file: "
                     + " | ".join(_trim_text(item, 140) for item in focus_lines[:2])
                 )
+    review_anchor = _review_feedback_mutation_anchor(
+        path=path,
+        current_content=current_content,
+        review_feedback=review_feedback,
+    )
+    if review_anchor:
+        anchors.append(review_anchor)
     undefined_symbol_anchor = _undefined_runtime_symbol_anchor(
         path=path,
         current_content=current_content,
@@ -3119,12 +3861,17 @@ def _mandatory_mutation_anchors(
     ):
         anchors.append(literal_anchor)
 
-    if not direct_main_option_contract:
-        for delta in _repair_semantic_delta_lines(repair_context, limit=2):
-            anchors.append(
-                "Apply this exact semantic delta in the behavior produced by this file: "
-                + _trim_text(delta, 220)
-            )
+    for delta in _repair_semantic_delta_lines(
+        repair_context,
+        limit=2,
+        path=path,
+        current_content=current_content,
+        supporting_context=supporting_context,
+    ):
+        anchors.append(
+            "Apply this exact semantic delta in the behavior produced by this file: "
+            + _trim_text(delta, 220)
+        )
 
     if review_feedback is not None:
         if review_feedback.blocking_issues:
@@ -3138,7 +3885,31 @@ def _mandatory_mutation_anchors(
                 + _trim_text(review_feedback.repair_hints[0], 220)
             )
 
-    return anchors[:3]
+    limit = 4 if review_anchor else 3
+    return anchors[:limit]
+
+
+def _review_feedback_mutation_anchor(
+    *,
+    path: str,
+    current_content: str,
+    review_feedback: ProposedUpdateReview | None,
+) -> str | None:
+    unchanged_anchors = _unchanged_identifier_anchor_list(review_feedback)
+    if not unchanged_anchors:
+        return None
+    rendered = ", ".join(_trim_text(anchor, 80) for anchor in unchanged_anchors[:4])
+    if not rendered:
+        return None
+    anchor = f"Change at least one of these previously unchanged anchors in {path}: {rendered}"
+    line_excerpt = _review_feedback_implicated_line_excerpt(
+        current_content=current_content,
+        review_feedback=review_feedback,
+        limit=220,
+    )
+    if line_excerpt:
+        anchor += "\n" + line_excerpt
+    return anchor
 
 
 def _direct_python_script_execution_anchor(
@@ -3273,6 +4044,55 @@ def _called_process_python_script_target(text: str) -> str | None:
             return candidate
         break
     return None
+
+
+def _direct_python_script_runtime_contract(
+    command: str,
+    *,
+    target_path: str,
+    limit: int = 4,
+) -> tuple[list[str], list[str]]:
+    try:
+        tokens = shlex.split(str(command or "").strip())
+    except ValueError:
+        return [], []
+    if len(tokens) < 3:
+        return [], []
+
+    lowered = [token.lower() for token in tokens]
+    if lowered[0] not in {"python", "python3"} or lowered[1] == "-m":
+        return [], []
+
+    script_path = str(tokens[1] or "").strip().replace("\\", "/")
+    normalized_target = str(target_path or "").strip().replace("\\", "/")
+    if not script_path or not normalized_target:
+        return [], []
+    if script_path != normalized_target and not script_path.endswith(f"/{normalized_target}"):
+        return [], []
+
+    option_tokens: list[str] = []
+    tail_tokens: list[str] = []
+    saw_option = False
+    last_option_tail: list[str] = []
+    for token in tokens[2:]:
+        normalized = str(token or "").strip()
+        if not normalized:
+            continue
+        if normalized.startswith("-"):
+            saw_option = True
+            last_option_tail = []
+            if normalized not in option_tokens:
+                option_tokens.append(normalized)
+            if len(option_tokens) >= limit and tail_tokens:
+                break
+            continue
+        if saw_option and normalized not in last_option_tail:
+            last_option_tail.append(normalized)
+            if len(option_tokens) >= limit and len(last_option_tail) >= limit:
+                break
+    if last_option_tail:
+        tail_tokens = last_option_tail[:limit]
+    return option_tokens[:limit], tail_tokens[:limit]
 
 
 def _undefined_runtime_symbol_from_text(text: str) -> str | None:
@@ -3584,16 +4404,19 @@ def _targeted_runtime_prompt_hints(
     supporting_context: str,
     targeted_context: dict[str, object],
 ) -> list[str]:
-    normalized_path = str(path or "").strip().lower()
-    if not normalized_path.endswith(".py"):
-        return []
-
+    normalized_path = str(path or "").strip()
+    suffix = Path(normalized_path).suffix.lower()
     lowered_current = str(current_content or "").lower()
-    has_argparse_runtime = any(
-        token in lowered_current for token in ("parse_args(", "parse_known_args(", "argparse.argumentparser")
-    )
-
     lowered_support = str(supporting_context or "").lower()
+    repair_brief = targeted_context.get("repair_brief") or {}
+    expected_semantics, observed_semantics = _repair_semantic_values_from_sources(
+        repair_brief=repair_brief,
+        evidence_texts=[
+            str(targeted_context.get("excerpt") or "").strip(),
+            str(targeted_context.get("failure_summary") or "").strip(),
+        ],
+    )
+    has_semantic_contract = bool(expected_semantics or observed_semantics)
     focus_text = "\n".join(
         str(item or "")
         for item in targeted_context.get("failure_focus", [])
@@ -3614,8 +4437,48 @@ def _targeted_runtime_prompt_hints(
     lowered_failure = failure_text.lower()
 
     hints: list[str] = []
+    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        pre_event_hints = _js_runtime_pre_event_state_hints(
+            current_content=current_content,
+            supporting_context=supporting_context,
+            repair_brief=repair_brief,
+        )
+        toggle_consistency_hints = _js_runtime_toggle_consistency_hints(
+            current_content=current_content,
+            supporting_context=supporting_context,
+            repair_brief=repair_brief,
+        )
+        hints.extend(pre_event_hints)
+        hints.extend(toggle_consistency_hints)
+        if not has_semantic_contract or (not pre_event_hints and not toggle_consistency_hints):
+            hints.extend(
+                _js_test_backed_toggle_contract_hints(
+                    current_content=current_content,
+                    supporting_context=supporting_context,
+                )
+            )
+        if has_semantic_contract:
+            hints.append(
+                "Treat the expected-versus-observed values as an interaction behavior contract. Repair the setup and handler logic that produces that state; do not hardcode the expected literal into the source."
+            )
+        return hints[:6]
+
+    if suffix != ".py":
+        return []
+
+    has_argparse_runtime = any(
+        token in lowered_current for token in ("parse_args(", "parse_known_args(", "argparse.argumentparser")
+    )
+
     direct_script_target = _called_process_python_script_target(failure_text)
-    normalized_path = str(path or "").strip().replace("\\", "/")
+    normalized_path = normalized_path.replace("\\", "/")
+    command_option_tokens: list[str] = []
+    command_tail_tokens: list[str] = []
+    if targeted_context.get("command"):
+        command_option_tokens, command_tail_tokens = _direct_python_script_runtime_contract(
+            str(targeted_context.get("command") or ""),
+            target_path=normalized_path,
+        )
     if direct_script_target:
         normalized_target = str(direct_script_target or "").strip().replace("\\", "/")
         if normalized_target == normalized_path or normalized_target.endswith(f"/{normalized_path}"):
@@ -3632,6 +4495,39 @@ def _targeted_runtime_prompt_hints(
                 hints.append(
                     "If this file needs bootstrap help to reach workspace code, place it above the current top-level project import instead of editing only downstream logic."
                 )
+    repair_brief = targeted_context.get("repair_brief") or {}
+    if command_option_tokens:
+        option_preview = ", ".join(command_option_tokens[:3])
+        hints.append(
+            f"The failing validation command invokes this script directly and exercises exact option tokens like {option_preview}. Match those tokens against the real argv payload after the script path; do not treat the script path itself as part of argv."
+        )
+        if command_tail_tokens:
+            tail_preview = ", ".join(repr(token) for token in command_tail_tokens[:4])
+            hints.append(
+                f"After handling {option_preview}, derive behavior from the remaining runtime argv tail {tail_preview} instead of echoing the flag token into stdout or hardcoding the sample output."
+            )
+        hints.append(
+            "When matching argv prefixes, ensure the compared literal sequence can actually match the exercised argv shape; do not compare a longer slice against a shorter literal list or tuple that can never satisfy the branch."
+        )
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in repair_brief.get("expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        observed_values = [
+            _repair_semantic_value_text(item)
+            for item in repair_brief.get("observed_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if (
+            observed_values
+            and expected_values
+            and any(observed_values[0].startswith(token) for token in command_option_tokens)
+            and not any(expected_values[0].startswith(token) for token in command_option_tokens)
+        ):
+            hints.append(
+                f"If the observed output still starts with {option_preview}, stop echoing that option token in stdout. Those tokens should steer behavior for the exercised path, not become part of the emitted payload."
+            )
     stdout_capture_contract = any(
         marker in lowered_support or marker in lowered_failure
         for marker in (
@@ -3669,14 +4565,21 @@ def _targeted_runtime_prompt_hints(
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
-    repair_brief = targeted_context.get("repair_brief") or {}
-    if (
-        not option_tokens
-        and (repair_brief.get("expected_semantics") or repair_brief.get("observed_semantics"))
-    ):
-        hints.append(
-            "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source unless the current implementation already derives it directly."
+    if has_semantic_contract:
+        if option_tokens:
+            hints.append(
+                "Treat the expected-versus-observed values as an output behavior contract for the exercised direct main branch. Change the branch logic or transformation that produces that output; do not implement the delta by hardcoding sample output or by adding literal substring replacements unless the current implementation already derives that exact text in the exercised path."
+            )
+        else:
+            hints.append(
+                "Treat expected-versus-observed values as a behavior contract. Repair the code path that produces them; do not hardcode the expected literal into the source or implement the delta through literal substring replacements unless the current implementation already derives that text directly."
+            )
+        separator_hint = _separator_only_output_behavior_hint(
+            observed_values=observed_semantics,
+            expected_values=expected_semantics,
         )
+        if separator_hint:
+            hints.append(separator_hint)
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure
@@ -3715,6 +4618,32 @@ def _targeted_runtime_prompt_hints(
             "Do not just ignore unknown flags if the module name would still become the positional argument; keep the explicit-name greeting and the default greeting both correct."
         )
     return hints[:6]
+
+
+def _separator_only_output_behavior_hint(
+    *,
+    observed_values: Sequence[str],
+    expected_values: Sequence[str],
+) -> str | None:
+    for observed_value, expected_value in zip(observed_values, expected_values):
+        observed = str(observed_value or "").strip()
+        expected = str(expected_value or "").strip()
+        if not observed or not expected or observed == expected:
+            continue
+        observed_tokens = re.findall(r"[A-Za-z0-9_]+", observed)
+        expected_tokens = re.findall(r"[A-Za-z0-9_]+", expected)
+        if not observed_tokens or observed_tokens != expected_tokens:
+            continue
+        observed_non_token = re.sub(r"[A-Za-z0-9_]+", "", observed)
+        expected_non_token = re.sub(r"[A-Za-z0-9_]+", "", expected)
+        if observed_non_token == expected_non_token:
+            continue
+        return (
+            "The remaining mismatch is only punctuation or spacing between already-correct output parts. "
+            f"Adjust the final formatting or joining expression so it emits '{_trim_repair_delta_value(expected)}' "
+            f"instead of '{_trim_repair_delta_value(observed)}', and keep the already-correct data selection and transformation intact."
+        )
+    return None
 
 
 def _runtime_support_file_prompt_hints(
@@ -3886,7 +4815,7 @@ def _artifact_scoped_focus(
             if requirement and requirement not in current_requirements:
                 current_requirements.append(requirement)
 
-    literal_constraints = _target_literal_constraints(
+    literal_anchor_details = _literal_anchor_details(
         route,
         session,
         path=path,
@@ -3894,6 +4823,11 @@ def _artifact_scoped_focus(
         current_markers=current_markers,
         other_markers=other_markers,
     )
+    literal_constraints = [
+        str(item.get("value") or "").strip()
+        for item in literal_anchor_details
+        if bool(item.get("hard_source_constraint")) and str(item.get("value") or "").strip()
+    ]
     for candidate in literal_constraints:
         if candidate not in current_requirements:
             current_requirements.append(candidate)
@@ -3936,6 +4870,7 @@ def _artifact_scoped_focus(
         "artifact_kind": current_artifact_kind,
         "artifact_role": current_artifact_role,
         "literal_constraints": literal_constraints[:4],
+        "literal_anchor_details": literal_anchor_details[:6],
         "current_write_requirements": current_requirements[:4],
         "other_pending_requirements": other_requirements[:4],
         "general_constraints": general_constraints[:4],
@@ -4347,11 +5282,15 @@ def _explicit_generation_constraints(
 
 def _request_text_for_literals(route: RouterOutput, session: SessionState | None) -> str:
     task_state = session.task_state if session is not None else None
-    parts = [
-        task_state.latest_user_turn if task_state is not None else "",
-        route.user_goal,
-        route.requested_outcome,
-    ]
+    parts: list[str] = []
+    if task_state is not None and task_state.latest_user_turn:
+        parts.append(task_state.latest_user_turn)
+    elif session is not None and session.task:
+        parts.append(session.task)
+    elif route.user_goal:
+        parts.append(route.user_goal)
+    elif route.requested_outcome:
+        parts.append(route.requested_outcome)
     return "\n".join(str(part or "").strip() for part in parts if str(part or "").strip())
 
 
@@ -4404,6 +5343,272 @@ def _python_call_argument_contains_example_payload(argument: ast.AST) -> bool:
     if isinstance(argument, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Starred)):
         return True
     return any(_python_call_argument_contains_example_payload(child) for child in ast.iter_child_nodes(argument))
+
+
+def _literal_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None = None,
+    current_markers: set[str] | None = None,
+    other_markers: set[str] | None = None,
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for detail in _hard_request_literal_anchor_details(
+        route,
+        session,
+        path=path,
+        current_content=current_content,
+    ):
+        _append_literal_anchor_detail(details, detail)
+    for detail in _generation_literal_anchor_details(
+        route,
+        session,
+        current_markers=current_markers or set(),
+        other_markers=other_markers or set(),
+    ):
+        _append_literal_anchor_detail(details, detail)
+    repair_context = session.active_repair_context if session is not None else None
+    if repair_context is not None:
+        for detail in _repair_literal_anchor_details(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        ):
+            _append_literal_anchor_detail(details, detail)
+    return details[:8]
+
+
+def _append_literal_anchor_detail(
+    details: list[dict[str, object]],
+    detail: dict[str, object],
+) -> None:
+    value = str(detail.get("value") or "").strip()
+    source = str(detail.get("source") or "").strip()
+    anchor_type = str(detail.get("type") or "").strip()
+    if not value or not source or not anchor_type:
+        return
+    hard_source_constraint = bool(detail.get("hard_source_constraint"))
+    key = (value, source)
+    for existing in details:
+        if (str(existing.get("value") or "").strip(), str(existing.get("source") or "").strip()) != key:
+            continue
+        if hard_source_constraint and not bool(existing.get("hard_source_constraint")):
+            existing["hard_source_constraint"] = True
+            existing["type"] = anchor_type
+        return
+    details.append(
+        {
+            "value": value,
+            "source": source,
+            "type": anchor_type,
+            "hard_source_constraint": hard_source_constraint,
+        }
+    )
+
+
+def _hard_request_literal_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    current_content: str | None = None,
+) -> list[dict[str, object]]:
+    reference = str(current_content or "").strip()
+    if not reference and session is not None:
+        reference = _last_read_excerpt(session, path)
+    if not reference:
+        return []
+
+    current_tokens = _literal_reference_tokens(reference)
+    if not current_tokens:
+        return []
+
+    details: list[dict[str, object]] = []
+    request_text = _request_text_for_literals(route, session)
+    other_paths = _literal_scope_other_artifacts(route, session, path)
+    for candidate in _request_literal_candidates(request_text):
+        if not _literal_matches_reference(candidate, current_tokens):
+            continue
+        if _request_cli_literal_is_illustrative(candidate, reference=reference):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "request_text",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=request_text),
+                    "hard_source_constraint": False,
+                },
+            )
+            continue
+        anchor_type = "must_source_anchor"
+        if _python_call_literal_needs_path_scope(candidate, path):
+            if _python_call_literal_contains_example_payload(candidate):
+                continue
+            if not _call_literal_scopes_to_current_artifact(
+                candidate,
+                request_text=request_text,
+                current_path=path,
+                other_paths=other_paths,
+                reference=reference,
+            ):
+                continue
+            anchor_type = "api_signature_anchor"
+        scoped_candidate = _scoped_literal_constraint(candidate, path)
+        if not scoped_candidate:
+            continue
+        _append_literal_anchor_detail(
+            details,
+            {
+                "value": scoped_candidate,
+                "source": "request_text",
+                "type": anchor_type,
+                "hard_source_constraint": True,
+            },
+        )
+    return details[:4]
+
+
+def _generation_literal_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    current_markers: set[str],
+    other_markers: set[str],
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for constraint in _generation_relevant_constraints(route, session, limit=8):
+        current_score = _scope_relevance_score(constraint, current_markers)
+        other_score = _scope_relevance_score(constraint, other_markers)
+        if other_score > current_score and other_score > 0:
+            continue
+        for candidate in _request_literal_candidates(constraint):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "generation_relevant_constraint",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=constraint),
+                    "hard_source_constraint": False,
+                },
+            )
+    return details[:3]
+
+
+def _repair_literal_anchor_details(
+    *,
+    path: str,
+    current_content: str | None,
+    repair_context: ValidationFailureEvidence,
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        for item in [*getattr(brief, "expected_semantics", []), *getattr(brief, "observed_semantics", [])]:
+            text = _repair_semantic_value_text(item)
+            if not text:
+                continue
+            for candidate in _request_literal_candidates(text):
+                _append_literal_anchor_detail(
+                    details,
+                    {
+                        "value": candidate,
+                        "source": "repair_brief",
+                        "type": _evidence_literal_anchor_type(candidate, context_text=text),
+                        "hard_source_constraint": False,
+                    },
+                )
+
+    for text in [str(repair_context.failure_summary or "").strip(), str(repair_context.summary or "").strip()]:
+        if not text:
+            continue
+        for candidate in _request_literal_candidates(text):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "validation_failure_evidence",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=text),
+                    "hard_source_constraint": False,
+                },
+            )
+
+    runtime_inputs = [
+        str(repair_context.excerpt or "").strip(),
+        *(
+            _targeted_runtime_failure_focus_lines(
+                "\n".join(
+                    part
+                    for part in [
+                        str(repair_context.excerpt or "").strip(),
+                        str(repair_context.failure_summary or "").strip(),
+                        str(repair_context.summary or "").strip(),
+                    ]
+                    if part
+                ),
+                target_path=path,
+                other_paths=_repair_other_paths(repair_context, target_path=path),
+                limit=6,
+            )
+        ),
+    ]
+    for text in runtime_inputs:
+        if not text:
+            continue
+        for candidate in _request_literal_candidates(text):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "runtime_evidence",
+                    "type": _evidence_literal_anchor_type(candidate, context_text=text),
+                    "hard_source_constraint": False,
+                },
+            )
+
+    for anchor in _repair_required_literal_anchors(
+        path=path,
+        current_content=str(current_content or ""),
+        repair_context=repair_context,
+    ):
+        for literal in _repair_required_anchor_literals(anchor):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": literal,
+                    "source": "repair_required_literal_anchor",
+                    "type": "must_source_anchor",
+                    "hard_source_constraint": True,
+                },
+            )
+    return details[:6]
+
+
+def _repair_required_anchor_literals(anchor: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(
+        r"exact required literal (?P<literal>'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")",
+        str(anchor or ""),
+    ):
+        literal = _literal_validation_token(match.group("literal"))
+        if literal and literal not in values:
+            values.append(literal)
+    return values[:2]
+
+
+def _evidence_literal_anchor_type(candidate: str, *, context_text: str) -> str:
+    normalized = str(candidate or "").strip()
+    lowered_context = str(context_text or "").strip().lower()
+    if normalized.startswith("--") or re.search(r"\s--[a-z0-9][\w-]*", normalized, re.IGNORECASE):
+        return "illustrative_runtime_cli_example"
+    if normalized.startswith(("[", "{", "(")) and normalized.endswith(("]", "}", ")")):
+        return "illustrative_runtime_payload_example"
+    if any(token in lowered_context for token in ("assert", "traceback", "not found", "validation command", "failure")):
+        return "repro_failure_description"
+    if "(" in normalized and ")" in normalized:
+        return "api_signature_anchor"
+    return "repro_failure_description"
 
 
 def _target_literal_constraints(
@@ -4584,6 +5789,19 @@ def _literal_matches_reference(candidate: str, reference_tokens: set[str]) -> bo
     return bool(identifier_tokens & reference_tokens)
 
 
+def _request_cli_literal_is_illustrative(candidate: str, *, reference: str) -> bool:
+    normalized = " ".join(str(candidate or "").split()).strip()
+    if not normalized:
+        return False
+    tokens = normalized.split()
+    if len(tokens) < 2 or tokens[0].startswith("--"):
+        return False
+    if not any(token.startswith("--") for token in tokens[1:]):
+        return False
+    normalized_reference = " ".join(str(reference or "").split()).strip()
+    return normalized not in normalized_reference
+
+
 def _literal_reference_tokens(text: str) -> set[str]:
     tokens: set[str] = set()
     for raw in re.split(r"[^a-z0-9]+", str(text or "").lower()):
@@ -4650,7 +5868,7 @@ def _split_requirement_clauses(text: str) -> list[str]:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip(" .")
     if not normalized:
         return []
-    if re.search(r"[\"'`<>]", normalized):
+    if re.search(r"[\"'`<>]", normalized) or _contains_structured_symbol_reference(normalized):
         return [normalized]
     fragments = re.split(r",\s+|\s+(?:and|und)\s+", normalized)
     clauses: list[str] = []
@@ -4661,6 +5879,13 @@ def _split_requirement_clauses(text: str) -> list[str]:
             continue
         clauses.append(cleaned)
     return clauses or [normalized]
+
+
+def _contains_structured_symbol_reference(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    return bool(re.search(r"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()\n]{0,200}\)", normalized))
 
 
 def _last_read_excerpt(session: SessionState, path: str) -> str:
@@ -4967,7 +6192,8 @@ def _requirement_dedupe_key(text: str) -> str:
 def _repair_rules(repair_strategy: str | None) -> str:
     lines = [
         "Repair rules:",
-        "- Use the failed validation evidence as a hard constraint for this update.",
+        "- Use the failed validation evidence as a hard behavioral constraint for this update: close the observed-vs-expected delta tied to the active failure.",
+        "- Treat runtime_evidence, validation_failure_evidence, repair_brief, and generation_relevant_constraint literals as illustrative behavior evidence unless the active file scope separately marks them as hard source obligations.",
         "- Make a concrete mutation that addresses the failed verification scope directly.",
         "- Do not return equivalent content or formatting-only changes.",
         "- No-op changes are forbidden: do not change only whitespace, comments, metadata, or unrelated regions.",
@@ -5071,25 +6297,24 @@ def _related_file_context(
         excerpt = str(latest_excerpts.get(path) or "").strip()
         if not excerpt:
             continue
-        if _related_context_is_test_like(path):
-            focused_line_hints = _related_context_task_line_hints(
+        is_test_like = _related_context_is_test_like(path)
+        focused_line_hints = _related_context_task_line_hints(
+            excerpt,
+            session=session,
+            target_path=target_path,
+        )
+        if focused_line_hints:
+            focused_limit = excerpt_limit if is_test_like else max(excerpt_limit, 560)
+            focused_excerpt = _line_focused_excerpt(
                 excerpt,
-                session=session,
-                target_path=target_path,
+                line_hints=focused_line_hints,
+                limit=focused_limit,
+                before_radius=1 if is_test_like else 2,
+                after_radius=0 if is_test_like else 4,
             )
-            if focused_line_hints:
-                focused_excerpt = _line_focused_excerpt(
-                    excerpt,
-                    line_hints=focused_line_hints,
-                    limit=excerpt_limit,
-                    before_radius=1,
-                    after_radius=0,
-                )
-            else:
-                focused_excerpt = _trim_balanced_text(excerpt, excerpt_limit)
         else:
-            focused_excerpt = excerpt[:excerpt_limit]
-        if _related_context_is_test_like(path):
+            focused_excerpt = _trim_balanced_text(excerpt, excerpt_limit)
+        if is_test_like:
             focused_excerpt = _preserve_runtime_contract_excerpt(
                 excerpt,
                 focused_excerpt=focused_excerpt,
@@ -5526,6 +6751,7 @@ def _line_focused_excerpt(
     *,
     line_hints: list[int],
     limit: int,
+    max_hints: int = 6,
     radius: int = 1,
     before_radius: int | None = None,
     after_radius: int | None = None,
@@ -5551,7 +6777,7 @@ def _line_focused_excerpt(
         return _trim_balanced_text(normalized, limit)
 
     selected_indexes: set[int] = set()
-    for hint in hinted_lines[:6]:
+    for hint in hinted_lines[: max(int(max_hints or 0), 1)]:
         start = max(hint - 1 - leading_radius, 0)
         end = min(hint + trailing_radius, len(lines))
         selected_indexes.update(range(start, end))

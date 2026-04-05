@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
+
+import pytest
 
 from config.settings import AppConfig
 from llm.schemas import RunShellArgs, RunTestsArgs
@@ -209,6 +212,148 @@ def test_shell_structural_web_validation_catches_dom_id_mismatch_across_referenc
     assert "missing DOM ids referenced by JS (themeSwitcher)" in result["stderr"]
 
 
+def test_shell_web_runtime_smoke_executes_small_interactive_page(tmp_path):
+    node_binary = shutil.which("node")
+    if not node_binary:
+        pytest.skip("node is required for web runtime smoke validation")
+
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<form id='feedbackForm'>"
+            "<textarea id='feedbackInput' name='feedback'></textarea>"
+            "<button type='submit'>Save</button>"
+            "</form>"
+            "<p id='feedbackStatus'></p>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const form = document.getElementById('feedbackForm');\n"
+            "const input = document.getElementById('feedbackInput');\n"
+            "const status = document.getElementById('feedbackStatus');\n"
+            "form?.addEventListener('submit', (event) => {\n"
+            "  event.preventDefault();\n"
+            "  const value = input?.value.trim() || '';\n"
+            "  localStorage.setItem('feedback', value);\n"
+            "  status.textContent = value || 'empty';\n"
+            "  form.reset();\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_runtime_smoke:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "runtime smoke passed" in result["stdout"]
+
+
+def test_shell_web_runtime_smoke_reports_bootstrap_errors(tmp_path):
+    node_binary = shutil.which("node")
+    if not node_binary:
+        pytest.skip("node is required for web runtime smoke validation")
+
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<button id='launchButton'>Launch</button>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "document.addEventListener('DOMContentLoaded', () => {\n"
+            "  missingBootstrapCall();\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_runtime_smoke:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is False
+    assert "missingBootstrapCall" in result["stderr"]
+
+
+def test_shell_web_runtime_smoke_supports_insert_before_and_dynamic_button_events(tmp_path):
+    node_binary = shutil.which("node")
+    if not node_binary:
+        pytest.skip("node is required for web runtime smoke validation")
+
+    (tmp_path / "index.html").write_text(
+        (
+            "<html><body>"
+            "<section class='panel'><p>Ready</p></section>"
+            "<script src='app.js'></script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "document.addEventListener('DOMContentLoaded', () => {\n"
+            "  const panel = document.querySelector('.panel');\n"
+            "  const button = document.createElement('button');\n"
+            "  button.textContent = 'Toggle';\n"
+            "  button.addEventListener('click', () => {\n"
+            "    document.body.dataset.clicked = 'yes';\n"
+            "  });\n"
+            "  panel.insertBefore(button, panel.firstChild);\n"
+            "  setTimeout(() => {\n"
+            "    if (document.body.dataset.clicked !== 'yes') {\n"
+            "      throw new Error('dynamic button was not clicked');\n"
+            "    }\n"
+            "  }, 0);\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command='internal:web_runtime_smoke:[{"path":"index.html","expected_features":[]}]',
+            cwd=".",
+        )
+    )
+
+    assert result["success"] is True
+    assert "runtime smoke passed" in result["stdout"]
+
+
 def test_shell_marks_zero_test_unittest_run_as_insufficient_validation(monkeypatch, tmp_path):
     config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
     config.ensure_state_dirs()
@@ -240,6 +385,73 @@ def test_shell_marks_zero_test_unittest_run_as_insufficient_validation(monkeypat
     assert result["insufficient_verification"] is True
     assert "did not execute any tests" in result["message"]
     assert "Ran 0 tests" in result["stdout"]
+
+
+def test_shell_marks_stdout_contract_mismatch_as_failed_validation(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+    monkeypatch.setattr(
+        shell,
+        "_run_command",
+        lambda command, cwd, timeout: {
+            "success": True,
+            "message": "Command exited with 0.",
+            "risk_level": "low",
+            "stdout": "Hello World\n",
+            "stderr": "",
+            "exit_code": 0,
+            "command": command,
+        },
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command="python normalize_cli.py --keep-case hello world",
+            cwd=".",
+            expected_stdout="hello world",
+        )
+    )
+
+    assert result["success"] is False
+    assert result["stdout_contract_failed"] is True
+    assert "AssertionError: 'Hello World' != 'hello world'" in result["stderr"]
+    assert result["observed_stdout"] == "Hello World"
+    assert result["expected_stdout"] == "hello world"
+
+
+def test_shell_accepts_matching_stdout_contract_with_trailing_newline(monkeypatch, tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path), access_mode="full").normalized()
+    config.ensure_state_dirs()
+    workspace = WorkspaceManager(tmp_path)
+    safety = SafetyManager(config, workspace)
+    shell = ShellTools(config, workspace, safety)
+    monkeypatch.setattr(
+        shell,
+        "_run_command",
+        lambda command, cwd, timeout: {
+            "success": True,
+            "message": "Command exited with 0.",
+            "risk_level": "low",
+            "stdout": "hello world\n",
+            "stderr": "",
+            "exit_code": 0,
+            "command": command,
+        },
+    )
+
+    result = shell.run_tests(
+        RunTestsArgs(
+            command="python normalize_cli.py --keep-case hello world",
+            cwd=".",
+            expected_stdout="hello world",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "Validation command exited with 0."
 
 
 def test_shell_runs_python_module_commands_with_current_runtime_interpreter(monkeypatch, tmp_path):

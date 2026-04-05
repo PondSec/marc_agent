@@ -81,6 +81,7 @@ class ValidationCommand(StrictModel):
     priority: int = 100
     reason: str | None = None
     required: bool = True
+    expected_stdout: str | None = None
 
 
 class ValidationRunRecord(StrictModel):

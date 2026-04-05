@@ -553,6 +553,8 @@ class TaskManager:
                 )
             workspace_root.mkdir(parents=True, exist_ok=True)
             for child in workspace_root.iterdir():
+                if child.name == self.base_config.state_dir_name:
+                    continue
                 if child.is_dir() and not child.is_symlink():
                     shutil.rmtree(child)
                 else:

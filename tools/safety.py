@@ -86,7 +86,7 @@ class SafetyManager:
         re.compile(r"^\s*(rg|grep|sed\s+-n)\b"),
     ]
     VERIFICATION_PATTERNS = [
-        re.compile(r"^internal:(python_syntax|python_cli_smoke|html_refs|web_artifact)\b"),
+        re.compile(r"^internal:(python_syntax|python_cli_smoke|html_refs|web_artifact|web_runtime_smoke)\b"),
         re.compile(r"\bpytest\b"),
         re.compile(r"\bpython(?:3)?\s+-m\s+pytest\b"),
         re.compile(r"\bpython(?:3)?\s+-m\s+py_compile\b"),

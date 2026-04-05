@@ -719,6 +719,11 @@ class AgentCore:
                 "command": command.command,
                 "cwd": command.cwd,
                 "timeout": self.config.shell_timeout,
+                **(
+                    {"expected_stdout": command.expected_stdout}
+                    if command.expected_stdout is not None
+                    else {}
+                ),
             },
             expected_outcome=f"Run the next {command.kind} validation step.",
             final_response=None,

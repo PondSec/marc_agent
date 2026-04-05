@@ -60,6 +60,15 @@ class ValidationPlanner:
         {
             "kind": "test",
             "verification_scope": "runtime",
+            "priority": 5,
+            "pattern": re.compile(
+                r"(?P<command>python(?:3)?\s+(?!-m\b)[^`\n]*?\.py\b[^`\n]*)",
+                re.IGNORECASE,
+            ),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
             "priority": 6,
             "pattern": re.compile(r"(?P<command>pytest\b[^`\n]*)", re.IGNORECASE),
         },
@@ -86,6 +95,12 @@ class ValidationPlanner:
             "verification_scope": "static",
             "priority": 12,
             "pattern": re.compile(r"(?P<command>node\s+--check\b[^`\n]*)", re.IGNORECASE),
+        },
+        {
+            "kind": "test",
+            "verification_scope": "runtime",
+            "priority": 7,
+            "pattern": re.compile(r"(?P<command>node\s+--test\b[^`\n]*)", re.IGNORECASE),
         },
         {
             "kind": "test",
@@ -123,6 +138,23 @@ class ValidationPlanner:
         r")\b.*$"
     )
     EXPLICIT_COMMAND_SENTENCE_BOUNDARY = re.compile(r"(?<=[\w)\]'\"])[.!?]\s+(?=[A-ZÄÖÜ])")
+    PYTHON_SCRIPT_COMMAND_BOUNDARY_WORDS = {
+        "ausgibt",
+        "exactly",
+        "genau",
+        "liefert",
+        "output",
+        "outputs",
+        "print",
+        "prints",
+        "produce",
+        "produces",
+        "return",
+        "returns",
+        "show",
+        "shows",
+        "zeigt",
+    }
     WEB_FEATURE_KEYWORDS = {
         "menu": ("menu", "menue", "menü", "navigation", "nav"),
         "highscore": ("highscore", "high score", "scoreboard", "leaderboard", "best score", "bestenliste"),
@@ -201,6 +233,15 @@ class ValidationPlanner:
         r"AssertionError:\s*(?P<expected>.+?)\s+not found in\s+(?P<observed>.+)",
         re.IGNORECASE,
     )
+    ASSERTION_NAMED_VALUE_PATTERN = re.compile(
+        r"^(?P<label>actual|expected)\s*:\s*(?P<value>.+)$",
+        re.IGNORECASE,
+    )
+    ASSERTION_DIFF_LABEL_PATTERN = re.compile(
+        r"^(?P<first_prefix>[+-])\s*(?P<first_label>actual|expected)\s+"
+        r"(?P<second_prefix>[+-])\s*(?P<second_label>actual|expected)\s*$",
+        re.IGNORECASE,
+    )
     UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
         re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
         re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -232,6 +273,21 @@ class ValidationPlanner:
     EXCEPTION_EVIDENCE_PATTERN = re.compile(
         r"\b(?:[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)|SystemExit|CalledProcessError)\b"
     )
+    OUTPUT_VERB_PATTERN = (
+        r"(?:ausgibt|ausgeben|ausgegeben(?:\s+werden)?|outputs?|prints?|returns?|shows?|zeigt|liefert|produces?)"
+    )
+    OUTPUT_EXPECTATION_QUOTED_BEFORE_VERB_PATTERN = re.compile(
+        rf"(?P<quote>[`'\"])(?P<expected>.+?)(?P=quote)\s+{OUTPUT_VERB_PATTERN}\b",
+        re.IGNORECASE,
+    )
+    OUTPUT_EXPECTATION_QUOTED_AFTER_VERB_PATTERN = re.compile(
+        rf"{OUTPUT_VERB_PATTERN}\s+(?:exactly|genau|exakt|weiterhin|still\s+)?(?P<quote>[`'\"])(?P<expected>.+?)(?P=quote)",
+        re.IGNORECASE,
+    )
+    OUTPUT_EXPECTATION_INLINE_PATTERN = re.compile(
+        rf"(?:exactly|genau|exakt)\s+(?P<expected>[^`'\n.,;:!?]+?)\s+{OUTPUT_VERB_PATTERN}\b",
+        re.IGNORECASE,
+    )
 
     def build_plan(
         self,
@@ -259,16 +315,20 @@ class ValidationPlanner:
             for item in snapshot.likely_commands
         ]
         commands = self._merge_explicit_validation_commands(commands, session=session)
+        commands = self._prefer_explicit_python_runtime_over_cli_smoke(commands)
+        commands = self._prefer_python_module_pytest_over_binary_pytest(commands)
         commands = self._replace_generic_unittest_commands(
             commands,
             snapshot=snapshot,
             changed_files=changed_paths,
+            session=session,
         )
         if changed_paths and not any(self.command_scope(command) == "runtime" for command in commands):
             commands.extend(self._default_commands(snapshot, changed_paths, task=task))
         synthesized = self._synthesized_runtime_commands(
             snapshot,
             changed_paths,
+            commands=commands,
             session=session,
         )
         if synthesized:
@@ -398,6 +458,8 @@ class ValidationPlanner:
             return "runtime"
         if lowered.startswith("internal:python_syntax:"):
             return "syntax"
+        if lowered.startswith("internal:web_runtime_smoke:"):
+            return "runtime"
         if lowered.startswith("internal:web_artifact:"):
             return "structural"
         if lowered.startswith("internal:semantic_review:"):
@@ -446,6 +508,79 @@ class ValidationPlanner:
             merged.append(item)
         return merged
 
+    def _prefer_explicit_python_runtime_over_cli_smoke(
+        self,
+        commands: list[ValidationCommand],
+    ) -> list[ValidationCommand]:
+        explicit_python_targets = {
+            path
+            for command in commands
+            if command.source in {"task_state", "user_request"}
+            and command.verification_scope == "runtime"
+            and self._is_explicit_python_script_command(command.command)
+            for path in self._paths_from_validation_command(command.command)
+        }
+        if not explicit_python_targets:
+            return commands
+
+        filtered: list[ValidationCommand] = []
+        for command in commands:
+            if not command.command.startswith("internal:python_cli_smoke:"):
+                filtered.append(command)
+                continue
+            command_paths = set(self._paths_from_validation_command(command.command))
+            if command_paths & explicit_python_targets:
+                continue
+            filtered.append(command)
+        return filtered
+
+    def _prefer_python_module_pytest_over_binary_pytest(
+        self,
+        commands: list[ValidationCommand],
+    ) -> list[ValidationCommand]:
+        explicit_module_signatures = {
+            signature[1]
+            for command in commands
+            if command.source in {"task_state", "user_request"}
+            and command.verification_scope == "runtime"
+            and (signature := self._pytest_command_signature(command.command)) is not None
+            and signature[0] == "python_module"
+        }
+        if not explicit_module_signatures:
+            return commands
+
+        filtered: list[ValidationCommand] = []
+        for command in commands:
+            signature = self._pytest_command_signature(command.command)
+            if signature is not None and signature[0] == "pytest_binary" and signature[1] in explicit_module_signatures:
+                continue
+            filtered.append(command)
+        return filtered
+
+    def _pytest_command_signature(self, command: str) -> tuple[str, tuple[str, ...]] | None:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+        lowered = [token.lower() for token in tokens]
+        if lowered[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):
+            return ("python_module", tuple(tokens[3:]))
+        if lowered[:1] == ["pytest"]:
+            return ("pytest_binary", tuple(tokens[1:]))
+        return None
+
+    def _is_explicit_python_script_command(self, command: str) -> bool:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return False
+        if len(tokens) < 2:
+            return False
+        lowered = [token.lower() for token in tokens]
+        return lowered[0] in {"python", "python3"} and lowered[1] != "-m" and tokens[1].endswith(".py")
+
     def _explicit_validation_commands(
         self,
         session: SessionState | None,
@@ -468,11 +603,24 @@ class ValidationPlanner:
             raw_text = str(text or "")
             if not raw_text.strip():
                 continue
+            covered_pytest_signatures: set[tuple[str, ...]] = set()
             for spec in self.EXPLICIT_VALIDATION_COMMAND_SPECS:
                 for match in spec["pattern"].finditer(raw_text):
                     command = self._normalize_explicit_validation_command(match.group("command"))
                     if not command:
                         continue
+                    pytest_signature = self._pytest_command_signature(command)
+                    if pytest_signature is not None:
+                        flavor, suffix = pytest_signature
+                        if flavor == "python_module":
+                            covered_pytest_signatures.add(suffix)
+                        elif flavor == "pytest_binary" and suffix in covered_pytest_signatures:
+                            continue
+                    expected_stdout = self._expected_stdout_for_explicit_validation_command(
+                        raw_text,
+                        match=match,
+                        command=command,
+                    )
                     extracted.append(
                         ValidationCommand(
                             command=command,
@@ -482,17 +630,64 @@ class ValidationPlanner:
                             priority=int(spec["priority"]),
                             reason="Explicit validation command requested in the active task.",
                             required=True,
+                            expected_stdout=expected_stdout,
                         )
                     )
-        unique: list[ValidationCommand] = []
-        seen: set[str] = set()
+        unique_by_identity: dict[str, ValidationCommand] = {}
+        order: list[str] = []
         for item in extracted:
             identity = self.command_identity(item.command)
-            if not identity or identity in seen:
+            if not identity:
                 continue
-            seen.add(identity)
-            unique.append(item)
-        return unique
+            existing = unique_by_identity.get(identity)
+            if existing is None:
+                unique_by_identity[identity] = item
+                order.append(identity)
+                continue
+            if existing.expected_stdout is None and item.expected_stdout is not None:
+                unique_by_identity[identity] = existing.model_copy(
+                    update={"expected_stdout": item.expected_stdout}
+                )
+        return [unique_by_identity[identity] for identity in order]
+
+    def _expected_stdout_for_explicit_validation_command(
+        self,
+        raw_text: str,
+        *,
+        match: re.Match[str],
+        command: str,
+    ) -> str | None:
+        if not self._is_explicit_python_script_command(command):
+            return None
+
+        raw_command = str(match.group("command") or "")
+        normalized_raw_command = " ".join(raw_command.strip().split())
+        inline_context = ""
+        if normalized_raw_command.startswith(command):
+            inline_context = normalized_raw_command[len(command) :]
+        tail_context = str(raw_text or "")[match.end() : match.end() + 240].lstrip(" \t`'\"")
+        context = " ".join(part.strip() for part in (inline_context, tail_context) if part.strip())
+        if not context:
+            return None
+
+        for pattern in (
+            self.OUTPUT_EXPECTATION_QUOTED_BEFORE_VERB_PATTERN,
+            self.OUTPUT_EXPECTATION_QUOTED_AFTER_VERB_PATTERN,
+            self.OUTPUT_EXPECTATION_INLINE_PATTERN,
+        ):
+            output_match = pattern.search(context)
+            if output_match is None:
+                continue
+            expected = self._normalized_expected_stdout(output_match.group("expected"))
+            if expected is not None:
+                return expected
+        return None
+
+    def _normalized_expected_stdout(self, raw: str | None) -> str | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        return text or None
 
     def _normalize_explicit_validation_command(self, raw: str) -> str | None:
         command = " ".join(str(raw or "").strip().split())
@@ -504,6 +699,7 @@ class ValidationPlanner:
             command = sentence_split[0].strip()
         command = self.EXPLICIT_COMMAND_TRAILING_STOPWORDS.sub("", command).strip()
         command = self._trim_python_test_command_tokens(command)
+        command = self._trim_python_script_command(command)
         command = command.rstrip(".,;:!?")
         if not command:
             return None
@@ -523,6 +719,7 @@ class ValidationPlanner:
                 "mypy",
                 "pyright",
                 "node --check",
+                "node --test",
                 "npm test",
                 "npm run test",
                 "npm run lint",
@@ -548,6 +745,26 @@ class ValidationPlanner:
             return command
         return None
 
+    def _trim_python_script_command(self, command: str) -> str:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return command
+        if len(tokens) < 2:
+            return command
+
+        lowered = [token.lower() for token in tokens]
+        if lowered[0] not in {"python", "python3"} or lowered[1] == "-m":
+            return command
+
+        trimmed = tokens[:2]
+        for token in tokens[2:]:
+            cleaned = str(token or "").strip().rstrip(".,;:!?").lower()
+            if cleaned in self.PYTHON_SCRIPT_COMMAND_BOUNDARY_WORDS:
+                break
+            trimmed.append(token)
+        return " ".join(trimmed) if trimmed else command
+
     def _trim_python_test_command_tokens(self, command: str) -> str:
         try:
             tokens = shlex.split(str(command or "").strip())
@@ -565,6 +782,9 @@ class ValidationPlanner:
             return " ".join(trimmed) if trimmed else command
         if lowered[:1] == ["pytest"]:
             trimmed = self._trim_pytest_command_tokens(tokens, prefix_len=1)
+            return " ".join(trimmed) if trimmed else command
+        if lowered[:2] == ["node", "--test"]:
+            trimmed = self._trim_node_test_command_tokens(tokens)
             return " ".join(trimmed) if trimmed else command
         return command
 
@@ -652,6 +872,56 @@ class ValidationPlanner:
             or "/" in normalized
             or "\\" in normalized
             or "::" in normalized
+            or lowered in {".", "tests", "test"}
+        )
+
+    def _trim_node_test_command_tokens(self, tokens: list[str]) -> list[str]:
+        if len(tokens) <= 2:
+            return tokens
+
+        option_value_flags = {
+            "--import",
+            "--loader",
+            "--require",
+            "--test-concurrency",
+            "--test-name-pattern",
+            "--test-reporter",
+            "--test-reporter-destination",
+            "--watch-path",
+        }
+        trimmed = tokens[:2]
+        saw_target = False
+        expect_option_value = False
+        for token in tokens[2:]:
+            lowered = token.lower()
+            if expect_option_value:
+                trimmed.append(token)
+                expect_option_value = False
+                continue
+            if token.startswith("-"):
+                trimmed.append(token)
+                if lowered in option_value_flags:
+                    expect_option_value = True
+                continue
+            if self._looks_like_node_test_target(token):
+                trimmed.append(token)
+                saw_target = True
+                continue
+            if saw_target:
+                break
+            break
+        return trimmed
+
+    def _looks_like_node_test_target(self, token: str) -> bool:
+        cleaned = str(token or "").strip()
+        normalized = cleaned.rstrip(".,;:!?")
+        if not normalized or normalized.startswith("-"):
+            return False
+        lowered = normalized.lower()
+        return (
+            normalized.endswith((".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"))
+            or "/" in normalized
+            or "\\" in normalized
             or lowered in {".", "tests", "test"}
         )
 
@@ -1333,18 +1603,28 @@ class ValidationPlanner:
         failure_summary: str,
         missing_features: list[str],
     ) -> str:
-        text = "\n".join(part for part in [failure_summary, excerpt, str(failed_run.summary or "").strip()] if part).lower()
+        text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                excerpt,
+                failure_summary,
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        )
+        lowered = text.lower()
         if missing_features and failed_run.verification_scope == "structural":
             return "structural_missing_feature"
-        if "assertionerror" in text and ("!=" in text or "not found in" in text):
+        if self._looks_like_assertion_mismatch(text):
             return "assertion_mismatch"
-        if "unrecognized arguments" in text:
+        if "unrecognized arguments" in lowered:
             return "runtime_argument_parsing"
-        if "filenotfounderror" in text or "no such file or directory" in text:
+        if "filenotfounderror" in lowered or "no such file or directory" in lowered:
             return "missing_artifact"
-        if any(pattern.search(text) for pattern in self.NO_TESTS_RAN_PATTERNS):
+        if any(pattern.search(lowered) for pattern in self.NO_TESTS_RAN_PATTERNS):
             return "test_discovery_gap"
-        if "importerror" in text or "modulenotfounderror" in text:
+        if "importerror" in lowered or "modulenotfounderror" in lowered:
             return "import_failure"
         if failed_run.verification_scope == "runtime":
             return "runtime_failure"
@@ -1358,7 +1638,16 @@ class ValidationPlanner:
         failure_summary: str,
         missing_features: list[str],
     ) -> tuple[list[str], list[str]]:
-        text = "\n".join(part for part in [excerpt, failure_summary, str(failed_run.summary or "").strip()] if part)
+        text = "\n".join(
+            part
+            for part in [
+                str(failed_run.excerpt or "").strip(),
+                excerpt,
+                failure_summary,
+                str(failed_run.summary or "").strip(),
+            ]
+            if part
+        )
         expected: list[str] = []
         observed: list[str] = []
         for assertion_observed, assertion_expected in self._assertion_semantic_pairs(text)[:3]:
@@ -1401,21 +1690,18 @@ class ValidationPlanner:
             return []
 
         pairs: list[tuple[str | None, str | None]] = []
-        for index, raw in enumerate(lines):
-            stripped = raw.strip()
-            if not stripped.startswith("AssertionError:"):
-                continue
-            diff_lines = self._adjacent_assertion_diff_lines(lines, start_index=index)
-            observed = self._first_semantic_diff_value(diff_lines, prefix="-")
-            expected = self._first_semantic_diff_value(diff_lines, prefix="+")
-            line_observed, line_expected = self._assertion_line_pair(stripped)
+        for block in self._assertion_context_blocks(lines):
+            diff_observed, diff_expected = self._assertion_diff_pair(block)
+            named_observed, named_expected = self._assertion_named_value_pair(block)
+            line_observed, line_expected = self._assertion_line_values("\n".join(block))
+            observed = named_observed or diff_observed or line_observed
+            expected = named_expected or diff_expected or line_expected
             if observed is None:
-                observed = line_observed
+                observed = diff_observed or line_observed
             if expected is None:
-                expected = line_expected
-            if observed is None and expected is None:
-                continue
-            pairs.append((observed, expected))
+                expected = diff_expected or line_expected
+            if observed is not None or expected is not None:
+                pairs.append((observed, expected))
 
         if pairs:
             return self._unique_semantic_pairs(pairs)
@@ -1424,8 +1710,10 @@ class ValidationPlanner:
         parsed_observed, parsed_expected = self._assertion_line_pair(str(text or ""))
         if parsed_observed is not None or parsed_expected is not None:
             fallback_pairs.append((parsed_observed, parsed_expected))
-        diff_observed = self._first_semantic_diff_value(lines, prefix="-")
-        diff_expected = self._first_semantic_diff_value(lines, prefix="+")
+        named_observed, named_expected = self._assertion_named_value_pair(lines)
+        if named_observed is not None or named_expected is not None:
+            fallback_pairs.append((named_observed, named_expected))
+        diff_observed, diff_expected = self._assertion_diff_pair(lines)
         if diff_observed is not None or diff_expected is not None:
             fallback_pairs.append((diff_observed, diff_expected))
         return self._unique_semantic_pairs(fallback_pairs)
@@ -1435,6 +1723,103 @@ class ValidationPlanner:
         if pairs:
             return pairs[0]
         return None, None
+
+    def _looks_like_assertion_mismatch(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        if self._assertion_semantic_pairs(text):
+            return True
+        if "assertionerror" in lowered and ("!=" in text or "not found in" in lowered):
+            return True
+        if "expected values to be strictly equal" in lowered and (
+            "expected:" in lowered or "actual:" in lowered or "err_assertion" in lowered
+        ):
+            return True
+        return "err_assertion" in lowered and ("expected:" in lowered or "actual:" in lowered)
+
+    def _assertion_anchor_line(self, line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return False
+        return (
+            lowered.startswith("assertionerror:")
+            or lowered.startswith("expected values to be strictly equal:")
+            or lowered.startswith("name:") and "assertionerror" in lowered
+            or lowered.startswith("code:") and "err_assertion" in lowered
+        )
+
+    def _is_assertion_context_line(self, line: str) -> bool:
+        stripped = str(line or "").strip()
+        lowered = stripped.lower()
+        if not stripped:
+            return False
+        if self._assertion_anchor_line(stripped):
+            return True
+        if lowered.startswith("error:"):
+            return True
+        if lowered.startswith("operator:") and "equal" in lowered:
+            return True
+        if self.ASSERTION_NAMED_VALUE_PATTERN.match(stripped):
+            return True
+        if self.ASSERTION_DIFF_LABEL_PATTERN.match(stripped):
+            return True
+        return self._semantic_diff_value(stripped) is not None
+
+    def _assertion_context_blocks(self, lines: list[str]) -> list[list[str]]:
+        blocks: list[list[str]] = []
+        current: list[str] = []
+        for raw in lines:
+            stripped = str(raw or "").strip()
+            if not stripped:
+                if current:
+                    continue
+                continue
+            if self._is_assertion_context_line(stripped):
+                current.append(stripped)
+                continue
+            if current:
+                if any(self._assertion_anchor_line(line) for line in current):
+                    blocks.append(current[:])
+                current.clear()
+        if current and any(self._assertion_anchor_line(line) for line in current):
+            blocks.append(current[:])
+        return blocks
+
+    def _assertion_named_value_pair(self, lines: list[str]) -> tuple[str | None, str | None]:
+        observed: str | None = None
+        expected: str | None = None
+        for raw in lines:
+            match = self.ASSERTION_NAMED_VALUE_PATTERN.match(str(raw or "").strip())
+            if match is None:
+                continue
+            label = str(match.group("label") or "").strip().lower()
+            value = self._literal_or_text(match.group("value"))
+            if label == "actual" and observed is None:
+                observed = value
+            if label == "expected" and expected is None:
+                expected = value
+        return observed, expected
+
+    def _assertion_diff_prefixes(self, lines: list[str]) -> tuple[str, str]:
+        for raw in lines:
+            match = self.ASSERTION_DIFF_LABEL_PATTERN.match(str(raw or "").strip())
+            if match is None:
+                continue
+            mapping = {
+                str(match.group("first_label") or "").strip().lower(): str(match.group("first_prefix") or "").strip(),
+                str(match.group("second_label") or "").strip().lower(): str(match.group("second_prefix") or "").strip(),
+            }
+            observed_prefix = mapping.get("actual", "-")
+            expected_prefix = mapping.get("expected", "+")
+            return observed_prefix, expected_prefix
+        return "-", "+"
+
+    def _assertion_diff_pair(self, lines: list[str]) -> tuple[str | None, str | None]:
+        observed_prefix, expected_prefix = self._assertion_diff_prefixes(lines)
+        observed = self._first_semantic_diff_value(lines, prefix=observed_prefix)
+        expected = self._first_semantic_diff_value(lines, prefix=expected_prefix)
+        return observed, expected
 
     def _adjacent_assertion_diff_lines(
         self,
@@ -1489,6 +1874,8 @@ class ValidationPlanner:
     def _semantic_diff_value(self, line: str) -> str | None:
         stripped = str(line or "").strip()
         if not stripped or stripped[0] not in {"-", "+"}:
+            return None
+        if self.ASSERTION_DIFF_LABEL_PATTERN.match(stripped):
             return None
         value = stripped[1:].strip()
         if not value:
@@ -1571,8 +1958,7 @@ class ValidationPlanner:
             ]
             if part
         )
-        lowered = failure_text.lower()
-        if "assertionerror" not in lowered or ("!=" not in failure_text and "not found in" not in lowered):
+        if not self._looks_like_assertion_mismatch(failure_text):
             return None
         frames = traceback_frames if traceback_frames is not None else self._traceback_workspace_frames(session, failed_run)
         if any(path and not self._is_test_path(path) for path, _line in frames):
@@ -2032,6 +2418,25 @@ class ValidationPlanner:
             if candidate.exists() and candidate.is_file():
                 existing.append(normalized)
         return existing
+
+    def _declared_workspace_candidate_paths(
+        self,
+        session: SessionState,
+        values: list[str],
+    ) -> list[str]:
+        workspace_root = Path(session.workspace_root).resolve()
+        declared: list[str] = []
+        for raw in self._unique_paths(values):
+            normalized = str(raw or "").strip().replace("\\", "/").removeprefix("./")
+            if not normalized:
+                continue
+            candidate = (workspace_root / normalized).resolve()
+            try:
+                candidate.relative_to(workspace_root)
+            except ValueError:
+                continue
+            declared.append(normalized)
+        return declared
 
     def _python_script_target_from_command(self, command: str) -> str | None:
         try:
@@ -2690,6 +3095,17 @@ class ValidationPlanner:
                     reason="Check that local HTML asset references resolve.",
                 )
             )
+            if snapshot.file_count <= 40 and shutil.which("node"):
+                commands.append(
+                    ValidationCommand(
+                        command=f"internal:web_runtime_smoke:{json.dumps(html_targets)}",
+                        kind="test",
+                        verification_scope="runtime",
+                        source="default",
+                        priority=22,
+                        reason="Execute a bounded browser-like runtime smoke harness for the changed standalone web artifact.",
+                    )
+                )
 
         if js_files and shutil.which("node"):
             commands.append(
@@ -2710,9 +3126,10 @@ class ValidationPlanner:
         snapshot: WorkspaceSnapshot,
         changed_files: list[str],
         *,
+        commands: list[ValidationCommand],
         session: SessionState | None,
     ) -> list[ValidationCommand]:
-        if any(self.command_scope(command) == "runtime" for command in snapshot.validation_commands):
+        if any(self.command_scope(command) == "runtime" for command in commands):
             return []
         if session is not None and self.runtime_verification_required(session):
             return self.build_diagnostic_plan(session)
@@ -2724,9 +3141,20 @@ class ValidationPlanner:
     ) -> list[ValidationCommand]:
         if not any(command.verification_scope == "runtime" for command in commands):
             return commands
+        has_web_runtime_smoke = any(
+            command.command.startswith("internal:web_runtime_smoke:")
+            for command in commands
+        )
         return [
             command.model_copy(update={"required": False})
-            if command.source == "default" and command.verification_scope in {"syntax", "static", "structural"}
+            if (
+                command.source == "default"
+                and command.verification_scope in {"syntax", "static", "structural"}
+                and not (
+                    has_web_runtime_smoke
+                    and command.command.startswith("internal:web_artifact:")
+                )
+            )
             else command
             for command in commands
         ]
@@ -2737,6 +3165,7 @@ class ValidationPlanner:
         *,
         snapshot: WorkspaceSnapshot,
         changed_files: list[str],
+        session: SessionState | None,
     ) -> list[ValidationCommand]:
         generic_indexes: list[int] = []
         command_prefix = "python"
@@ -2756,6 +3185,7 @@ class ValidationPlanner:
         modules = self._targeted_unittest_modules(
             changed_files=changed_files,
             snapshot=snapshot,
+            session=session,
         )
         if not modules:
             return commands
@@ -2776,12 +3206,20 @@ class ValidationPlanner:
         *,
         changed_files: list[str],
         snapshot: WorkspaceSnapshot,
+        session: SessionState | None,
     ) -> list[str]:
         candidate_paths = [
             path
             for path in changed_files
             if self._is_test_path(path) and Path(path).suffix.lower() == ".py"
         ]
+        if not candidate_paths and session is not None:
+            candidate_paths = [
+                path
+                for command in self._explicit_validation_commands(session)
+                for path in self._paths_from_explicit_test_command(command.command)
+                if self._is_test_path(path) and Path(path).suffix.lower() == ".py"
+            ]
         if not candidate_paths:
             candidate_paths = [
                 path
@@ -3025,7 +3463,8 @@ class ValidationPlanner:
                 for artifact in task_state.target_artifacts
                 if artifact.path and artifact.role != "supporting_context"
             ]
-            paths.extend(self._existing_workspace_candidate_paths(session, task_paths))
+            existing_task_paths = self._existing_workspace_candidate_paths(session, task_paths)
+            paths.extend(existing_task_paths or self._declared_workspace_candidate_paths(session, task_paths))
             if snapshot is not None:
                 paths.extend(
                     self._existing_workspace_candidate_paths(
@@ -3044,7 +3483,8 @@ class ValidationPlanner:
                         or artifact.kind == "test"
                     )
                 ]
-                paths.extend(self._existing_workspace_candidate_paths(session, test_paths))
+                existing_test_paths = self._existing_workspace_candidate_paths(session, test_paths)
+                paths.extend(existing_test_paths or self._declared_workspace_candidate_paths(session, test_paths))
             paths.extend(
                 item.path
                 for item in session.changed_files
@@ -3168,6 +3608,9 @@ class ValidationPlanner:
         if not tokens:
             return []
         lowered = [token.lower() for token in tokens]
+        if lowered[0] in {"python", "python3"} and len(tokens) >= 2 and lowered[1] != "-m":
+            candidate = str(tokens[1] or "").strip().replace("\\", "/").removeprefix("./")
+            return [candidate] if candidate.endswith(".py") else []
         if len(tokens) >= 3 and lowered[:3] in (["python", "-m", "unittest"], ["python3", "-m", "unittest"]):
             return self._unittest_targets_to_paths(tokens[3:])
         if len(tokens) >= 3 and lowered[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):
@@ -3177,6 +3620,23 @@ class ValidationPlanner:
         return []
 
     def _unittest_targets_to_paths(self, targets: list[str]) -> list[str]:
+        normalized_targets = [str(target or "").strip() for target in targets if str(target or "").strip()]
+        if normalized_targets and normalized_targets[0].lower() == "discover":
+            start_directory: str | None = None
+            for index, token in enumerate(normalized_targets[1:], start=1):
+                lowered = token.lower()
+                if lowered in {"-s", "--start-directory"} and index + 1 < len(normalized_targets):
+                    start_directory = normalized_targets[index + 1]
+                    break
+            if not start_directory:
+                return []
+            cleaned_start = str(start_directory or "").strip().replace("\\", "/").removeprefix("./")
+            if not cleaned_start or cleaned_start.lower() in {"tests", "test"}:
+                return []
+            if cleaned_start.endswith(".py"):
+                return [cleaned_start]
+            return [f"{cleaned_start}.py"]
+
         paths: list[str] = []
         for target in targets:
             cleaned = str(target or "").strip()
@@ -3230,7 +3690,7 @@ class ValidationPlanner:
 
     def _expected_features_from_command(self, command: str) -> list[str]:
         kind, payload = self._decoded_internal_validation_payload(command)
-        if kind != "web_artifact":
+        if kind not in {"web_artifact", "web_runtime_smoke"}:
             return []
         values = payload if isinstance(payload, list) else [payload]
         features: list[str] = []
@@ -3280,6 +3740,10 @@ class ValidationPlanner:
             *(str(item.summary or "").strip() for item in diagnostics),
         ]:
             lines = self._evidence_lines_from_text(text)
+            for block in self._assertion_context_blocks(lines):
+                for line in block:
+                    if line not in focused_lines:
+                        focused_lines.append(line)
             for index, line in enumerate(lines):
                 if not self._line_contains_failure_evidence(line):
                     continue

@@ -179,6 +179,48 @@ def test_first_run_setup_status_is_available_when_config_is_incomplete(tmp_path)
     assert blocked_response.status_code == 503
 
 
+def test_setup_status_stays_available_when_auth_db_cannot_switch_to_wal(tmp_path):
+    state_root = tmp_path / ".marc_a1"
+    state_root.mkdir()
+    for name in ("sessions", "logs", "memory", "helpers", "reports", "active_sessions"):
+        (state_root / name).mkdir()
+    (state_root / "workspaces.json").write_text('{"workspaces": []}', encoding="utf-8")
+    from server.auth_store import AuthStore
+
+    store = AuthStore(state_root / "auth.db")
+    store.create_user(
+        user_id="admin-1",
+        email=TEST_ADMIN_EMAIL,
+        display_name="Operator",
+        password_hash="hash",
+        role="admin",
+        totp_secret=None,
+        now="2026-04-04T00:00:00+00:00",
+    )
+
+    os.chmod(state_root, 0o555)
+    try:
+        config = AppConfig(
+            workspace_root=str(tmp_path),
+            ollama_host="http://127.0.0.1:9",
+            auth_secret_key=TEST_AUTH_SECRET,
+            auth_initial_admin_email=None,
+            auth_initial_admin_password=None,
+            auth_cookie_secure=True,
+        )
+        app = create_app(config)
+        client = TestClient(app, base_url=TEST_ORIGIN)
+
+        response = client.get("/api/setup/status")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["required"] is False
+        assert payload["defaults"]["initial_workspace_path"] == str(tmp_path.resolve())
+    finally:
+        os.chmod(state_root, 0o755)
+
+
 def test_setup_completion_creates_env_admin_and_workspace(tmp_path):
     config = build_incomplete_setup_config(tmp_path)
     app = create_app(config)
@@ -1105,6 +1147,29 @@ def test_clear_workspace_contents_removes_files_but_keeps_workspace(tmp_path):
     assert workspaces_response.json()[0]["id"] == workspace["id"]
     assert workspace_root.exists()
     assert list(workspace_root.iterdir()) == []
+
+
+def test_clear_workspace_contents_preserves_internal_state_dir(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    nested_dir = workspace_root / "src"
+    nested_dir.mkdir()
+    (nested_dir / "main.py").write_text("print('ready')\n", encoding="utf-8")
+    state_dir = workspace_root / config.state_dir_name
+    (state_dir / "sessions").mkdir(parents=True)
+    (state_dir / "sessions" / "keep.json").write_text("{}", encoding="utf-8")
+
+    response = client.post(f"/api/workspaces/{workspace['id']}/clear")
+
+    assert response.status_code == 204
+    assert workspace_root.exists()
+    assert sorted(item.name for item in workspace_root.iterdir()) == [config.state_dir_name]
+    assert (state_dir / "sessions" / "keep.json").exists()
 
 
 def test_workspaces_are_recovered_from_workspace_root_when_store_is_empty(tmp_path):

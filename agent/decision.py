@@ -512,25 +512,55 @@ class ExecutionDecisionPolicy:
     ) -> str | None:
         if target_paths:
             return target_paths[0]
-        if self._route_intent(understanding) == RouteIntent.CREATE:
-            for artifact in understanding.target_artifacts:
-                if artifact.role != "primary_target":
-                    continue
-                for candidate in (artifact.name, artifact.path):
-                    text = str(candidate or "").strip()
-                    if text:
-                        return text
-        for artifact in understanding.target_artifacts:
-            for candidate in (artifact.name, artifact.path):
-                text = str(candidate or "").strip()
-                if text:
-                    return text
+        create_intent = self._route_intent(understanding) == RouteIntent.CREATE
+        prioritized_candidates = self._prioritized_target_name_candidates(
+            understanding.target_artifacts,
+            primary_only=create_intent,
+        )
+        if prioritized_candidates:
+            return prioritized_candidates[0]
         if self._route_intent(understanding) == RouteIntent.CREATE:
             return infer_artifact_name_hint(
                 understanding.original_request,
                 understanding.interpreted_goal,
             )
         return None
+
+    def _prioritized_target_name_candidates(
+        self,
+        artifacts: list[TaskArtifact],
+        *,
+        primary_only: bool,
+    ) -> list[str]:
+        scored: list[tuple[tuple[int, int, int, float, int], str]] = []
+        seen: set[str] = set()
+        for artifact_index, artifact in enumerate(artifacts):
+            if primary_only and artifact.role != "primary_target":
+                continue
+            for candidate_index, candidate in enumerate((artifact.path, artifact.name)):
+                text = str(candidate or "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                score = (
+                    0 if self._looks_like_explicit_target_name(text) else 1,
+                    candidate_index,
+                    0 if str(artifact.kind or "").strip().lower() == "file" else 1,
+                    -float(artifact.confidence or 0.0),
+                    artifact_index,
+                )
+                scored.append((score, text))
+        scored.sort(key=lambda item: item[0])
+        return [text for _, text in scored]
+
+    def _looks_like_explicit_target_name(self, value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        path = Path(text)
+        if path.suffix and path.name != path.suffix:
+            return True
+        return "/" in text or "\\" in text
 
     def _search_terms(
         self,

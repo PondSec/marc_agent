@@ -313,6 +313,10 @@ class RunTestsArgs(StrictModel):
         description="Working directory relative to the workspace root, or absolute in full access mode.",
     )
     timeout: int | None = Field(default=None, description="Timeout in seconds.")
+    expected_stdout: str | None = Field(
+        default=None,
+        description="Optional expected stdout contract for direct runtime validation commands.",
+    )
 
 
 class GitDiffArgs(StrictModel):

@@ -16,6 +16,7 @@ from agent.prompts import (
     _prioritized_compact_payload,
     task_state_update_prompt,
 )
+from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
@@ -121,6 +122,32 @@ class ProgressTimeoutThenSuccessLLM(ScriptedLLM):
                 first_output_received=True,
                 characters=240,
                 activity_count=40,
+            )
+        return super().generate_json(*args, **kwargs)
+
+
+class ProgressTimeoutWithoutPartialThenSuccessLLM(ScriptedLLM):
+    def __init__(self, payload: dict, *, config=None):
+        super().__init__(json_payloads=[payload])
+        self.config = config
+        self._raised = False
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if not self._raised:
+            self._raised = True
+            raise OllamaGenerationError(
+                "timed out waiting for model completion after 72.0 seconds",
+                reason="total_timeout",
+                retryable=True,
+                model_name=str(kwargs.get("model") or "") or None,
+                startup_timeout_seconds=72,
+                inactivity_timeout_seconds=18,
+                total_timeout_seconds=72,
+                partial_text="",
+                first_output_received=True,
+                characters=248,
+                activity_count=70,
             )
         return super().generate_json(*args, **kwargs)
 
@@ -1912,6 +1939,119 @@ def test_task_state_updater_keeps_empty_workspace_create_requests_out_of_debug_f
     assert route.action_plan[0].action.value == "create_artifact"
 
 
+def test_minimal_task_state_extracts_named_config_file_path_in_german_request(tmp_path):
+    state = build_minimal_task_state(
+        "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen.",
+        session=None,
+        snapshot=empty_snapshot(tmp_path),
+        semantic_resolution="minimal_inference",
+    )
+
+    assert state.target_artifacts
+    assert state.target_artifacts[0].path == "smoke.ini"
+    assert state.target_artifacts[0].name == "smoke.ini"
+
+
+def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_request(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen.",
+        "root_goal": "Create smoke.ini with three exact lines.",
+        "active_goal": "Create smoke.ini with the requested content.",
+        "goal_relation": "new_task",
+        "output_expectation": "Return the created path and a short validation note.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "workspace/smoke.ini",
+        "target_artifacts": [
+            {
+                "path": "workspace/smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.98,
+            }
+        ],
+        "active_artifacts": [
+            {
+                "path": "workspace/smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.98,
+            }
+        ],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.98,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": [],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.target_artifacts[0].path == "smoke.ini"
+    assert task_state.active_artifacts[0].path == "smoke.ini"
+    assert task_state.verification_target == "smoke.ini"
+    assert route.entities.target_paths[0] == "smoke.ini"
+
+
+def test_task_state_updater_accepts_null_clarification_questions_without_blocking_create(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen und sonst nichts: [smoke], enabled=true, level=2.",
+        "root_goal": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen und sonst nichts: [smoke], enabled=true, level=2.",
+        "active_goal": "Erstelle die Datei smoke.ini.",
+        "goal_relation": "continue",
+        "output_expectation": "Pfad der erstellten Datei und eine knappe Validierung.",
+        "current_user_intent": "implement",
+        "execution_strategy": None,
+        "verification_target": None,
+        "target_artifacts": [
+            {
+                "path": "smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 1.0,
+            }
+        ],
+        "constraints": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 1.0,
+        "next_action": "create",
+        "needs_clarification": False,
+        "clarification_questions": None,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.needs_clarification is False
+    assert task_state.clarification_questions == []
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.target_artifacts[0].path == "smoke.ini"
+    assert route.intent == RouteIntent.CREATE
+    assert route.needs_clarification is False
+
+
 def test_task_state_updater_clears_spurious_clarification_from_confident_executable_payload(tmp_path):
     payload = {
         "latest_user_turn": "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, and run python -m unittest tests.test_normalize before finishing.",
@@ -2450,6 +2590,86 @@ def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
     assert task_state.semantic_resolution == "minimal_inference"
     assert task_state.current_user_intent == "implement"
     assert task_state.next_action == "modify"
+
+
+def test_task_state_updater_accepts_string_active_artifact_shorthand(tmp_path):
+    payload = {
+        "latest_user_turn": "Ergaenze einen Theme-Umschalter.",
+        "root_goal": "Implement a theme switcher.",
+        "active_goal": "Implement a theme switcher.",
+        "goal_relation": "continue",
+        "output_expectation": "A working theme switcher.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "A functional theme switcher.",
+        "target_artifacts": [
+            {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "app.js", "name": "app.js", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+        ],
+        "active_artifacts": ["index.html", "app.js", "styles.css"],
+        "constraints": ["No external libraries."],
+        "assumptions": ["The project uses index.html, app.js, and styles.css."],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.92,
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "execution_outline": ["Inspect existing files.", "Implement the theme switcher."],
+        "needs_clarification": False,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        "Ergaenze einen Theme-Umschalter.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert [artifact.path for artifact in task_state.active_artifacts[:3]] == [
+        "index.html",
+        "app.js",
+        "styles.css",
+    ]
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "app.js",
+        "styles.css",
+    }
+
+
+def test_task_state_infers_confidence_for_structured_semantic_state_without_explicit_confidence(tmp_path):
+    payload = {
+        "latest_user_turn": "Ergaenze einen Theme-Umschalter.",
+        "root_goal": "Implement a theme switcher.",
+        "active_goal": "Implement a theme switcher.",
+        "goal_relation": "continue",
+        "output_expectation": "A working theme switcher.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "index.html, app.js, styles.css",
+        "target_artifacts": [
+            {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "app.js", "name": "app.js", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+        ],
+        "active_artifacts": ["index.html", "app.js", "styles.css"],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "needs_clarification": False,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        "Ergaenze einen Theme-Umschalter.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.confidence >= 0.58
+    assert route.needs_clarification is False
+    assert route.intent == RouteIntent.UPDATE
 
 
 def test_task_state_timeout_fallback_clarifies_vague_request_without_specialized_strategy(tmp_path):
@@ -3269,6 +3489,64 @@ def test_task_state_resumes_after_progress_timeout_before_blocking(tmp_path):
     assert resume_call["kwargs"]["num_ctx"] == 2048
     assert "Partial JSON from the timed-out attempt" in resume_call["args"][0]
     assert '"goal_relation": "new_task"' in resume_call["args"][0]
+
+
+def test_task_state_retries_same_model_after_progress_timeout_without_partial_text(tmp_path):
+    payload = {
+        "latest_user_turn": "Repair app.js menu toggle behavior.",
+        "root_goal": "Repair the menu toggle behavior.",
+        "active_goal": "Fix app.js so the menu toggle updates both interaction states correctly.",
+        "goal_relation": "continue",
+        "output_expectation": "A repaired app.js plus a passing node test.",
+        "current_user_intent": "repair",
+        "execution_strategy": "debug_repair",
+        "verification_target": "node --test tests/test_menu_toggle.cjs",
+        "target_artifacts": [
+            {
+                "path": "app.js",
+                "name": "app.js",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.92,
+            }
+        ],
+        "constraints": ["Keep the change local to app.js."],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "confidence": 0.84,
+        "next_action": "modify",
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen2.5-coder:7b",
+        model_candidates=("qwen2.5-coder:7b", "qwen3:8b", "qwen3:14b"),
+    )
+    llm = ProgressTimeoutWithoutPartialThenSuccessLLM(payload, config=config)
+    updater = TaskStateUpdater(llm, timeout=18, num_ctx=4096)
+    session = SessionState(
+        task="Repair app.js menu toggle behavior.",
+        workspace_root=str(tmp_path),
+    )
+
+    task_state = updater.update_task_state(
+        "Repair app.js menu toggle behavior.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.next_action == "modify"
+    assert len(llm.generate_json_calls) >= 2
+    first_call = llm.generate_json_calls[0]["kwargs"]
+    resume_call = llm.generate_json_calls[-1]
+    assert first_call["model"] == "qwen2.5-coder:7b"
+    assert resume_call["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert resume_call["kwargs"]["total_timeout"] == 114
+    assert resume_call["kwargs"]["strict_timeouts"] is False
+    assert "Partial JSON from the timed-out attempt" not in resume_call["args"][0]
 
 
 def test_task_state_contract_handles_backend_correction():

@@ -4,6 +4,7 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 
+import agent.state_updater as state_updater_module
 import llm.runtime_resilience as runtime_resilience
 import pytest
 
@@ -30,9 +31,12 @@ from agent.planner import (
     ValidationFailureEvidence,
 )
 from agent.prompts import (
+    _direct_main_runtime_contract,
+    _direct_python_script_runtime_contract,
     _artifact_scoped_focus,
     _repair_target_line_hints,
     _repair_required_literal_anchors,
+    _split_requirement_clauses,
     _targeted_runtime_failure_focus_lines,
     _targeted_runtime_prompt_hints,
     generate_content_prompt,
@@ -42,6 +46,7 @@ from agent.prompts import (
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
 from agent.memory import RepoMemoryStore
+from agent.decision import ExecutionDecisionPolicy
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
 from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure
@@ -186,6 +191,55 @@ def test_choose_create_path_prefers_index_html_for_empty_workspace_web_requests(
     )
 
     assert planner._choose_create_path(route, session) == "index.html"
+
+
+def test_execution_decision_prefers_explicit_file_target_name_over_generic_primary_artifact(tmp_path):
+    task_state = TaskState(
+        latest_user_turn=(
+            "Erstelle im aktuellen Workspace eine kleine Datei namens smoke_live_run_01.txt "
+            "mit genau drei kurzen Zeilen Text."
+        ),
+        root_goal="Erstelle die angeforderte Textdatei.",
+        active_goal="Erstelle die angeforderte Textdatei.",
+        goal_relation="new_task",
+        output_expectation="Create a small runnable implementation with a conventional default artifact and minimal scope.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        verification_target="Create the initial implementation and run the most relevant validation or entry command.",
+        target_artifacts=[
+            TaskArtifact(
+                path=None,
+                name="im aktuellen workspace datei",
+                kind="artifact",
+                role="primary_target",
+                confidence=0.66,
+            ),
+            TaskArtifact(
+                path=None,
+                name="smoke_live_run_01.txt",
+                kind="file",
+                role="primary_target",
+                confidence=1.0,
+            ),
+        ],
+        confidence=1.0,
+        next_action="create",
+        next_best_action="create",
+        ambiguity_level="low",
+        risk_level="low",
+        assumptions=["A conventional default artifact is acceptable unless the workspace strongly suggests another entrypoint."],
+        execution_outline=[
+            "Choose the smallest conventional artifact or scaffold that fits the request.",
+            "Implement the requested behavior in minimal runnable scope.",
+            "Validate the created artifact with the most relevant command if available.",
+        ],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_name == "smoke_live_run_01.txt"
+    assert route.safe_to_execute is True
 
 
 def test_next_update_target_stays_on_locked_repair_target_before_other_explicit_targets(tmp_path):
@@ -530,6 +584,9 @@ def test_planner_prefers_lightweight_semantic_review_for_small_validated_change_
 
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 25
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
     assert "adds unrequested new sections, paragraphs, examples, commands, tests, or guidance" in prompt
     assert "Treat explicit literal examples from the request as hard constraints" in prompt
     assert session.validation_runs[-1].verification_scope == "semantic"
@@ -699,6 +756,392 @@ def test_planner_skips_model_backed_semantic_review_for_small_standalone_web_pro
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
 
 
+def test_small_single_model_semantic_review_uses_compact_primary_attempt_for_simple_change(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "The changed artifact satisfies the explicit request.",
+                "confidence": 0.78,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 3, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task="Create smoke_live_run_01.txt with a short smoke-test status note.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_01.txt").write_text("smoke test ready\n", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert len(llm.generate_json_calls) == 1
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 35
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 120
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+
+
+def test_explicit_create_constraint_review_blocks_exact_text_line_mismatch(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_01.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._explicit_create_constraint_review(
+        session.router_result,
+        session,
+        path="smoke_live_run_01.txt",
+        proposed_content="alpha  \nbeta  \ngamma",
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "exact requested line sequence" in review.summary.lower()
+    assert any("trailing whitespace" in issue.lower() for issue in review.blocking_issues)
+
+
+def test_planner_skips_model_backed_semantic_review_for_exact_text_create_contract(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "Unused model review payload.",
+                "confidence": 0.5,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_01.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_01.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_create_review"
+
+
+def test_generate_file_content_uses_deterministic_exact_text_contract_for_create(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_alpha.txt"],
+        target_name="smoke_alpha.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_alpha.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    generation = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="smoke_alpha.txt",
+        current_content=None,
+    )
+
+    assert generation.content == "alpha\nbeta\ngamma"
+    assert generation.source == "deterministic_exact_text_contract"
+    assert llm.generate_calls == []
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_contract"
+
+
+def test_retry_update_after_review_failure_uses_deterministic_exact_text_contract(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_alpha.txt"],
+        target_name="smoke_alpha.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_alpha.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed text content does not match the exact requested line sequence.",
+        confidence=0.99,
+        blocking_issues=["Line 1 in smoke_alpha.txt has trailing whitespace."],
+        preservation_risks=[],
+        repair_hints=["Write the exact requested lines."],
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="smoke_alpha.txt",
+        current_content="alpha  \nbeta  \ngamma",
+        review_feedback=review_feedback,
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content == "alpha\nbeta\ngamma"
+    assert result.recovery_strategy == "deterministic_exact_text_contract"
+    assert llm.generate_calls == []
+
+
+def test_planner_deterministic_exact_text_create_review_flags_mismatched_lines(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_01.txt"],
+        target_name="smoke_live_run_01.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_01.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_01.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_01.txt").write_text("alpha  \nbeta  \ngamma", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "failed"
+    assert session.active_repair_context is not None
+    assert "trailing whitespace" in (session.active_repair_context.failure_summary or "").lower()
+
+
+def test_semantic_change_review_rejects_unbound_web_contracts_before_model_review(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"themeSwitcher\" aria-label=\"Toggle Theme\">Toggle Theme</button>\n"
+            "      <div id=\"statusMessage\" role=\"alert\"></div>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "document.body.appendChild(themeSwitcher);\n\n"
+            "const statusMessage = document.createElement('div');\n"
+            "document.body.appendChild(statusMessage);\n\n"
+            "function applyTheme(theme) {\n"
+            "  document.documentElement.style.colorScheme = theme;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            "body.dark-mode {\n"
+            "  background: #111;\n"
+            "  color: #f5f5f5;\n"
+            "}\n\n"
+            "body.dark-mode .panel {\n"
+            "  border-color: #f5f5f5;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "requirements_satisfied": True,
+                "summary": "The changed implementation matches the requested behavior.",
+                "confidence": 0.9,
+                "missing_requirements": [],
+                "suspicious_issues": [],
+                "file_hints": [],
+                "repair_hints": [],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Add an accessible theme switcher with persistent state and a status message across the existing web files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        validation_status="passed",
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested multi-file web update."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the changed implementation."},
+        ],
+        target_paths=["app.js", "index.html", "styles.css"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Verify the generated web artifact.",
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="internal:web_artifact:[{\"path\":\"index.html\"}]",
+            kind="check",
+            verification_scope="structural",
+            status="passed",
+            edit_generation=0,
+            summary="Basic web artifact checks passed.",
+        )
+    )
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "failed"
+    assert "cross-file web contract" in (session.validation_runs[-1].summary or "").lower()
+    assert session.active_repair_context is not None
+    assert "dark-mode" in (session.validation_runs[-1].excerpt or "")
+
+
 def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -755,7 +1198,7 @@ def test_planner_uses_compact_ai_review_for_small_existing_file_updates(tmp_path
     assert review.safe_to_write is True
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
     assert '"task_understanding"' not in prompt
     assert '"follow_up_context"' not in prompt
@@ -905,6 +1348,203 @@ def test_planner_uses_local_review_fallback_for_compact_single_model_repairs(tmp
     assert review.safe_to_write is True
     assert llm.generate_json_calls == []
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_fallback"
+    assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
+
+
+def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_available(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+                "confidence": 0.9,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:14b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Fix the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:lightweight-repair-review",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_region_hint="greet_cli/__main__.py:line 5",
+            repair_constraints=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title}: {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title} {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    assert len(llm.generate_json_calls) == 1
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
+    assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
+    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+    assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
+
+
+def test_planner_repair_review_escalates_to_primary_after_lightweight_timeout(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:14b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Fix the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["greet_cli/__main__.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    session = SessionState(
+        task="Repair the CLI greeting formatting without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:repair-review-escalation",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should produce: Dr. Hello, Ada!"],
+            observed_semantics=["Validation currently produces: Dr.: Hello, Ada!"],
+            implicated_region_hint="greet_cli/__main__.py:line 5",
+            repair_constraints=["Change greet_cli/__main__.py so the failing runtime path can complete successfully."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    safe_review = {
+        "safe_to_write": True,
+        "summary": "The proposed update stays focused and preserves the existing CLI behavior.",
+        "confidence": 0.9,
+        "blocking_issues": [],
+        "preservation_risks": [],
+        "repair_hints": [],
+    }
+
+    def fake_generate_json(*args, **kwargs):
+        llm.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if len(llm.generate_json_calls) == 1:
+            raise OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 45.0 seconds",
+                reason="startup_timeout",
+                elapsed=45.0,
+                idle_for=45.0,
+                retryable=True,
+                model_name=kwargs.get("model"),
+                startup_timeout_seconds=45,
+                inactivity_timeout_seconds=25,
+                total_timeout_seconds=45,
+                first_output_received=False,
+            )
+        return safe_review
+
+    llm.generate_json = fake_generate_json
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title}: {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    greeting = 'Hello, Ada!'\n"
+            "    title = 'Dr.'\n"
+            "    if title:\n"
+            "        greeting = f\"{title} {greeting}\"\n"
+            "    print(greeting)\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    assert len(llm.generate_json_calls) == 2
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 210
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
@@ -1205,6 +1845,79 @@ def test_planner_repair_no_effective_change_blocks_model_review(tmp_path):
     assert llm.generate_json_calls == []
 
 
+def test_pre_write_update_review_rejects_identical_task_backed_update_without_repair_context(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+                "focus_files": ["app.js"],
+                "test_files": ["tests/test_menu_toggle.cjs"],
+                "entrypoints": ["app.js"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    current_content = app_path.read_text(encoding="utf-8")
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "no-op" in review.summary.lower() or "equivalent" in review.summary.lower()
+    assert any("tests/test_menu_toggle.cjs" in hint for hint in review.repair_hints)
+    assert llm.generate_json_calls == []
+
+
 def test_planner_falls_back_locally_after_compact_review_start_failure(tmp_path):
     llm = ScriptedLLM()
     planner = Planner(llm, "")
@@ -1250,10 +1963,12 @@ def test_planner_falls_back_locally_after_compact_review_start_failure(tmp_path)
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
     assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen3:14b"
-    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 180
 
 
-def test_planner_uses_compact_primary_review_for_validation_guided_repairs(tmp_path):
+def test_planner_prefers_lightweight_compact_review_for_validation_guided_repairs(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
             {
@@ -1323,9 +2038,9 @@ def test_planner_uses_compact_primary_review_for_validation_guided_repairs(tmp_p
     prompt = llm.generate_json_calls[0]["args"][0]
 
     assert review.safe_to_write is True
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen3:8b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert '"safe_to_write"' in prompt
 
 
@@ -1772,6 +2487,150 @@ def test_planner_prefers_lightweight_model_for_small_empty_workspace_create(tmp_
     assert llm.generate_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
     assert llm.generate_calls[0]["kwargs"]["num_ctx"] == 2048
     assert "Produce the full file content for exactly one file." in llm.generate_calls[0]["args"][0]
+
+
+def test_planner_bootstraps_task_state_generation_with_router_model_budget(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3:14b",
+            router_model_name="qwen3:8b",
+            model_candidates=("qwen3:14b",),
+            ollama_num_ctx=8192,
+            router_num_ctx=2048,
+            router_timeout=35,
+        )
+    )
+
+    planner = Planner(llm, "")
+
+    assert planner.task_state_updater.model_name == "qwen3:8b"
+    assert planner.task_state_updater.timeout == 35
+    assert planner.task_state_updater.num_ctx == 2048
+    assert planner.task_state_updater._model_candidates()[:2] == ["qwen3:8b", "qwen3:14b"]
+
+
+def test_task_state_recovery_ignores_larger_timeout_reserve_when_no_faster_model_exists(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen3:14b",
+                router_model_name="qwen3:8b",
+            )
+        ),
+        "",
+    )
+    failure = ExecutionFailure(
+        failure_class="total_timeout",
+        state="failed_total_timeout",
+        had_progress=True,
+        first_output_received=True,
+        model_identifier="qwen3:8b",
+        backend_identifier="ollama",
+        context_pressure_estimate="low",
+        retryable=True,
+        raw_reason="total_timeout",
+    )
+
+    recovery_model = planner.task_state_updater._recovery_model_for_failure(
+        primary_model="qwen3:8b",
+        reserve_models=["qwen3:14b"],
+        failure=failure,
+    )
+
+    assert recovery_model is None
+
+
+def test_task_state_update_refreshes_live_inventory_for_timeout_recovery(tmp_path, monkeypatch):
+    class LiveInventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [{"name": "qwen3:8b"}, {"name": "qwen2.5-coder:7b"}, {"name": "qwen3:14b"}]
+
+    llm = LiveInventoryLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen3:14b",
+            router_model_name="qwen3:8b",
+            router_num_ctx=2048,
+        )
+    )
+    planner = Planner(llm, "")
+    updater = planner.task_state_updater
+    fallback_payload = updater._fallback_state("Repair normalize_cli.py").model_dump()
+    seen_models: list[str | None] = []
+    seen_strategies: list[str] = []
+
+    def fake_invoke_model(_invoke, **kwargs):
+        model_identifier = kwargs.get("model_identifier")
+        seen_models.append(model_identifier)
+        seen_strategies.append(str(kwargs.get("recovery_strategy") or ""))
+        attempt = ExecutionAttemptRecord(
+            operation_name=kwargs["operation_name"],
+            task_class=kwargs["task_class"],
+            attempt_number=kwargs["attempt_number"],
+            capability_tier=kwargs["capability_tier"],
+            recovery_strategy=kwargs["recovery_strategy"],
+            prompt_variant=kwargs["prompt_variant"],
+            model_identifier=model_identifier,
+            backend_identifier=kwargs["backend_identifier"],
+            startup_timeout_seconds=kwargs.get("startup_timeout_seconds"),
+            inactivity_timeout_seconds=kwargs.get("inactivity_timeout_seconds"),
+            total_timeout_seconds=kwargs.get("total_timeout_seconds"),
+        )
+        if len(seen_models) == 1:
+            failure = ExecutionFailure(
+                failure_class="total_timeout",
+                state="failed_total_timeout",
+                had_progress=True,
+                first_output_received=True,
+                startup_timeout_seconds=kwargs.get("startup_timeout_seconds"),
+                inactivity_timeout_seconds=kwargs.get("inactivity_timeout_seconds"),
+                total_timeout_seconds=kwargs.get("total_timeout_seconds"),
+                elapsed_seconds=float(kwargs.get("total_timeout_seconds") or 0),
+                idle_seconds=0.1,
+                model_identifier=model_identifier,
+                backend_identifier=kwargs["backend_identifier"],
+                context_pressure_estimate="low",
+                retryable=True,
+                raw_reason="total_timeout",
+                detail="timed out waiting for completion",
+                characters=128,
+                activity_count=8,
+            )
+            attempt.state = failure.state
+            attempt.had_progress = True
+            attempt.first_output_received = True
+            attempt.output_characters = 128
+            attempt.activity_count = 8
+            attempt.failure = failure
+            return runtime_resilience.InvocationOutcome(
+                attempt=attempt,
+                exception=runtime_resilience.InvocationLifecycleTimeoutError(
+                    "timed out waiting for completion",
+                    reason="total_timeout",
+                    elapsed=float(kwargs.get("total_timeout_seconds") or 0),
+                    idle_for=0.1,
+                    characters=128,
+                    activity_count=8,
+                    model_name=model_identifier,
+                    backend_identifier=kwargs["backend_identifier"],
+                    startup_timeout_seconds=kwargs.get("startup_timeout_seconds"),
+                    inactivity_timeout_seconds=kwargs.get("inactivity_timeout_seconds"),
+                    total_timeout_seconds=kwargs.get("total_timeout_seconds"),
+                    first_output_received=True,
+                ),
+            )
+        attempt.state = "completed"
+        return runtime_resilience.InvocationOutcome(attempt=attempt, value=fallback_payload)
+
+    monkeypatch.setattr(state_updater_module, "invoke_model", fake_invoke_model)
+
+    state = updater.update_task_state("Repair normalize_cli.py")
+
+    assert seen_models[:2] == ["qwen3:8b", "qwen3:8b"]
+    assert seen_strategies[:2] == ["primary_model_generation", "resume_after_progress"]
+    assert state.semantic_resolution == "full_model"
 
 
 def test_planner_uses_compact_primary_prompt_for_low_risk_multi_file_create_when_lightweight_is_too_narrow(tmp_path):
@@ -2423,7 +3282,7 @@ def test_planner_review_prompt_includes_recent_changed_file_evidence_for_cross_f
     review_prompt = llm.generate_json_calls[0]["args"][0]
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] == 45
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert "Supporting artifact evidence:" in review_prompt
     assert "Changed supporting artifacts already written:" in review_prompt
     assert "Recent supporting context (may still be pending updates):" in review_prompt
@@ -3334,6 +4193,17 @@ def test_artifact_scoped_focus_scopes_helper_signature_literal_to_owning_python_
 
     assert "greet(name, shout=False)" not in main_focus["literal_constraints"]
     assert "greet(name, shout=False)" in cli_focus["literal_constraints"]
+    assert not any(
+        item["value"] == "greet(name, shout=False)" and item["hard_source_constraint"]
+        for item in main_focus["literal_anchor_details"]
+    )
+    assert any(
+        item["value"] == "greet(name, shout=False)"
+        and item["source"] == "request_text"
+        and item["type"] == "api_signature_anchor"
+        and item["hard_source_constraint"] is True
+        for item in cli_focus["literal_anchor_details"]
+    )
 
 
 def test_artifact_scoped_focus_ignores_placeholder_call_example_for_python_target(tmp_path):
@@ -3389,6 +4259,384 @@ def test_artifact_scoped_focus_ignores_placeholder_call_example_for_python_targe
     )
 
     assert "main([...])" not in focus["literal_constraints"]
+
+
+def test_artifact_scoped_focus_marks_runtime_cli_literal_as_nonbinding_example(tmp_path):
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source = ' '.join(args[1:] if keep_case else args)\n"
+        "    print(' '.join(normalize_words(source or 'Hello WORLD', keep_case)))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    main(['--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair normalize_cli.py so the direct main runtime path preserves keep-case output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."},
+        ],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:keep-case-cli-example",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+        current_content=current_content,
+    )
+
+    assert "--keep-case hello world" not in focus["literal_constraints"]
+    assert any(
+        item["value"] == "--keep-case hello world"
+        and item["source"] == "runtime_evidence"
+        and item["type"] == "illustrative_runtime_cli_example"
+        and item["hard_source_constraint"] is False
+        for item in focus["literal_anchor_details"]
+    )
+
+
+def test_artifact_scoped_focus_marks_request_cli_command_example_as_nonbinding_for_python_target(tmp_path):
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+            "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+            "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+        current_content=current_content,
+    )
+
+    assert "python normalize_cli.py --keep-case hello world" not in focus["literal_constraints"]
+    assert any(
+        item["value"] == "python normalize_cli.py --keep-case hello world"
+        and item["source"] == "request_text"
+        and item["type"] == "illustrative_runtime_cli_example"
+        and item["hard_source_constraint"] is False
+        for item in focus["literal_anchor_details"]
+    )
+
+
+def test_artifact_scoped_focus_keeps_request_cli_command_as_hard_anchor_when_target_already_contains_exact_literal(
+    tmp_path,
+):
+    current_content = (
+        "# CLI examples\n"
+        "python normalize_cli.py --keep-case hello world\n"
+    )
+    (tmp_path / "README.md").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Ergaenze README.md mit dem genauen Aufruf `python normalize_cli.py --keep-case hello world` "
+            "und erklaere den keep-case Pfad."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["README.md"],
+                "focus_files": ["README.md"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the requested command example."}],
+        target_paths=["README.md"],
+        target_name="README.md",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "README.md",
+        current_content=current_content,
+    )
+
+    assert "python normalize_cli.py --keep-case hello world" in focus["literal_constraints"]
+    assert any(
+        item["value"] == "python normalize_cli.py --keep-case hello world"
+        and item["source"] == "request_text"
+        and item["type"] == "must_source_anchor"
+        and item["hard_source_constraint"] is True
+        for item in focus["literal_anchor_details"]
+    )
+
+
+def test_repair_route_requested_outcome_does_not_promote_failure_literal_into_request_anchor(tmp_path):
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package marker\n", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class DirectMainTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so python -m unittest tests.__init__ tests.test_normalize passes. "
+            "Inspect the failing direct main keep-case payload handling, change only normalize_cli.py, and rerun the test."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/__init__.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py", "tests/__init__.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_direct_main_flag (tests.test_normalize.DirectMainTests.test_direct_main_flag)\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: '--keep-case hello world' != 'Hello WORLD'\n"
+            "- --keep-case hello world\n"
+            "+ Hello WORLD\n"
+            "FAILED (failures=1)"
+        ),
+        failure_summary=(
+            "FAIL: test_direct_main_flag (tests.test_normalize.DirectMainTests.test_direct_main_flag)\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: '--keep-case hello world' != 'Hello WORLD'\n"
+            "- --keep-case hello world\n"
+            "+ Hello WORLD"
+        ),
+        repair_requirements=["Change normalize_cli.py so the failing runtime or test path can complete successfully."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py", "tests/__init__.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:repair-route-request-literal-scope",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+    failed_run = ValidationRunRecord(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        summary="Validation command exited with 1.",
+        excerpt=repair_context.excerpt,
+    )
+
+    repair_route = planner._repair_route_after_failed_validation(
+        session.router_result,
+        session,
+        failed_run,
+        repair_context,
+    )
+
+    assert repair_route is not None
+    focus = _artifact_scoped_focus(
+        repair_route,
+        session,
+        "normalize_cli.py",
+        current_content=current_content,
+    )
+
+    assert "--keep-case hello world" not in focus["literal_constraints"]
+    assert not any(
+        item["value"] == "--keep-case hello world"
+        and item["source"] == "request_text"
+        and item["hard_source_constraint"] is True
+        for item in focus["literal_anchor_details"]
+    )
+    assert any(
+        item["value"] == "--keep-case hello world"
+        and item["source"] == "runtime_evidence"
+        and item["hard_source_constraint"] is False
+        for item in focus["literal_anchor_details"]
+    )
+
+
+def test_artifact_scoped_focus_keeps_required_validation_literal_as_hard_anchor(tmp_path):
+    about = tmp_path / "about.html"
+    about.write_text(
+        "<!doctype html>\n<html><body><header class='about-hero'></header></body></html>\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_site.py").write_text("pass\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the portfolio about page so the targeted page-level validation passes.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the targeted website file."}],
+        target_paths=["about.html"],
+        target_name="about.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_site and repair the failing website behavior.",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_site",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["about.html", "tests/test_site.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_about_page (tests.test_site.TestSite.test_about_page)\n"
+            '  File "/tmp/tests/test_site.py", line 8, in test_about_page\n'
+            "    self.assertIn('class=\"about-hero\"', self.read('about.html'))\n"
+            "AssertionError: 'class=\"about-hero\"' not found in \"<header class='about-hero'></header>\"\n"
+        ),
+        failure_summary="The about page still misses the required hero marker.",
+        file_hints=["about.html", "tests/test_site.py"],
+        repair_requirements=[],
+        evidence_signature="sig-website-literal-anchor-scope",
+    )
+
+    focus = _artifact_scoped_focus(
+        session.router_result,
+        session,
+        "about.html",
+        current_content=about.read_text(encoding="utf-8"),
+    )
+
+    assert 'class="about-hero"' in focus["literal_constraints"]
+    assert any(
+        item["value"] == 'class="about-hero"'
+        and item["source"] == "repair_required_literal_anchor"
+        and item["type"] == "must_source_anchor"
+        and item["hard_source_constraint"] is True
+        for item in focus["literal_anchor_details"]
+    )
 
 
 def test_artifact_scoped_focus_adds_cross_file_import_consistency_requirement(tmp_path):
@@ -5825,6 +7073,140 @@ def test_planner_escalates_after_no_effective_validation_guided_repair(tmp_path)
     assert session.repair_history[1].result == "mutation_planned"
 
 
+def test_generate_file_content_retries_after_initial_noop_pre_write_review(tmp_path, monkeypatch):
+    target = tmp_path / "normalize_cli.py"
+    original = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).upper())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    repaired = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        words = args[1:]\n"
+        "        if words:\n"
+        "            head, *tail = words\n"
+        "            print(' '.join([head.title(), *tail]))\n"
+        "        else:\n"
+        "            print('')\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    llm = ScriptedLLM(text_payloads=[original, repaired])
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the keep-case title-preservation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[
+            {"step": 1, "action": "read_relevant_files", "reason": "Inspect the failing entrypoint."},
+            {"step": 2, "action": "update_artifact", "reason": "Apply the smallest repair that fixes the runtime failure."},
+        ],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.test_normalize",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_direct_main_flag (tests.test_normalize.DirectMainTests.test_direct_main_flag)\n"
+            "AssertionError: 'HELLO WORLD' != 'Hello WORLD'\n"
+            "- HELLO WORLD\n"
+            "+ Hello WORLD\n"
+        ),
+        failure_summary=(
+            "normalize_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Hello WORLD but observed Validation currently produces: HELLO WORLD."
+        ),
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        line_hints=[13],
+        repair_requirements=[
+            "Change normalize_cli.py so the failing runtime path prints Hello WORLD for keep-case argv input."
+        ],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:noop-review-retry",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=[
+                "Change normalize_cli.py so the failing runtime path prints Hello WORLD for keep-case argv input."
+            ],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+    safe_review = ProposedUpdateReview(
+        safe_to_write=True,
+        summary="The retry proposal makes a real local behavior change.",
+        confidence=0.84,
+        blocking_issues=[],
+        preservation_risks=[],
+        repair_hints=[],
+    )
+
+    def fake_pre_write_review(*_args, proposed_content: str, **_kwargs):
+        if proposed_content.strip() == original.strip():
+            review = planner._repair_no_effective_change_review(
+                path="normalize_cli.py",
+                current_content=original,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+            assert review is not None
+            return review
+        return safe_review
+
+    monkeypatch.setattr(planner, "_pre_write_update_review", fake_pre_write_review)
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=original,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+    )
+
+    assert result.failure is None
+    assert result.content.strip() == repaired.strip()
+    assert result.repair_strategy_used == "validation_escalated"
+    assert len(llm.generate_calls) == 2
+    assert "A previous repair attempt produced no effective change." in llm.generate_calls[1]["args"][0]
+    assert session.repair_history[0].result == "no_effective_change"
+    assert session.repair_history[0].strategy == "validation_targeted"
+
+
 def test_planner_rejects_equivalent_repair_after_escalation(tmp_path):
     target = tmp_path / "snake_game.html"
     original = "<html><body><h1>Snake</h1></body></html>\n"
@@ -5901,7 +7283,7 @@ def test_planner_rejects_equivalent_repair_after_escalation(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert session.stop_reason == "no_effective_change"
-    assert len(llm.generate_calls) == 2
+    assert len(llm.generate_calls) >= 2
     assert any(item.result == "no_effective_change" for item in session.repair_history)
     assert session.blockers
     assert "did not produce a substantive repair change" in session.blockers[-1]
@@ -6077,6 +7459,119 @@ def test_planner_skips_generic_unittest_after_targeted_module_passes(tmp_path):
     session.validation_runs.append(
         ValidationRunRecord(
             command="python -m unittest tests.test_cli",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+            edit_generation=1,
+            iteration=5,
+            summary="Validation command exited with 0.",
+        )
+    )
+
+    assert planner._pick_validation_command(session) is None
+
+
+def test_validation_plan_prefers_explicit_unittest_targets_over_snapshot_test_files(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "focus_files": ["normalize_cli.py"],
+            "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "likely_commands": ["python -m unittest"],
+            "validation_commands": [
+                ValidationCommand(
+                    command="python -m unittest",
+                    kind="test",
+                    verification_scope="runtime",
+                    source="python-test-files",
+                )
+            ],
+        }
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+
+    plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["normalize_cli.py"],
+        session=session,
+    )
+
+    unittest_commands = [
+        item.command
+        for item in plan
+        if item.command.startswith("python -m unittest")
+    ]
+
+    assert unittest_commands == ["python -m unittest tests.__init__ tests.test_normalize"]
+
+
+def test_planner_does_not_requeue_snapshot_unittest_targets_after_explicit_targeted_pass(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "focus_files": ["normalize_cli.py"],
+            "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+            "entrypoints": ["normalize_cli.py"],
+            "likely_commands": ["python -m unittest"],
+            "validation_commands": [
+                ValidationCommand(
+                    command="python -m unittest",
+                    kind="test",
+                    verification_scope="runtime",
+                    source="python-test-files",
+                )
+            ],
+        }
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        edit_generation=1,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+    session.changed_files.append(FileChangeRecord(path="normalize_cli.py", operation="write"))
+    session.validation_plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["normalize_cli.py"],
+        session=session,
+    )
+    session.verification_commands = [item.command for item in session.validation_plan]
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m unittest tests.__init__ tests.test_normalize",
             kind="test",
             verification_scope="runtime",
             status="passed",
@@ -8342,6 +9837,155 @@ def test_compact_create_retry_prompt_marks_other_requested_files_out_of_scope(tm
     assert "tests/test_wordfreq.py" in prompt
 
 
+def test_compact_retry_prompt_uses_task_focused_related_file_hints_for_multi_file_web_updates(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button class=\"theme-switcher\" aria-label=\"Toggle Theme\">Toggle Theme</button>\n"
+            "      <p id=\"status-message\" role=\"alert\" style=\"display: none;\"></p>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "console.log(\"board ready\");\n\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.setAttribute('aria-label', 'Toggle Theme');\n"
+            "themeSwitcher.classList.add('theme-switcher');\n\n"
+            "document.querySelector('.shell').appendChild(themeSwitcher);\n\n"
+            "let currentTheme = localStorage.getItem('theme') || 'light';\n\n"
+            "function applyTheme(theme) {\n"
+            "  document.documentElement.style.colorScheme = theme;\n"
+            "}\n\n"
+            "applyTheme(currentTheme);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            ":root {\n"
+            "  color-scheme: light;\n"
+            "}\n\n"
+            "body {\n"
+            "  margin: 0;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Ergaenze einen keyboard-accessible Theme-Umschalter mit persistenter localStorage-Auswahl und Statusmeldung.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+    )
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="update",
+            action_plan=[
+                {"step": 1, "action": "read_relevant_files", "reason": "Inspect the current implementation."},
+                {"step": 2, "action": "update_artifact", "reason": "Apply the requested update."},
+            ],
+            target_paths=["app.js", "index.html", "styles.css"],
+            target_name="styles.css",
+        )
+    )
+    session.router_result = route
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Theme switcher with persistent state",
+        active_goal="Update the web theme switcher across app.js, index.html, and styles.css",
+        goal_relation="continue",
+        output_expectation="Accessible theme switcher with localStorage and visible status message",
+        verification_target="app.js, index.html, styles.css",
+        next_action="modify",
+        target_artifacts=[
+            {"path": "app.js", "kind": "file", "role": "primary_target", "confidence": 0.9},
+            {"path": "index.html", "kind": "file", "role": "primary_target", "confidence": 0.9},
+            {"path": "styles.css", "kind": "file", "role": "primary_target", "confidence": 0.9},
+        ],
+        constraints=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="medium",
+        confidence=0.92,
+        next_best_action=None,
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "app.js"},
+                success=True,
+                summary="Read app.js.",
+                output_excerpt=(tmp_path / "app.js").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Read index.html.",
+                output_excerpt=(tmp_path / "index.html").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Read styles.css.",
+                output_excerpt=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+            ),
+        ]
+    )
+
+    prompt = generate_content_retry_prompt(
+        route,
+        session,
+        path="styles.css",
+        current_content=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The previous CSS draft was inconsistent with the current JavaScript theme behavior.",
+            confidence=0.91,
+            blocking_issues=["The CSS draft assumes dark-theme classes that app.js does not apply."],
+            preservation_risks=[],
+            repair_hints=["Keep styles aligned with the actual theme application logic in app.js."],
+        ),
+        mode="compact",
+    )
+
+    assert "document.documentElement.style.colorScheme = theme;" in prompt
+    assert "role=\"alert\"" in prompt
+
+
 def test_targeted_runtime_prompt_hints_detect_launcher_failure_even_when_supporting_excerpt_is_truncated():
     hints = _targeted_runtime_prompt_hints(
         path="greet_cli/__main__.py",
@@ -10180,9 +11824,634 @@ def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_c
     assert "The test calls main([...]) directly." in prompt
     assert "Recognize those tokens verbatim" in prompt
     assert "derive the behavior from the remaining argv payload" in prompt
-    assert "Expected semantics:" not in prompt
-    assert "Observed semantics:" not in prompt
-    assert "Minimal semantic delta:" not in prompt
+    assert "Treat the expected-versus-observed values as an output behavior contract" in prompt
+    assert "Expected semantics: Validation should produce: Hello WORLD" in prompt
+    assert "Observed semantics: Validation currently produces: ''" in prompt
+    assert "Minimal semantic delta:" in prompt
+    assert "Apply this exact semantic delta in the behavior produced by this file:" in prompt
+    assert "Change the setup-time behavior for this interaction" not in prompt
+    assert "compute the next state once" not in prompt
+
+
+def test_runtime_repair_prompt_derives_semantic_delta_from_assertion_evidence_when_brief_semantics_missing(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_cli = (
+        "def main(argv=None):\n"
+        "    greeting = 'Hello, Ada!'\n"
+        "    title = 'Dr.'\n"
+        "    if title:\n"
+        "        greeting = f\"{title}: {greeting}\"\n"
+        "    print(greeting)\n"
+    )
+    cli_path = tmp_path / "greet_cli.py"
+    cli_path.write_text(current_cli, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from greet_cli import main\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["greet_cli.py", "tests/test_cli.py"],
+            "focus_files": ["greet_cli.py"],
+            "test_files": ["tests/test_cli.py"],
+            "entrypoints": ["greet_cli.py"],
+            "symbol_index": {"greet_cli.py": ["main"]},
+        }
+    )
+    session = SessionState(
+        task="Repair greet_cli.py so titled greetings no longer insert the extra punctuation.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the greeting formatting."}],
+        target_paths=["greet_cli.py", "tests/test_cli.py"],
+        target_name="greet_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest -q tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest -q tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: Hello, Ada!' != 'Dr. Hello, Ada!'",
+        failure_summary="The CLI currently inserts punctuation that the expected output does not contain.",
+        repair_requirements=["Change greet_cli.py so the failing runtime path can complete successfully."],
+        file_hints=["greet_cli.py", "tests/test_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:greet-cli-derived-semantics",
+            primary_target="greet_cli.py",
+            locked_target="greet_cli.py",
+            implicated_symbols=["main"],
+            implicated_region_hint="greet_cli.py",
+            repair_constraints=["Keep the fix local to greet_cli.py."],
+            allowed_files=["greet_cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+        confidence=0.9,
+        blocking_issues=[
+            "The proposed repair does not make a productive change to greet_cli.py for runtime:assertion_mismatch:greet-cli-derived-semantics (file hash unchanged)."
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the locked repair target so the failing greeting output changes materially."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="greet_cli.py",
+        current_content=current_cli,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "Expected semantics: Validation should produce: Dr. Hello, Ada!" in prompt
+    assert "Observed semantics: Validation currently produces: Dr.: Hello, Ada!" in prompt
+    assert (
+        "Minimal semantic delta: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+    assert (
+        "Apply this exact semantic delta in the behavior produced by this file: Remove observed-only text ':' between shared prefix 'Dr.' and shared suffix 'Hello, Ada!'."
+        in prompt
+    )
+    assert "Treat expected-versus-observed values as a behavior contract." in prompt
+
+
+def test_runtime_repair_prompts_keep_interactive_support_context_across_modes(tmp_path):
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_content = (
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n"
+    )
+    (tests_dir / "test_menu_toggle.cjs").write_text(test_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 1},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll einen interaktiven Menu-Button korrekt auf "
+            "und zu toggeln: aria-expanded und panel.hidden muessen sich bei jedem Klick gegenseitig spiegeln. "
+            "Fuehre danach node --test tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "app.js"},
+                success=True,
+                summary="Read app.js.",
+                output_excerpt=app_path.read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=test_content,
+            ),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "AssertionError: Expected values to be strictly equal:\n"
+            "+ actual - expected\n\n"
+            "+ undefined\n"
+            "- 'false'"
+        ),
+        failure_summary="app.js still produces the wrong behavior for the menu toggle runtime path.",
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        line_hints=[24],
+        repair_requirements=[
+            "Change app.js so the menu toggle initializes aria-expanded and mirrors panel.hidden correctly across clicks."
+        ],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-prompt-context",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: 'false'"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    compact_prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+    full_prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="full",
+    )
+
+    assert "button.click();" in compact_prompt
+    assert 'assert.equal(button.getAttribute("aria-expanded"), "true");' in compact_prompt
+    assert "Minimal semantic delta:" in compact_prompt
+    assert "Failure focus:" in compact_prompt
+    assert "Supporting file hints:" in compact_prompt
+
+    assert "Supporting file hints:" in full_prompt
+    assert "Minimal semantic delta:" in full_prompt
+    assert "Failure focus:" in full_prompt
+    assert "Primary repair target: app.js" in full_prompt
+    assert "Current file content:" in full_prompt
+
+
+def test_split_requirement_clauses_keeps_callable_behavior_sentence_intact():
+    sentence = (
+        "wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+        "bei jedem Klick korrekt gegeneinander umschalten"
+    )
+
+    assert _split_requirement_clauses(sentence) == [sentence]
+
+
+def test_generate_content_prompt_keeps_callable_requirement_sentence_intact_for_js_toggle_requests(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert (
+        "wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt gegeneinander umschalten"
+        in prompt
+    )
+    assert "wireMenuToggle(button; panel)" not in prompt
+
+
+def test_generate_content_prompt_derives_test_backed_toggle_contract_hints_without_repair_context(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=(tests_dir / "test_menu_toggle.cjs").read_text(encoding="utf-8"),
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "The supporting test already defines the post-interaction state contract." in prompt
+    assert "Read the current state once, compute the next state once" in prompt
+    assert "The supporting test exercises the interaction more than once." in prompt
+    assert "When aria-expanded changes in the handler, hidden/visible state should follow the same transition" in prompt
+
+
+def test_generate_content_prompt_keeps_toggle_contract_hints_when_sentence_semantics_exist(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_content = (
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n"
+    )
+    (tests_dir / "test_menu_toggle.cjs").write_text(test_content, encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+            "repo_summary": "Small JavaScript interaction module with a focused node test.",
+        }
+    )
+    session = SessionState(
+        task="Fix app.js so the menu toggle keeps aria-expanded and panel.hidden in sync.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=test_content,
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: expected panel.hidden to be false after the first click, but observed true.",
+        failure_summary="app.js leaves panel.hidden out of sync with aria-expanded in the exercised toggle path.",
+        repair_requirements=["Change app.js so the toggle keeps aria-expanded and panel.hidden aligned across repeated clicks."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:toggle-sentence-semantics",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=[
+                "After the first interaction, aria-expanded should be 'true' and panel.hidden should be false.",
+                "After the second interaction, aria-expanded should be 'false' and panel.hidden should be true.",
+            ],
+            observed_semantics=[
+                "After the first interaction, aria-expanded becomes 'true' while panel.hidden stays true.",
+            ],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "The supporting test already defines the post-interaction state contract." in prompt
+    assert "Read the current state once, compute the next state once" in prompt
+    assert "The supporting test exercises the interaction more than once." in prompt
+    assert "Treat the expected-versus-observed values as an interaction behavior contract." in prompt
+    assert "After the first interaction, aria-expanded should be 'true' and panel.hidden should be false." in prompt
+
+
+def test_generate_content_prompt_skips_test_backed_toggle_contract_hints_without_boolean_post_event_assertions(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    panel.hidden = !panel.hidden;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle registers one click handler\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.listenerCount, 1);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "language_counts": {"javascript": 2},
+            "project_labels": ["javascript"],
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js so der Klick-Handler korrekt registriert bleibt.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=(tests_dir / "test_menu_toggle.cjs").read_text(encoding="utf-8"),
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the click handler registration."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=app_path.read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "The supporting test already defines the post-interaction state contract." not in prompt
+    assert "The supporting test exercises the interaction more than once." not in prompt
 
 
 def test_compact_repair_prompt_prioritizes_test_line_hints_for_stdout_contract(tmp_path):
@@ -10433,9 +12702,779 @@ def test_compact_repair_retry_prompt_preserves_parseable_direct_main_contract_li
     assert "main(['--keep-case', 'Hello', 'WORLD'])" in prompt
     assert "Recognize those tokens verbatim" in prompt
     assert "derive behavior from the remaining argv payload 'Hello', 'WORLD'" in prompt
-    assert "Expected semantics:" not in prompt
-    assert "Observed semantics:" not in prompt
-    assert "Minimal semantic delta:" not in prompt
+    assert "Treat the expected-versus-observed values as an output behavior contract" in prompt
+    assert "Expected semantics: Validation should produce: Hello WORLD" in prompt
+    assert "Observed semantics: Validation currently produces: hello world" in prompt
+    assert "Minimal semantic delta:" in prompt
+
+
+def test_targeted_runtime_prompt_hints_cover_direct_script_cli_contracts():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--prefix', 'Dr.']:\n"
+        "        print('Dr. ' + ' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context="",
+        targeted_context={
+            "command": "python prefix_cli.py --prefix Ms. jane DOE",
+            "failure_summary": (
+                "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+                "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+            ),
+            "excerpt": (
+                "--prefix Ms. jane DOE\n\n"
+                "AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'\n"
+                "- --prefix Ms. jane DOE\n"
+                "+ Ms. Jane Doe"
+            ),
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Ms. Jane Doe"],
+                "observed_semantics": ["Validation currently produces: --prefix Ms. jane DOE"],
+            },
+        },
+    )
+
+    assert any("exact option tokens like --prefix" in hint for hint in hints)
+    assert any("remaining runtime argv tail 'Ms.', 'jane', 'DOE'" in hint for hint in hints)
+    assert any("can actually match the exercised argv shape" in hint for hint in hints)
+    assert any("stop echoing that option token" in hint for hint in hints)
+
+
+def test_direct_main_runtime_contract_keeps_only_tail_after_last_option():
+    option_tokens, positional_tokens = _direct_main_runtime_contract(
+        "main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])",
+    )
+
+    assert option_tokens == ["--prefix", "--keep-case"]
+    assert positional_tokens == ["Hello", "WORLD"]
+
+
+def test_direct_python_script_runtime_contract_keeps_only_tail_after_last_option():
+    option_tokens, tail_tokens = _direct_python_script_runtime_contract(
+        "python prefix_cli.py --prefix Dr. --keep-case Hello WORLD",
+        target_path="prefix_cli.py",
+    )
+
+    assert option_tokens == ["--prefix", "--keep-case"]
+    assert tail_tokens == ["Hello", "WORLD"]
+
+
+def test_targeted_runtime_prompt_hints_ignore_interleaved_direct_main_option_values():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    prefix = ''\n"
+        "    if len(args) >= 2 and args[0] == '--prefix':\n"
+        "        prefix = args[1]\n"
+        "        args = args[2:]\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        return prefix + ' ' + ' '.join(args[1:])\n"
+        "    return ' '.join(args).title()\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from prefix_cli import main\n\n"
+            "def test_direct_main_prefix_keep_case():\n"
+            "    assert main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD']) == 'Dr. Hello WORLD'\n"
+        ),
+        targeted_context={
+            "failure_summary": "prefix_cli.py still formats the direct main prefix keep-case path incorrectly.",
+            "excerpt": "AssertionError: 'Dr.: WORLD' != 'Dr. Hello WORLD'",
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py", "tests/test_prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Dr. Hello WORLD"],
+                "observed_semantics": ["Validation currently produces: Dr.: WORLD"],
+            },
+        },
+    )
+
+    assert any("exact option tokens like --prefix, --keep-case" in hint for hint in hints)
+    assert any("remaining argv payload 'Hello', 'WORLD'" in hint for hint in hints)
+    assert not any("'Dr.', 'Hello', 'WORLD'" in hint for hint in hints)
+
+
+def test_targeted_runtime_prompt_hints_call_out_separator_only_runtime_deltas():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    prefix = ''\n"
+        "    keep_case = False\n"
+        "    i = 0\n"
+        "    while i < len(args):\n"
+        "        if args[i] == '--prefix':\n"
+        "            prefix = args[i + 1]\n"
+        "            i += 2\n"
+        "        elif args[i] == '--keep-case':\n"
+        "            keep_case = True\n"
+        "            i += 1\n"
+        "        else:\n"
+        "            break\n"
+        "    text = ' '.join(args[i:]).title() if not keep_case else ' '.join(args[i:])\n"
+        "    return f\"{prefix}: {text}\" if prefix else text\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from prefix_cli import main\n\n"
+            "def test_direct_main_prefix_keep_case():\n"
+            "    assert main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD']) == 'Dr. Hello WORLD'\n"
+        ),
+        targeted_context={
+            "failure_summary": "prefix_cli.py still leaves an extra separator in the keep-case branch output.",
+            "excerpt": "AssertionError: 'Dr.: Hello WORLD' != 'Dr. Hello WORLD'",
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py", "tests/test_prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Dr. Hello WORLD"],
+                "observed_semantics": ["Validation currently produces: Dr.: Hello WORLD"],
+            },
+        },
+    )
+
+    assert any("only punctuation or spacing between already-correct output parts" in hint for hint in hints)
+    assert any("keep the already-correct data selection and transformation intact" in hint for hint in hints)
+
+
+def test_targeted_runtime_prompt_hints_do_not_misclassify_payload_mismatches_as_separator_only():
+    current_cli = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="prefix_cli.py",
+        current_content=current_cli,
+        supporting_context="",
+        targeted_context={
+            "command": "python prefix_cli.py --prefix Ms. jane DOE",
+            "failure_summary": (
+                "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+                "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+            ),
+            "excerpt": (
+                "--prefix Ms. jane DOE\n\n"
+                "AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'\n"
+                "- --prefix Ms. jane DOE\n"
+                "+ Ms. Jane Doe"
+            ),
+            "failure_focus": [],
+            "file_hints": ["prefix_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: Ms. Jane Doe"],
+                "observed_semantics": ["Validation currently produces: --prefix Ms. jane DOE"],
+            },
+        },
+    )
+
+    assert not any("only punctuation or spacing between already-correct output parts" in hint for hint in hints)
+
+
+def test_direct_python_script_option_contract_review_rejects_impossible_prefix_slice(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-impossible-slice",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-impossible-slice",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:2] == ['--prefix']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "direct python script argv prefix contract" in review.summary
+    assert any("args[:2]" in issue and "never match" in issue for issue in review.blocking_issues)
+
+
+def test_direct_python_script_option_contract_review_rejects_payload_skip_without_first_tail_access(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-tail-skip",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-tail-skip",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:1] == ['--prefix']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "drops the first direct python script payload token" in review.summary
+    assert any("args[2:]" in issue or "first runtime payload token" in issue for issue in review.blocking_issues)
+
+
+def test_direct_python_script_option_contract_review_rejects_hardcoded_sample_tail_token(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-hardcoded-tail",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-hardcoded-tail",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:2] == ['--prefix', 'Ms.']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "illustrative direct python script payload tokens" in review.summary
+    assert any("'Ms.'" in issue and "sample runtime payload token" in issue for issue in review.blocking_issues)
+
+
+def test_direct_python_script_option_contract_review_allows_explicit_first_tail_access(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path preserves the prefix token as output payload."],
+        evidence_signature="sig-direct-script-prefix-tail-safe",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-tail-safe",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    review = planner._direct_python_script_option_contract_review(
+        path="prefix_cli.py",
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:1] == ['--prefix'] and len(args) > 1:\n"
+            "        words = [args[1], *[word.capitalize() for word in args[2:]]]\n"
+            "        print(' '.join(words))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review is None
+
+
+def test_pre_write_update_review_rejects_direct_script_contract_before_generated_review(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(task="Repair prefix_cli.py", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["prefix_cli.py"],
+        target_name="prefix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary=(
+            "prefix_cli.py still produces the wrong behavior: expected Validation should produce: "
+            "Ms. Jane Doe but observed Validation currently produces: --prefix Ms. jane DOE."
+        ),
+        expected_features=[],
+        missing_features=[],
+        file_hints=["prefix_cli.py"],
+        line_hints=[3],
+        action_hints=[],
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path formats the prefixed name correctly."],
+        evidence_signature="sig-direct-script-prefix-prewrite-short-circuit",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-prewrite-short-circuit",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+
+    def fail_generated_review(*_args, **_kwargs):
+        raise AssertionError("generated review should not run for a blocked direct script contract")
+
+    monkeypatch.setattr(planner, "_review_generated_update", fail_generated_review)
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="prefix_cli.py",
+        current_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        proposed_content=(
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    if args[:2] == ['--prefix']:\n"
+            "        print(' '.join(word.capitalize() for word in args[2:]))\n"
+            "        return\n"
+            "    print(' '.join(args or ['hello', 'world']))\n"
+        ),
+        repair_context=repair_context,
+    )
+
+    assert review.safe_to_write is False
+    assert "direct python script argv prefix contract" in review.summary
+
+
+def test_deterministic_direct_python_script_runtime_recovery_generalizes_hardcoded_payload_literal(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--prefix', 'Dr.']:\n"
+        "        print('Dr. ' + ' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "prefix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair prefix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["prefix_cli.py"],
+                "focus_files": ["prefix_cli.py"],
+                "entrypoints": ["prefix_cli.py"],
+                "symbol_index": {"prefix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["prefix_cli.py"],
+        target_name="prefix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python prefix_cli.py --prefix Ms. jane DOE")
+    repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary="prefix_cli.py still produces the wrong output for the direct script prefix path.",
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path formats the prefixed name correctly."],
+        file_hints=["prefix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-deterministic-recovery",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_python_script_runtime_recovery(
+        session.router_result,
+        session,
+        path="prefix_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still misstates the direct python script argv prefix contract exercised by the failed runtime path.",
+            confidence=0.9,
+            blocking_issues=[
+                "The proposal compares args[:2] against '--prefix' in prefix_cli.py, but that branch can never match because the slice length and literal token count differ."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "If you compare args[:N] against a literal option sequence in prefix_cli.py, keep the slice length aligned with the compared literal tokens."
+            ],
+        ),
+    )
+
+    assert result is not None
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
+    assert result.review.safe_to_write is True
+    assert "if len(args) >= 2 and args[:1] == ['--prefix']:" in result.content
+    assert "print(args[1] + ' ' + ' '.join(" in result.content
+    assert "word.capitalize() for word in args[2:]" in result.content
+
+
+def test_deterministic_direct_python_script_runtime_recovery_preserves_punctuated_expected_output(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--suffix', '!']:\n"
+        "        print(' '.join(word.capitalize() for word in args[2:]) + '!')\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).title())\n"
+    )
+    (tmp_path / "suffix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair suffix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["suffix_cli.py"],
+                "focus_files": ["suffix_cli.py"],
+                "entrypoints": ["suffix_cli.py"],
+                "symbol_index": {"suffix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["suffix_cli.py"],
+        target_name="suffix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python suffix_cli.py --suffix ! Hello WORLD")
+    repair_context = ValidationFailureEvidence(
+        command="python suffix_cli.py --suffix ! Hello WORLD",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["suffix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello World!' != 'Hello WORLD!'",
+        failure_summary="suffix_cli.py still produces the wrong output for the direct script suffix path.",
+        repair_requirements=["Change suffix_cli.py so the direct script runtime path preserves the requested suffix output."],
+        file_hints=["suffix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-suffix-deterministic-recovery",
+            primary_target="suffix_cli.py",
+            locked_target="suffix_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD!"],
+            observed_semantics=["Validation currently produces: Hello World!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="suffix_cli.py",
+            repair_constraints=["Keep the fix local to suffix_cli.py."],
+            allowed_files=["suffix_cli.py"],
+            forbidden_files=["tests/test_suffix_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_python_script_runtime_recovery(
+        session.router_result,
+        session,
+        path="suffix_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is not None
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
+    assert result.review.safe_to_write is True
+    assert "if len(args) >= 2 and args[:1] == ['--suffix']:" in result.content
+    assert "print(' '.join(args[2:]) + args[1])" in result.content
+    assert "capitalize" not in result.content
+    assert "['--suffix', '!']" not in result.content
+
+
+def test_retry_update_after_review_failure_uses_verbatim_direct_python_script_recovery_for_dynamic_suffix_branch(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(text_payloads=["def fallback():\n    return None\n"]), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if len(args) >= 2 and args[:1] == ['--suffix']:\n"
+        "        print(' '.join(word.capitalize() for word in args[2:]) + args[1].replace('orld', 'ORLD'))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    (tmp_path / "suffix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair suffix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["suffix_cli.py"],
+                "focus_files": ["suffix_cli.py"],
+                "entrypoints": ["suffix_cli.py"],
+                "symbol_index": {"suffix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["suffix_cli.py"],
+        target_name="suffix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python suffix_cli.py --suffix ! Hello WORLD")
+    repair_context = ValidationFailureEvidence(
+        command="python suffix_cli.py --suffix ! Hello WORLD",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["suffix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Hello World!' != 'Hello WORLD!'",
+        failure_summary="suffix_cli.py still produces the wrong output for the direct script suffix path.",
+        repair_requirements=["Change suffix_cli.py so the direct script runtime path preserves the requested suffix output."],
+        file_hints=["suffix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-suffix-review-retry",
+            primary_target="suffix_cli.py",
+            locked_target="suffix_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD!"],
+            observed_semantics=["Validation currently produces: Hello World!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="suffix_cli.py",
+            repair_constraints=["Keep the fix local to suffix_cli.py."],
+            allowed_files=["suffix_cli.py"],
+            forbidden_files=["tests/test_suffix_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="suffix_cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so writing it would only repeat the same failing state.",
+            confidence=0.94,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to suffix_cli.py for runtime:assertion_mismatch:direct-script-suffix-review-retry (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=["Make a productive change to suffix_cli.py instead of repeating the same failing state."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
+    assert result.review.safe_to_write is True
+    assert "print(' '.join(args[2:]) + args[1])" in result.content
+    assert "replace('orld', 'ORLD')" not in result.content
+    assert "print(' '.join(word.capitalize() for word in args[2:])" not in result.content
+
+
+def test_deterministic_direct_python_script_runtime_recovery_skips_nonverbatim_payload_wraps(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--wrap', '*']:\n"
+        "        print('* ' + ' '.join(args[2:]) + ' *')\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "wrap_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair wrap_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["wrap_cli.py"],
+                "focus_files": ["wrap_cli.py"],
+                "entrypoints": ["wrap_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI contract."}],
+        target_paths=["wrap_cli.py"],
+        target_name="wrap_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python wrap_cli.py --wrap [] hello world")
+    repair_context = ValidationFailureEvidence(
+        command="python wrap_cli.py --wrap [] hello world",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["wrap_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '* hello world *' != '[hello world]'",
+        failure_summary="wrap_cli.py still formats the direct script wrap path incorrectly.",
+        repair_requirements=["Change wrap_cli.py so the direct script runtime path formats the wrapped output correctly."],
+        file_hints=["wrap_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-wrap-nonverbatim",
+            primary_target="wrap_cli.py",
+            locked_target="wrap_cli.py",
+            expected_semantics=["Validation should produce: [hello world]"],
+            observed_semantics=["Validation currently produces: * hello world *"],
+            implicated_symbols=["main"],
+            implicated_region_hint="wrap_cli.py",
+            repair_constraints=["Keep the fix local to wrap_cli.py."],
+            allowed_files=["wrap_cli.py"],
+            forbidden_files=["tests/test_wrap_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_python_script_runtime_recovery(
+        session.router_result,
+        session,
+        path="wrap_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is None
 
 
 def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repair(tmp_path):
@@ -10516,6 +13555,596 @@ def test_generate_content_prompt_surfaces_direct_main_runtime_hints_before_repai
     assert "The test calls main([...]) directly." in prompt
     assert "Recognize those tokens verbatim" in prompt
     assert "remaining argv payload 'Hello', 'WORLD'" in prompt
+
+
+def test_review_guided_retry_prompt_surfaces_pre_interaction_initialization_hints_for_js_runtime_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test('wireMenuToggle toggles panel state on each click', () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        repair_requirements=["Change app.js so the failing runtime path initializes and toggles the menu state correctly."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-init-state",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed change introduces a new return statement that was not requested.",
+        confidence=0.9,
+        blocking_issues=[
+            "The proposal broadens scope without evidence, adding a new return statement that was not explicitly requested."
+        ],
+        preservation_risks=[],
+        repair_hints=[],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "The failing interaction is asserted immediately after setup and before the first user event fires." in prompt
+    assert "Do not use the first click or dispatched event to create the initial state." in prompt
+    assert "Set the relevant attribute or property explicitly instead of relying on an undefined or implicit default." in prompt
+    assert "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring" in prompt
+    assert "Do not add new early-return branches, wrapper conditions, or API changes" in prompt
+    assert "Treat the expected-versus-observed values as an interaction behavior contract." in prompt
+    assert "Change the setup-time behavior for this interaction so the initialized state yields 'false'" in prompt
+    assert "Replace observed-only text 'undefined' with expected text 'false'" not in prompt
+
+
+def test_review_guided_retry_prompt_keeps_boolean_semantic_delta_atomic_for_js_runtime_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test('wireMenuToggle toggles panel state on each click', () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "expected: false\n"
+            "actual: true\n"
+        ),
+        failure_summary="panel.hidden still reflects the wrong post-click state after the first interaction.",
+        repair_requirements=["Change app.js so the post-click runtime path flips panel.hidden together with aria-expanded."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-post-click-state",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: true"],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair changes the file, but not the lines tied to the failed runtime behavior.",
+        confidence=0.9,
+        blocking_issues=[
+            "The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"
+        ],
+        preservation_risks=[],
+        repair_hints=["Update the relevant function signature or behavior line that the failing traceback points to."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Match the supporting interaction contract exactly." in prompt
+    assert "After the first interaction, aria-expanded should be 'true' and panel.hidden should be false." in prompt
+    assert "After the second interaction, aria-expanded should be 'false' and panel.hidden should be true." in prompt
+    assert "Replace observed-only text 'tru' with expected text 'fals'" not in prompt
+    assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
+    assert "panel.hidden = !expanded;" in prompt
+    assert "compute the next state once" in prompt
+    assert "derive every dependent update from it while preserving whether" in prompt
+    assert "Do not mix one assignment derived from the pre-click state with another derived from the toggled state" in prompt
+    assert "opposite visibility meaning: expanded/open maps to visible" in prompt
+    assert "same next-state boolean" not in prompt
+
+
+def test_review_guided_retry_prompt_treats_unchanged_identifier_lines_as_noop_with_hard_mutation_anchors(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        repair_requirements=["Change app.js so the failing runtime path initializes and toggles the menu state correctly."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-unchanged-identifiers",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposal leaves the implicated identifier lines unchanged.",
+        confidence=0.92,
+        blocking_issues=[
+            "The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the initialization and toggle lines instead of adding unrelated returns."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "Repeated no-op detected:" in prompt
+    assert "Change at least one of these previously unchanged anchors in app.js: panel.hidden, wireMenuToggle" in prompt
+    assert (
+        "The next draft must change at least one of these currently unchanged anchors: panel.hidden, wireMenuToggle."
+        in prompt
+    )
+    assert "Implicated current lines that must change:" in prompt
+    assert '2:   button.addEventListener("click", () => {' in prompt
+    assert '5:     panel.hidden = !expanded;' in prompt
+
+
+def test_review_guided_retry_prompt_recovers_implicated_lines_from_near_anchor_without_line_hints(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "import argparse\nfrom .cli import greet\n\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser(description='Greet someone by name.')\n"
+        "    parser.add_argument('name', nargs='?', default='world')\n"
+        "    args = parser.parse_args()\n"
+        "    print(greet(args.name))\n"
+    )
+    pkg = tmp_path / "greet_cli"
+    pkg.mkdir()
+    (pkg / "__main__.py").write_text(current_content, encoding="utf-8")
+    (pkg / "cli.py").write_text("def greet(name):\n    return f'Hello, {name}!'\n", encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text("from greet_cli import __main__\n", encoding="utf-8")
+
+    session = SessionState(
+        task="Fix the failing CLI unittest.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["greet_cli/__main__.py", "tests/test_cli.py"],
+                "focus_files": ["greet_cli/__main__.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["greet_cli/__main__.py"],
+                "symbol_index": {"greet_cli/__main__.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        target_name="greet_cli/__main__.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_cli")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["greet_cli/__main__.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "usage: python [-h] [name]\n"
+            "python: error: unrecognized arguments: -m Ada\n"
+            '  File "/tmp/greet_cli/__main__.py", line 7, in main\n'
+            "    args = parser.parse_args()\n"
+            "SystemExit: 2\n"
+        ),
+        failure_summary="The CLI entrypoint rejects the patched python -m style argv.",
+        file_hints=["greet_cli/__main__.py", "tests/test_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:near-anchor-followup",
+            primary_target="greet_cli/__main__.py",
+            locked_target="greet_cli/__main__.py",
+            expected_semantics=["Validation should accept the patched python -m style argv."],
+            observed_semantics=["Validation currently rejects the patched python -m style argv."],
+            implicated_symbols=["main"],
+            implicated_region_hint="greet_cli/__main__.py",
+            repair_constraints=["Keep the fix local to greet_cli/__main__.py."],
+            allowed_files=["greet_cli/__main__.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed repair leaves the implicated identifier lines unchanged.",
+        confidence=0.91,
+        blocking_issues=[
+            "The proposal leaves the implicated identifier lines unchanged: main near args = parser.parse_args()"
+        ],
+        preservation_risks=[],
+        repair_hints=["Change the implicated callable instead of editing unrelated helper code."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="greet_cli/__main__.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=review_feedback,
+        mode="full",
+    )
+
+    assert "Implicated current lines that must change:" in prompt
+    assert "4: def main():" in prompt
+    assert "7:     args = parser.parse_args()" in prompt
+
+
+def test_review_guided_retry_prompt_omits_pre_interaction_initialization_hints_without_pre_event_assertions(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    (tmp_path / "app.js").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_menu_toggle.cjs").write_text(
+        "const test = require('node:test');\n"
+        "const assert = require('node:assert/strict');\n"
+        "const { wireMenuToggle } = require('../app.js');\n\n"
+        "function createButton() {\n"
+        "  return {\n"
+        "    attrs: {},\n"
+        "    listeners: {},\n"
+        "    setAttribute(name, value) { this.attrs[name] = String(value); },\n"
+        "    getAttribute(name) { return this.attrs[name]; },\n"
+        "    addEventListener(name, handler) { this.listeners[name] = handler; },\n"
+        "    click() { this.listeners.click(); },\n"
+        "  };\n"
+        "}\n\n"
+        "function createPanel() {\n"
+        "  return { hidden: false };\n"
+        "}\n\n"
+        "test('wireMenuToggle toggles panel state after clicks', () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+            "focus_files": ["app.js"],
+            "test_files": ["tests/test_menu_toggle.cjs"],
+            "entrypoints": ["app.js"],
+            "symbol_index": {"app.js": ["wireMenuToggle"]},
+        }
+    )
+    session = SessionState(
+        task="Repair app.js so the menu toggle still works after clicks.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'true'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: true "
+            "but observed Validation currently produces: undefined."
+        ),
+        repair_requirements=["Change app.js so the failing runtime path toggles the menu state correctly after interaction."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-post-click",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: true"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is still a no-op.",
+            confidence=0.9,
+            blocking_issues=["The proposal does not change the failing behavior."],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+        mode="full",
+    )
+
+    assert "The failing interaction is asserted immediately after setup and before the first user event fires." not in prompt
+    assert "Do not use the first click or dispatched event to create the initial state." not in prompt
+    assert "Prefer the smallest local repair: initialize the exercised state next to the existing event wiring" not in prompt
+    assert "Do not add new early-return branches, wrapper conditions, or API changes" not in prompt
 
 
 def test_planner_current_repair_context_pivots_back_to_provider_after_support_noop(tmp_path):
@@ -12417,6 +16046,158 @@ def test_validation_repair_relevance_review_rejects_unresolved_undefined_symbol(
     assert any("binds/imports 'sys'" in issue for issue in review.blocking_issues)
 
 
+def test_validation_repair_relevance_review_rejects_js_runtime_fix_that_skips_request_state_anchors(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt umschalten."
+        ),
+        workspace_root=str(tmp_path),
+    )
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    proposed_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "    return false; // Ensure the function returns 'false'\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_requirements=["Change app.js so the menu toggle initializes and toggles state correctly."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-request-anchors",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="app.js",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "failed runtime behavior" in review.summary.lower()
+    assert any("aria-expanded" in issue or "panel.hidden" in issue for issue in review.blocking_issues)
+
+
+def test_validation_repair_relevance_review_allows_js_runtime_fix_that_updates_request_state_anchors(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt umschalten."
+        ),
+        workspace_root=str(tmp_path),
+    )
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    proposed_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Expected values to be strictly equal:\n"
+            "+ actual - expected\n"
+            "+ undefined\n"
+            "- 'false'\n"
+        ),
+        failure_summary=(
+            "app.js still produces the wrong behavior: expected Validation should produce: false "
+            "but observed Validation currently produces: undefined."
+        ),
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_requirements=["Change app.js so the menu toggle initializes and toggles state correctly."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-request-anchors-pass",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: undefined"],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="app.js",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
+
+
 def test_fallback_proposed_update_review_reuses_runtime_symbol_review_after_model_timeout(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(task="Repair tests/test_wordfreq.py", workspace_root=str(tmp_path))
@@ -13115,6 +16896,109 @@ def test_primary_compact_repair_review_uses_compact_repair_runtime_budget(tmp_pa
     assert kwargs["strict_timeouts"] is False
 
 
+def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(tmp_path, monkeypatch):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    llm = InventoryLLM(
+        json_payloads=[
+            {
+                "safe_to_write": True,
+                "summary": "The focused repair changes the implicated runtime path and stays scoped.",
+                "confidence": 0.92,
+                "blocking_issues": [],
+                "preservation_risks": [],
+                "repair_hints": [],
+            }
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+            model_candidates=("qwen2.5-coder:7b",),
+        ),
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Repair the failing target."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the repair."},
+        ],
+        target_paths=["app.js"],
+        target_name="app.js",
+    )
+    session = SessionState(
+        task="Repair the runtime output without changing unrelated files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: false !== true",
+        failure_summary="The toggle path still leaves panel.hidden out of sync with aria-expanded.",
+        repair_requirements=["Change app.js so the runtime toggle path matches the test contract."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:review-recovery-model",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["Validation should produce: false"],
+            observed_semantics=["Validation currently produces: true"],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the repair on app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    monkeypatch.setattr(planner, "_should_skip_model_backed_repair_review", lambda *_args, **_kwargs: False)
+
+    review = planner._review_generated_update(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener(\"click\", () => {\n"
+            "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+            "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+            "    panel.hidden = !expanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+        proposed_content=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener(\"click\", () => {\n"
+            "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+            "    const nextExpanded = !expanded;\n"
+            "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+            "    panel.hidden = !nextExpanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+    kwargs = llm.generate_json_calls[0]["kwargs"]
+    assert kwargs["model"] == "qwen3:8b"
+    assert kwargs["num_ctx"] == 2048
+    assert kwargs["timeout"] == 60
+    assert kwargs["total_timeout"] == 210
+    assert kwargs["strict_timeouts"] is True
+    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+
+
 def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
@@ -13176,7 +17060,339 @@ def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(
     )
 
     assert '"failure_evidence_behavior_deltas"' in prompt
+    assert '"literal_anchor_details"' in prompt
+    assert '"hard_source_constraint": false' in prompt
+    assert "Do not promote repair_brief, runtime_evidence, validation_failure_evidence, or generation_relevant_constraint examples" in prompt
     assert "When active runtime failure evidence for this file includes observed-vs-expected behavior deltas" in prompt
+
+
+def test_proposed_update_review_prompt_includes_runtime_interaction_hints_for_js_toggle_repairs(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix app.js so the menu toggle keeps aria-expanded and panel.hidden in sync.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: expected panel.hidden to be false after the first click, but observed true.",
+        failure_summary="app.js leaves panel.hidden out of sync with aria-expanded in the exercised toggle path.",
+        repair_requirements=["Change app.js so the toggle keeps aria-expanded and panel.hidden aligned across repeated clicks."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:toggle-review-hints",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=[
+                "Validation should produce: false",
+                "Validation should produce: true",
+            ],
+            observed_semantics=[
+                "Validation currently produces: true",
+                "Validation currently produces: false",
+            ],
+            implicated_symbols=["wireMenuToggle", "expanded"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        supporting_artifact_context=(
+            "tests/test_menu_toggle.cjs:\n"
+            "20:   button.click();\n"
+            "21:   assert.equal(button.getAttribute('aria-expanded'), 'true');\n"
+            "22:   assert.equal(panel.hidden, false);\n"
+            "23:   button.click();\n"
+            "24:   assert.equal(button.getAttribute('aria-expanded'), 'false');\n"
+            "25:   assert.equal(panel.hidden, true);\n"
+        ),
+        current_excerpt=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener('click', () => {\n"
+            "    const expanded = button.getAttribute('aria-expanded') === 'true';\n"
+            "    button.setAttribute('aria-expanded', expanded ? 'false' : 'true');\n"
+            "    panel.hidden = !expanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+        proposed_excerpt=(
+            "function wireMenuToggle(button, panel) {\n"
+            "  button.addEventListener('click', () => {\n"
+            "    const expanded = button.getAttribute('aria-expanded') === 'true';\n"
+            "    const nextExpanded = !expanded;\n"
+            "    button.setAttribute('aria-expanded', nextExpanded ? 'true' : 'false');\n"
+            "    panel.hidden = !nextExpanded;\n"
+            "  });\n"
+            "}\n"
+        ),
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert '"failure_evidence_runtime_hints"' in prompt
+    assert "Read the current state once, compute the next state once" in prompt
+    assert "hidden/visible state should follow the same transition with the opposite visibility meaning" in prompt
+    assert "Do not call a proposal regressive merely because it computes the required next-state behavior from a different local formulation" in prompt
+
+
+def test_proposed_update_review_prompt_marks_runtime_cli_literal_examples_as_nonbinding(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair normalize_cli.py so the direct main runtime path preserves keep-case output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:prompt-literal-provenance",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        supporting_artifact_context="tests/test_normalize.py exercises the direct main runtime path.",
+        current_excerpt=(
+            "from texttools import normalize_words\n\n"
+            "def main(argv=None):\n"
+            "    args = list(argv or [])\n"
+            "    keep_case = bool(args and args[0] == '--keep-case')\n"
+            "    source = ' '.join(args[1:] if keep_case else args)\n"
+            "    print(' '.join(normalize_words(source or 'Hello WORLD', keep_case)))\n"
+        ),
+        proposed_excerpt="same",
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert "--keep-case hello world" in prompt
+    assert '"source": "runtime_evidence"' in prompt
+    assert '"type": "illustrative_runtime_cli_example"' in prompt
+    assert '"hard_source_constraint": false' in prompt
+    assert "A missing-literal blocker is valid only when the exact literal already appears in path_scope.literal_constraints" in prompt
+
+
+def test_compact_repair_prompt_marks_runtime_cli_literal_examples_as_nonbinding(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py so the direct main runtime path preserves keep-case output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:repair-prompt-literal-provenance",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Literal provenance: treat only hard file-local source obligations as exact source-text requirements." in prompt
+    assert "--keep-case hello world [runtime_evidence/illustrative_runtime_cli_example]" in prompt
+    assert "illustrative behavior evidence unless the active file scope separately marks them as hard source obligations" in prompt
+
+
+def test_compact_repair_retry_prompt_keeps_runtime_cli_literal_example_nonbinding(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py so the direct main runtime path preserves keep-case output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:retry-prompt-literal-provenance",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed update does not preserve an explicit literal constraint from the request.",
+        confidence=0.88,
+        blocking_issues=[
+            "The exact requested literal is missing from normalize_cli.py: --keep-case hello world",
+        ],
+        preservation_risks=[],
+        repair_hints=[
+            "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+        ],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Literal provenance: treat only hard file-local source obligations as exact source-text requirements." in prompt
+    assert "--keep-case hello world [runtime_evidence/illustrative_runtime_cli_example]" in prompt
+    assert "Previous proposal was rejected because: The exact requested literal is missing from normalize_cli.py: --keep-case hello world" in prompt
 
 
 def test_pre_write_update_review_allows_evidence_backed_local_behavior_adjustment_after_scope_rejection(
@@ -13258,6 +17474,111 @@ def test_pre_write_update_review_allows_evidence_backed_local_behavior_adjustmen
 
     assert review.safe_to_write is True
     assert "runtime failure evidence" in review.summary.lower()
+
+
+def test_pre_write_update_review_does_not_reject_safe_python_repair_for_request_cli_example_literal(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+            "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+            "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python normalize_cli.py --keep-case hello world",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py"],
+        summary="Validation command stdout differed from the expected output.",
+        excerpt=(
+            "AssertionError: '--keep-case hello world' != 'hello world'\n"
+            "- --keep-case hello world\n"
+            "+ hello world"
+        ),
+        failure_summary=(
+            "AssertionError: '--keep-case hello world' != 'hello world'\n"
+            "- --keep-case hello world\n"
+            "+ hello world"
+        ),
+        repair_requirements=["Change normalize_cli.py so the failing runtime path succeeds."],
+        file_hints=["normalize_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:request-cli-example-review",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: hello world"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=[],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.86,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    print(normalize_words(' '.join(source_tokens or ['Hello', 'WORLD']), keep_case=keep_case))\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert review.summary == "ok"
 
 
 def test_pre_write_update_review_keeps_scope_rejection_without_direct_failure_evidence(tmp_path, monkeypatch):
@@ -13529,6 +17850,773 @@ def test_pre_write_update_review_rejects_stdout_only_fix_when_direct_main_option
     assert review.safe_to_write is False
     assert "exact direct main([...]) option tokens" in review.summary
     assert any("--keep-case" in issue for issue in review.blocking_issues)
+
+
+def test_validation_repair_relevance_review_accepts_literal_anchor_when_implicated_python_branch_changes(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize_cli.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeCliTests(unittest.TestCase):\n"
+        "    def test_direct_main_keep_case_preserves_payload(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Der direct-main CLI-Pfad mit --keep-case soll die Payload exakt erhalten. "
+            "Fuehre danach python3 -m unittest tests.test_normalize_cli aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python3 -m unittest tests.test_normalize_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:literal-anchor-python-branch-change",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=[],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize_cli.py"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
+
+
+def test_validation_repair_relevance_review_still_rejects_literal_anchor_when_implicated_python_branch_is_unchanged(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(word.capitalize() for word in (args or ['hello', 'world'])))\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task=(
+            "Repariere normalize_cli.py. Der direct-main CLI-Pfad mit --keep-case soll die Payload exakt erhalten. "
+            "Fuehre danach python3 -m unittest tests.test_normalize_cli aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python3 -m unittest tests.test_normalize_cli",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:literal-anchor-python-branch-unchanged",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=[],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=[],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert any("--keep-case" in issue for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_rejects_css_root_state_without_completed_web_contract(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"themeSwitcher\" aria-label=\"Toggle Theme\">Toggle Theme</button>\n"
+            "      <div id=\"statusMessage\" role=\"alert\"></div>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "document.body.appendChild(themeSwitcher);\n\n"
+            "const statusMessage = document.createElement('div');\n"
+            "document.body.appendChild(statusMessage);\n\n"
+            "function applyTheme(theme) {\n"
+            "  document.documentElement.style.colorScheme = theme;\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    current_content = ":root {\n  color-scheme: light;\n}\n"
+    (tmp_path / "styles.css").write_text(current_content, encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Add a persistent accessible theme switcher across the current web files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested multi-file web update."},
+        ],
+        target_paths=["app.js", "index.html", "styles.css"],
+        target_name="styles.css",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    proposed_content = (
+        ":root {\n"
+        "  color-scheme: light;\n"
+        "}\n\n"
+        "body.dark-mode {\n"
+        "  background: #111;\n"
+        "  color: #f5f5f5;\n"
+        "}\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="styles.css",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert "cross-file web contract" in review.summary.lower()
+    assert any("dark-mode" in issue for issue in review.blocking_issues)
+
+
+def test_pre_write_update_review_surfaces_consumed_sibling_web_hooks_in_repair_hints(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <h1>Board</h1>\n"
+            "    </main>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "document.addEventListener('DOMContentLoaded', () => {\n"
+            "  const themeSwitch = document.createElement('button');\n"
+            "  themeSwitch.classList.add('theme-switch');\n"
+            "  themeSwitch.setAttribute('aria-label', 'Toggle theme');\n"
+            "  document.body.appendChild(themeSwitch);\n"
+            "});\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Add a keyboard-accessible theme switcher to the current web files.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            language_counts={"html": 1, "javascript": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js"],
+            focus_files=["index.html", "app.js"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[FileChangeRecord(path="app.js", operation="modify")],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {"step": 1, "action": "update_artifact", "reason": "Apply the requested multi-file web update."},
+        ],
+        target_paths=["app.js", "index.html"],
+        target_name="index.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=(tmp_path / "index.html").read_text(encoding="utf-8"),
+        proposed_content=(
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <h1>Board</h1>\n"
+            "    </main>\n"
+            "    <button id=\"theme-switch\" class=\"theme-switch\" aria-label=\"Toggle theme\" tabindex=\"0\">Toggle Theme</button>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert any("theme-switch" in issue for issue in review.blocking_issues)
+    assert any("theme-switch" in hint and "class" in hint.lower() for hint in review.repair_hints)
+
+def test_pre_write_update_review_tells_html_repairs_to_remove_unconsumed_id_hooks(
+    tmp_path,
+    monkeypatch,
+):
+    current_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main class=\"app-shell\">\n"
+        "      <p id=\"status-message\">Bereit.</p>\n"
+        "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+        "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+        "    </main>\n"
+        "    <script src=\"app.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    (tmp_path / "index.html").write_text(current_content, encoding="utf-8")
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(".app-shell { display: grid; }\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Update the existing mini web app with an accessible theme switcher.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[FileChangeRecord(path="app.js", operation="modify")],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the web contract mismatch."}],
+            target_paths=["index.html", "app.js"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is False
+    assert any("theme-switcher" in issue for issue in review.blocking_issues)
+    assert any("remove" in hint.lower() and "theme-switcher" in hint for hint in review.repair_hints)
+
+
+def test_compact_retry_prompt_includes_orphan_hook_removal_direction_for_html_repairs(tmp_path):
+    current_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main class=\"app-shell\">\n"
+        "      <p id=\"status-message\">Bereit.</p>\n"
+        "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+        "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+        "    </main>\n"
+        "    <script src=\"app.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    (tmp_path / "index.html").write_text(current_content, encoding="utf-8")
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Web-App in index.html und app.js mit einem Theme-Umschalter.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            language_counts={"html": 1, "javascript": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js"],
+            focus_files=["index.html", "app.js"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[FileChangeRecord(path="app.js", operation="modify")],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the web contract mismatch."}],
+            target_paths=["index.html", "app.js"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+    review_feedback = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=None,
+    )
+    repair_context = ValidationFailureEvidence(
+        command='internal:semantic_review:[{"path":"app.js"},{"path":"index.html"}]',
+        verification_scope="semantic",
+        status="failed",
+        artifact_paths=["index.html", "app.js"],
+        summary="Semantic review found a cross-file web contract mismatch.",
+        excerpt="index.html introduces the id hook 'theme-switcher', but no current sibling CSS or JS consumes it.",
+        failure_summary="Missing requirements: Resolve the introduced cross-file web contract mismatch across the changed HTML, CSS, and JS artifacts.",
+        repair_requirements=["Repair index.html so the failed semantic validation passes."],
+        repair_brief=RepairBrief(
+            failure_type="semantic_contract_mismatch",
+            failure_signature="semantic:web-contract:index-html-retry-prompt",
+            primary_target="index.html",
+            locked_target="index.html",
+            repair_constraints=["Keep the repair focused on the shared web contract."],
+            allowed_files=["index.html", "app.js"],
+        ),
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "remove or rename the unconsumed id hook 'theme-switcher'" in prompt
+    assert "Required corrections from the rejected draft:" in prompt
+
+
+def test_semantic_web_contract_review_prioritizes_file_local_hook_repair_hints(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"app-shell\">\n"
+            "      <p id=\"status-message\">Bereit.</p>\n"
+            "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+            "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+            "    </main>\n"
+            "    <script src=\"app.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+            "document.body.classList.toggle('dark-mode', false);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            ".app-shell { display: grid; }\n"
+            "body.dark-theme { color: white; }\n"
+            "body.light-theme { color: black; }\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Web-App mit einem Theme-Umschalter.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web contract."}],
+            target_paths=["app.js", "index.html", "styles.css"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+
+    review = planner._semantic_web_contract_review(session)
+
+    assert review is not None
+    assert any("theme-switcher" in issue for issue in review.suspicious_issues)
+    assert any("remove" in hint.lower() and "theme-switcher" in hint for hint in review.repair_hints)
+
+
+def test_semantic_review_failure_evidence_keeps_file_local_web_contract_repair_direction(tmp_path):
+    (tmp_path / "index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"app-shell\">\n"
+            "      <p id=\"status-message\">Bereit.</p>\n"
+            "      <button id=\"primary-action\" type=\"button\">Aktion</button>\n"
+            "      <button id=\"theme-switcher\" type=\"button\" tabindex=\"0\">Toggle Theme</button>\n"
+            "    </main>\n"
+            "    <script src=\"app.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.js").write_text(
+        (
+            "const statusMessage = document.getElementById('status-message');\n"
+            "const themeSwitcher = document.createElement('button');\n"
+            "themeSwitcher.textContent = 'Toggle Theme';\n"
+            "themeSwitcher.type = 'button';\n"
+            "themeSwitcher.tabIndex = 0;\n"
+            "document.body.appendChild(themeSwitcher);\n"
+            "document.body.classList.toggle('dark-mode', false);\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        (
+            ".app-shell { display: grid; }\n"
+            "body.dark-theme { color: white; }\n"
+            "body.light-theme { color: black; }\n"
+        ),
+        encoding="utf-8",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Web-App mit einem Theme-Umschalter.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["index.html", "app.js", "styles.css"],
+            focus_files=["index.html", "app.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="index.html", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web contract."}],
+            target_paths=["app.js", "index.html", "styles.css"],
+            target_name="index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+
+    review = planner._semantic_web_contract_review(session)
+    assert review is not None
+
+    planner._record_semantic_change_review(session, review)
+
+    assert session.active_repair_context is not None
+    assert session.active_repair_context.verification_scope == "semantic"
+    assert any(
+        "remove or rename the unconsumed id hook 'theme-switcher'" in item
+        for item in session.active_repair_context.repair_requirements
+    )
 
 
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
@@ -13955,6 +19043,397 @@ def test_pre_write_update_review_rejects_direct_main_option_fix_with_inexact_tok
     assert any("remaining argv payload" in hint for hint in review.repair_hints)
 
 
+def test_pre_write_update_review_discards_unsupported_runtime_literal_blocker_from_model_review(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        json_payloads=[
+            {
+                "safe_to_write": False,
+                "summary": "The proposed update does not preserve an explicit literal constraint from the request.",
+                "confidence": 0.88,
+                "blocking_issues": [
+                    "The exact requested literal is missing from normalize_cli.py: --keep-case hello world",
+                ],
+                "preservation_risks": [],
+                "repair_hints": [
+                    "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+                ],
+            }
+        ]
+    )
+    planner = Planner(llm, "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    source = ' '.join(source_tokens or ['Hello', 'WORLD'])\n"
+        "    print(normalize_words(source, keep_case=keep_case))\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct main runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:keep-case-cli-example",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert review.blocking_issues == []
+    assert "unsupported literal obligations" in review.summary
+    assert llm.generate_json_calls
+
+
+def test_pre_write_update_review_sanitizes_unsupported_literal_blocker_from_any_review_source(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    proposed_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    keep_case = bool(args and args[0] == '--keep-case')\n"
+        "    source_tokens = args[1:] if keep_case else args\n"
+        "    source = ' '.join(source_tokens or ['Hello', 'WORLD'])\n"
+        "    print(normalize_words(source, keep_case=keep_case))\n"
+    )
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct main runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:keep-case-cli-any-source",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed update does not preserve an explicit literal constraint from the request.",
+            confidence=0.88,
+            blocking_issues=[
+                "The exact requested literal is missing from normalize_cli.py: --keep-case hello world",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+            ],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert review.blocking_issues == []
+
+
+def test_model_backed_review_sanitizer_keeps_supported_hard_literal_blocker(tmp_path):
+    current_content = "<!doctype html>\n<html><body><header class='about-hero'></header></body></html>\n"
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_site.py").write_text("pass\n", encoding="utf-8")
+    session = SessionState(
+        task="Repair the portfolio about page so the targeted page-level validation passes.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the targeted website file."}],
+        target_paths=["about.html"],
+        target_name="about.html",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="Run python -m unittest tests.test_site and repair the failing website behavior.",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_site",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["about.html", "tests/test_site.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "FAIL: test_about_page (tests.test_site.TestSite.test_about_page)\n"
+            '  File "/tmp/tests/test_site.py", line 8, in test_about_page\n'
+            "    self.assertIn('class=\"about-hero\"', self.read('about.html'))\n"
+            "AssertionError: 'class=\"about-hero\"' not found in \"<header class='about-hero'></header>\"\n"
+        ),
+        failure_summary="The about page still misses the required hero marker.",
+        file_hints=["about.html", "tests/test_site.py"],
+        repair_requirements=[],
+        evidence_signature="sig-website-literal-anchor-scope",
+    )
+    review = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed update does not preserve an explicit literal constraint from the request.",
+        confidence=0.91,
+        blocking_issues=[
+            'The exact requested literal is missing from about.html: class="about-hero"',
+        ],
+        preservation_risks=[],
+        repair_hints=[
+            "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+        ],
+    )
+
+    sanitized = planner._sanitize_model_backed_review(
+        session.router_result,
+        session,
+        path="about.html",
+        current_content=current_content,
+        review=review,
+    )
+
+    assert sanitized.safe_to_write is False
+    assert sanitized.blocking_issues == review.blocking_issues
+    assert sanitized.repair_hints == review.repair_hints
+
+
+def test_model_backed_review_sanitizer_discards_unsupported_literal_but_keeps_other_blockers(
+    tmp_path,
+):
+    current_content = (
+        "from texttools import normalize_words\n\n"
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print('--keep-case ' + ' '.join(word.lower() for word in args[1:]))\n"
+        "        return\n"
+        "    print(normalize_words(' '.join(args or ['Hello', 'WORLD'])))\n"
+    )
+    planner = Planner(ScriptedLLM(), "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "def test_cli_supports_keep_case_flag():\n"
+        "    output = io.StringIO()\n"
+        "    with redirect_stdout(output):\n"
+        "        main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "    assert output.getvalue().strip() == 'Hello WORLD'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Repair normalize_cli.py so the direct main runtime path handles --keep-case correctly "
+            "when the failing test calls main([...]) directly."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--keep-case hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:keep-case-cli-example",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: --keep-case hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+    review = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed update does not preserve an explicit literal constraint from the request.",
+        confidence=0.9,
+        blocking_issues=[
+            "The exact requested literal is missing from normalize_cli.py: --keep-case hello world",
+            "The proposal removes stdout emission from normalize_cli.py.",
+        ],
+        preservation_risks=[],
+        repair_hints=[
+            "Keep the update narrow and include the exact requested literal without changing its order or placeholder values.",
+            "Keep writing the expected text to stdout.",
+        ],
+    )
+
+    sanitized = planner._sanitize_model_backed_review(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        review=review,
+    )
+
+    assert sanitized.safe_to_write is False
+    assert sanitized.blocking_issues == ["The proposal removes stdout emission from normalize_cli.py."]
+    assert sanitized.repair_hints == ["Keep writing the expected text to stdout."]
+
+
 def test_pre_write_update_review_still_rejects_launcher_style_direct_main_argv_indexing_when_request_mentions_placeholder_call_example(
     tmp_path,
 ):
@@ -14216,6 +19695,102 @@ def test_pre_write_update_review_keeps_scope_rejection_for_too_broad_evidence_ba
 
     assert review.safe_to_write is False
     assert "broadens scope" in review.summary.lower()
+
+
+def test_pre_write_update_review_allows_local_js_toggle_behavior_fix_despite_model_semantic_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Fix app.js so the menu toggle keeps aria-expanded and panel.hidden aligned.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_menu_toggle.cjs")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: expected panel.hidden to be false after the first click, but observed true.",
+        failure_summary="wireMenuToggle leaves panel.hidden out of sync with aria-expanded in the exercised toggle path.",
+        repair_requirements=["Change app.js so the toggle keeps aria-expanded and panel.hidden aligned across repeated clicks."],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:menu-toggle-review-misread",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=[
+                "After the first interaction, aria-expanded should be 'true' and panel.hidden should be false.",
+                "After the second interaction, aria-expanded should be 'false' and panel.hidden should be true.",
+            ],
+            observed_semantics=[
+                "After the first interaction, aria-expanded becomes 'true' while panel.hidden stays true."
+            ],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed change flips the logic for setting panel.hidden, which does not align with the intended behavior based on the test evidence.",
+            confidence=0.84,
+            blocking_issues=[
+                "The proposed change would cause the panel to be hidden when it should be shown, and vice versa."
+            ],
+            preservation_risks=[],
+            repair_hints=["Review the logic for setting panel.hidden to ensure it matches the intended interaction contract."],
+        ),
+    )
+
+    current_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    proposed_content = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=session.active_repair_context,
+    )
+
+    assert review.safe_to_write is True
+    assert "runtime failure evidence" in review.summary.lower()
 
 
 def test_validation_repair_relevance_review_allows_python_body_change_with_same_function_signature(tmp_path):
@@ -15346,7 +20921,7 @@ def test_planner_prefers_primary_model_for_validation_guided_repairs(tmp_path):
     assert model_name is None
 
 
-def test_planner_uses_primary_model_for_task_state_updates(tmp_path):
+def test_planner_uses_router_model_budget_for_task_state_updates(tmp_path):
     planner = Planner(
         ScriptedLLM(
             config=AppConfig(
@@ -15359,8 +20934,8 @@ def test_planner_uses_primary_model_for_task_state_updates(tmp_path):
         "",
     )
 
-    assert planner.task_state_updater.model_name == "qwen2.5-coder:14b"
-    assert planner.task_state_updater.num_ctx == 4096
+    assert planner.task_state_updater.model_name == "qwen2.5-coder:7b"
+    assert planner.task_state_updater.num_ctx == 2048
 
 
 def test_review_guided_retry_prefers_primary_model_for_validation_repairs(tmp_path, monkeypatch):
@@ -15547,6 +21122,559 @@ def test_planner_repair_followup_retry_budget_expands_for_single_model_runtime(t
     assert total_timeout_seconds == 420
 
 
+def test_generation_recovery_model_name_uses_live_inventory_for_single_model_runtime(tmp_path):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    planner = Planner(
+        InventoryLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:7b",
+                router_model_name="qwen2.5-coder:7b",
+            )
+        ),
+        "",
+    )
+
+    assert planner._generation_recovery_model_name() == "qwen3:8b"
+
+
+def test_planner_review_retry_uses_live_reserve_model_after_same_model_noop_runtime_retries(
+    tmp_path,
+    monkeypatch,
+):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    initial_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repaired_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    const nextExpanded = !expanded;\n"
+        "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+        "    panel.hidden = !nextExpanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    llm = InventoryLLM(
+        text_payloads=[
+            initial_draft,
+            initial_draft,
+            repaired_draft,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Fix app.js", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing JS runtime behavior."}],
+        target_paths=["app.js"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review_responses = iter(
+        [
+            ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposal still leaves the exercised JS state lines unchanged.",
+                confidence=0.91,
+                blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+                preservation_risks=[],
+                repair_hints=["Change the implicated current lines in app.js."],
+            ),
+            ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposal still leaves the exercised JS state lines unchanged.",
+                confidence=0.91,
+                blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+                preservation_risks=[],
+                repair_hints=["Change the implicated current lines in app.js."],
+            ),
+            ProposedUpdateReview(
+                safe_to_write=True,
+                summary="ok",
+                confidence=0.9,
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=[],
+            ),
+        ]
+    )
+    monkeypatch.setattr(planner, "_pre_write_update_review", lambda *_args, **_kwargs: next(review_responses))
+
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: false !== true",
+        failure_summary="wireMenuToggle does not initialize and toggle aria-expanded and panel.hidden correctly.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        line_hints=[],
+        action_hints=["Prefer a targeted fix over broad refactors."],
+        repair_requirements=["Change app.js so the setup path starts closed and the click path toggles correctly."],
+        evidence_signature="sig-js-runtime-retry",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:js-runtime-live-reserve",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["The initial observed state should be closed before the first click."],
+            observed_semantics=["The initial observed state stays open before the first click."],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=initial_draft,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal leaves the implicated JS state lines unchanged.",
+            confidence=0.88,
+            blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+            preservation_risks=[],
+            repair_hints=["Change the implicated current lines in app.js."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content == repaired_draft.strip()
+    assert len(llm.generate_calls) == 3
+    assert [call["kwargs"]["model"] for call in llm.generate_calls] == [
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+    ]
+    assert llm.generate_calls[-1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_calls[-1]["kwargs"]["num_ctx"] == 3072
+    assert result.recovery_strategy == "review_guided_fallback_model"
+
+
+def test_planner_review_retry_prefers_reserve_after_initial_primary_noop_runtime_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    initial_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repaired_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    const nextExpanded = !expanded;\n"
+        "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+        "    panel.hidden = !nextExpanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    llm = InventoryLLM(
+        text_payloads=[
+            initial_draft,
+            repaired_draft,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Fix app.js", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing JS runtime behavior."}],
+        target_paths=["app.js"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review_responses = iter(
+        [
+            ProposedUpdateReview(
+                safe_to_write=False,
+                summary="The proposal still leaves the exercised JS state lines unchanged.",
+                confidence=0.91,
+                blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+                preservation_risks=[],
+                repair_hints=["Change the implicated current lines in app.js."],
+            ),
+            ProposedUpdateReview(
+                safe_to_write=True,
+                summary="ok",
+                confidence=0.9,
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=[],
+            ),
+        ]
+    )
+    monkeypatch.setattr(planner, "_pre_write_update_review", lambda *_args, **_kwargs: next(review_responses))
+
+    repair_context = ValidationFailureEvidence(
+        command="node --test tests/test_menu_toggle.cjs",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: false !== true",
+        failure_summary="wireMenuToggle does not initialize and toggle aria-expanded and panel.hidden correctly.",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["app.js", "tests/test_menu_toggle.cjs"],
+        line_hints=[],
+        action_hints=["Prefer a targeted fix over broad refactors."],
+        repair_requirements=["Change app.js so the setup path starts closed and the click path toggles correctly."],
+        evidence_signature="sig-js-runtime-initial-noop",
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:js-runtime-initial-primary-noop",
+            primary_target="app.js",
+            locked_target="app.js",
+            expected_semantics=["The initial observed state should be closed before the first click."],
+            observed_semantics=["The initial observed state stays open before the first click."],
+            implicated_symbols=["wireMenuToggle", "panel.hidden"],
+            implicated_region_hint="app.js",
+            repair_constraints=["Keep the fix local to app.js."],
+            allowed_files=["app.js"],
+            forbidden_files=["tests/test_menu_toggle.cjs"],
+        ),
+    )
+    prior_attempts = [
+        ExecutionAttemptRecord(
+            operation_name="content_generation",
+            task_class="content_generation",
+            attempt_number=1,
+            capability_tier="tier_a",
+            recovery_strategy="primary_model",
+            prompt_variant="compact",
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            state="completed",
+            had_progress=True,
+            first_output_received=True,
+            output_characters=len(initial_draft),
+        )
+    ]
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=initial_draft,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposal leaves the implicated JS state lines unchanged.",
+            confidence=0.88,
+            blocking_issues=["The proposal for app.js leaves the implicated identifier lines unchanged: panel.hidden, wireMenuToggle"],
+            preservation_risks=[],
+            repair_hints=["Change the implicated current lines in app.js."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=prior_attempts,
+    )
+
+    assert result.content == repaired_draft.strip()
+    assert len(llm.generate_calls) == 2
+    assert [call["kwargs"]["model"] for call in llm.generate_calls] == [
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+    ]
+    assert llm.generate_calls[-1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_calls[-1]["kwargs"]["num_ctx"] == 3072
+    assert result.recovery_strategy == "review_guided_fallback_model"
+
+
+def test_generate_file_content_retries_after_identical_task_backed_update_without_repair_context(tmp_path):
+    initial_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repaired_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    const nextExpanded = !expanded;\n"
+        "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+        "    panel.hidden = !nextExpanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    llm = ScriptedLLM(
+        text_payloads=[
+            initial_draft,
+            repaired_draft,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    test_content = (
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n"
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+                "focus_files": ["app.js"],
+                "test_files": ["tests/test_menu_toggle.cjs"],
+                "entrypoints": ["app.js"],
+                "language_counts": {"javascript": 2},
+                "project_labels": ["javascript"],
+            }
+        ),
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=test_content,
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=initial_draft,
+    )
+
+    assert result.failure is None
+    assert result.content == repaired_draft.strip()
+    assert len(llm.generate_calls) == 2
+    retry_prompt = llm.generate_calls[1]["args"][0]
+    assert "Self-review feedback on the previous proposal:" in retry_prompt
+    assert "no-op or only an equivalent restatement" in retry_prompt or "does not make a productive change" in retry_prompt
+
+
+def test_generate_file_content_uses_reserve_model_after_duplicate_compact_retry_prompt_without_repair_context(
+    tmp_path,
+):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    initial_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    button.setAttribute(\"aria-expanded\", expanded ? \"false\" : \"true\");\n"
+        "    panel.hidden = !expanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    repaired_draft = (
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.setAttribute(\"aria-expanded\", \"false\");\n"
+        "  panel.hidden = true;\n"
+        "  button.addEventListener(\"click\", () => {\n"
+        "    const expanded = button.getAttribute(\"aria-expanded\") === \"true\";\n"
+        "    const nextExpanded = !expanded;\n"
+        "    button.setAttribute(\"aria-expanded\", nextExpanded ? \"true\" : \"false\");\n"
+        "    panel.hidden = !nextExpanded;\n"
+        "  });\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n"
+    )
+    llm = InventoryLLM(
+        text_payloads=[
+            initial_draft,
+            initial_draft,
+            repaired_draft,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    test_content = (
+        "const test = require(\"node:test\");\n"
+        "const assert = require(\"node:assert/strict\");\n"
+        "const { wireMenuToggle } = require(\"../app.js\");\n\n"
+        "test(\"wireMenuToggle toggles panel state on each click\", () => {\n"
+        "  const button = createButton();\n"
+        "  const panel = createPanel();\n"
+        "  wireMenuToggle(button, panel);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"true\");\n"
+        "  assert.equal(panel.hidden, false);\n"
+        "  button.click();\n"
+        "  assert.equal(button.getAttribute(\"aria-expanded\"), \"false\");\n"
+        "  assert.equal(panel.hidden, true);\n"
+        "});\n"
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt gegeneinander umschalten. Fuehre danach node --test "
+            "tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["app.js", "tests/test_menu_toggle.cjs"],
+                "focus_files": ["app.js"],
+                "test_files": ["tests/test_menu_toggle.cjs"],
+                "entrypoints": ["app.js"],
+                "language_counts": {"javascript": 2},
+                "project_labels": ["javascript"],
+            }
+        ),
+        tool_calls=[
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_menu_toggle.cjs"},
+                success=True,
+                summary="Read tests/test_menu_toggle.cjs.",
+                output_excerpt=test_content,
+            )
+        ],
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the JS toggle behavior."}],
+        target_paths=["app.js", "tests/test_menu_toggle.cjs"],
+        target_name="app.js",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="node --test tests/test_menu_toggle.cjs",
+    )
+
+    result = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=initial_draft,
+    )
+
+    assert result.failure is None
+    assert result.content == repaired_draft.strip()
+    assert llm.generate_calls[0]["kwargs"]["model"] is None
+    assert [call["kwargs"]["model"] for call in llm.generate_calls[1:]] == [
+        "qwen2.5-coder:7b",
+        "qwen3:8b",
+    ]
+    assert llm.generate_calls[-1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[-1]["kwargs"]["timeout"] >= 90
+    assert llm.generate_calls[-1]["kwargs"]["total_timeout"] >= 420
+    assert session.runtime_executions[-1]["recovery_strategy"] == "review_guided_fallback_model"
+
+
 def test_review_guided_retry_uses_deterministic_direct_main_recovery_before_extra_model_retry(
     tmp_path,
 ):
@@ -15650,6 +21778,745 @@ def test_review_guided_retry_uses_deterministic_direct_main_recovery_before_extr
     assert "argv[1:]" in result.content
     assert result.recovery_strategy == "deterministic_direct_main_contract"
     assert result.capability_tier == "tier_d"
+    assert llm.generate_calls == []
+
+
+def test_review_guided_retry_uses_deterministic_direct_main_payload_echo_recovery_after_generic_review_failure(
+    tmp_path,
+):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep-case title-preservation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-payload-echo",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+            confidence=0.93,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to normalize_cli.py for runtime:assertion_mismatch:direct-main-payload-echo (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the locked repair target so the failing runtime behavior changes materially."],
+        ),
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "print(' '.join(args[1:]))" in result.content
+    assert "word.upper()" not in result.content
+    assert result.recovery_strategy == "deterministic_direct_main_contract"
+    assert result.capability_tier == "tier_d"
+    assert llm.generate_calls == []
+
+
+def test_review_guided_retry_uses_deterministic_direct_python_script_recovery_before_extra_model_retry(
+    tmp_path,
+):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args[:2] == ['--prefix', 'Dr.']:\n"
+        "        print('Dr. ' + ' '.join(word.capitalize() for word in args[2:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']))\n"
+    )
+    (tmp_path / "prefix_cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair prefix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["prefix_cli.py"],
+                "focus_files": ["prefix_cli.py"],
+                "entrypoints": ["prefix_cli.py"],
+                "symbol_index": {"prefix_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the direct script CLI behavior."}],
+        target_paths=["prefix_cli.py"],
+        target_name="prefix_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python prefix_cli.py --prefix Ms. jane DOE")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python prefix_cli.py --prefix Ms. jane DOE",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: '--prefix Ms. jane DOE' != 'Ms. Jane Doe'",
+        failure_summary="prefix_cli.py still produces the wrong behavior for the direct python script prefix path.",
+        repair_requirements=["Change prefix_cli.py so the direct script runtime path formats the prefixed name correctly."],
+        file_hints=["prefix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-script-prefix-retry-recovery",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Ms. Jane Doe"],
+            observed_semantics=["Validation currently produces: --prefix Ms. jane DOE"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="prefix_cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still misstates the direct python script argv prefix contract exercised by the failed runtime path.",
+            confidence=0.9,
+            blocking_issues=[
+                "The proposal compares args[:2] against '--prefix' in prefix_cli.py, but that branch can never match because the slice length and literal token count differ."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "If you compare args[:N] against a literal option sequence in prefix_cli.py, keep the slice length aligned with the compared literal tokens."
+            ],
+        ),
+        repair_context=session.active_repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "if len(args) >= 2 and args[:1] == ['--prefix']:" in result.content
+    assert "print(args[1] + ' ' + ' '.join(" in result.content
+    assert "word.capitalize() for word in args[2:]" in result.content
+    assert result.recovery_strategy == "deterministic_direct_python_script_contract"
+    assert result.capability_tier == "tier_d"
+    assert llm.generate_calls == []
+
+
+def test_deterministic_direct_main_payload_echo_recovery_skips_nonverbatim_expected_output(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(word.upper() for word in args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello,', 'WORLD!'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep-case punctuation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO, WORLD!' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case punctuation path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-payload-echo-punctuation",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO, WORLD!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    result = planner._deterministic_direct_main_runtime_recovery(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so it would preserve the same failing state.",
+            confidence=0.93,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to normalize_cli.py for runtime:assertion_mismatch:direct-main-payload-echo-punctuation (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the locked repair target so the failing runtime behavior changes materially."],
+        ),
+    )
+
+    assert result is None
+
+
+def test_draft_update_decision_uses_deterministic_direct_main_payload_echo_for_runtime_repair(tmp_path):
+    llm = ScriptedLLM(text_payloads=["def wrong():\n    return None\n"])
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).upper())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).title())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep-case title-preservation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO WORLD' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-runtime-repair-entry",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    decision = planner._draft_update_decision(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "write_file"
+    assert "print(' '.join(args[1:]))" in decision.tool_args["content"]
+    assert ".upper()" not in decision.tool_args["content"]
+    assert llm.generate_calls == []
+
+
+def test_deterministic_runtime_repair_decision_skips_nonverbatim_direct_main_case(tmp_path):
+    llm = ScriptedLLM(text_payloads=["def fallback():\n    return None\n"])
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).upper())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello,', 'WORLD!'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the keep-case punctuation bug in normalize_cli.py.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/test_normalize.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m unittest tests.test_normalize")
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'HELLO, WORLD!' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case punctuation path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-runtime-repair-punctuation",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: HELLO, WORLD!"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    decision = planner._deterministic_runtime_repair_decision(
+        session.router_result,
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert decision is None
+
+
+def test_direct_main_option_contract_details_prefers_explicit_validation_command_targets(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package\n", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "def test_direct_main_flag():\n"
+        "    main(['--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_greet_cli.py").write_text(
+        "def test_prefix_flag():\n"
+        "    main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py", "tests/__init__.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:command-scoped-direct-main-tests",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py", "greet_cli.py"],
+            forbidden_files=["tests/test_normalize.py", "tests/test_greet_cli.py"],
+        ),
+    )
+    option_tokens, positional_tokens = planner._direct_main_option_contract_details(session, repair_context)
+
+    assert option_tokens == ["--keep-case"]
+    assert positional_tokens == ["Hello", "WORLD"]
+
+
+def test_direct_main_option_contract_details_drop_interleaved_option_values(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package\n", encoding="utf-8")
+    (tests_dir / "test_prefix_cli.py").write_text(
+        "def test_direct_main_prefix_keep_case():\n"
+        "    main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair prefix_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["prefix_cli.py", "tests/test_prefix_cli.py"],
+                "focus_files": ["prefix_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_prefix_cli.py"],
+                "entrypoints": ["prefix_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest -q tests/test_prefix_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["prefix_cli.py", "tests/test_prefix_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'Dr.: WORLD' != 'Dr. Hello WORLD'",
+        failure_summary="prefix_cli.py still formats the direct main prefix keep-case path incorrectly.",
+        repair_requirements=["Change prefix_cli.py so the direct main prefix keep-case path returns the expected output."],
+        file_hints=["prefix_cli.py", "tests/test_prefix_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-prefix-keep-case-tail",
+            primary_target="prefix_cli.py",
+            locked_target="prefix_cli.py",
+            expected_semantics=["Validation should produce: Dr. Hello WORLD"],
+            observed_semantics=["Validation currently produces: Dr.: WORLD"],
+            implicated_symbols=["main"],
+            implicated_region_hint="prefix_cli.py",
+            repair_constraints=["Keep the fix local to prefix_cli.py."],
+            allowed_files=["prefix_cli.py"],
+            forbidden_files=["tests/test_prefix_cli.py"],
+        ),
+    )
+
+    option_tokens, positional_tokens = planner._direct_main_option_contract_details(session, repair_context)
+
+    assert option_tokens == ["--prefix", "--keep-case"]
+    assert positional_tokens == ["Hello", "WORLD"]
+
+
+def test_direct_main_option_contract_review_ignores_unrelated_test_option_tokens(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package\n", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "def test_direct_main_flag():\n"
+        "    main(['--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_greet_cli.py").write_text(
+        "def test_prefix_flag():\n"
+        "    main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py", "tests/__init__.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:command-scoped-direct-main-review",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py", "greet_cli.py"],
+            forbidden_files=["tests/test_normalize.py", "tests/test_greet_cli.py"],
+        ),
+    )
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).lower())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    proposed_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]))\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+
+    review = planner._direct_main_option_contract_review(
+        session,
+        path="normalize_cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+    )
+
+    assert review is None
+
+
+def test_draft_update_decision_normalizes_direct_main_prefixed_argv_binding(tmp_path):
+    llm = ScriptedLLM(text_payloads=["def wrong():\n    return None\n"])
+    planner = Planner(llm, "")
+    current_content = (
+        "def main(argv=None):\n"
+        "    args = list(argv or [])[1:]\n"
+        "    if args and args[0] == '--keep-case':\n"
+        "        print(' '.join(args[1:]).lower())\n"
+        "        return\n"
+        "    print(' '.join(args or ['hello', 'world']).lower())\n"
+    )
+    (tmp_path / "normalize_cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# package\n", encoding="utf-8")
+    (tests_dir / "test_normalize.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from normalize_cli import main\n\n"
+        "class NormalizeTests(unittest.TestCase):\n"
+        "    def test_direct_main_flag(self):\n"
+        "        output = io.StringIO()\n"
+        "        with redirect_stdout(output):\n"
+        "            main(['--keep-case', 'Hello', 'WORLD'])\n"
+        "        self.assertEqual(output.getvalue().strip(), 'Hello WORLD')\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_greet_cli.py").write_text(
+        "def test_prefix_flag():\n"
+        "    main(['--prefix', 'Dr.', '--keep-case', 'Hello', 'WORLD'])\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair normalize_cli.py",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "focus_files": ["normalize_cli.py"],
+                "test_files": ["tests/__init__.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+                "entrypoints": ["normalize_cli.py"],
+                "symbol_index": {"normalize_cli.py": ["main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI behavior."}],
+        target_paths=["normalize_cli.py", "tests/test_normalize.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m unittest tests.__init__ tests.test_normalize",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.__init__ tests.test_normalize",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: 'hello world' != 'Hello WORLD'",
+        failure_summary="normalize_cli.py still produces the wrong behavior for the direct main keep-case path.",
+        repair_requirements=["Change normalize_cli.py so the direct main runtime path preserves keep-case output."],
+        file_hints=["normalize_cli.py", "tests/test_normalize.py", "tests/test_greet_cli.py", "tests/__init__.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:direct-main-prefixed-argv-binding",
+            primary_target="normalize_cli.py",
+            locked_target="normalize_cli.py",
+            expected_semantics=["Validation should produce: Hello WORLD"],
+            observed_semantics=["Validation currently produces: hello world"],
+            implicated_symbols=["main"],
+            implicated_region_hint="normalize_cli.py",
+            repair_constraints=["Keep the fix local to normalize_cli.py."],
+            allowed_files=["normalize_cli.py"],
+            forbidden_files=["tests/test_normalize.py"],
+        ),
+    )
+
+    decision = planner._draft_update_decision(
+        session.router_result,
+        session,
+        "normalize_cli.py",
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "write_file"
+    assert "args = list(argv or [])" in decision.tool_args["content"]
+    assert "print(' '.join(args[1:]))" in decision.tool_args["content"]
     assert llm.generate_calls == []
 
 
@@ -18788,6 +25655,183 @@ def test_planner_runs_validation_after_changes(tmp_path):
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "run_tests"
     assert decision.tool_args["command"] == "python -m pytest"
+
+
+def test_planner_reproduces_direct_cli_contract_with_expected_stdout(tmp_path):
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["normalize_cli.py"],
+        focus_files=["normalize_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    user_turn = (
+        "Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+        "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+        "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "diagnose_issue", "reason": "Reproduce the CLI behavior before editing."}],
+        target_paths=["normalize_cli.py"],
+        target_name="normalize_cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.validation_plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=[],
+        session=session,
+    )
+
+    decision = planner._diagnose_issue_decision(
+        session.router_result,
+        session,
+        ["normalize_cli.py"],
+        {"normalize_cli.py"},
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python normalize_cli.py --keep-case hello world"
+    assert decision.tool_args["expected_stdout"] == "hello world"
+
+
+def test_planner_runs_pending_changed_file_validation_with_expected_stdout(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="debug",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "run_validation",
+                        "reason": "Verify the changed CLI behavior.",
+                    }
+                ],
+                target_paths=["prefix_cli.py"],
+                target_name="prefix_cli.py",
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the prefix CLI behavior safely.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command="python prefix_cli.py --prefix Ms. jane DOE",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="Ms. Jane Doe",
+                required=True,
+            ),
+            ValidationCommand(
+                command="python prefix_cli.py hello world",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="hello world",
+                required=True,
+            ),
+        ],
+    )
+    commit_task_state_and_route(planner, session, llm.json_payloads[0])
+    session.changed_files.append(FileChangeRecord(path="prefix_cli.py", operation="write"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python prefix_cli.py --prefix Ms. jane DOE"
+    assert decision.tool_args["expected_stdout"] == "Ms. Jane Doe"
+
+
+def test_planner_keeps_expected_stdout_for_second_pending_cli_contract(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="debug",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "run_validation",
+                        "reason": "Verify the remaining CLI contract.",
+                    }
+                ],
+                target_paths=["prefix_cli.py"],
+                target_name="prefix_cli.py",
+            )
+        ]
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Repair the prefix CLI behavior safely.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        edit_generation=1,
+        validation_plan=[
+            ValidationCommand(
+                command="python prefix_cli.py --prefix Ms. jane DOE",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="Ms. Jane Doe",
+                required=True,
+            ),
+            ValidationCommand(
+                command="python prefix_cli.py hello world",
+                kind="test",
+                verification_scope="runtime",
+                expected_stdout="hello world",
+                required=True,
+            ),
+        ],
+        validation_runs=[
+            ValidationRunRecord(
+                command="python prefix_cli.py --prefix Ms. jane DOE",
+                cwd=".",
+                kind="test",
+                verification_scope="runtime",
+                status="passed",
+                exit_code=0,
+                risk_level="medium",
+                iteration=4,
+                edit_generation=1,
+                summary="Validation command exited with 0.",
+                excerpt="Ms. Jane Doe\n",
+            )
+        ],
+    )
+    commit_task_state_and_route(planner, session, llm.json_payloads[0])
+    session.changed_files.append(FileChangeRecord(path="prefix_cli.py", operation="write"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python prefix_cli.py hello world"
+    assert decision.tool_args["expected_stdout"] == "hello world"
 
 
 def test_planner_plan_completion_criteria_uses_task_state_verification_target(tmp_path):

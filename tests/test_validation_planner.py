@@ -1657,7 +1657,46 @@ def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypat
     assert any(command.startswith("internal:python_syntax:") for command in commands)
     assert any(command.startswith("internal:web_artifact:") for command in commands)
     assert any(command.startswith("internal:html_refs:") for command in commands)
+    assert any(command.startswith("internal:web_runtime_smoke:") for command in commands)
     assert any(command.startswith("node --check") for command in commands)
+
+
+def test_validation_planner_keeps_structural_web_checks_required_when_runtime_smoke_exists(monkeypatch):
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=4,
+        language_counts={"html": 1, "javascript": 1},
+        top_directories=[],
+        important_files=["index.html", "app.js"],
+        focus_files=["index.html"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small standalone web artifact.",
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+
+    plan = planner.build_plan(
+        "Ergaenze einen keyboard-accessible Theme-Umschalter mit localStorage und Statusmeldung",
+        snapshot,
+        changed_files=["index.html", "app.js"],
+    )
+
+    structural = next(item for item in plan if item.command.startswith("internal:web_artifact:"))
+    runtime = next(item for item in plan if item.command.startswith("internal:web_runtime_smoke:"))
+
+    assert structural.required is True
+    assert runtime.verification_scope == "runtime"
 
 
 def test_validation_planner_prefers_runtime_smoke_for_small_python_entry_artifact():
@@ -1744,6 +1783,558 @@ def test_validation_planner_includes_explicit_user_requested_validation_command(
     assert plan[0].command == "python -m unittest"
     assert plan[0].verification_scope == "runtime"
     assert plan[0].required is True
+
+
+def test_validation_planner_trims_direct_python_cli_example_from_user_request():
+    planner = ValidationPlanner()
+
+    command = planner._normalize_explicit_validation_command(
+        "python main.py --keep-case hello world genau hello world ausgibt."
+    )
+
+    assert command == "python main.py --keep-case hello world"
+
+
+def test_validation_planner_prefers_explicit_python_cli_example_over_generic_smoke():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["main.py"],
+        focus_files=["main.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["main.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    session = SessionState(
+        task=(
+            "Aktualisiere main.py. Fuege die Option --keep-case hinzu, sodass "
+            "python main.py --keep-case hello world genau hello world ausgibt."
+        ),
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=(
+                "Aktualisiere main.py. Fuege die Option --keep-case hinzu, sodass "
+                "python main.py --keep-case hello world genau hello world ausgibt."
+            ),
+            root_goal="Extend the CLI safely.",
+            active_goal="Add the new option and keep existing behavior.",
+            goal_relation="continue",
+            output_expectation="Updated CLI behavior.",
+            verification_target="Verify the requested CLI behavior.",
+            next_action="modify",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["main.py"],
+        session=session,
+    )
+
+    commands = [item.command for item in plan]
+
+    assert "python main.py --keep-case hello world" in commands
+    assert not any(command.startswith('internal:python_cli_smoke:["main.py"]') for command in commands)
+    explicit = next(item for item in plan if item.command == "python main.py --keep-case hello world")
+    assert explicit.verification_scope == "runtime"
+    assert explicit.required is True
+
+
+def test_validation_planner_extracts_expected_stdout_from_direct_python_cli_examples():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["normalize_cli.py"],
+        focus_files=["normalize_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["normalize_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    user_turn = (
+        "Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+        "soll exakt `hello world` ausgegeben werden, ohne das Flag mit auszugeben. "
+        "Ohne Flag soll `python normalize_cli.py hello world` weiterhin `Hello World` ausgeben."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the CLI behavior safely.",
+            active_goal="Fix the keep-case and default formatting output.",
+            goal_relation="continue",
+            output_expectation="Updated CLI output behavior.",
+            verification_target="Verify the requested CLI behavior.",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["normalize_cli.py"],
+        session=session,
+    )
+
+    keep_case = next(item for item in plan if item.command == "python normalize_cli.py --keep-case hello world")
+    default_case = next(item for item in plan if item.command == "python normalize_cli.py hello world")
+
+    assert keep_case.expected_stdout == "hello world"
+    assert default_case.expected_stdout == "Hello World"
+
+
+def test_validation_planner_extracts_explicit_node_test_command_from_user_request(monkeypatch):
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"javascript": 1},
+        top_directories=[],
+        important_files=["app.js", "tests/test_menu_toggle.cjs"],
+        focus_files=["app.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_menu_toggle.cjs"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app.js"],
+        repo_map=[],
+        project_labels=["javascript"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small JavaScript interaction module with a focused node test.",
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+    user_turn = (
+        "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+        "bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the menu toggle behavior safely.",
+            active_goal="Fix the JS interaction and rerun the targeted node test.",
+            goal_relation="continue",
+            output_expectation="Updated JS interaction behavior plus a passing node test.",
+            verification_target="node --test tests/test_menu_toggle.cjs",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["app.js", "tests/test_menu_toggle.cjs"],
+        session=session,
+    )
+
+    explicit = next(item for item in plan if item.command == "node --test tests/test_menu_toggle.cjs")
+
+    assert explicit.verification_scope == "runtime"
+    assert explicit.required is True
+
+
+def test_validation_planner_strips_trailing_passes_token_from_inline_node_test_command():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "node --test tests/test_menu_toggle.cjs passes"
+    )
+
+    assert normalized == "node --test tests/test_menu_toggle.cjs"
+
+
+def test_validation_planner_keeps_node_test_flags_while_trimming_following_prose():
+    planner = ValidationPlanner()
+
+    normalized = planner._normalize_explicit_validation_command(
+        "node --test --test-name-pattern toggle tests/test_menu_toggle.cjs passes."
+    )
+
+    assert normalized == "node --test --test-name-pattern toggle tests/test_menu_toggle.cjs"
+
+
+def test_validation_planner_build_plan_trims_trailing_prose_from_explicit_node_test_command(monkeypatch):
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"javascript": 1},
+        top_directories=[],
+        important_files=["app.js", "tests/test_menu_toggle.cjs"],
+        focus_files=["app.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_menu_toggle.cjs"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app.js"],
+        repo_map=[],
+        project_labels=["javascript"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small JavaScript interaction module with a focused node test.",
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+    user_turn = (
+        "Fix app.js so node --test tests/test_menu_toggle.cjs passes. "
+        "Keep wireMenuToggle as the exported function."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the menu toggle behavior safely.",
+            active_goal="Fix the JS interaction and rerun the targeted node test.",
+            goal_relation="continue",
+            output_expectation="Updated JS interaction behavior plus a passing node test.",
+            verification_target="Verify the requested JS behavior.",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["app.js", "tests/test_menu_toggle.cjs"],
+        session=session,
+    )
+
+    explicit = next(item for item in plan if item.command == "node --test tests/test_menu_toggle.cjs")
+
+    assert explicit.verification_scope == "runtime"
+    assert explicit.required is True
+
+
+def test_validation_planner_preserves_node_tap_assertion_context_for_runtime_repairs(tmp_path):
+    planner = ValidationPlanner()
+    app_path = tmp_path / "app.js"
+    app_path.write_text(
+        "function wireMenuToggle(button, panel) {\n"
+        "  button.addEventListener('click', () => {});\n"
+        "}\n\n"
+        "module.exports = { wireMenuToggle };\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_menu_toggle.cjs"
+    test_path.write_text("const test = require('node:test');\n", encoding="utf-8")
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=2,
+        language_counts={"javascript": 2},
+        top_directories=["tests"],
+        important_files=["app.js", "tests/test_menu_toggle.cjs"],
+        focus_files=["app.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_menu_toggle.cjs"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["app.js"],
+        repo_map=[],
+        project_labels=["javascript"],
+        likely_commands=["node --test tests/test_menu_toggle.cjs"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small JavaScript interaction module with a focused node test.",
+    )
+    session = SessionState(
+        task=(
+            "Repariere app.js. wireMenuToggle(button, panel) soll aria-expanded und panel.hidden "
+            "bei jedem Klick korrekt umschalten. Fuehre danach node --test tests/test_menu_toggle.cjs aus."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        edit_generation=1,
+    )
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="app.js", operation="modify"),
+            FileChangeRecord(path="tests/test_menu_toggle.cjs", operation="modify"),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command="node --test tests/test_menu_toggle.cjs",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "TAP version 13\n"
+            "# Subtest: wireMenuToggle toggles panel state on each click\n"
+            "not ok 1 - wireMenuToggle toggles panel state on each click\n"
+            "  ---\n"
+            f"  location: '{test_path}:20:1'\n"
+            "  failureType: 'testCodeFailure'\n"
+            "  error: |-\n"
+            "    Expected values to be strictly equal:\n"
+            "    + actual - expected\n"
+            "\n"
+            "    + undefined\n"
+            "    - 'false'\n"
+            "  code: 'ERR_ASSERTION'\n"
+            "  name: 'AssertionError'\n"
+            "  expected: 'false'\n"
+            "  operator: 'strictEqual'\n"
+            "  stack: |-\n"
+            f"    TestContext.<anonymous> ({test_path}:24:10)\n"
+            "  ...\n"
+            "1..1\n"
+            "# tests 1\n"
+            "# pass 0\n"
+            "# fail 1\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.failure_type == "assertion_mismatch"
+    assert evidence.repair_brief.primary_target == "app.js"
+    assert evidence.repair_brief.expected_semantics == ["Validation should produce: false"]
+    assert evidence.repair_brief.observed_semantics == ["Validation currently produces: undefined"]
+    assert "Expected values to be strictly equal:" in evidence.excerpt
+    assert "+ actual - expected" in evidence.excerpt
+    assert "expected: 'false'" in evidence.excerpt
+    assert "Expected values to be strictly equal" in evidence.failure_summary
+    assert "app.js still produces the wrong behavior" in evidence.repair_brief.root_cause_summary
+
+
+def test_validation_planner_preserves_punctuation_in_expected_stdout_from_direct_python_cli_examples():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=1,
+        language_counts={"python": 1},
+        top_directories=[],
+        important_files=["suffix_cli.py"],
+        focus_files=["suffix_cli.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["suffix_cli.py"],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Single Python CLI entrypoint.",
+    )
+    user_turn = (
+        "Wenn `python suffix_cli.py --suffix ! Hello WORLD` ausgefuehrt wird, "
+        "soll exakt `Hello WORLD!` ausgegeben werden. "
+        "Ohne Suffix soll `python suffix_cli.py hello world` weiterhin `Hello World` ausgeben."
+    )
+    session = SessionState(
+        task=user_turn,
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=user_turn,
+            root_goal="Repair the CLI behavior safely.",
+            active_goal="Fix the suffix and default formatting output.",
+            goal_relation="continue",
+            output_expectation="Updated CLI output behavior.",
+            verification_target="Verify the requested CLI behavior.",
+            next_action="debug",
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["suffix_cli.py"],
+        session=session,
+    )
+
+    suffix_case = next(item for item in plan if item.command == "python suffix_cli.py --suffix ! Hello WORLD")
+    default_case = next(item for item in plan if item.command == "python suffix_cli.py hello world")
+
+    assert suffix_case.expected_stdout == "Hello WORLD!"
+    assert default_case.expected_stdout == "Hello World"
+
+
+def test_validation_planner_prefers_richer_duplicate_cli_command_with_expected_stdout():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Repair the CLI output safely.",
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=(
+                "Wenn `python normalize_cli.py --keep-case hello world` ausgefuehrt wird, "
+                "soll exakt `hello world` ausgegeben werden."
+            ),
+            root_goal="Repair the CLI behavior safely.",
+            active_goal="Fix the keep-case output.",
+            goal_relation="continue",
+            output_expectation="Updated CLI behavior.",
+            verification_target="Fuehre python normalize_cli.py --keep-case hello world aus.",
+            next_action="debug",
+        ),
+    )
+
+    commands = planner._explicit_validation_commands(session)
+    keep_case = next(item for item in commands if item.command == "python normalize_cli.py --keep-case hello world")
+
+    assert keep_case.expected_stdout == "hello world"
+
+
+def test_validation_planner_deduplicates_nested_pytest_match_inside_python_module_request():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task=(
+            "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+            "in [lower, upper] begrenzen. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+        ),
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn=(
+                "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+                "in [lower, upper] begrenzen. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+            ),
+            root_goal="Repair the failing range clamp behavior.",
+            active_goal="Fix the range clamp behavior and rerun the relevant test.",
+            goal_relation="report_problem",
+            output_expectation="Updated range helper plus a passing targeted pytest run.",
+            verification_target="Reproduce the failing path, apply the smallest safe fix, and rerun the most relevant validation.",
+            next_action="debug",
+            execution_strategy="debug_repair",
+        ),
+    )
+
+    commands = [item.command for item in planner._explicit_validation_commands(session)]
+
+    assert commands == ["python -m pytest tests/test_range_utils.py"]
+
+
+def test_validation_planner_skips_diagnostic_smokes_when_explicit_runtime_validation_exists():
+    planner = ValidationPlanner()
+    snapshot = WorkspaceSnapshot(
+        root="/tmp/demo",
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["tests"],
+        important_files=["range_utils.py", "tests/test_range_utils.py"],
+        focus_files=["tests/test_range_utils.py", "range_utils.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_range_utils.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["python"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small Python helper with one focused pytest file.",
+    )
+    session = SessionState(
+        task=(
+            "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+            "in [lower, upper] begrenzen und lower/upper auch dann richtig behandeln, wenn sie "
+            "vertauscht uebergeben werden. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+        ),
+        workspace_root="/tmp/demo",
+        candidate_files=[
+            "tests/test_range_utils.py",
+            "range_utils.py",
+            "normalize_cli.py",
+            "tests/test_normalize.py",
+        ],
+        task_state=TaskState(
+            latest_user_turn=(
+                "Repariere range_utils.py. clamp_range(value, lower, upper) soll Werte korrekt "
+                "in [lower, upper] begrenzen und lower/upper auch dann richtig behandeln, wenn sie "
+                "vertauscht uebergeben werden. Fuehre danach python -m pytest tests/test_range_utils.py aus."
+            ),
+            root_goal="Repair the failing range clamp behavior.",
+            active_goal="Fix the range clamp behavior and rerun the relevant test.",
+            goal_relation="report_problem",
+            output_expectation="Updated range helper plus a passing targeted pytest run.",
+            verification_target="Reproduce the failing path, apply the smallest safe fix, and rerun the most relevant validation.",
+            next_action="debug",
+            execution_strategy="debug_repair",
+            target_artifacts=[
+                {"path": "range_utils.py", "name": "range_utils.py", "kind": ".py", "role": "primary_target", "confidence": 0.58},
+                {"path": "tests/test_range_utils.py", "name": "test_range_utils.py", "kind": ".py", "role": "validation_target", "confidence": 0.58},
+            ],
+        ),
+    )
+
+    plan = planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=["range_utils.py"],
+        session=session,
+    )
+
+    commands = [item.command for item in plan]
+
+    assert commands == ["python -m pytest tests/test_range_utils.py"]
+
+
+def test_validation_planner_keeps_explicit_pytest_binary_when_requested_directly():
+    planner = ValidationPlanner()
+    session = SessionState(
+        task="Repariere range_utils.py und fuehre danach pytest tests/test_range_utils.py aus.",
+        workspace_root="/tmp/demo",
+        task_state=TaskState(
+            latest_user_turn="Repariere range_utils.py und fuehre danach pytest tests/test_range_utils.py aus.",
+            root_goal="Repair the failing range clamp behavior.",
+            active_goal="Fix the range clamp behavior and rerun the relevant test.",
+            goal_relation="report_problem",
+            output_expectation="Updated range helper plus a passing targeted pytest run.",
+            verification_target="pytest tests/test_range_utils.py",
+            next_action="debug",
+            execution_strategy="debug_repair",
+        ),
+    )
+
+    commands = [item.command for item in planner._explicit_validation_commands(session)]
+
+    assert commands == ["pytest tests/test_range_utils.py"]
 
 
 def test_validation_planner_targets_changed_unittest_module_instead_of_generic_command():

@@ -2286,12 +2286,11 @@ function renderAuthStatusPanel(tone, loading, lockedSeconds) {
 function renderSidebar() {
   const workspace = selectedWorkspace();
   const activeRuns = state.sessions.filter((session) => isSessionRunning(session)).length;
-  const selectedSessions = workspace ? sessionsForWorkspace(workspace.id) : [];
 
   return `
-    <div class="sidebar-shell sidebar-shell-minimal">
+    <div class="sidebar-shell sidebar-shell-minimal workbench-sidebar">
       <div class="sidebar-header sidebar-header-minimal workbench-sidebar-header">
-        <div class="sidebar-brand-card">
+        <div class="sidebar-brand-line">
           <div class="sidebar-brand-mark" aria-hidden="true">${icon("spark")}</div>
           <div class="sidebar-brand-copy">
             <strong>${escapeHtml(APP_BRAND_PLAIN)}</strong>
@@ -2302,7 +2301,7 @@ function renderSidebar() {
             live: activeRuns > 0,
           })}
         </div>
-        <div class="sidebar-cta-grid">
+        <div class="sidebar-action-row">
           <button class="sidebar-primary-action sidebar-cta-button primary" type="button" data-action="open-workspace-modal">
             ${icon("project-add")}
             <span>Projekt anlegen</span>
@@ -2320,14 +2319,13 @@ function renderSidebar() {
         </div>
       </div>
       <div class="sidebar-scroll">
-        <section class="sidebar-section sidebar-panel sidebar-project-section">
+        <section class="sidebar-section sidebar-section-plain sidebar-project-section">
           <div class="sidebar-section-head">
             <p class="sidebar-label">Projekte</p>
             <span class="sidebar-count">${escapeHtml(countLabel(state.workspaces.length, "1 Projekt", `${state.workspaces.length} Projekte`))}</span>
           </div>
           ${renderSidebarProjectList()}
         </section>
-        ${renderSidebarThreadSection(workspace, selectedSessions)}
       </div>
       ${renderSidebarFooter(activeRuns)}
     </div>
@@ -2353,70 +2351,83 @@ function renderSidebarProjectList() {
 function renderSidebarProject(workspace) {
   const active = workspace.id === activeWorkspaceId();
   const sessions = sessionsForWorkspace(workspace.id);
-  const activeRuns = sessions.filter((session) => isSessionRunning(session)).length;
-  const latestSession = sessions[0] || null;
   const disabled = isWorkspaceBusy(workspace.id);
-  const metaParts = [
-    countLabel(sessions.length, "1 Thread", `${sessions.length} Threads`),
-    activeRuns ? `${activeRuns} aktiv` : "Bereit",
-    latestSession?.updated_at ? `Zuletzt ${formatSessionTimestamp(latestSession.updated_at)}` : "",
-  ].filter(Boolean);
 
   return `
-    <article class="project-row ${active ? "active" : ""}">
-      <div class="project-row-main">
+    <div class="project-row ${active ? "active" : ""}">
+      <div class="project-row-main sidebar-entry-row">
         <button
           class="project-button project-row-button"
           type="button"
           data-action="select-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
+          title="${escapeAttribute(workspace.name)}"
         >
-          <span class="project-button-icon project-row-icon" aria-hidden="true">${icon(active ? "folder-open" : "folder")}</span>
-          <span class="project-button-copy project-row-copy">
-            <span class="project-button-name project-row-title">${escapeHtml(workspace.name)}</span>
-            <span class="project-button-path project-row-path">${escapeHtml(shortenPath(workspace.path, 42))}</span>
-            <span class="project-row-meta">${escapeHtml(metaParts.join(" · "))}</span>
-          </span>
-          <span class="project-button-count project-row-count">${escapeHtml(String(sessions.length))}</span>
+          <span class="project-button-icon project-row-icon" aria-hidden="true">${icon("folder")}</span>
+          <span class="project-button-name project-row-title">${escapeHtml(workspace.name)}</span>
         </button>
-        ${renderProjectOverflowMenu(workspace, { disabled })}
+        <div class="sidebar-row-actions project-row-actions">
+          <button
+            class="icon-button sidebar-row-icon-button"
+            type="button"
+            data-action="edit-workspace"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt bearbeiten"
+          >
+            ${icon("edit")}
+          </button>
+          <button
+            class="icon-button sidebar-row-icon-button warning"
+            type="button"
+            data-action="clear-workspace-contents"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt leeren"
+            ${disabled ? "disabled" : ""}
+          >
+            ${icon("broom")}
+          </button>
+          <button
+            class="icon-button sidebar-row-icon-button danger"
+            type="button"
+            data-action="delete-workspace"
+            data-workspace-id="${escapeHtml(workspace.id)}"
+            aria-label="Projekt loeschen"
+            ${disabled ? "disabled" : ""}
+          >
+            ${icon("trash")}
+          </button>
+        </div>
       </div>
-    </article>
+      ${active && sessions.length ? `<div class="project-thread-list">${sessions.map(renderSidebarThreadItem).join("")}</div>` : ""}
+    </div>
   `;
 }
 
 function renderSidebarThreadItem(session) {
   const active = session.id === state.activeSessionId;
   const title = session.title || session.last_message_preview || session.task || "Neuer Thread";
-  const preview = threadPreview(session);
-  const changedCount = session.changed_files?.length || 0;
 
   return `
-    <button
-      class="thread-nav-item thread-nav-card ${active ? "active" : ""}"
-      type="button"
-      data-action="open-session"
-      data-session-id="${escapeHtml(session.id)}"
-    >
-      <span class="thread-nav-main thread-nav-card-top">
-        <span class="thread-nav-title">${escapeHtml(shorten(title, 40))}</span>
-        ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), {
-          compact: true,
-          live: isSessionRunning(session),
-        })}
-      </span>
-      <span class="thread-nav-preview">${escapeHtml(shorten(preview, 72))}</span>
-      <span class="thread-nav-meta thread-nav-card-meta">
-        <span>${escapeHtml(formatSessionTimestamp(session.updated_at))}</span>
-        ${changedCount ? `<span>${escapeHtml(countLabel(changedCount, "1 Datei", `${changedCount} Dateien`))}</span>` : ""}
-      </span>
-    </button>
+    <div class="thread-row ${active ? "active" : ""}">
+      <button
+        class="thread-nav-item thread-nav-row ${active ? "active" : ""}"
+        type="button"
+        data-action="open-session"
+        data-session-id="${escapeHtml(session.id)}"
+        title="${escapeAttribute(title)}"
+      >
+        <span class="thread-nav-title">${escapeHtml(title)}</span>
+      </button>
+      <div class="sidebar-row-actions thread-row-actions">
+        ${renderThreadOverflowMenu(session)}
+      </div>
+    </div>
   `;
 }
 
 function renderSidebarThreadSection(workspace, sessions) {
   return `
-    <section class="sidebar-section sidebar-panel sidebar-thread-section">
+    <section class="sidebar-section sidebar-section-plain sidebar-thread-section">
       <div class="sidebar-section-head sidebar-thread-head">
         <div>
           <p class="sidebar-label">Threads</p>
@@ -2450,10 +2461,10 @@ function renderSidebarThreadSection(workspace, sessions) {
 }
 
 function renderProjectOverflowMenu(workspace, options = {}) {
-  const { disabled = false } = options;
+  const { disabled = false, compact = false } = options;
   return `
     <details class="overflow-menu project-row-menu" data-preserve-open id="project-menu-${escapeHtml(workspace.id)}">
-      <summary class="overflow-action" aria-label="Projektaktionen">
+      <summary class="${compact ? "overflow-action sidebar-row-icon-button" : "overflow-action"}" aria-label="Projektaktionen">
         ${icon("more")}
       </summary>
       <div class="overflow-menu-panel">
@@ -2485,6 +2496,41 @@ function renderProjectOverflowMenu(workspace, options = {}) {
         >
           ${icon("trash")}
           <span>Projekt entfernen</span>
+        </button>
+      </div>
+    </details>
+  `;
+}
+
+function renderThreadOverflowMenu(session) {
+  const canDelete = !isSessionRunning(session);
+  const hasHandoff = Array.isArray(session?.changed_files) && session.changed_files.length > 0;
+
+  return `
+    <details class="overflow-menu thread-row-menu" data-preserve-open id="thread-menu-${escapeHtml(session.id)}">
+      <summary class="overflow-action sidebar-row-icon-button" aria-label="Threadaktionen">
+        ${icon("more")}
+      </summary>
+      <div class="overflow-menu-panel">
+        <button
+          class="overflow-menu-item"
+          type="button"
+          data-action="download-session-handoff"
+          data-session-id="${escapeHtml(session.id)}"
+          ${hasHandoff ? "" : "disabled"}
+        >
+          ${icon("download")}
+          <span>Handoff exportieren</span>
+        </button>
+        <button
+          class="overflow-menu-item danger"
+          type="button"
+          data-action="delete-session"
+          data-session-id="${escapeHtml(session.id)}"
+          ${canDelete ? "" : "disabled"}
+        >
+          ${icon("trash")}
+          <span>Thread loeschen</span>
         </button>
       </div>
     </details>
@@ -2564,7 +2610,7 @@ function renderWorkspaceList() {
   }
 
   return `
-    <div class="workspace-list">
+    <div class="workspace-list settings-workspace-list">
       ${state.workspaces.map(renderWorkspaceItem).join("")}
     </div>
   `;
@@ -2600,22 +2646,33 @@ function renderWorkspaceItem(workspace) {
           )}
         </span>
       </button>
-      <div class="workspace-item-actions">
+      ${renderWorkspaceItemMenu(workspace, { disabled })}
+    </div>
+  `;
+}
+
+function renderWorkspaceItemMenu(workspace, options = {}) {
+  const { disabled = false } = options;
+  return `
+    <details class="overflow-menu workspace-item-menu" data-preserve-open id="workspace-item-menu-${escapeHtml(workspace.id)}">
+      <summary class="overflow-action" aria-label="Projektaktionen">
+        ${icon("more")}
+      </summary>
+      <div class="overflow-menu-panel">
         <button
-          class="workspace-action"
+          class="overflow-menu-item"
           type="button"
           data-action="edit-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
-          aria-label="Projekt bearbeiten"
         >
           ${icon("edit")}
+          <span>Projekt bearbeiten</span>
         </button>
         <button
-          class="workspace-action warning-button"
+          class="overflow-menu-item warning"
           type="button"
           data-action="clear-workspace-contents"
           data-workspace-id="${escapeHtml(workspace.id)}"
-          aria-label="Projektordner leeren"
           title="${escapeAttribute(
             disabled
               ? "Projekt kann erst geleert werden, wenn keine Threads mehr laufen."
@@ -2624,13 +2681,13 @@ function renderWorkspaceItem(workspace) {
           ${disabled ? "disabled" : ""}
         >
           ${icon("broom")}
+          <span>Projektordner leeren</span>
         </button>
         <button
-          class="workspace-action danger-button"
+          class="overflow-menu-item danger"
           type="button"
           data-action="delete-workspace"
           data-workspace-id="${escapeHtml(workspace.id)}"
-          aria-label="Projekt loeschen"
           title="${escapeAttribute(
             disabled
               ? "Projekt kann erst geloescht werden, wenn keine Threads mehr laufen."
@@ -2639,9 +2696,10 @@ function renderWorkspaceItem(workspace) {
           ${disabled ? "disabled" : ""}
         >
           ${icon("trash")}
+          <span>Projekt loeschen</span>
         </button>
       </div>
-    </div>
+    </details>
   `;
 }
 
@@ -3109,6 +3167,8 @@ function renderTopBar() {
   const primaryAction = workspace
     ? `data-action="new-chat" data-workspace-id="${escapeHtml(workspace.id)}"`
     : `data-action="open-workspace-modal"`;
+  const inlineContext = session && workspace?.name && workspace.name !== shell.title ? workspace.name : "";
+  const metaItems = shell.metaItems.filter((item, index) => !(inlineContext && index === 0));
 
   return `
     <header class="thread-topbar workbench-topbar">
@@ -3116,13 +3176,17 @@ function renderTopBar() {
         <div class="thread-topbar-copy">
           <div class="thread-topbar-title-row">
             <h1 class="thread-topbar-title">${escapeHtml(shell.title || APP_BRAND_NAME)}</h1>
-            ${renderStatusBadge(shell.statusText, shell.statusTone, {
-              compact: true,
-              live: shell.running,
-            })}
+            ${inlineContext ? `<span class="thread-topbar-inline-context">${escapeHtml(inlineContext)}</span>` : ""}
+            <span class="thread-topbar-title-dots" aria-hidden="true">...</span>
           </div>
-          <div class="thread-topbar-meta-grid">
-            ${shell.metaItems.map(renderTopbarMetaItem).join("")}
+          <div class="thread-topbar-meta-line">
+            <span class="thread-topbar-status-wrap">
+              ${renderStatusBadge(shell.statusText, shell.statusTone, {
+                compact: true,
+                live: shell.running,
+              })}
+            </span>
+            ${metaItems.map(renderTopbarMetaItem).join("")}
           </div>
         </div>
         <div class="thread-toolbar workbench-toolbar">
@@ -3155,10 +3219,10 @@ function renderTopBar() {
 
 function renderTopbarMetaItem(item) {
   return `
-    <div class="thread-topbar-meta-item tone-${escapeHtml(item.tone || "muted")}">
-      <span>${escapeHtml(item.label)}</span>
+    <span class="thread-topbar-meta-item tone-${escapeHtml(item.tone || "muted")}">
+      <span class="thread-topbar-meta-label">${escapeHtml(item.label)}</span>
       <strong>${escapeHtml(item.value)}</strong>
-    </div>
+    </span>
   `;
 }
 
@@ -3253,7 +3317,7 @@ function renderChatStateMessages() {
 
 function renderStageState(title, copy, actions = "") {
   return `
-    <section class="surface-panel empty-state-panel">
+    <section class="thread-section stage-state-section">
       <div class="empty-state-copy">
         <p class="panel-kicker">Status</p>
         <h2>${escapeHtml(title)}</h2>
@@ -3311,8 +3375,8 @@ function renderEmptyThreadState() {
 
   if (!ready.workspace) {
     return `
-      <section class="thread-card ready-state-card ready-state-empty">
-        <div class="ready-state-header">
+      <section class="ready-state-shell ready-state-shell-empty">
+        <div class="ready-state-section-head">
           <div>
             <p class="panel-kicker">Ready</p>
             <h2>${escapeHtml(ready.title)}</h2>
@@ -3320,7 +3384,7 @@ function renderEmptyThreadState() {
           ${renderStatusBadge("Ohne Projekt", "warning", { compact: true })}
         </div>
         <p class="ready-state-copy">${escapeHtml(ready.copy)}</p>
-        <div class="ready-state-actions">
+        <div class="ready-state-action-row">
           <button class="button-primary" type="button" data-action="open-workspace-modal">
             ${icon("project-add")}
             <span>Projekt anlegen</span>
@@ -3335,9 +3399,9 @@ function renderEmptyThreadState() {
   }
 
   return `
-    <div class="ready-state-workbench">
-      <section class="thread-card ready-state-card">
-        <div class="ready-state-header">
+    <div class="ready-state-shell">
+      <section class="ready-state-section ready-state-intro">
+        <div class="ready-state-section-head">
           <div>
             <p class="panel-kicker">Ready</p>
             <h2>${escapeHtml(ready.title)}</h2>
@@ -3348,11 +3412,11 @@ function renderEmptyThreadState() {
           })}
         </div>
         <p class="ready-state-copy">${escapeHtml(ready.copy)}</p>
-        <div class="ready-state-facts">
+        <div class="ready-state-facts-row">
           ${ready.facts
             .map(
               (item) => `
-                <div class="ready-state-fact">
+                <div class="ready-state-fact-inline">
                   <span>${escapeHtml(item.label)}</span>
                   <strong>${escapeHtml(item.value)}</strong>
                 </div>
@@ -3360,15 +3424,7 @@ function renderEmptyThreadState() {
             )
             .join("")}
         </div>
-      </section>
-      <section class="thread-card ready-state-card ready-state-actions-card">
-        <div class="ready-state-header compact">
-          <div>
-            <p class="panel-kicker">Start</p>
-            <h3>Naechster Schritt</h3>
-          </div>
-        </div>
-        <div class="ready-state-actions">
+        <div class="ready-state-action-row">
           <button
             class="button-primary"
             type="button"
@@ -3382,6 +3438,14 @@ function renderEmptyThreadState() {
             ${icon("arrow")}
             <span>In Composer springen</span>
           </button>
+        </div>
+      </section>
+      <section class="ready-state-section">
+        <div class="ready-state-section-head compact">
+          <div>
+            <p class="panel-kicker">Start</p>
+            <h3>Naechster Schritt</h3>
+          </div>
         </div>
         <div class="ready-prompt-list">
           ${ready.suggestions
@@ -3400,8 +3464,8 @@ function renderEmptyThreadState() {
             .join("")}
         </div>
       </section>
-      <section class="thread-card ready-state-card ready-state-recent">
-        <div class="ready-state-header compact">
+      <section class="ready-state-section ready-state-recent">
+        <div class="ready-state-section-head compact">
           <div>
             <p class="panel-kicker">Verlauf</p>
             <h3>Letzte Threads</h3>
@@ -3444,18 +3508,147 @@ function renderEmptyThreadState() {
 function renderThreadView(session) {
   const presentation = buildThreadPresentationView(session, state.logs);
   const diffFile = activeDiffFile(session);
+  return renderThreadTranscriptWorkbench(session, presentation, diffFile);
+}
+
+function renderThreadTranscriptWorkbench(session, presentation, diffFile) {
+  const timeline = conversationTimeline(session);
+  const transcript = timeline.length
+    ? timeline.map((entry) => renderTimelineEntry(entry, session)).join("")
+    : renderTranscriptNote({
+        author: "Agent",
+        tone: presentation.overview.tone,
+        timestamp: session.updated_at,
+        title: presentation.overview.title,
+        content: presentation.overview.summary,
+      });
+
+  const worklog = renderThreadSystemFeed(session, state.logs);
+  const dividerLabel =
+    presentation.durationLabel && !presentation.running ? `${presentation.durationLabel} lang gearbeitet` : "";
+
   return `
-    <div class="thread-workbench ${presentation.running ? "is-running" : "is-complete"}">
-      <div class="thread-workbench-main">
-        ${renderConversationPanel(session, presentation)}
-        ${
-          presentation.running
-            ? renderThreadLivePanel(session, presentation)
-            : renderThreadOutcomePanel(session, presentation, diffFile)
-        }
-      </div>
-      ${presentation.running ? renderThreadSideRail(session, state.logs) : ""}
+    <div class="thread-transcript-layout ${state.ui.diffViewer.open && diffFile ? "with-review" : ""}">
+      <section class="thread-transcript-view">
+        <div class="thread-feed thread-feed-transcript">
+          ${transcript}
+          ${dividerLabel ? renderThreadSessionDivider(dividerLabel) : ""}
+          ${worklog}
+          ${renderThreadChangeSummaryCard(session, presentation)}
+        </div>
+      </section>
+      ${state.ui.diffViewer.open && diffFile ? renderThreadReviewPane(session, diffFile) : ""}
     </div>
+  `;
+}
+
+function renderThreadSessionDivider(label) {
+  return `
+    <div class="thread-session-divider" aria-label="${escapeAttribute(label)}">
+      <span></span>
+      <strong>${escapeHtml(label)}</strong>
+      <span></span>
+    </div>
+  `;
+}
+
+function renderThreadSystemFeed(session, logs) {
+  const activity = [...buildActivityClusters(session, logs)].reverse();
+  const activityNotes = activity.map((item) =>
+    renderTranscriptNote({
+      author: "Agent",
+      tone: item.tone || "muted",
+      timestamp: item.timestamp || session.updated_at,
+      title: item.text,
+      content: item.meta || "",
+    }),
+  );
+  const transcriptNotes = isSessionRunning(session)
+    ? []
+    : buildThreadTranscriptNotes(session, { includeChanges: false }).map(renderTranscriptNote);
+  const runningNote = isSessionRunning(session) ? renderRunningMessage(session) : "";
+
+  return `
+    <div class="thread-system-feed">
+      ${runningNote}
+      ${activityNotes.join("")}
+      ${transcriptNotes.join("")}
+    </div>
+  `;
+}
+
+function renderThreadChangeSummaryCard(session, presentation) {
+  const changes = Array.isArray(presentation?.changes) ? presentation.changes : [];
+  if (!changes.length) {
+    return "";
+  }
+
+  const buttonLabel = state.ui.diffViewer.open ? "Review ausblenden" : "Aenderungen ueberpruefen";
+  const buttonAction = state.ui.diffViewer.open ? "close-diff-panel" : "toggle-diff-panel";
+  const summary = [
+    presentation.validation?.statusLabel || "",
+    countLabel(changes.length, "1 Datei", `${changes.length} Dateien`),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return `
+    <section class="thread-change-card">
+      <div class="thread-change-card-head">
+        <div class="thread-change-card-copy">
+          <strong>${escapeHtml(countLabel(changes.length, "1 Datei geaendert", `${changes.length} Dateien geaendert`))}</strong>
+          <span>${escapeHtml(summary)}</span>
+        </div>
+        <button class="button-ghost thread-change-card-action" type="button" data-action="${buttonAction}">
+          <span>${escapeHtml(buttonLabel)}</span>
+        </button>
+      </div>
+      <div class="thread-change-card-list">
+        ${changes.slice(0, 6).map(renderThreadChangeSummaryRow).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderThreadChangeSummaryRow(change) {
+  return `
+    <button
+      class="thread-change-card-row"
+      type="button"
+      data-action="open-diff-file"
+      data-path="${escapeAttribute(change.path)}"
+    >
+      <span class="thread-change-card-path">${escapeHtml(shortenPath(change.path, 112))}</span>
+      <span class="thread-change-card-meta">${escapeHtml(labelForFileOperation(change.operation))}</span>
+    </button>
+  `;
+}
+
+function renderThreadReviewPane(session, diffFile) {
+  const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
+
+  return `
+    <aside class="thread-review-pane">
+      <div class="thread-review-pane-inner">
+        <div class="thread-review-pane-header">
+          <strong>Review</strong>
+          <div class="thread-review-pane-actions">
+            <button class="icon-button thread-panel-toggle" type="button" data-action="toggle-diff-expanded" aria-label="Review vergroessern">
+              ${icon(state.ui.diffViewer.expanded ? "collapse" : "expand")}
+            </button>
+            <button class="icon-button thread-panel-toggle" type="button" data-action="close-diff-panel" aria-label="Review schliessen">
+              ${icon("close")}
+            </button>
+          </div>
+        </div>
+        <div class="thread-review-pane-files">
+          ${changes.map((change) => renderThreadOutcomeFile(change, diffFile?.path === change.path)).join("")}
+        </div>
+        <div class="thread-review-pane-diff">
+          ${renderThreadDiffViewer(diffFile)}
+        </div>
+      </div>
+    </aside>
   `;
 }
 
@@ -3505,16 +3698,15 @@ function renderPromptCard(session) {
   const workspace = workspaceForSession(session);
 
   return `
-    <section class="thread-card prompt-card">
-      <div class="prompt-card-head">
+    <section class="thread-section prompt-block">
+      <div class="thread-section-head prompt-block-head">
         <div>
           <p class="panel-kicker">User Prompt</p>
-          <h2>${escapeHtml(shorten(prompt.content, 96))}</h2>
         </div>
         ${renderStatusBadge("Anfrage", "muted", { compact: true })}
       </div>
-      <div class="prompt-card-body rich-text">${renderRichText(prompt.content)}</div>
-      <div class="prompt-card-meta">
+      <div class="prompt-block-body rich-text">${renderRichText(prompt.content)}</div>
+      <div class="prompt-block-meta">
         ${workspace?.name ? renderMetaChip(workspace.name, "muted") : ""}
         ${workspace?.path ? renderMetaChip(shortenPath(workspace.path, 72), "muted") : ""}
         ${renderMetaChip(labelForAccessMode(session.access_mode), "muted")}
@@ -3586,8 +3778,8 @@ function renderConversationPanel(session, presentation = buildThreadPresentation
       ${
         transcript.length
           ? `
-            <section class="thread-card transcript-card">
-              <div class="workbench-card-head">
+            <section class="thread-section transcript-section">
+              <div class="thread-section-head">
                 <div>
                   <p class="panel-kicker">Thread</p>
                   <h3>Kontext und Verlauf</h3>
@@ -3635,57 +3827,53 @@ function renderThreadLivePanel(session, presentation) {
         },
       ];
   return `
-    <div class="thread-live-workbench">
-      <section class="thread-card thread-live-panel thread-stage-card">
-        <div class="workbench-card-head">
-          <div>
-            <p class="panel-kicker">Live Run</p>
-            <h3>${escapeHtml(headline)}</h3>
-          </div>
-          ${renderStatusBadge(labelForPhase(session?.current_phase || "planning"), sessionStatusTone(session), {
-            compact: true,
-            live: true,
-          })}
+    <section class="thread-section live-section">
+      <div class="thread-section-head">
+        <div>
+          <p class="panel-kicker">Live Run</p>
+          <h3>${escapeHtml(headline)}</h3>
         </div>
-        <div class="thread-live-summary">
-          <div class="thread-live-summary-copy">
-            <strong>${escapeHtml(currentStep || "Der Agent arbeitet fokussiert am aktuellen Auftrag.")}</strong>
-            <p>${escapeHtml(buildSessionOverview(session).summary)}</p>
-          </div>
-          <div class="thread-live-metric-list">
-            ${renderThreadLiveMetric("Dauer", presentation.durationLabel || "Gerade gestartet")}
-            ${renderThreadLiveMetric("Dateien", countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`))}
-            ${renderThreadLiveMetric("Checks", presentation.validation.statusLabel)}
-          </div>
-        </div>
-        <div class="thread-phase-focus">
-          <span class="thread-phase-focus-label">Aktuelle Phase</span>
-          <strong>${escapeHtml(labelForPhase(session?.current_phase || "planning"))}</strong>
-          <p>${escapeHtml(currentStep || headline)}</p>
-        </div>
+        ${renderStatusBadge(labelForPhase(session?.current_phase || "planning"), sessionStatusTone(session), {
+          compact: true,
+          live: true,
+        })}
+      </div>
+      <div class="live-inline-summary">
+        <strong>${escapeHtml(currentStep || "Der Agent arbeitet fokussiert am aktuellen Auftrag.")}</strong>
+        <p>${escapeHtml(buildSessionOverview(session).summary)}</p>
+      </div>
+      <div class="thread-inline-stats">
+        ${renderThreadLiveMetric("Dauer", presentation.durationLabel || "Gerade gestartet")}
+        ${renderThreadLiveMetric("Dateien", countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`))}
+        ${renderThreadLiveMetric("Checks", presentation.validation.statusLabel)}
+      </div>
+      <div class="live-phase-strip">
+        <span class="live-phase-strip-label">Aktuelle Phase</span>
+        <strong>${escapeHtml(labelForPhase(session?.current_phase || "planning"))}</strong>
+        <span>${escapeHtml(currentStep || headline)}</span>
+      </div>
+      <div class="live-phase-track">
         ${renderPhaseTrack(session)}
-      </section>
-      <section class="thread-card timeline-card">
-        <div class="workbench-card-head">
-          <div>
-            <p class="panel-kicker">Aktivitaet</p>
-            <h3>Live Timeline</h3>
-          </div>
-          ${renderStatusBadge(countLabel(activity.length, "1 Eintrag", `${activity.length} Eintraege`), "muted", {
-            compact: true,
-          })}
+      </div>
+      <div class="thread-section-head thread-section-head-subtle">
+        <div>
+          <p class="panel-kicker">Aktivitaet</p>
+          <h3>Live Timeline</h3>
         </div>
-        <div class="thread-timeline-list">
-          ${activity.map(renderActivityStreamItem).join("")}
-        </div>
-      </section>
-    </div>
+        ${renderStatusBadge(countLabel(activity.length, "1 Eintrag", `${activity.length} Eintraege`), "muted", {
+          compact: true,
+        })}
+      </div>
+      <div class="thread-timeline-list thread-timeline-feed">
+        ${activity.map(renderActivityStreamItem).join("")}
+      </div>
+    </section>
   `;
 }
 
 function renderThreadLiveMetric(label, value) {
   return `
-    <div class="thread-live-metric">
+    <div class="thread-stat-item">
       <span>${escapeHtml(label)}</span>
       <strong>${escapeHtml(value)}</strong>
     </div>
@@ -3711,8 +3899,8 @@ function renderThreadOutcomePanel(session, presentation, diffFile) {
 
   return `
     <div class="thread-result-workbench">
-      <section class="thread-card thread-outcome-panel tone-${escapeHtml(presentation.overview.tone)}">
-        <div class="workbench-card-head">
+      <section class="thread-section result-section tone-${escapeHtml(presentation.overview.tone)}">
+        <div class="thread-section-head">
           <div>
             <p class="panel-kicker">Result</p>
             <h3>${escapeHtml(presentation.overview.title)}</h3>
@@ -3720,7 +3908,7 @@ function renderThreadOutcomePanel(session, presentation, diffFile) {
           ${renderStatusBadge(sessionBadgeText(session), sessionStatusTone(session), { compact: true })}
         </div>
         <p class="thread-panel-copy">${escapeHtml(presentation.overview.summary)}</p>
-        <div class="thread-outcome-stats">
+        <div class="thread-inline-stats thread-outcome-stats">
           ${renderThreadOutcomeStat("Status", sessionBadgeText(session))}
           ${renderThreadOutcomeStat("Dauer", presentation.durationLabel || "-")}
           ${renderThreadOutcomeStat("Dateien", countLabel(presentation.changes.length, "1 Datei", `${presentation.changes.length} Dateien`))}
@@ -3731,8 +3919,8 @@ function renderThreadOutcomePanel(session, presentation, diffFile) {
       ${
         assistantResponse
           ? `
-            <section class="thread-card result-response-card">
-              <div class="workbench-card-head">
+            <section class="thread-section result-response-section">
+              <div class="thread-section-head">
                 <div>
                   <p class="panel-kicker">Agent</p>
                   <h3>Antwort</h3>
@@ -3743,8 +3931,8 @@ function renderThreadOutcomePanel(session, presentation, diffFile) {
           `
           : ""
       }
-      <section class="thread-card result-summary-card">
-        <div class="workbench-card-head">
+      <section class="thread-section result-summary-section">
+        <div class="thread-section-head">
           <div>
             <p class="panel-kicker">Summary</p>
             <h3>Abschluss und Validierung</h3>
@@ -3793,11 +3981,11 @@ function renderThreadFilesWorkbench(session, presentation, diffFile) {
   }
 
   return `
-    <section class="thread-card thread-files-card">
-      <div class="workbench-card-head">
+    <section class="thread-section thread-files-section">
+      <div class="thread-section-head">
         <div>
           <p class="panel-kicker">Dateien</p>
-          <h3>Geaenderte Dateien und Diff</h3>
+          <h3>${state.ui.diffViewer.open ? "Geaenderte Dateien und Diff" : "Geaenderte Dateien"}</h3>
         </div>
         <div class="thread-panel-actions">
           <button class="button-secondary thread-files-toggle" type="button" data-action="toggle-diff-panel">
@@ -3832,7 +4020,7 @@ function renderThreadFilesWorkbench(session, presentation, diffFile) {
 
 function renderThreadOutcomeStat(label, value) {
   return `
-    <div class="thread-outcome-stat">
+    <div class="thread-stat-item">
       <span>${escapeHtml(label)}</span>
       <strong>${escapeHtml(value)}</strong>
     </div>
@@ -3847,10 +4035,13 @@ function renderThreadOutcomeFile(change, active = false) {
       data-action="open-diff-file"
       data-path="${escapeAttribute(change.path)}"
     >
+      <span class="thread-outcome-file-main">
+        <strong>${escapeHtml(shortenPath(change.path, 104))}</strong>
+        <span class="thread-outcome-file-meta">Zum Diff oeffnen</span>
+      </span>
       <span class="thread-outcome-file-badge tone-${escapeHtml(operationTone(change.operation))}">${escapeHtml(
         labelForFileOperation(change.operation),
       )}</span>
-      <strong>${escapeHtml(shortenPath(change.path, 104))}</strong>
     </button>
   `;
 }
@@ -3868,7 +4059,7 @@ function activeDiffFile(session) {
 
 function renderThreadDiffViewer(change) {
   return `
-    <div class="thread-diff-panel">
+    <div class="thread-diff-panel thread-diff-view">
       <div class="thread-diff-head">
         <div class="thread-diff-copy">
           <span class="thread-panel-kicker">Diff</span>
@@ -4275,39 +4466,41 @@ function renderChatInput() {
   return `
     <footer class="chat-input-shell workbench-composer-shell">
       <div class="chat-input-inner">
-        <div class="chat-input-container composer-panel workbench-composer-panel">
-          <div class="composer-topline">
-            <div class="composer-topline-copy">
+        <div class="chat-input-container workbench-composer">
+          <div class="composer-context-row">
+            <div class="composer-context-copy">
               <strong>${escapeHtml(workspace?.name || "Kein Projekt verbunden")}</strong>
               <span>${escapeHtml(composerHint(workspace))}</span>
             </div>
             ${notice ? renderComposerNotice(notice) : renderComposerNotice({ label: "Shortcut", text: "Ctrl/Cmd + Enter sendet", tone: "muted" })}
           </div>
-          <div class="chat-input-row workbench-chat-input-row">
-            <textarea
-              id="composerInput"
-              class="chat-input workbench-chat-input"
-              rows="1"
-              placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
-            ></textarea>
-            <div class="composer-action-column">
-              ${renderComposerControlsMenu()}
-              <button
-                class="send-button workbench-send-button ${running ? "stop" : "send"}"
-                type="button"
-                data-action="${running ? "stop-session" : "submit-prompt"}"
-                aria-label="${running ? "Stoppen" : "Senden"}"
-              >
-                ${icon(running ? "stop" : "arrow")}
-              </button>
+          <div class="workbench-composer-surface">
+            <div class="chat-input-row workbench-chat-input-row">
+              <textarea
+                id="composerInput"
+                class="chat-input workbench-chat-input"
+                rows="1"
+                placeholder="${escapeAttribute(composerPlaceholder(workspace))}"
+              ></textarea>
+              <div class="composer-actions-inline">
+                ${renderComposerControlsMenu()}
+                <button
+                  class="send-button workbench-send-button ${running ? "stop" : "send"}"
+                  type="button"
+                  data-action="${running ? "stop-session" : "submit-prompt"}"
+                  aria-label="${running ? "Stoppen" : "Senden"}"
+                >
+                  ${icon(running ? "stop" : "arrow")}
+                </button>
+              </div>
             </div>
-          </div>
-          <div class="composer-meta-row workbench-composer-footer">
-            ${renderComposerMetaItem(workspace?.name || "Kein Projekt")}
-            ${renderComposerMetaItem(state.composer.modelName || state.config?.model_name || "Standardmodell")}
-            ${renderComposerMetaItem(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode))}
-            ${renderComposerMetaItem(executionProfileLabelFromState())}
-            <span class="composer-shortcut-hint">Ctrl/Cmd + Enter</span>
+            <div class="composer-meta-row workbench-composer-footer">
+              ${renderComposerMetaItem(workspace?.name || "Kein Projekt")}
+              ${renderComposerMetaItem(state.composer.modelName || state.config?.model_name || "Standardmodell")}
+              ${renderComposerMetaItem(labelForAccessMode(state.activeSession?.access_mode || state.composer.accessMode))}
+              ${renderComposerMetaItem(executionProfileLabelFromState())}
+              <span class="composer-shortcut-hint">Ctrl/Cmd + Enter</span>
+            </div>
           </div>
         </div>
       </div>
@@ -4599,9 +4792,11 @@ function renderSettingsPage() {
 function renderSettingsInfoCard(label, value, hint = "") {
   return `
     <article class="settings-info-card">
-      <span>${escapeHtml(label)}</span>
+      <div class="settings-info-main">
+        <span>${escapeHtml(label)}</span>
+        ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
+      </div>
       <strong>${escapeHtml(String(value || "-"))}</strong>
-      ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
     </article>
   `;
 }
@@ -4946,7 +5141,8 @@ function renderTranscriptNote(note) {
   `;
 }
 
-function buildThreadTranscriptNotes(session) {
+function buildThreadTranscriptNotes(session, options = {}) {
+  const { includeChanges = true, includeIssues = true, includeValidation = true } = options;
   const notes = [];
   const validation = buildValidationSnapshot(session);
   const changes = Array.isArray(session?.changed_files) ? session.changed_files : [];
@@ -4957,7 +5153,7 @@ function buildThreadTranscriptNotes(session) {
       ? "warning"
       : "muted";
 
-  if (shouldRenderValidationTranscript(session, validation)) {
+  if (includeValidation && shouldRenderValidationTranscript(session, validation)) {
     notes.push({
       author: "Validierung",
       tone: validation.tone,
@@ -4967,7 +5163,7 @@ function buildThreadTranscriptNotes(session) {
     });
   }
 
-  if (changes.length) {
+  if (includeChanges && changes.length) {
     notes.push({
       author: "Aenderungen",
       tone: "success",
@@ -4977,7 +5173,7 @@ function buildThreadTranscriptNotes(session) {
     });
   }
 
-  if (issues.length) {
+  if (includeIssues && issues.length) {
     notes.push({
       author: "Hinweise",
       tone: issueTone,
