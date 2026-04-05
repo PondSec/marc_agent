@@ -4641,6 +4641,42 @@ class Planner:
         repair_context: ValidationFailureEvidence | None = None,
         repair_strategy: str | None = None,
     ) -> ContentGenerationResult:
+        deterministic_exact_text = self._deterministic_exact_text_contract_generation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_exact_text is not None:
+            self._log(
+                "content_generation_skipped",
+                path=path,
+                update=current_content is not None,
+                reason="deterministic_exact_text_contract",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="completed",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_exact_text_contract",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(deterministic_exact_text.content),
+                    validation_possible=True,
+                    summary="Artifact generation used a deterministic exact-text contract instead of a model guess.",
+                    attempts=[],
+                ),
+            )
+            return ContentGenerationResult(
+                content=deterministic_exact_text.content,
+                source="deterministic_exact_text_contract",
+                repair_strategy_used=repair_strategy,
+            )
+
         model_name = self._content_generation_model_name(
             route,
             session,
@@ -8374,6 +8410,15 @@ class Planner:
         if not self._supports_update_style_existing_artifact(route, current_content=current_content):
             return None
 
+        if self._exact_text_contract_resolved_by_mutation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+        ):
+            return None
+
         mutation = self._assess_effective_mutation(path, current_content, proposed_content)
         if mutation.effective:
             return None
@@ -10623,14 +10668,22 @@ class Planner:
             )
         )
 
-        deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+        deterministic_recovery = self._deterministic_exact_text_contract_generation(
             route,
             session,
             path=path,
             current_content=current_content,
             repair_context=repair_context,
-            review_feedback=review_feedback,
         )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
         if deterministic_recovery is None:
             deterministic_recovery = self._deterministic_direct_python_script_runtime_recovery(
                 route,
@@ -11979,6 +12032,71 @@ class Planner:
                 )
             return f"Line {index} in {path} should be {expected_line!r}, but is {actual_line!r}."
         return f"{path} does not match the exact requested line sequence."
+
+    def _deterministic_exact_text_contract_generation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is not None and repair_context is None and route.intent != RouteIntent.CREATE:
+            return None
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return None
+        deterministic_content = "\n".join(expected_lines)
+        if current_content is None:
+            review = self._pre_write_create_review(
+                route,
+                session,
+                path=path,
+                proposed_content=deterministic_content,
+            )
+        else:
+            review = self._pre_write_update_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=deterministic_content,
+                repair_context=repair_context,
+            )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=deterministic_content,
+            review=review,
+            recovery_strategy="deterministic_exact_text_contract",
+        )
+
+    def _exact_text_contract_resolved_by_mutation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> bool:
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return False
+        current_mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=current_content,
+        )
+        if current_mismatch is None:
+            return False
+        proposed_mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=proposed_content,
+        )
+        return proposed_mismatch is None
 
     def _markdown_instruction_echo(
         self,

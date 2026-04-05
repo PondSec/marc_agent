@@ -889,6 +889,98 @@ def test_planner_skips_model_backed_semantic_review_for_exact_text_create_contra
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_create_review"
 
 
+def test_generate_file_content_uses_deterministic_exact_text_contract_for_create(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_alpha.txt"],
+        target_name="smoke_alpha.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_alpha.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    generation = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="smoke_alpha.txt",
+        current_content=None,
+    )
+
+    assert generation.content == "alpha\nbeta\ngamma"
+    assert generation.source == "deterministic_exact_text_contract"
+    assert llm.generate_calls == []
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_contract"
+
+
+def test_retry_update_after_review_failure_uses_deterministic_exact_text_contract(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_alpha.txt"],
+        target_name="smoke_alpha.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_alpha.txt mit exakt diesen drei Zeilen und sonst nichts: "
+            "alpha, beta, gamma."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The proposed text content does not match the exact requested line sequence.",
+        confidence=0.99,
+        blocking_issues=["Line 1 in smoke_alpha.txt has trailing whitespace."],
+        preservation_risks=[],
+        repair_hints=["Write the exact requested lines."],
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="smoke_alpha.txt",
+        current_content="alpha  \nbeta  \ngamma",
+        review_feedback=review_feedback,
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content == "alpha\nbeta\ngamma"
+    assert result.recovery_strategy == "deterministic_exact_text_contract"
+    assert llm.generate_calls == []
+
+
 def test_planner_deterministic_exact_text_create_review_flags_mismatched_lines(tmp_path):
     llm = ScriptedLLM(
         config=AppConfig(
