@@ -1621,6 +1621,83 @@ def test_validation_planner_prefers_implementation_region_hint_over_test_line(tm
     assert evidence.repair_brief.implicated_region_hint == "greet_cli/__main__.py:line 11"
 
 
+def test_validation_planner_drops_test_helper_symbol_for_behavioral_cli_assertion(tmp_path):
+    planner = ValidationPlanner()
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(
+        "def main(argv=None):\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_cli.py"
+    test_path.write_text(
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    return main(argv)\n",
+        encoding="utf-8",
+    )
+
+    session = SessionState(
+        task="Repair the taskboard owner filter behavior.",
+        workspace_root=str(tmp_path),
+        edit_generation=1,
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"python": 3},
+            top_directories=["taskboard", "tests"],
+            important_files=["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+            focus_files=["taskboard/cli.py"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=["tests/test_cli.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["taskboard/cli.py"],
+            repo_map=["taskboard/", "tests/"],
+            service_files=[],
+            import_hotspots=[],
+            symbol_index={
+                "taskboard/cli.py": ["main"],
+                "tests/test_cli.py": ["run_cli"],
+            },
+            project_labels=["python"],
+            likely_commands=["python -m pytest"],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small taskboard CLI with pytest coverage.",
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    failed_run = ValidationRunRecord(
+        command="python -m pytest",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py ..F\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'\n"
+        ),
+    )
+
+    evidence = planner.build_failure_evidence(session, failed_run)
+
+    assert evidence.repair_brief is not None
+    assert evidence.repair_brief.primary_target == "taskboard/cli.py"
+    assert "run_cli" not in evidence.repair_brief.implicated_symbols
+
+
 def test_validation_planner_synthesizes_default_python_and_html_checks(monkeypatch):
     planner = ValidationPlanner()
     snapshot = WorkspaceSnapshot(

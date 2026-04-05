@@ -18012,6 +18012,108 @@ def test_validation_repair_relevance_review_still_rejects_literal_anchor_when_im
     assert any("--keep-case" in issue for issue in review.blocking_issues)
 
 
+def test_validation_repair_relevance_review_accepts_cli_output_message_fix_despite_test_helper_trace(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    tasks = TASKS\n"
+        "    if owner:\n"
+        "        tasks = [task for task in tasks if task['owner'] == owner]\n"
+        "    return tasks\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n"
+    )
+    proposed_content = current_content.replace(
+        "        return 'No tasks found.'\n",
+        "        return 'No tasks found for owner zoe.'\n",
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    return main(argv)\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Implement the missing owner filter for the taskboard CLI. "
+            "Keep the default output unchanged, support the no-match message, and run python -m pytest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py ..F\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'\n"
+        ),
+        failure_summary="taskboard/cli.py still produces the wrong behavior for the owner-specific no-match output.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=[],
+            implicated_region_hint="taskboard/cli.py",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
+
+
 def test_pre_write_update_review_rejects_css_root_state_without_completed_web_contract(
     tmp_path,
     monkeypatch,

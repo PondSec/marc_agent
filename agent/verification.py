@@ -1393,6 +1393,12 @@ class ValidationPlanner:
             )
             if provider_target:
                 primary_target = provider_target
+        implicated_symbols = self._filter_implicated_symbols_for_primary_target(
+            session,
+            primary_target=primary_target,
+            implicated_symbols=implicated_symbols,
+            failure_type=failure_type,
+        )
         target_line_hint = self._target_traceback_line_hint(
             primary_target,
             text=raw_failure,
@@ -2203,6 +2209,52 @@ class ValidationPlanner:
         if self._is_test_path(target) and implicated_symbols:
             return f"{target}:symbol {implicated_symbols[0]}"
         return target
+
+    def _filter_implicated_symbols_for_primary_target(
+        self,
+        session: SessionState,
+        *,
+        primary_target: str | None,
+        implicated_symbols: list[str],
+        failure_type: str,
+    ) -> list[str]:
+        filtered = self._unique_paths(
+            [
+                str(symbol or "").strip()
+                for symbol in implicated_symbols
+                if str(symbol or "").strip()
+            ]
+        )[:6]
+        if not filtered:
+            return []
+        if failure_type not in {"assertion_mismatch", "runtime_failure", "runtime_argument_parsing"}:
+            return filtered
+
+        normalized_target = self._workspace_relative_path(session, primary_target)
+        if not normalized_target or self._is_test_path(normalized_target):
+            return filtered
+
+        workspace_root = Path(session.workspace_root).resolve()
+        try:
+            target_path = (workspace_root / normalized_target).resolve()
+            target_path.relative_to(workspace_root)
+            target_content = target_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError):
+            return filtered
+
+        kept: list[str] = []
+        lowered_content = target_content.lower()
+        for symbol in filtered:
+            lowered_symbol = symbol.lower()
+            symbol_paths = self._symbol_resolved_workspace_paths(session, [symbol])
+            if lowered_symbol in lowered_content:
+                kept.append(symbol)
+                continue
+            if any(not self._is_test_path(path) for path in symbol_paths):
+                kept.append(symbol)
+        if kept:
+            return self._unique_paths(kept)[:6]
+        return []
 
     def _prefer_import_failure_provider_target(
         self,
