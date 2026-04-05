@@ -1351,7 +1351,7 @@ def test_planner_uses_local_review_fallback_for_compact_single_model_repairs(tmp
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
-def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_available(tmp_path):
+def test_planner_prefers_primary_model_backed_review_for_repairs_when_available(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
             {
@@ -1432,11 +1432,11 @@ def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_availa
 
     assert review.safe_to_write is True
     assert len(llm.generate_json_calls) == 1
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is False
     assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
@@ -1539,12 +1539,11 @@ def test_planner_repair_review_escalates_to_primary_after_lightweight_timeout(tm
 
     assert review.safe_to_write is True
     assert len(llm.generate_json_calls) == 2
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
-    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
-    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
-    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 210
-    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 90
+    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
@@ -3702,7 +3701,7 @@ def test_planner_uses_compact_primary_generation_for_small_existing_updates_with
 
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert kwargs["model"] is None
-    assert kwargs["strict_timeouts"] is True
+    assert kwargs["strict_timeouts"] is False
     assert kwargs["num_ctx"] == 2048
     assert "Latest user request:" in prompt
     assert '"current_write_requirements"' in prompt
@@ -16896,7 +16895,7 @@ def test_primary_compact_repair_review_uses_compact_repair_runtime_budget(tmp_pa
     assert kwargs["strict_timeouts"] is False
 
 
-def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(tmp_path, monkeypatch):
+def test_runtime_repair_review_uses_primary_review_when_router_matches_primary(tmp_path, monkeypatch):
     class InventoryLLM(ScriptedLLM):
         def list_models_safe(self):
             return [
@@ -16991,12 +16990,12 @@ def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(t
 
     assert review.safe_to_write is True
     kwargs = llm.generate_json_calls[0]["kwargs"]
-    assert kwargs["model"] == "qwen3:8b"
+    assert kwargs["model"] == "qwen2.5-coder:7b"
     assert kwargs["num_ctx"] == 2048
     assert kwargs["timeout"] == 60
     assert kwargs["total_timeout"] == 210
-    assert kwargs["strict_timeouts"] is True
-    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+    assert kwargs["strict_timeouts"] is False
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
 
 
 def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(tmp_path):

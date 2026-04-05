@@ -8682,9 +8682,9 @@ class Planner:
             return review
         review_attempts: list[tuple[str | None, str, str]] = []
         if repair_review:
+            review_attempts.append((primary_model, "tier_a", "primary_model_review"))
             if reserve_model is not None:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
-            review_attempts.append((primary_model, "tier_a", "primary_model_review"))
         elif focused_compact_review:
             if reserve_model is not None:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
