@@ -31,7 +31,9 @@ from agent.prompts import (
     _artifact_scoped_focus,
     _direct_main_runtime_contract,
     _direct_python_script_runtime_contract,
+    _format_similar_python_name_candidates,
     _line_focused_excerpt,
+    _python_similar_defined_name_candidates,
     _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
@@ -12266,6 +12268,16 @@ class Planner:
             return None
         evidence_lines = self._runtime_target_evidence_lines(path, repair_context)
         evidence_hint = f" near {' | '.join(evidence_lines[:2])}" if evidence_lines else ""
+        similar_candidates = _python_similar_defined_name_candidates(current_content, undefined_symbol)
+        similar_hint = ""
+        reuse_hint = ""
+        if similar_candidates:
+            formatted_candidates = _format_similar_python_name_candidates(similar_candidates)
+            similar_hint = f" Existing same-file definitions with similar names: {formatted_candidates}."
+            reuse_hint = (
+                f"Prefer reusing the closest matching same-file definition when it already fits the missing behavior: "
+                f"{formatted_candidates}."
+            )
         return ProposedUpdateReview(
             safe_to_write=False,
             summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
@@ -12274,10 +12286,12 @@ class Planner:
                 (
                     f"The runtime failure still reports '{undefined_symbol}' as undefined in {path}, "
                     f"but the proposal neither binds/imports '{undefined_symbol}' nor removes its failing usage{evidence_hint}."
+                    f"{similar_hint}"
                 )
             ],
             preservation_risks=[],
             repair_hints=[
+                *([reuse_hint] if reuse_hint else []),
                 f"Either import or otherwise bind '{undefined_symbol}' in {path}, or remove the failing usage from the implicated line.",
                 *self._runtime_target_repair_hints(path, repair_context, evidence_lines=evidence_lines),
             ],

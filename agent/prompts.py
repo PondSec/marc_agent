@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 from pathlib import Path
 import re
@@ -4137,6 +4138,103 @@ def _python_line_binds_name(line: str, name: str) -> bool:
     return False
 
 
+def _python_similar_defined_name_candidates(
+    content: str,
+    name: str,
+    *,
+    limit: int = 3,
+) -> list[tuple[str, str, int | None]]:
+    target = str(name or "").strip()
+    if not target:
+        return []
+    try:
+        module = ast.parse(str(content or ""))
+    except SyntaxError:
+        return []
+
+    normalized_target = target.lower()
+    seen: dict[str, tuple[str, int | None, float]] = {}
+
+    def _register(candidate: str, kind: str, lineno: int | None) -> None:
+        cleaned = str(candidate or "").strip()
+        if not cleaned:
+            return
+        normalized_candidate = cleaned.lower()
+        if normalized_candidate == normalized_target:
+            return
+        ratio = difflib.SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_candidate.startswith(normalized_target):
+            ratio += 0.35
+        elif normalized_target.startswith(normalized_candidate):
+            ratio += 0.1
+        if normalized_target in normalized_candidate:
+            ratio += 0.1
+        if normalized_candidate.replace("_", "") == normalized_target.replace("_", ""):
+            ratio += 0.15
+        if ratio < 0.72:
+            return
+        if kind == "function":
+            ratio += 0.08
+        elif kind == "import":
+            ratio += 0.04
+        existing = seen.get(cleaned)
+        if existing is None or ratio > existing[2]:
+            seen[cleaned] = (kind, lineno, ratio)
+
+    def _register_target(node: ast.AST | None, kind: str, lineno: int | None) -> None:
+        if node is None:
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            _register(node.id, kind, lineno)
+            return
+        if isinstance(node, (ast.Tuple, ast.List)):
+            for item in node.elts:
+                _register_target(item, kind, lineno)
+            return
+        if isinstance(node, ast.Starred):
+            _register_target(node.value, kind, lineno)
+
+    for node in ast.walk(module):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _register(node.name, "function", getattr(node, "lineno", None))
+        elif isinstance(node, ast.ClassDef):
+            _register(node.name, "class", getattr(node, "lineno", None))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                alias_name = alias.asname or alias.name.split(".", 1)[0]
+                _register(alias_name, "import", getattr(node, "lineno", None))
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                alias_name = alias.asname or alias.name
+                _register(alias_name, "import", getattr(node, "lineno", None))
+        elif isinstance(node, ast.Assign):
+            for target_node in node.targets:
+                _register_target(target_node, "variable", getattr(node, "lineno", None))
+        elif isinstance(node, ast.AnnAssign):
+            _register_target(node.target, "variable", getattr(node, "lineno", None))
+        elif isinstance(node, ast.AugAssign):
+            _register_target(node.target, "variable", getattr(node, "lineno", None))
+
+    ranked = sorted(
+        (
+            (candidate, kind, lineno, score)
+            for candidate, (kind, lineno, score) in seen.items()
+        ),
+        key=lambda item: (-item[3], item[2] is None, item[2] or 0, item[0]),
+    )
+    return [(candidate, kind, lineno) for candidate, kind, lineno, _score in ranked[:limit]]
+
+
+def _format_similar_python_name_candidates(candidates: list[tuple[str, str, int | None]]) -> str:
+    formatted: list[str] = []
+    for candidate, kind, lineno in candidates:
+        details = kind
+        if lineno is not None:
+            details += f", line {lineno}"
+        formatted.append(f"{candidate} ({details})")
+    return ", ".join(formatted)
+
+
 def _undefined_runtime_symbol_anchor(
     *,
     path: str,
@@ -4161,13 +4259,23 @@ def _undefined_runtime_symbol_anchor(
         implicated_lines.append(f"{index}: {line}")
         if len(implicated_lines) >= 2:
             break
+    similar_candidates = _python_similar_defined_name_candidates(current_content, symbol_name)
+    similar_hint = ""
+    if similar_candidates:
+        formatted = _format_similar_python_name_candidates(similar_candidates)
+        similar_hint = (
+            f"\nExisting same-file definitions with similar names: {formatted}. "
+            "Reuse one if it already matches the failing intent instead of inventing a new symbol."
+        )
     if implicated_lines:
         return (
             f"Resolve the undefined symbol '{symbol_name}' in {path}; either import/bind it before use or remove the failing use from these current lines:\n"
             + "\n".join(implicated_lines)
+            + similar_hint
         )
     return (
         f"Resolve the undefined symbol '{symbol_name}' in {path}; either import/bind it before its current use or remove that failing use if it is unnecessary."
+        + similar_hint
     )
 
 
