@@ -24985,7 +24985,7 @@ def test_planner_recovers_from_retryable_no_start_with_same_model_retry(tmp_path
     assert len(llm.generate_calls) == 2
     assert llm.generate_calls[1]["kwargs"]["model"] is None
     assert llm.generate_calls[1]["kwargs"]["timeout"] >= 60
-    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 210
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 240
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
 
 
@@ -25015,6 +25015,34 @@ def test_planner_extends_compact_primary_generation_budget_for_repairs(tmp_path)
 
     assert timeout_seconds == 60
     assert total_timeout_seconds == 210
+
+
+def test_planner_extends_generation_retry_budget_after_no_start_failure(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+
+    timeout_seconds, total_timeout_seconds, num_ctx = planner._content_generation_runtime_for_attempt(
+        GenerationRecoveryAttempt(
+            strategy="retry_same_model",
+            prompt_kind="full",
+            model_name=None,
+            capability_tier="tier_a",
+        ),
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="low",
+            retryable=True,
+            raw_reason="startup_timeout",
+        ),
+    )
+
+    assert timeout_seconds == 75
+    assert total_timeout_seconds == 240
+    assert num_ctx == 4096
 
 
 def test_planner_extends_compact_resume_budget_after_timeout_progress(tmp_path):

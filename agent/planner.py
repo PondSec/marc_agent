@@ -5574,6 +5574,7 @@ class Planner:
         *,
         retained_progress_issue: ExecutionFailure | None = None,
     ) -> tuple[int, int, int]:
+        cold_start_recovery = issue.no_start_failure
         progress_timeout_recovery = (
             issue.timeout_like and issue.had_progress
         ) or (
@@ -5584,15 +5585,27 @@ class Planner:
         )
         if attempt.prompt_kind == "resume":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 3072 if attempt.model_name is None else 2048
         elif attempt.prompt_kind == "compact":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 2048
         else:
             base_timeout = 75 if issue.timeout_like else 60
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 4096 if attempt.model_name is None else 3072
         return (
             max(self._llm_timeout(base_timeout), base_timeout),
