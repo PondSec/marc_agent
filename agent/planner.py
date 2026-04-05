@@ -35,6 +35,7 @@ from agent.prompts import (
     _line_focused_excerpt,
     _python_line_binds_name,
     _python_similar_defined_name_candidates,
+    _repair_semantic_values,
     _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
@@ -9631,6 +9632,17 @@ class Planner:
 
         replacement_pairs: list[tuple[str, str]] = []
         seen_pairs: set[tuple[str, str]] = set()
+        expected_values, observed_values = _repair_semantic_values(repair_context)
+        for observed, expected in zip(observed_values, expected_values, strict=False):
+            observed_text = str(observed or "").strip()
+            expected_text = str(expected or "").strip()
+            if not observed_text or not expected_text or observed_text == expected_text:
+                continue
+            pair = (observed_text, expected_text)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            replacement_pairs.append(pair)
         mismatch_patterns = (
             re.compile(r"assert ['\"](?P<observed>.+?)['\"] == ['\"](?P<expected>.+?)['\"]"),
             re.compile(r"AssertionError:\s*['\"](?P<observed>.+?)['\"] != ['\"](?P<expected>.+?)['\"]"),

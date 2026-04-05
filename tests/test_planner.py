@@ -13414,6 +13414,70 @@ def test_deterministic_runtime_literal_delta_recovery_rewrites_explicit_runtime_
     assert "build_parser" in result.content
 
 
+def test_deterministic_runtime_literal_delta_recovery_prefers_exact_semantics_over_truncated_pytest_diff(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(task="Repair the taskboard no-match output.", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py ..F\n"
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+        ),
+        failure_summary="taskboard/cli.py still produces the wrong owner-specific no-match output.",
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[3],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match-truncated-diff",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=["render_tasks"],
+            implicated_region_hint="taskboard/cli.py:line 3",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert "fou...or owner zoe." not in result.content
+
+
 def test_retry_update_after_review_failure_uses_deterministic_runtime_literal_delta_recovery(tmp_path):
     llm = ScriptedLLM(text_payloads=["__should_not_run__"])
     planner = Planner(llm, "")
