@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from agent.prompts import task_state_system_prompt, task_state_update_prompt
-from agent.semantic_guardrails import build_minimal_task_state
+from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
     availability_recovery_model,
@@ -914,10 +914,91 @@ class TaskStateUpdater:
         session.runtime_executions = session.runtime_executions[-20:]
 
     def _finalize_state(self, state: TaskState, *, semantic_resolution: str) -> TaskState:
+        self._ground_explicit_request_paths(state)
         state.semantic_resolution = semantic_resolution
         state.secondary_semantics_limited = secondary_semantics_limited(semantic_resolution)
         state.semantic_inference_mode = "conservative" if semantic_resolution == "minimal_inference" else "full"
         return state
+
+    def _ground_explicit_request_paths(self, state: TaskState) -> None:
+        request = str(state.latest_user_turn or "").strip()
+        if not request:
+            return
+        explicit_paths: list[str] = []
+        for raw_path in _extract_explicit_paths(request):
+            normalized = self._normalize_request_path(raw_path)
+            if normalized and normalized not in explicit_paths:
+                explicit_paths.append(normalized)
+        if not explicit_paths:
+            return
+        state.target_artifacts = self._canonicalize_artifacts_to_explicit_paths(
+            state.target_artifacts,
+            explicit_paths,
+        )
+        state.active_artifacts = self._canonicalize_artifacts_to_explicit_paths(
+            state.active_artifacts,
+            explicit_paths,
+        )
+        verification_target = str(state.verification_target or "").strip()
+        canonical_target = self._canonicalize_explicit_request_path(
+            verification_target,
+            explicit_paths,
+        )
+        if canonical_target and canonical_target != verification_target:
+            state.verification_target = canonical_target
+
+    def _canonicalize_artifacts_to_explicit_paths(
+        self,
+        artifacts: list,
+        explicit_paths: list[str],
+    ) -> list:
+        normalized_artifacts = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for artifact in artifacts or []:
+            path = self._normalize_request_path(getattr(artifact, "path", None))
+            canonical_path = self._canonicalize_explicit_request_path(path, explicit_paths)
+            updates: dict[str, str | None] = {}
+            if canonical_path:
+                updates["path"] = canonical_path
+                if not str(getattr(artifact, "name", "") or "").strip() or path != canonical_path:
+                    updates["name"] = Path(canonical_path).name
+            elif path:
+                updates["path"] = path
+            normalized_artifact = artifact.model_copy(update=updates) if updates else artifact
+            identity = (
+                str(getattr(normalized_artifact, "path", "") or ""),
+                str(getattr(normalized_artifact, "name", "") or ""),
+                str(getattr(normalized_artifact, "kind", "") or ""),
+                str(getattr(normalized_artifact, "role", "") or ""),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            normalized_artifacts.append(normalized_artifact)
+        return normalized_artifacts
+
+    def _canonicalize_explicit_request_path(
+        self,
+        path: str | None,
+        explicit_paths: list[str],
+    ) -> str:
+        normalized_path = self._normalize_request_path(path)
+        if not normalized_path:
+            return ""
+        for explicit_path in explicit_paths:
+            if normalized_path == explicit_path:
+                return explicit_path
+            if normalized_path.endswith(f"/{explicit_path}"):
+                return explicit_path
+            if "/" not in explicit_path and Path(normalized_path).name == explicit_path:
+                return explicit_path
+        return normalized_path
+
+    def _normalize_request_path(self, path: str | None) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
 
     def _model_candidates(self, *, refresh_live_inventory: bool = False) -> list[str]:
         config = getattr(self.llm, "config", None)

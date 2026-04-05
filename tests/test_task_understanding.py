@@ -16,6 +16,7 @@ from agent.prompts import (
     _prioritized_compact_payload,
     task_state_update_prompt,
 )
+from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
@@ -1936,6 +1937,75 @@ def test_task_state_updater_keeps_empty_workspace_create_requests_out_of_debug_f
     assert task_state.next_action == "create"
     assert route.intent == RouteIntent.CREATE
     assert route.action_plan[0].action.value == "create_artifact"
+
+
+def test_minimal_task_state_extracts_named_config_file_path_in_german_request(tmp_path):
+    state = build_minimal_task_state(
+        "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen.",
+        session=None,
+        snapshot=empty_snapshot(tmp_path),
+        semantic_resolution="minimal_inference",
+    )
+
+    assert state.target_artifacts
+    assert state.target_artifacts[0].path == "smoke.ini"
+    assert state.target_artifacts[0].name == "smoke.ini"
+
+
+def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_request(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen.",
+        "root_goal": "Create smoke.ini with three exact lines.",
+        "active_goal": "Create smoke.ini with the requested content.",
+        "goal_relation": "new_task",
+        "output_expectation": "Return the created path and a short validation note.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "workspace/smoke.ini",
+        "target_artifacts": [
+            {
+                "path": "workspace/smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.98,
+            }
+        ],
+        "active_artifacts": [
+            {
+                "path": "workspace/smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.98,
+            }
+        ],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.98,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": [],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.target_artifacts[0].path == "smoke.ini"
+    assert task_state.active_artifacts[0].path == "smoke.ini"
+    assert task_state.verification_target == "smoke.ini"
+    assert route.entities.target_paths[0] == "smoke.ini"
 
 
 def test_task_state_updater_clears_spurious_clarification_from_confident_executable_payload(tmp_path):

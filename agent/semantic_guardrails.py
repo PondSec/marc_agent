@@ -104,7 +104,7 @@ _EMPTY_WORKSPACE_CREATE_MARKERS = (
     "need an",
 )
 _PATH_RE = re.compile(
-    r"([\w./-]+\.(py|js|ts|tsx|jsx|json|md|html|css|sh|toml|ya?ml|go|rs|java|kt|rb))",
+    r"([\w./-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|html|css|sh|toml|ya?ml|go|rs|java|kt|rb|ini|cfg|conf|env|log|sql|xml|svg|csv))",
     flags=re.IGNORECASE,
 )
 _CONVENTIONAL_ARTIFACT_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
