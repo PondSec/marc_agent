@@ -21478,6 +21478,115 @@ def test_planner_review_retry_keeps_same_model_and_escalates_follow_up_to_full_f
     assert "add import sys before using it" in llm.generate_calls[1]["args"][0]
 
 
+def test_review_guided_retry_uses_local_review_for_single_model_followup_repairs(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "def main():\n    return 'compact'\n",
+            "def main(argv=None):\n    return argv\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Fix app.py", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing runtime behavior."}],
+        target_paths=["app.py"],
+        target_name="app.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    pre_write_calls = {"count": 0}
+    local_review_calls = {"count": 0}
+
+    def fake_pre_write(*_args, **_kwargs):
+        pre_write_calls["count"] += 1
+        raise AssertionError("model-backed pre-write review should be skipped for the guided single-model retry")
+
+    def fake_local_review(*_args, **_kwargs):
+        local_review_calls["count"] += 1
+        if local_review_calls["count"] == 1:
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary="Compact retry still leaves the runtime argv repair incomplete.",
+                confidence=0.9,
+                blocking_issues=["The proposal references sys.argv without importing sys."],
+                preservation_risks=[],
+                repair_hints=["If you reference sys.argv, add import sys before using it."],
+            )
+        return ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.86,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        )
+
+    monkeypatch.setattr(planner, "_pre_write_update_review", fake_pre_write)
+    monkeypatch.setattr(planner, "_local_pre_write_update_review", fake_local_review)
+
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_app",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.py", "tests/test_app.py"],
+        summary="Validation command exited with 1.",
+        excerpt="TypeError: main() takes 0 positional arguments but 1 was given",
+        failure_summary="TypeError: main() takes 0 positional arguments but 1 was given",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["app.py", "tests/test_app.py"],
+        line_hints=[12],
+        action_hints=["Prefer a targeted fix over broad refactors."],
+        repair_requirements=["Change app.py so the failing runtime path succeeds."],
+        evidence_signature="sig-single-model-guided-followup",
+        repair_brief=RepairBrief(
+            failure_type="type_error",
+            failure_signature="runtime:type_error:single-model-guided-followup",
+            primary_target="app.py",
+            locked_target="app.py",
+            expected_semantics=["Validation should allow argv to be passed into main()."],
+            observed_semantics=["Validation currently raises when argv is passed into main()."],
+            implicated_symbols=["main"],
+            implicated_region_hint="app.py",
+            repair_constraints=["Keep the repair on app.py."],
+            allowed_files=["app.py"],
+            forbidden_files=["tests/test_app.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.py",
+        current_content="def main():\n    pass\n",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="Lines unchanged.",
+            confidence=0.8,
+            blocking_issues=["The proposal leaves the implicated identifier lines unchanged."],
+            preservation_risks=[],
+            repair_hints=["Change the implicated callable."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content == "def main(argv=None):\n    return argv"
+    assert pre_write_calls["count"] == 0
+    assert local_review_calls["count"] == 2
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is False
+
+
 def test_planner_repair_followup_retry_budget_expands_for_single_model_runtime(tmp_path):
     planner = Planner(
         ScriptedLLM(

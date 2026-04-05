@@ -8316,6 +8316,29 @@ class Planner:
         proposed_content: str,
         reserve_model: str | None,
     ) -> bool:
+        return self._compact_single_model_repair_review_candidate(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+            respect_attempt_history=True,
+            allow_evidence_backed_behavior_adjustment=False,
+        )
+
+    def _compact_single_model_repair_review_candidate(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+        respect_attempt_history: bool,
+        allow_evidence_backed_behavior_adjustment: bool,
+    ) -> bool:
         repair_context = session.active_repair_context
         if repair_context is None or current_content is None:
             return False
@@ -8352,11 +8375,14 @@ class Planner:
             return False
         if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
             return False
-        if self._repair_update_is_evidence_backed_behavior_adjustment(
-            path=normalized_path,
-            current_content=current_content,
-            proposed_content=proposed_content,
-            repair_context=repair_context,
+        if (
+            not allow_evidence_backed_behavior_adjustment
+            and self._repair_update_is_evidence_backed_behavior_adjustment(
+                path=normalized_path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
         ):
             return False
         if allowed_files and normalized_path not in allowed_files:
@@ -8378,10 +8404,11 @@ class Planner:
         }
         if len(unresolved_competing_scope) > 1:
             return False
-        if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
-            return False
-        if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
-            return False
+        if respect_attempt_history:
+            if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
+                return False
+            if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
+                return False
 
         changed_line_count = self._compact_repair_change_line_count(
             current_content=current_content,
@@ -8393,6 +8420,66 @@ class Planner:
             return False
 
         return True
+
+    def _should_skip_retry_model_backed_repair_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+        review_feedback: ProposedUpdateReview,
+    ) -> bool:
+        if review_feedback.safe_to_write:
+            return False
+        if review_feedback.preservation_risks:
+            return False
+        if self._review_rejection_looks_like_scope_broadening(review_feedback):
+            return False
+        return self._compact_single_model_repair_review_candidate(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+            respect_attempt_history=False,
+            allow_evidence_backed_behavior_adjustment=True,
+        )
+
+    def _record_local_update_review_skip(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        reason: str,
+        model: str | None,
+        summary: str,
+    ) -> None:
+        self._log(
+            "proposed_update_review_skipped",
+            path=path,
+            reason=reason,
+            model=model,
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="proposed_update_review",
+                task_class="proposed_update_review",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=True,
+                summary=summary,
+                attempts=[],
+            ),
+        )
 
     def _repair_no_effective_change_review(
         self,
@@ -8708,27 +8795,12 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
             )
-            self._log(
-                "proposed_update_review_skipped",
+            self._record_local_update_review_skip(
+                session,
                 path=path,
                 reason=local_review_reason,
                 model=primary_model,
-            )
-            self._append_runtime_execution(
-                session,
-                build_execution_run_record(
-                    operation_name="proposed_update_review",
-                    task_class="proposed_update_review",
-                    final_state="degraded_success",
-                    capability_tier="tier_d",
-                    recovery_strategy="deterministic_fallback",
-                    degraded=True,
-                    honest_blocked=False,
-                    artifact_bytes_generated=0,
-                    validation_possible=True,
-                    summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
-                    attempts=[],
-                ),
+                summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
             )
             return review
         review_attempts: list[tuple[str | None, str, str]] = []
@@ -11424,14 +11496,42 @@ class Planner:
                 strategy=strategy,
                 characters=len(cleaned),
             )
-            review = self._pre_write_update_review(
+            if self._should_skip_retry_model_backed_repair_review(
                 route,
                 session,
                 path=path,
                 current_content=current_content,
                 proposed_content=cleaned,
-                repair_context=repair_context,
-            )
+                reserve_model=reserve_model,
+                review_feedback=last_review,
+            ):
+                self._record_local_update_review_skip(
+                    session,
+                    path=path,
+                    reason="single_model_compact_repair_followup",
+                    model=primary_model,
+                    summary=(
+                        "A guided single-model repair follow-up reused deterministic local preservation checks "
+                        "instead of repeating the same model-backed review hop."
+                    ),
+                )
+                review = self._local_pre_write_update_review(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content or "",
+                    proposed_content=cleaned,
+                    repair_context=repair_context,
+                )
+            else:
+                review = self._pre_write_update_review(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                    proposed_content=cleaned,
+                    repair_context=repair_context,
+                )
             if review.safe_to_write:
                 return UpdateReviewRetryResult(
                     content=cleaned,
