@@ -33,6 +33,7 @@ from agent.prompts import (
     _direct_python_script_runtime_contract,
     _format_similar_python_name_candidates,
     _line_focused_excerpt,
+    _python_line_binds_name,
     _python_similar_defined_name_candidates,
     _repair_semantic_value_text,
     _repair_target_line_hints,
@@ -9648,6 +9649,192 @@ class Planner:
             )
         return None
 
+    def _deterministic_runtime_similar_function_name_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None or review_feedback is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        undefined_symbol = self._undefined_runtime_symbol(repair_context)
+        if not undefined_symbol:
+            return None
+        review_text = self._proposed_update_review_text(review_feedback)
+        if undefined_symbol not in review_text or "undefined" not in review_text:
+            return None
+
+        similar_candidates = _python_similar_defined_name_candidates(current_content, undefined_symbol)
+        if not similar_candidates:
+            return None
+        if not self._similar_python_name_candidate_is_unambiguous(undefined_symbol, similar_candidates):
+            return None
+
+        candidate_name, candidate_kind, _lineno = similar_candidates[0]
+        if candidate_kind != "function":
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        target_indexes: list[int] = []
+        for hint in line_hints:
+            if not isinstance(hint, int) or hint <= 0:
+                continue
+            candidate_index = hint - 1
+            if 0 <= candidate_index < len(lines) and undefined_symbol in lines[candidate_index]:
+                target_indexes.append(candidate_index)
+                continue
+            search_start = max(candidate_index - 2, 0)
+            search_end = min(candidate_index + 3, len(lines))
+            nearby_match = next(
+                (
+                    index
+                    for index in range(search_start, search_end)
+                    if undefined_symbol in lines[index]
+                    and not _python_line_binds_name(lines[index], undefined_symbol)
+                ),
+                None,
+            )
+            if nearby_match is not None:
+                target_indexes.append(nearby_match)
+        target_indexes = sorted(set(target_indexes))
+        if not target_indexes:
+            target_indexes = [
+                index
+                for index, raw_line in enumerate(lines)
+                if undefined_symbol in raw_line and not _python_line_binds_name(raw_line, undefined_symbol)
+            ]
+            if len(target_indexes) != 1:
+                return None
+
+        bare_symbol_replacement = None
+        if self._python_function_accepts_zero_args(current_content, candidate_name):
+            bare_symbol_replacement = f"{candidate_name}()"
+
+        call_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b(?=\s*\()")
+        bare_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b(?!\s*\()")
+        updated_lines = list(lines)
+        changed = False
+        for index in target_indexes:
+            raw_line = updated_lines[index]
+            if not raw_line.strip() or _python_line_binds_name(raw_line, undefined_symbol):
+                continue
+            replaced_line = call_pattern.sub(candidate_name, raw_line)
+            if bare_pattern.search(replaced_line):
+                if bare_symbol_replacement is None:
+                    return None
+                replaced_line = bare_pattern.sub(bare_symbol_replacement, replaced_line)
+            if replaced_line != raw_line:
+                updated_lines[index] = replaced_line
+                changed = True
+        if not changed:
+            return None
+
+        patched_content = "".join(updated_lines)
+        if patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_runtime_similar_function_name",
+        )
+
+    def _similar_python_name_candidate_is_unambiguous(
+        self,
+        target_name: str,
+        candidates: list[tuple[str, str, int | None]],
+    ) -> bool:
+        if not candidates:
+            return False
+        top_name, top_kind, _ = candidates[0]
+        top_score = self._similar_python_name_score(target_name, top_name, top_kind)
+        if top_score < 0.95:
+            return False
+        if len(candidates) == 1:
+            return True
+        second_name, second_kind, _ = candidates[1]
+        second_score = self._similar_python_name_score(target_name, second_name, second_kind)
+        return top_score - second_score >= 0.12
+
+    def _similar_python_name_score(
+        self,
+        target_name: str,
+        candidate_name: str,
+        candidate_kind: str,
+    ) -> float:
+        normalized_target = str(target_name or "").strip().lower()
+        normalized_candidate = str(candidate_name or "").strip().lower()
+        if not normalized_target or not normalized_candidate or normalized_candidate == normalized_target:
+            return 0.0
+        score = difflib.SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_candidate.startswith(normalized_target):
+            score += 0.35
+        elif normalized_target.startswith(normalized_candidate):
+            score += 0.1
+        if normalized_target in normalized_candidate:
+            score += 0.1
+        if normalized_candidate.replace("_", "") == normalized_target.replace("_", ""):
+            score += 0.15
+        if candidate_kind == "function":
+            score += 0.08
+        elif candidate_kind == "import":
+            score += 0.04
+        return score
+
+    def _python_function_accepts_zero_args(
+        self,
+        content: str,
+        function_name: str,
+    ) -> bool:
+        target = str(function_name or "").strip()
+        if not target:
+            return False
+        try:
+            module = ast.parse(str(content or ""))
+        except SyntaxError:
+            return False
+        for node in ast.walk(module):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != target:
+                continue
+            positional_args = [
+                *getattr(node.args, "posonlyargs", []),
+                *getattr(node.args, "args", []),
+            ]
+            required_positional = max(len(positional_args) - len(node.args.defaults), 0)
+            required_kwonly = sum(1 for item in node.args.kwonlyargs if item is not None) - sum(
+                1 for default in node.args.kw_defaults if default is not None
+            )
+            return required_positional == 0 and required_kwonly <= 0
+        return False
+
     def _deterministic_runtime_repair_decision(
         self,
         route: RouterOutput,
@@ -10852,12 +11039,13 @@ class Planner:
             repair_context=repair_context,
         )
         if deterministic_recovery is None:
-            deterministic_recovery = self._deterministic_runtime_literal_delta_recovery(
+            deterministic_recovery = self._deterministic_runtime_similar_function_name_recovery(
                 route,
                 session,
                 path=path,
                 current_content=current_content,
                 repair_context=repair_context,
+                review_feedback=review_feedback,
             )
         if deterministic_recovery is None:
             deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
@@ -10876,6 +11064,14 @@ class Planner:
                 current_content=current_content,
                 repair_context=repair_context,
                 review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_runtime_literal_delta_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
             )
         if deterministic_recovery is not None:
             effective_repair_strategy = self._review_retry_repair_strategy(
@@ -12427,8 +12623,17 @@ class Planner:
         undefined_symbol = self._undefined_runtime_symbol(repair_context)
         if not undefined_symbol:
             return None
-        current_uses = [line.strip() for line in str(current_content or "").splitlines() if undefined_symbol in line]
-        proposed_uses = [line.strip() for line in str(proposed_content or "").splitlines() if undefined_symbol in line]
+        symbol_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b")
+        current_uses = [
+            line.strip()
+            for line in str(current_content or "").splitlines()
+            if symbol_pattern.search(line)
+        ]
+        proposed_uses = [
+            line.strip()
+            for line in str(proposed_content or "").splitlines()
+            if symbol_pattern.search(line)
+        ]
         if not current_uses and not proposed_uses:
             return None
         if current_uses and not proposed_uses:

@@ -13500,6 +13500,105 @@ def test_retry_update_after_review_failure_uses_deterministic_runtime_literal_de
     assert llm.generate_calls == []
 
 
+def test_retry_update_after_review_failure_uses_deterministic_similar_function_name_recovery(tmp_path):
+    llm = ScriptedLLM(text_payloads=["__should_not_run__"])
+    planner = Planner(llm, "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner')\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build\n"
+        "    return parser.parse_args(argv)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the failing taskboard CLI runtime error.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["build_parser", "main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI module."}],
+        target_paths=["taskboard/cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/taskboard/cli.py", line 9, in main\n'
+            "    parser = build\n"
+            "NameError: name 'build' is not defined\n"
+        ),
+        failure_summary="NameError: name 'build' is not defined.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[9],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime path can complete successfully.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:build-nameerror-deterministic-retry",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["The symbol 'build' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'build' before it is bound or imported. Current use: parser = build"
+            ],
+            implicated_symbols=["build", "build_parser", "main"],
+            implicated_region_hint="taskboard/cli.py:line 9",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
+            confidence=0.92,
+            blocking_issues=[
+                "The runtime failure still reports 'build' as undefined in taskboard/cli.py, but the proposal neither binds/imports 'build' nor removes its failing usage. Existing same-file definitions with similar names: build_parser (function, line 5)."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Prefer reusing the closest matching same-file definition when it already fits the missing behavior: build_parser (function, line 5).",
+                "Either import or otherwise bind 'build' in taskboard/cli.py, or remove the failing usage from the implicated line.",
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert result.recovery_strategy == "deterministic_runtime_similar_function_name"
+    assert "parser = build_parser()" in result.content
+    assert llm.generate_calls == []
+
+
 def test_retry_update_after_review_failure_uses_verbatim_direct_python_script_recovery_for_dynamic_suffix_branch(
     tmp_path,
 ):
@@ -23398,6 +23497,65 @@ def test_undefined_runtime_symbol_review_mentions_similar_same_file_definition(t
     assert review is not None
     assert "build_parser (function, line 5)" in review.blocking_issues[0]
     assert any("build_parser (function, line 5)" in hint for hint in review.repair_hints)
+
+
+def test_undefined_runtime_symbol_review_allows_boundary_safe_same_file_function_reuse(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner')\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build\n"
+        "    return parser.parse_args(argv)\n"
+    )
+    proposed_content = current_content.replace("parser = build\n", "parser = build_parser()\n")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/taskboard/cli.py", line 9, in main\n'
+            "    parser = build\n"
+            "NameError: name 'build' is not defined\n"
+        ),
+        failure_summary="NameError: name 'build' is not defined.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[9],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime path can complete successfully.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:build-nameerror-boundary-safe",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["The symbol 'build' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'build' before it is bound or imported. Current use: parser = build"
+            ],
+            implicated_symbols=["build", "build_parser", "main"],
+            implicated_region_hint="taskboard/cli.py:line 9",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._undefined_runtime_symbol_repair_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+    )
+
+    assert review is None
 
 
 def test_runtime_repair_review_ignores_called_process_error_summary_noise(tmp_path):
