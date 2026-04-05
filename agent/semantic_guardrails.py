@@ -1265,6 +1265,12 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
         and path not in manifests
         and Path(path).suffix.lower() not in {".md", ".rst", ".txt"}
     ]
+    if request_targets_cli_entrypoint:
+        selected_primary_paths = [
+            path
+            for path in selected_primary_paths
+            if not (_is_package_init_path(path) and path not in explicit_request_paths)
+        ]
     selected_support_paths = [
         path
         for path in selected

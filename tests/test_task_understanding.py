@@ -1817,6 +1817,44 @@ def test_task_state_timeout_fallback_prefers_cli_helper_over_package_init_for_cl
     assert "greet_cli/__init__.py" not in {artifact.path for artifact in task_state.target_artifacts}
 
 
+def test_task_state_timeout_fallback_excludes_package_init_for_existing_cli_feature_request_without_dunder_main(
+    tmp_path,
+):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["taskboard", "tests"],
+        important_files=["README.md", "taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+        focus_files=["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["taskboard/cli.py"],
+        repo_map=["taskboard/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m pytest"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI package with one taskboard entrypoint and pytest coverage.",
+    )
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Implement the missing owner filter for the taskboard CLI. "
+        "Keep the default output unchanged, support the no-match message, and finish only when python -m pytest passes."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+
+    artifact_paths = [artifact.path for artifact in task_state.target_artifacts]
+    assert artifact_paths[0] == "taskboard/cli.py"
+    assert {"taskboard/cli.py", "tests/test_cli.py"} <= set(artifact_paths)
+    assert "taskboard/__init__.py" not in set(artifact_paths)
+
+
 def test_task_state_model_normalizes_route_style_aliases():
     state = TaskState.model_validate(
         {
