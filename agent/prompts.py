@@ -793,6 +793,19 @@ def generate_content_retry_prompt(
             sections.append(file_requirement_summary)
         if session is not None:
             sections.append(f"Related file hints: {related_context}")
+            if current_content is not None and review_feedback is not None:
+                exact_output_contracts = _source_backed_runtime_output_contracts(
+                    session,
+                    target_path=path,
+                    repair_context=None,
+                    require_truncated_repair_context=False,
+                    limit=3,
+                )
+                if exact_output_contracts:
+                    sections.append(
+                        "Exact supporting output contract:\n"
+                        + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+                    )
             if runtime_hints:
                 sections.append(
                     "Targeted runtime hints: "
@@ -867,6 +880,19 @@ def generate_content_retry_prompt(
         sections.append(file_requirement_summary)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
+    if session is not None and current_content is not None and review_feedback is not None:
+        exact_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=None,
+            require_truncated_repair_context=False,
+            limit=3,
+        )
+        if exact_output_contracts:
+            sections.append(
+                "Exact supporting output contract:\n"
+                + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+            )
     if runtime_hints:
         sections.append(
             "Targeted runtime hints: "
@@ -5547,13 +5573,19 @@ def _source_backed_runtime_output_contracts(
     *,
     target_path: str,
     repair_context: ValidationFailureEvidence | None,
+    require_truncated_repair_context: bool = True,
     limit: int = 2,
 ) -> list[str]:
     if (
         session is None
-        or repair_context is None
-        or repair_context.verification_scope != "runtime"
-        or not _repair_context_has_truncated_semantic_markers(repair_context)
+        or (
+            require_truncated_repair_context
+            and (
+                repair_context is None
+                or repair_context.verification_scope != "runtime"
+                or not _repair_context_has_truncated_semantic_markers(repair_context)
+            )
+        )
     ):
         return []
     snapshot = session.workspace_snapshot
