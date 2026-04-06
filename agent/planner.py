@@ -5821,6 +5821,14 @@ class Planner:
             current_content=current_content,
             repair_context=session.active_repair_context,
         )
+        if direct_main_recovery is None:
+            direct_main_recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=session.active_repair_context,
+            )
         if direct_main_recovery is not None:
             self._log(
                 "content_generation_recovery_started",
@@ -8188,17 +8196,11 @@ class Planner:
     ) -> bool:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return False
-
-        candidate_paths = list(
-            dict.fromkeys(
-                [
-                    str(candidate or "").strip()
-                    for candidate in getattr(repair_context, "file_hints", []) or []
-                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
-                ]
-            )
+        support_texts = self._runtime_support_contract_texts(
+            session,
+            repair_context=repair_context,
         )
-        if not candidate_paths:
+        if not support_texts:
             return False
 
         stdout_capture_markers = (
@@ -8209,11 +8211,113 @@ class Planner:
             "patch('sys.stdout'",
             'patch("sys.stdout"',
         )
-        for candidate in candidate_paths[:4]:
-            excerpt = self._current_or_last_read_excerpt(session, path=candidate)
-            if any(marker in excerpt for marker in stdout_capture_markers):
+        for excerpt in support_texts:
+            lowered_excerpt = excerpt.lower()
+            if any(marker in lowered_excerpt for marker in stdout_capture_markers):
                 return True
         return False
+
+    def _runtime_support_contract_texts(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+        limit: int = 4,
+    ) -> list[str]:
+        if repair_context is None:
+            return []
+        candidate_paths = list(
+            dict.fromkeys(
+                [
+                    str(candidate or "").strip()
+                    for candidate in [
+                        *(getattr(repair_context, "file_hints", []) or []),
+                        *(getattr(repair_context, "artifact_paths", []) or []),
+                    ]
+                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+                ]
+            )
+        )
+        texts: list[str] = []
+        for candidate in candidate_paths[:limit]:
+            content = self._session_or_current_file_content(session, candidate)
+            if content:
+                texts.append(content)
+        return texts
+
+    def _supporting_runtime_contract_requires_zero_exit_status(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        support_texts = self._runtime_support_contract_texts(
+            session,
+            repair_context=repair_context,
+        )
+        if not support_texts:
+            return False
+        stdout_capture_markers = (
+            "redirect_stdout(",
+            ".getvalue().strip(",
+            ".getvalue().strip()",
+            "capsys.readouterr(",
+            "patch('sys.stdout'",
+            'patch("sys.stdout"',
+        )
+        for excerpt in support_texts:
+            lowered_excerpt = excerpt.lower()
+            if not any(marker in lowered_excerpt for marker in stdout_capture_markers):
+                continue
+            for match in re.finditer(
+                r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:__main__\.)?main\(",
+                excerpt,
+            ):
+                capture_name = str(match.group("name") or "").strip()
+                if not capture_name:
+                    continue
+                if re.search(rf"assert\s+{re.escape(capture_name)}\s*==\s*0\b", excerpt):
+                    return True
+                if re.search(
+                    rf"self\.assertEqual\(\s*{re.escape(capture_name)}\s*,\s*0\s*\)",
+                    excerpt,
+                ):
+                    return True
+                if re.search(
+                    rf"self\.assertEqual\(\s*0\s*,\s*{re.escape(capture_name)}\s*\)",
+                    excerpt,
+                ):
+                    return True
+        return False
+
+    def _repair_context_returns_output_instead_of_success_status(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return False
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        observed_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "observed_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if "0" not in expected_values:
+            return False
+        return any(
+            value
+            and value not in {"0", "''", '""', "None", "null", "undefined"}
+            for value in observed_values
+        )
 
     def _repair_update_addresses_stdout_contract(
         self,
@@ -9202,6 +9306,60 @@ class Planner:
             recovery_strategy="deterministic_direct_main_contract",
         )
 
+    def _deterministic_cli_stdout_exit_contract_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        del review_feedback
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        if not self._supporting_runtime_contract_requires_stdout_emission(
+            session,
+            repair_context=repair_context,
+        ):
+            return None
+        if not self._supporting_runtime_contract_requires_zero_exit_status(
+            session,
+            repair_context=repair_context,
+        ):
+            return None
+        if not self._repair_context_returns_output_instead_of_success_status(repair_context):
+            return None
+
+        patched_content = self._apply_cli_stdout_exit_contract_patch(current_content)
+        if patched_content is None or patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_cli_stdout_exit_contract",
+        )
+
     def _direct_python_script_expected_output(
         self,
         repair_context: ValidationFailureEvidence,
@@ -9938,6 +10096,14 @@ class Planner:
             repair_context=repair_context,
         )
         if recovery is None:
+            recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
             recovery = self._deterministic_direct_python_script_runtime_recovery(
                 route,
                 session,
@@ -10122,6 +10288,56 @@ class Planner:
         if not expected_output or not payload_output or expected_output != payload_output:
             return None
         return expected_output
+
+    def _apply_cli_stdout_exit_contract_patch(
+        self,
+        current_content: str,
+    ) -> str | None:
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = list(lines[start:end])
+        if not block_lines:
+            return None
+        if any(
+            "print(" in line or "sys.stdout.write(" in line.lower() or "stdout.write(" in line.lower()
+            for line in block_lines
+        ):
+            return None
+
+        signature_line = block_lines[0]
+        if "->" in signature_line and "-> int:" not in signature_line:
+            block_lines[0] = re.sub(r"->\s*[^:]+:", "-> int:", signature_line)
+
+        changed = False
+        for index in range(1, len(block_lines)):
+            raw_line = block_lines[index]
+            stripped = raw_line.lstrip()
+            indent = raw_line[: len(raw_line) - len(stripped)]
+            if not stripped.startswith("return "):
+                continue
+            expr = stripped[len("return ") :].rstrip("\n").strip()
+            if not expr:
+                continue
+            if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", expr) or expr in {"None", "True", "False"}:
+                continue
+            if "\\" in expr:
+                return None
+            block_lines[index : index + 1] = [
+                f"{indent}print({expr})\n",
+                f"{indent}return 0\n",
+            ]
+            changed = True
+
+        if not changed:
+            return None
+        updated_content = "".join([*lines[:start], *block_lines, *lines[end:]])
+        if updated_content == current_content:
+            return None
+        return updated_content
 
     def _apply_direct_main_contract_patch(
         self,
@@ -11133,6 +11349,15 @@ class Planner:
             )
         if deterministic_recovery is None:
             deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_cli_stdout_exit_contract_recovery(
                 route,
                 session,
                 path=path,

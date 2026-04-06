@@ -11681,6 +11681,258 @@ def test_runtime_repair_read_scope_stays_on_locked_target_when_entrypoint_was_al
     assert decision.tool_args["path"] == "normalize_cli.py"
 
 
+def test_deterministic_runtime_repair_decision_uses_cli_stdout_exit_contract_recovery(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Review incident timeline', 'owner': 'bob', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> str:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        return render_tasks(tasks)\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from __future__ import annotations\n\n"
+        "from io import StringIO\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv: list[str]) -> str:\n"
+        "    stream = StringIO()\n"
+        "    with redirect_stdout(stream):\n"
+        "        exit_code = main(argv)\n"
+        "    assert exit_code == 0\n"
+        "    return stream.getvalue().strip()\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["main", "render_tasks", "build_parser"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI contract."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py::test_default_list_output_stays_unchanged\n"
+            "E       AssertionError: assert 'Escalate billing ticket\\nReview incident timeline' == 0\n"
+        ),
+        failure_summary=(
+            "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: 0 "
+            "but observed Validation currently produces: Escalate billing ticket\nReview incident timeline."
+        ),
+        repair_requirements=["Change taskboard/cli.py so the CLI prints the result and returns a success status."],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[28],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-cli-stdout-exit-contract",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: 0"],
+            observed_semantics=[
+                "Validation currently produces: Escalate billing ticket\nReview incident timeline"
+            ],
+            implicated_symbols=["main"],
+            implicated_region_hint="taskboard/cli.py:line 28",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    decision = planner._deterministic_runtime_repair_decision(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "write_file"
+    repaired = decision.tool_args["content"]
+    assert "print(render_tasks(tasks))" in repaired
+    assert "return 0" in repaired
+    assert "return render_tasks(tasks)" not in repaired
+
+
+def test_retry_update_after_review_failure_uses_cli_stdout_exit_contract_recovery(tmp_path):
+    llm = ScriptedLLM(text_payloads=["__should_not_run__"])
+    planner = Planner(llm, "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Review incident timeline', 'owner': 'bob', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> str:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        return render_tasks(tasks)\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from __future__ import annotations\n\n"
+        "from io import StringIO\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv: list[str]) -> str:\n"
+        "    stream = StringIO()\n"
+        "    with redirect_stdout(stream):\n"
+        "        exit_code = main(argv)\n"
+        "    assert exit_code == 0\n"
+        "    return stream.getvalue().strip()\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the taskboard CLI contract after the latest failed validation.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["main", "render_tasks"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI contract."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py::test_default_list_output_stays_unchanged\n"
+            "E       AssertionError: assert 'Escalate billing ticket\\nReview incident timeline' == 0\n"
+        ),
+        failure_summary=(
+            "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: 0 "
+            "but observed Validation currently produces: Escalate billing ticket\nReview incident timeline."
+        ),
+        repair_requirements=["Change taskboard/cli.py so the CLI prints the result and returns a success status."],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[28],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-cli-stdout-exit-contract-retry",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: 0"],
+            observed_semantics=[
+                "Validation currently produces: Escalate billing ticket\nReview incident timeline"
+            ],
+            implicated_symbols=["main"],
+            implicated_region_hint="taskboard/cli.py:line 28",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair changes the file, but not the lines tied to the failed runtime behavior.",
+            confidence=0.88,
+            blocking_issues=[
+                "The proposal for taskboard/cli.py leaves the implicated identifier lines unchanged: main"
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Update the relevant function signature or behavior line that the failing traceback points to."
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert result.recovery_strategy == "deterministic_cli_stdout_exit_contract"
+    assert "print(render_tasks(tasks))" in result.content
+    assert "return 0" in result.content
+    assert llm.generate_calls == []
+
+
 def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_contract(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
