@@ -1695,6 +1695,12 @@ def test_validation_planner_drops_test_helper_symbol_for_behavioral_cli_assertio
 
     assert evidence.repair_brief is not None
     assert evidence.repair_brief.primary_target == "taskboard/cli.py"
+    assert evidence.repair_brief.expected_semantics == [
+        "Validation should produce: No tasks found for owner zoe."
+    ]
+    assert evidence.repair_brief.observed_semantics == [
+        "Validation currently produces: No tasks found."
+    ]
     assert "run_cli" not in evidence.repair_brief.implicated_symbols
 
 

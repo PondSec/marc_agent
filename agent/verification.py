@@ -229,6 +229,12 @@ class ValidationPlanner:
     ASSERTION_MISMATCH_PATTERN = re.compile(
         r"AssertionError:\s*(?P<observed>.+?)\s*!=\s*(?P<expected>.+)"
     )
+    PYTEST_ASSERTION_MISMATCH_PATTERN = re.compile(
+        r"AssertionError:\s*assert\s+(?P<observed>.+?)\s*==\s*(?P<expected>.+)"
+    )
+    ASSERTION_SOURCE_EQUALS_PATTERN = re.compile(
+        r"^>?\s*assert\s+(?P<left>.+?)\s*==\s*(?P<right>.+?)\s*$"
+    )
     ASSERTION_CONTAINMENT_PATTERN = re.compile(
         r"AssertionError:\s*(?P<expected>.+?)\s+not found in\s+(?P<observed>.+)",
         re.IGNORECASE,
@@ -1700,29 +1706,37 @@ class ValidationPlanner:
             diff_observed, diff_expected = self._assertion_diff_pair(block)
             named_observed, named_expected = self._assertion_named_value_pair(block)
             line_observed, line_expected = self._assertion_line_values("\n".join(block))
+            source_expected = self._assertion_source_expected_value(block)
             observed = named_observed or diff_observed or line_observed
             expected = named_expected or diff_expected or line_expected
             if observed is None:
                 observed = diff_observed or line_observed
             if expected is None:
                 expected = diff_expected or line_expected
+            if source_expected is not None and (
+                expected is None or self._semantic_value_looks_truncated(expected)
+            ):
+                expected = source_expected
             if observed is not None or expected is not None:
                 pairs.append((observed, expected))
 
         if pairs:
-            return self._unique_semantic_pairs(pairs)
+            return self._normalize_assertion_semantic_pairs(self._unique_semantic_pairs(pairs))
 
         fallback_pairs: list[tuple[str | None, str | None]] = []
         parsed_observed, parsed_expected = self._assertion_line_pair(str(text or ""))
         if parsed_observed is not None or parsed_expected is not None:
             fallback_pairs.append((parsed_observed, parsed_expected))
+        source_expected = self._assertion_source_expected_value(lines)
+        if source_expected is not None:
+            fallback_pairs.append((None, source_expected))
         named_observed, named_expected = self._assertion_named_value_pair(lines)
         if named_observed is not None or named_expected is not None:
             fallback_pairs.append((named_observed, named_expected))
         diff_observed, diff_expected = self._assertion_diff_pair(lines)
         if diff_observed is not None or diff_expected is not None:
             fallback_pairs.append((diff_observed, diff_expected))
-        return self._unique_semantic_pairs(fallback_pairs)
+        return self._normalize_assertion_semantic_pairs(self._unique_semantic_pairs(fallback_pairs))
 
     def _assertion_diff_values(self, text: str) -> tuple[str | None, str | None]:
         pairs = self._assertion_semantic_pairs(text)
@@ -1766,11 +1780,20 @@ class ValidationPlanner:
             return True
         if lowered.startswith("operator:") and "equal" in lowered:
             return True
+        if self._is_assertion_source_line(stripped):
+            return True
         if self.ASSERTION_NAMED_VALUE_PATTERN.match(stripped):
             return True
         if self.ASSERTION_DIFF_LABEL_PATTERN.match(stripped):
             return True
         return self._semantic_diff_value(stripped) is not None
+
+    def _is_assertion_source_line(self, line: str) -> bool:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return False
+        normalized = stripped[1:].strip() if stripped.startswith(">") else stripped
+        return self.ASSERTION_SOURCE_EQUALS_PATTERN.match(normalized) is not None
 
     def _assertion_context_blocks(self, lines: list[str]) -> list[list[str]]:
         blocks: list[list[str]] = []
@@ -1906,12 +1929,75 @@ class ValidationPlanner:
             return None, None
         match = self.ASSERTION_MISMATCH_PATTERN.search(stripped)
         if match is None:
+            match = self.PYTEST_ASSERTION_MISMATCH_PATTERN.search(stripped)
+        if match is None:
             match = self.ASSERTION_CONTAINMENT_PATTERN.search(stripped)
         if match is None:
             return None, None
         observed = self._literal_or_text(match.group("observed"))
         expected = self._literal_or_text(match.group("expected"))
         return observed, expected
+
+    def _assertion_source_expected_value(self, lines: list[str]) -> str | None:
+        for raw in lines:
+            stripped = str(raw or "").strip()
+            if not stripped:
+                continue
+            normalized = stripped[1:].strip() if stripped.startswith(">") else stripped
+            match = self.ASSERTION_SOURCE_EQUALS_PATTERN.match(normalized)
+            if match is None:
+                continue
+            left_literal = self._literal_expression_value(match.group("left"))
+            right_literal = self._literal_expression_value(match.group("right"))
+            if right_literal is not None and left_literal is None:
+                return right_literal
+            if left_literal is not None and right_literal is None:
+                return left_literal
+        return None
+
+    def _normalize_assertion_semantic_pairs(
+        self,
+        pairs: list[tuple[str | None, str | None]],
+    ) -> list[tuple[str | None, str | None]]:
+        if not pairs:
+            return []
+        normalized: list[tuple[str | None, str | None]] = []
+        index = 0
+        while index < len(pairs):
+            observed, expected = pairs[index]
+            next_pair = pairs[index + 1] if index + 1 < len(pairs) else None
+            if (
+                observed is not None
+                and self._semantic_value_looks_truncated(expected)
+                and next_pair is not None
+                and next_pair[0] is None
+                and next_pair[1] is not None
+                and not self._semantic_value_looks_truncated(next_pair[1])
+            ):
+                normalized.append((observed, next_pair[1]))
+                index += 2
+                continue
+            if (
+                observed is None
+                and expected is not None
+                and not self._semantic_value_looks_truncated(expected)
+                and normalized
+                and normalized[-1][0] is not None
+                and self._semantic_value_looks_truncated(normalized[-1][1])
+            ):
+                prior_observed, _prior_expected = normalized[-1]
+                normalized[-1] = (prior_observed, expected)
+                index += 1
+                continue
+            normalized.append((observed, expected))
+            index += 1
+        return self._unique_semantic_pairs(normalized)
+
+    def _semantic_value_looks_truncated(self, value: str | None) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        return "..." in text or "…" in text
 
     def _semantic_display_value(self, value: str | None) -> str | None:
         if value is None:
@@ -2042,6 +2128,22 @@ class ValidationPlanner:
             value = ast.literal_eval(text)
         except (SyntaxError, ValueError):
             return text[:160]
+        return str(value)
+
+    def _literal_expression_value(self, raw: str | None) -> str | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            node = ast.parse(text, mode="eval").body
+        except SyntaxError:
+            return None
+        if not isinstance(node, (ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Set, ast.UnaryOp)):
+            return None
+        try:
+            value = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            return None
         return str(value)
 
     def _missing_path_from_failure_text(self, text: str) -> str | None:
