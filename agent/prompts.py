@@ -2137,6 +2137,16 @@ def _compact_repair_update_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+    )
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:2])
+        )
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2327,6 +2337,16 @@ def _compact_repair_retry_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+    )
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:2])
+        )
     if repair_brief.get("allowed_files"):
         sections.append(
             "Allowed repair files: "
@@ -5317,6 +5337,253 @@ def _python_test_call_contract(
     if isinstance(parent, ast.Assert):
         return f"preserve compatibility with {rendered_call}"
     return ""
+
+
+def _repair_context_has_truncated_semantic_markers(
+    repair_context: ValidationFailureEvidence | None,
+) -> bool:
+    if repair_context is None:
+        return False
+    texts: list[str] = [
+        str(repair_context.excerpt or "").strip(),
+        str(repair_context.failure_summary or "").strip(),
+        str(repair_context.summary or "").strip(),
+    ]
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        texts.extend(str(item or "").strip() for item in getattr(brief, "expected_semantics", []) or [])
+        texts.extend(str(item or "").strip() for item in getattr(brief, "observed_semantics", []) or [])
+    return any("..." in text or "…" in text for text in texts if text)
+
+
+def _runtime_output_contract_focus_tokens(
+    repair_context: ValidationFailureEvidence | None,
+) -> set[str]:
+    if repair_context is None:
+        return set()
+    stopwords = {
+        "actual",
+        "assert",
+        "assertion",
+        "behavior",
+        "command",
+        "current",
+        "currently",
+        "expected",
+        "failed",
+        "failure",
+        "output",
+        "produce",
+        "runtime",
+        "scope",
+        "should",
+        "still",
+        "summary",
+        "test",
+        "tests",
+        "validation",
+    }
+    texts: list[str] = [
+        str(repair_context.excerpt or "").strip(),
+        str(repair_context.failure_summary or "").strip(),
+        str(repair_context.summary or "").strip(),
+    ]
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        texts.extend(str(item or "").strip() for item in getattr(brief, "expected_semantics", []) or [])
+        texts.extend(str(item or "").strip() for item in getattr(brief, "observed_semantics", []) or [])
+    tokens: set[str] = set()
+    for text in texts:
+        for token in re.findall(r"[A-Za-z0-9_]+", text):
+            normalized = token.strip().lower()
+            if len(normalized) < 4 or normalized in stopwords:
+                continue
+            tokens.add(normalized)
+    return tokens
+
+
+def _python_test_imports_reference_target(
+    session: SessionState,
+    *,
+    snapshot: WorkspaceSnapshot,
+    test_path: str,
+    target_path: str,
+    test_text: str,
+) -> bool:
+    try:
+        tree = ast.parse(test_text)
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        provider_candidates = _resolve_import_from_provider_paths(
+            test_path,
+            module=str(node.module or "").strip(),
+            level=int(getattr(node, "level", 0) or 0),
+            snapshot=snapshot,
+        )
+        if any(
+            _python_provider_references_target(
+                session,
+                snapshot=snapshot,
+                provider_path=provider_path,
+                target_path=target_path,
+            )
+            for provider_path in provider_candidates
+        ):
+            return True
+    return False
+
+
+def _python_string_output_contract_literal(node: ast.AST) -> str | list[str] | None:
+    try:
+        value = ast.literal_eval(node)
+    except (SyntaxError, ValueError):
+        return None
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, (list, tuple)) and value and all(isinstance(item, str) and str(item).strip() for item in value):
+        return [str(item) for item in value]
+    return None
+
+
+def _python_output_contract_left_kind(
+    node: ast.AST,
+    *,
+    splitline_names: set[str],
+) -> str | None:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "splitlines":
+        return "output_lines"
+    if isinstance(node, ast.Name):
+        name = str(node.id or "").strip().lower()
+        if node.id in splitline_names or name in {"lines", "output_lines"}:
+            return "output_lines"
+        if name in {"output", "result", "message", "text"}:
+            return "output_text"
+    rendered = _python_render_expression(node).lower()
+    if ".splitlines(" in rendered:
+        return "output_lines"
+    return None
+
+
+def _render_python_output_contract(
+    *,
+    left: ast.AST,
+    expected: str | list[str],
+    splitline_names: set[str],
+) -> str | None:
+    kind = _python_output_contract_left_kind(left, splitline_names=splitline_names)
+    if kind == "output_lines" and isinstance(expected, list):
+        preview = " | ".join(repr(item) for item in expected[:4])
+        return f"Emit exact output lines in order: {preview}."
+    if kind == "output_text" and isinstance(expected, str):
+        return f"Emit exact output text: {expected!r}."
+    return None
+
+
+def _python_test_output_contract_lines(
+    test_text: str,
+    *,
+    focus_tokens: set[str],
+    limit: int,
+) -> list[str]:
+    try:
+        tree = ast.parse(test_text)
+    except SyntaxError:
+        return []
+
+    scored_contracts: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    order = 0
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        splitline_names: set[str] = set()
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "splitlines"
+            ):
+                splitline_names.add(target.id)
+
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assert):
+                continue
+            test = node.test
+            if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+                continue
+            if not isinstance(test.ops[0], ast.Eq):
+                continue
+            expected = _python_string_output_contract_literal(test.comparators[0])
+            if expected is None:
+                continue
+            contract = _render_python_output_contract(
+                left=test.left,
+                expected=expected,
+                splitline_names=splitline_names,
+            )
+            if not contract or contract in seen:
+                continue
+            normalized = contract.lower()
+            score = sum(1 for token in focus_tokens if token in normalized)
+            if focus_tokens and score <= 0:
+                continue
+            seen.add(contract)
+            scored_contracts.append((score, order, contract))
+            order += 1
+
+    return [contract for _, _, contract in sorted(scored_contracts, key=lambda item: (-item[0], item[1]))[:limit]]
+
+
+def _source_backed_runtime_output_contracts(
+    session: SessionState | None,
+    *,
+    target_path: str,
+    repair_context: ValidationFailureEvidence | None,
+    limit: int = 2,
+) -> list[str]:
+    if (
+        session is None
+        or repair_context is None
+        or repair_context.verification_scope != "runtime"
+        or not _repair_context_has_truncated_semantic_markers(repair_context)
+    ):
+        return []
+    snapshot = session.workspace_snapshot
+    if snapshot is None:
+        return []
+
+    focus_tokens = _runtime_output_contract_focus_tokens(repair_context)
+    contracts: list[str] = []
+    for test_path in _candidate_test_contract_paths(session):
+        test_text = _workspace_file_excerpt(session, test_path)
+        if not test_text:
+            continue
+        if not _python_test_imports_reference_target(
+            session,
+            snapshot=snapshot,
+            test_path=test_path,
+            target_path=target_path,
+            test_text=test_text,
+        ):
+            continue
+        for contract in _python_test_output_contract_lines(
+            test_text,
+            focus_tokens=focus_tokens,
+            limit=limit,
+        ):
+            if contract not in contracts:
+                contracts.append(contract)
+            if len(contracts) >= limit:
+                return contracts
+    return contracts[:limit]
 
 
 def _python_render_expression(node: ast.AST | None) -> str:

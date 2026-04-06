@@ -13892,6 +13892,137 @@ def test_deterministic_runtime_literal_delta_recovery_keeps_mixed_pytest_failure
     assert "fou...or owner zoe." not in result.content
 
 
+def test_compact_repair_prompts_surface_exact_supporting_output_contracts_for_truncated_taskboard_diffs(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_kept() -> None:\n"
+        "    output = run_cli(['list'])\n"
+        "    lines = output.splitlines()\n"
+        "    assert lines == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli(['list', '--owner', 'zoe'])\n"
+        "    assert output == 'No tasks found for owner zoe.'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "__________________ test_default_list_output_kept ___________________\n\n"
+            "    def test_default_list_output_kept() -> None:\n"
+            '        output = run_cli(["list"])\n'
+            "        lines = output.splitlines()\n"
+            "        assert lines == [\n"
+            "            '- Escalate billing ticket (alice) [todo]',\n"
+            "            '- Rotate API token (bob) [doing]',\n"
+            "            '- Draft outage summary (alice) [done]',\n"
+            "        ]\n"
+            "E       AssertionError: assert ['Escalate bi...tage summary'] == ['- Escalate ...lice) [done]']\n\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+    assert repair_context is not None
+
+    compact_update_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+    compact_retry_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair was a no-op.",
+            confidence=0.95,
+            blocking_issues=[
+                "The proposal for taskboard/cli.py left the failing behavior unchanged."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the emitted output contract in taskboard/cli.py."],
+        ),
+        mode="compact",
+    )
+
+    for prompt in (compact_update_prompt, compact_retry_prompt):
+        assert "Exact supporting output contract:" in prompt
+        assert "Emit exact output lines in order:" in prompt
+        assert "- Escalate billing ticket (alice) [todo]" in prompt
+        assert "- Rotate API token (bob) [doing]" in prompt
+        assert "- Draft outage summary (alice) [done]" in prompt
+        assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+
+
 def test_retry_update_after_review_failure_uses_deterministic_runtime_literal_delta_recovery(tmp_path):
     llm = ScriptedLLM(text_payloads=["__should_not_run__"])
     planner = Planner(llm, "")
