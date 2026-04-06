@@ -13805,6 +13805,93 @@ def test_deterministic_runtime_literal_delta_recovery_uses_validation_planner_py
     assert "fou...or owner zoe." not in result.content
 
 
+def test_deterministic_runtime_literal_delta_recovery_keeps_mixed_pytest_failures_local(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "__________________ test_default_list_output_kept ___________________\n\n"
+            "    def test_default_list_output_kept() -> None:\n"
+            '        output = run_cli(["list"])\n'
+            "        lines = output.splitlines()\n"
+            "        assert lines == [\n"
+            "            '- Escalate billing ticket (alice) [todo]',\n"
+            "            '- Rotate API token (bob) [doing]',\n"
+            "            '- Draft outage summary (alice) [done]',\n"
+            "        ]\n"
+            "E       AssertionError: assert ['Escalate bi...tage summary'] == ['- Escalate ...lice) [done]']\n\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert repair_context.repair_brief is not None
+    assert repair_context.repair_brief.expected_semantics == [
+        "Validation should produce: ['- Escalate ...lice) [done]']",
+        "Validation should produce: No tasks found for owner zoe.",
+    ]
+    assert repair_context.repair_brief.observed_semantics == [
+        "Validation currently produces: ['Escalate bi...tage summary']",
+        "Validation currently produces: No tasks found.",
+    ]
+    assert result is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert "fou...or owner zoe." not in result.content
+
+
 def test_retry_update_after_review_failure_uses_deterministic_runtime_literal_delta_recovery(tmp_path):
     llm = ScriptedLLM(text_payloads=["__should_not_run__"])
     planner = Planner(llm, "")

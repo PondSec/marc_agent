@@ -1723,6 +1723,10 @@ class ValidationPlanner:
         if pairs:
             return self._normalize_assertion_semantic_pairs(self._unique_semantic_pairs(pairs))
 
+        fallback_pairs = self._assertion_fallback_context_pairs(lines)
+        if fallback_pairs:
+            return self._normalize_assertion_semantic_pairs(self._unique_semantic_pairs(fallback_pairs))
+
         fallback_pairs: list[tuple[str | None, str | None]] = []
         parsed_observed, parsed_expected = self._assertion_line_pair(str(text or ""))
         if parsed_observed is not None or parsed_expected is not None:
@@ -1938,6 +1942,45 @@ class ValidationPlanner:
         expected = self._literal_or_text(match.group("expected"))
         return observed, expected
 
+    def _assertion_fallback_context_pairs(self, lines: list[str]) -> list[tuple[str | None, str | None]]:
+        pairs: list[tuple[str | None, str | None]] = []
+        for index, raw in enumerate(lines):
+            stripped = str(raw or "").strip()
+            if not stripped:
+                continue
+            observed, expected = self._assertion_line_pair(stripped)
+            if observed is None and expected is None:
+                continue
+            source_expected = self._nearest_assertion_source_expected(lines, mismatch_index=index)
+            if source_expected is not None and (
+                expected is None or self._semantic_value_looks_truncated(expected)
+            ):
+                expected = source_expected
+            pairs.append((observed, expected))
+        return self._unique_semantic_pairs(pairs)
+
+    def _nearest_assertion_source_expected(
+        self,
+        lines: list[str],
+        *,
+        mismatch_index: int,
+        lookback: int = 8,
+    ) -> str | None:
+        lower_bound = max(0, mismatch_index - lookback)
+        for index in range(mismatch_index - 1, lower_bound - 1, -1):
+            stripped = str(lines[index] or "").strip()
+            if not stripped:
+                continue
+            if self._assertion_anchor_line(stripped):
+                break
+            if re.match(r"[_=]{5,}", stripped):
+                break
+            if re.search(r"\b(?:FAIL|FAILED|ERROR)\b", stripped):
+                break
+            if self._is_assertion_source_line(stripped):
+                return self._assertion_source_expected_value([stripped])
+        return None
+
     def _assertion_source_expected_value(self, lines: list[str]) -> str | None:
         for raw in lines:
             stripped = str(raw or "").strip()
@@ -1991,7 +2034,27 @@ class ValidationPlanner:
                 continue
             normalized.append((observed, expected))
             index += 1
-        return self._unique_semantic_pairs(normalized)
+        preferred: list[tuple[str | None, str | None]] = []
+        observed_indexes: dict[str, int] = {}
+        for observed, expected in normalized:
+            observed_text = str(observed or "").strip()
+            if observed_text and observed_text in observed_indexes:
+                existing_index = observed_indexes[observed_text]
+                existing_observed, existing_expected = preferred[existing_index]
+                if (
+                    existing_expected is None
+                    or (
+                        self._semantic_value_looks_truncated(existing_expected)
+                        and expected is not None
+                        and not self._semantic_value_looks_truncated(expected)
+                    )
+                ):
+                    preferred[existing_index] = (existing_observed, expected)
+                continue
+            preferred.append((observed, expected))
+            if observed_text:
+                observed_indexes[observed_text] = len(preferred) - 1
+        return self._unique_semantic_pairs(preferred)
 
     def _semantic_value_looks_truncated(self, value: str | None) -> bool:
         text = str(value or "").strip()

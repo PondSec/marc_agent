@@ -9776,6 +9776,10 @@ class Planner:
         if repair_context.verification_scope != "runtime":
             return None
 
+        def looks_truncated(value: str) -> bool:
+            candidate = str(value or "").strip()
+            return "..." in candidate or "…" in candidate
+
         line_hints = _repair_target_line_hints(
             path=path,
             current_content=current_content,
@@ -9795,6 +9799,8 @@ class Planner:
             observed_text = str(observed or "").strip()
             expected_text = str(expected or "").strip()
             if not observed_text or not expected_text or observed_text == expected_text:
+                continue
+            if looks_truncated(observed_text) or looks_truncated(expected_text):
                 continue
             pair = (observed_text, expected_text)
             if pair in seen_pairs:
@@ -9819,6 +9825,8 @@ class Planner:
                     expected = str(match.group("expected") or "")
                     if not observed or not expected or observed == expected:
                         continue
+                    if looks_truncated(observed) or looks_truncated(expected):
+                        continue
                     pair = (observed, expected)
                     if pair in seen_pairs:
                         continue
@@ -9842,6 +9850,8 @@ class Planner:
             observed = str(replace_match.group("observed") or "").strip()
             expected = str(replace_match.group("expected") or "").strip()
             if not observed or not expected or observed == expected:
+                continue
+            if looks_truncated(observed) or looks_truncated(expected):
                 continue
             pair = (observed, expected)
             if pair in seen_pairs:
