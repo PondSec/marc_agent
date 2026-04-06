@@ -3506,6 +3506,97 @@ def _direct_main_runtime_contract(
     return option_tokens[:limit], positional_tokens[:limit]
 
 
+def _exercised_runtime_argv_contract(
+    supporting_context: str,
+    *,
+    limit: int = 6,
+) -> tuple[list[str], list[str]]:
+    direct_option_tokens, direct_positional_tokens = _direct_main_runtime_contract(
+        supporting_context,
+        limit=limit,
+    )
+    if direct_option_tokens or direct_positional_tokens:
+        return direct_option_tokens, direct_positional_tokens
+
+    text = str(supporting_context or "")
+    option_tokens: list[str] = []
+    positional_tokens: list[str] = []
+    for match in re.finditer(r"(?:[A-Za-z_][A-Za-z0-9_\.]*)\(\s*(\[[^\]]*\])\s*\)", text):
+        raw_argv = str(match.group(1) or "").strip()
+        if not raw_argv:
+            continue
+        try:
+            values = ast.literal_eval(raw_argv)
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(values, (list, tuple)):
+            continue
+
+        saw_option = False
+        last_option_tail: list[str] = []
+        for value in values:
+            token = str(value or "").strip()
+            if not token:
+                continue
+            if token.startswith("-"):
+                saw_option = True
+                last_option_tail = []
+                if token not in option_tokens:
+                    option_tokens.append(token)
+                    if len(option_tokens) >= limit and positional_tokens:
+                        return option_tokens[:limit], positional_tokens[:limit]
+                continue
+            if not saw_option:
+                continue
+            if token not in last_option_tail:
+                last_option_tail.append(token)
+        if last_option_tail:
+            positional_tokens = last_option_tail[:limit]
+            if len(positional_tokens) >= limit:
+                return option_tokens[:limit], positional_tokens[:limit]
+    return option_tokens[:limit], positional_tokens[:limit]
+
+
+def _direct_main_runtime_value_propagation_hint(
+    *,
+    expected_values: Sequence[str],
+    observed_values: Sequence[str],
+    positional_tokens: Sequence[str],
+) -> str | None:
+    runtime_value_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for raw in positional_tokens:
+        token = str(raw or "").strip().strip("'\"")
+        normalized = token.lower()
+        if len(normalized) < 2 or normalized in seen_tokens:
+            continue
+        seen_tokens.add(normalized)
+        runtime_value_tokens.append(token)
+    if not runtime_value_tokens:
+        return None
+
+    for expected_value, observed_value in zip(expected_values, observed_values):
+        expected_text = _repair_semantic_value_text(expected_value)
+        observed_text = _repair_semantic_value_text(observed_value)
+        if not expected_text or not observed_text or expected_text == observed_text:
+            continue
+        expected_lower = expected_text.lower()
+        observed_lower = observed_text.lower()
+        dropped_tokens = [
+            token
+            for token in runtime_value_tokens
+            if token.lower() in expected_lower and token.lower() not in observed_lower
+        ]
+        if not dropped_tokens:
+            continue
+        preview = ", ".join(repr(token) for token in dropped_tokens[:3])
+        return (
+            f"The expected runtime output includes exercised argv payload values like {preview} that the observed output drops. "
+            "Propagate the existing runtime value through the exercised branch instead of keeping a generic placeholder message or hardcoding the whole sample output."
+        )
+    return None
+
+
 def _direct_main_option_contract_present(supporting_context: str) -> bool:
     option_tokens, _ = _direct_main_runtime_contract(supporting_context)
     return bool(option_tokens)
@@ -4708,17 +4799,35 @@ def _targeted_runtime_prompt_hints(
         hints.append(
             "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
         )
-    option_tokens, positional_tokens = _direct_main_runtime_contract(supporting_context)
+    direct_main_option_tokens, direct_main_positional_tokens = _direct_main_runtime_contract(supporting_context)
+    exercised_option_tokens, exercised_positional_tokens = _exercised_runtime_argv_contract(supporting_context)
+    option_tokens = direct_main_option_tokens or exercised_option_tokens
+    positional_tokens = direct_main_positional_tokens or exercised_positional_tokens
     if option_tokens:
         option_preview = ", ".join(option_tokens[:3])
         hints.append(
-            f"The failing main([...]) call exercises exact option tokens like {option_preview}. Recognize those tokens verbatim; do not drop leading hyphens or rewrite them into lookalike spellings."
+            (
+                f"The failing main([...]) call exercises exact option tokens like {option_preview}. "
+                "Recognize those tokens verbatim; do not drop leading hyphens or rewrite them into lookalike spellings."
+                if direct_main_option_tokens
+                else (
+                    f"The failing runtime example exercises exact option tokens like {option_preview}. "
+                    "Recognize those tokens verbatim and preserve their effect through the exercised branch."
+                )
+            )
         )
         if positional_tokens:
             positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
+    propagation_hint = _direct_main_runtime_value_propagation_hint(
+        expected_values=expected_semantics,
+        observed_values=observed_semantics,
+        positional_tokens=positional_tokens,
+    )
+    if propagation_hint:
+        hints.append(propagation_hint)
     if has_semantic_contract:
         if option_tokens:
             hints.append(
