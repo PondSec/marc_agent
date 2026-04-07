@@ -2195,6 +2195,7 @@ def _compact_repair_update_prompt(
         session,
         target_path=path,
         repair_context=repair_context,
+        limit=3,
     )
     if exact_output_contracts:
         option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
@@ -2203,7 +2204,7 @@ def _compact_repair_update_prompt(
         )
         sections.append(
             "Exact supporting output contract:\n"
-            + "\n".join(f"- {item}" for item in exact_output_contracts[:2])
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
         )
         targeted_context = {
             **targeted_context,
@@ -2225,6 +2226,7 @@ def _compact_repair_update_prompt(
         repair_context=repair_context,
         review_feedback=review_feedback,
         supporting_context=related_context,
+        supporting_output_contracts=exact_output_contracts,
     )
     sections.extend(
         [
@@ -2324,6 +2326,25 @@ def _compact_repair_retry_prompt(
         max_files=support_max_files,
     )
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        limit=3,
+    )
+    if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2336,6 +2357,7 @@ def _compact_repair_retry_prompt(
         repair_context=repair_context,
         review_feedback=review_feedback,
         supporting_context=related_context,
+        supporting_output_contracts=exact_output_contracts,
     )
 
     sections = [
@@ -2403,28 +2425,11 @@ def _compact_repair_retry_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
-    exact_output_contracts = _source_backed_runtime_output_contracts(
-        session,
-        target_path=path,
-        repair_context=repair_context,
-    )
     if exact_output_contracts:
-        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
-            session,
-            target_path=path,
-        )
         sections.append(
             "Exact supporting output contract:\n"
-            + "\n".join(f"- {item}" for item in exact_output_contracts[:2])
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
         )
-        targeted_context = {
-            **targeted_context,
-            "supporting_output_contracts": exact_output_contracts,
-            "supporting_runtime_argv_contract": {
-                "option_tokens": option_tokens,
-                "positional_tokens": positional_tokens,
-            },
-        }
     if repair_brief.get("allowed_files"):
         sections.append(
             "Allowed repair files: "
@@ -2502,6 +2507,25 @@ def _focused_full_repair_update_prompt(
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        limit=3,
+    )
+    if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     repair_brief = targeted_context.get("repair_brief") or {}
     support_excerpt_limit = 500 if repair_context.verification_scope == "runtime" else 220
     support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
@@ -2524,6 +2548,7 @@ def _focused_full_repair_update_prompt(
         repair_context=repair_context,
         review_feedback=review_feedback,
         supporting_context=related_context,
+        supporting_output_contracts=exact_output_contracts,
     )
     working_memory = _compact_working_memory(session)
     noop_followup = _review_feedback_indicates_noop_repair(review_feedback)
@@ -2674,6 +2699,11 @@ def _focused_full_repair_update_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+        )
     diagnostic_context = _diagnostic_context(session)
     if diagnostic_context and not noop_followup:
         sections.append(f"Diagnostic context: {diagnostic_context}")
@@ -3186,26 +3216,129 @@ def _repair_semantic_values_from_sources(
     return expected_items[:4], observed_items[:4]
 
 
-def _runtime_output_contract_expected_values(contract_lines: Sequence[str]) -> list[str]:
+def _runtime_output_contract_required_literals(
+    contract_lines: Sequence[str],
+    *,
+    limit: int = 8,
+) -> list[str]:
     values: list[str] = []
     for raw_line in contract_lines:
         line = str(raw_line or "").strip()
         if not line:
             continue
-        match = re.search(
-            r"Emit exact output text:\s*(?P<expected>'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")\.?$",
-            line,
-        )
-        if match is None:
+        payload = ""
+        if line.startswith("Emit exact output text:"):
+            payload = line.partition(":")[2]
+        elif line.startswith("Emit exact output lines in order:"):
+            payload = line.partition(":")[2]
+        else:
+            continue
+        for literal_text in re.findall(r"""'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*" """.strip(), payload):
+            try:
+                expected_value = ast.literal_eval(literal_text)
+            except (SyntaxError, ValueError):
+                continue
+            expected_text = str(expected_value or "").strip()
+            if expected_text and expected_text not in values:
+                values.append(expected_text)
+            if len(values) >= limit:
+                return values[:limit]
+    return values[:limit]
+
+
+def _runtime_output_contract_expected_values(contract_lines: Sequence[str]) -> list[str]:
+    values = _runtime_output_contract_required_literals(contract_lines, limit=8)
+    return values[:4]
+
+
+def _content_string_literal_candidates(
+    current_content: str,
+    *,
+    limit: int = 80,
+) -> list[str]:
+    content = str(current_content or "")
+    if not content:
+        return []
+
+    literals: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"""(?P<literal>'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")""", content):
+        token = str(match.group("literal") or "").strip()
+        if not token:
             continue
         try:
-            expected_value = ast.literal_eval(str(match.group("expected") or ""))
+            value = ast.literal_eval(token)
         except (SyntaxError, ValueError):
             continue
-        expected_text = str(expected_value or "").strip()
-        if expected_text and expected_text not in values:
-            values.append(expected_text)
-    return values[:4]
+        if not isinstance(value, str):
+            continue
+        normalized = " ".join(str(value or "").split())
+        if not normalized or len(normalized) > 160 or normalized in seen:
+            continue
+        seen.add(normalized)
+        literals.append(normalized)
+        if len(literals) >= limit:
+            break
+    return literals
+
+
+def _output_contract_fragment_candidates(
+    required_literal: str,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    normalized = " ".join(str(required_literal or "").split())
+    if not normalized:
+        return []
+    fragments: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        cleaned = re.sub(r"^[*-]\s*", "", " ".join(str(candidate or "").split())).strip()
+        if len(cleaned) < 4 or cleaned in seen:
+            return
+        seen.add(cleaned)
+        fragments.append(cleaned)
+
+    _add(normalized)
+    _add(re.sub(r"^[*-]\s*", "", normalized))
+    for part in re.split(r"[\[\]\(\)\|,:]", normalized):
+        _add(part)
+        if len(fragments) >= limit:
+            break
+    return fragments[:limit]
+
+
+def _best_contract_fragment_near_match(
+    required_literal: str,
+    current_content: str,
+) -> tuple[str, str] | None:
+    candidates = _content_string_literal_candidates(current_content)
+    if not candidates:
+        return None
+
+    contract_fragments = _output_contract_fragment_candidates(required_literal)
+    exact_fragment_set = {fragment.lower() for fragment in contract_fragments}
+    best_match: tuple[str, str] | None = None
+    best_score = 0.0
+    for fragment in contract_fragments:
+        normalized_fragment = fragment.lower()
+        for candidate in candidates:
+            normalized_candidate = candidate.lower()
+            if not normalized_candidate or normalized_candidate == normalized_fragment:
+                continue
+            if normalized_candidate in exact_fragment_set:
+                continue
+            score = difflib.SequenceMatcher(None, normalized_candidate, normalized_fragment).ratio()
+            if normalized_fragment in normalized_candidate or normalized_candidate in normalized_fragment:
+                score += 0.08
+            if len(set(normalized_fragment.split()) & set(normalized_candidate.split())) >= 2:
+                score += 0.08
+            if score < 0.78 or score <= best_score:
+                continue
+            best_score = score
+            best_match = (candidate, fragment)
+    return best_match
 
 
 def _repair_semantic_values_from_texts(
@@ -3673,7 +3806,7 @@ def _runtime_value_tokens_relevant_to_semantics(
         normalized = token.lower()
         if not any(normalized in expected for expected in expected_texts):
             continue
-        missing_from_observed = not observed_texts or any(normalized not in observed for observed in observed_texts)
+        missing_from_observed = bool(observed_texts) and any(normalized not in observed for observed in observed_texts)
         missing_from_current = normalized not in lowered_current
         if missing_from_observed or missing_from_current:
             relevant_tokens.append(token)
@@ -3907,6 +4040,7 @@ def _repair_required_literal_anchors(
     path: str,
     current_content: str,
     repair_context: ValidationFailureEvidence,
+    supporting_output_contracts: Sequence[str] | None = None,
     limit: int = 3,
 ) -> list[str]:
     focus_text = "\n".join(
@@ -3952,8 +4086,6 @@ def _repair_required_literal_anchors(
         if line and references_target and line not in requirement_lines:
             requirement_lines.append(line)
     requirements = _literal_validation_requirements(requirement_lines)
-    if not requirements:
-        return []
 
     anchors: list[str] = []
     seen: set[tuple[str, int]] = set()
@@ -3984,6 +4116,30 @@ def _repair_required_literal_anchors(
         else:
             anchors.append(
                 f"Ensure the exact required literal {literal!r} appears verbatim in {path}."
+            )
+        if len(anchors) >= limit:
+            break
+    if len(anchors) >= limit:
+        return anchors[:limit]
+
+    for required_literal in _runtime_output_contract_required_literals(
+        supporting_output_contracts or [],
+        limit=max(limit * 2, 6),
+    ):
+        if current_content.count(required_literal) > 0:
+            continue
+        near_match = _literal_near_match_in_content(required_literal, current_content)
+        if near_match and near_match != required_literal:
+            anchors.append(
+                f"Replace near-match literal {near_match!r} with the exact required literal {required_literal!r} in {path}."
+            )
+        else:
+            fragment_match = _best_contract_fragment_near_match(required_literal, current_content)
+            if fragment_match is None:
+                continue
+            candidate, fragment = fragment_match
+            anchors.append(
+                f"Replace near-match source literal {candidate!r} with the exact contract fragment {fragment!r} in {path} so the exercised output can satisfy the supporting contract {required_literal!r}."
             )
         if len(anchors) >= limit:
             break
@@ -4054,6 +4210,7 @@ def _mandatory_mutation_anchors(
     repair_context: ValidationFailureEvidence,
     review_feedback: ProposedUpdateReview | None,
     supporting_context: str = "",
+    supporting_output_contracts: Sequence[str] | None = None,
 ) -> list[str]:
     anchors: list[str] = []
     direct_script_anchor = _direct_python_script_execution_anchor(
@@ -4123,6 +4280,7 @@ def _mandatory_mutation_anchors(
         path=path,
         current_content=current_content,
         repair_context=repair_context,
+        supporting_output_contracts=supporting_output_contracts,
     ):
         anchors.append(literal_anchor)
 

@@ -14147,6 +14147,156 @@ def test_general_retry_prompt_surfaces_exact_supporting_output_contracts_for_tas
     assert "The exact runtime contract includes exercised argv payload values like 'zoe'" in prompt
 
 
+def test_compact_repair_retry_prompt_anchors_taskboard_source_near_matches_from_exact_output_contracts(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage, outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(f'- {task[\"title\"]} ({task[\"owner\"]}) [{task[\"status\"]}]' for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        print(render_tasks(tasks))\n"
+        "        return 0\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_stays_unchanged() -> None:\n"
+        "    output = run_cli([\"list\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_returns_only_matching_tasks() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"alice\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Implement the missing owner filter for the taskboard CLI. "
+            "Keep the default output unchanged, support the no-match message, and run python -m pytest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py", "README.md"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the requested owner filter behavior."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "___________________ test_default_list_output_stays_unchanged ___________________\n"
+            ">       assert output.splitlines() == [\n"
+            "E       AssertionError: assert ['- Escalate ...lice) [done]'] == ['- Escalate ...lice) [done]']\n"
+            "E         At index 2 diff: '- Draft outage, outage summary (alice) [done]' != '- Draft outage summary (alice) [done]'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks found for owner zoe.'\n"
+            "tests/test_cli.py:36: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+    assert repair_context is not None
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair was a no-op.",
+            confidence=0.95,
+            blocking_issues=[
+                "The proposal for taskboard/cli.py left the failing behavior unchanged."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the emitted output contract in taskboard/cli.py."],
+        ),
+        mode="compact",
+    )
+
+    assert "Exact supporting output contract:" in prompt
+    assert (
+        "Replace near-match source literal 'Draft outage, outage summary' "
+        "with the exact contract fragment 'Draft outage summary' in taskboard/cli.py"
+    ) in prompt
+    assert (
+        "Replace near-match source literal 'No tasks found for the specified owner.' "
+        "with the exact contract fragment 'No tasks found for owner zoe.' in taskboard/cli.py"
+    ) in prompt
+
+
 def test_runtime_repair_prompt_surfaces_wrapper_argv_value_propagation_hint_for_owner_output(
     tmp_path,
 ):
