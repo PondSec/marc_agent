@@ -14143,6 +14143,8 @@ def test_general_retry_prompt_surfaces_exact_supporting_output_contracts_for_tas
     assert "- Rotate API token (bob) [doing]" in prompt
     assert "- Draft outage summary (alice) [done]" in prompt
     assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+    assert "remaining argv payload 'zoe'" in prompt
+    assert "The exact runtime contract includes exercised argv payload values like 'zoe'" in prompt
 
 
 def test_runtime_repair_prompt_surfaces_wrapper_argv_value_propagation_hint_for_owner_output(

@@ -771,11 +771,33 @@ def generate_content_retry_prompt(
             )
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
         related_context = _related_file_context(session, path) if session is not None else "none"
+        exact_output_contracts: list[str] = []
+        supporting_runtime_argv_contract: dict[str, list[str]] = {}
+        if session is not None and current_content is not None and review_feedback is not None:
+            exact_output_contracts = _source_backed_runtime_output_contracts(
+                session,
+                target_path=path,
+                repair_context=None,
+                require_truncated_repair_context=False,
+                limit=3,
+            )
+            option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+                session,
+                target_path=path,
+            )
+            if option_tokens or positional_tokens:
+                supporting_runtime_argv_contract = {
+                    "option_tokens": option_tokens,
+                    "positional_tokens": positional_tokens,
+                }
         runtime_hints = _targeted_runtime_prompt_hints(
             path=path,
             current_content=current_content or "",
             supporting_context=related_context,
-            targeted_context={},
+            targeted_context={
+                "supporting_output_contracts": exact_output_contracts,
+                "supporting_runtime_argv_contract": supporting_runtime_argv_contract,
+            },
         )
         sections = [
             "Produce the full file content for exactly one file.",
@@ -793,19 +815,11 @@ def generate_content_retry_prompt(
             sections.append(file_requirement_summary)
         if session is not None:
             sections.append(f"Related file hints: {related_context}")
-            if current_content is not None and review_feedback is not None:
-                exact_output_contracts = _source_backed_runtime_output_contracts(
-                    session,
-                    target_path=path,
-                    repair_context=None,
-                    require_truncated_repair_context=False,
-                    limit=3,
+            if exact_output_contracts:
+                sections.append(
+                    "Exact supporting output contract:\n"
+                    + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
                 )
-                if exact_output_contracts:
-                    sections.append(
-                        "Exact supporting output contract:\n"
-                        + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
-                    )
             if runtime_hints:
                 sections.append(
                     "Targeted runtime hints: "
@@ -855,11 +869,33 @@ def generate_content_retry_prompt(
 
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     related_context = _related_file_context(session, path) if session is not None else "none"
+    exact_output_contracts: list[str] = []
+    supporting_runtime_argv_contract: dict[str, list[str]] = {}
+    if session is not None and current_content is not None and review_feedback is not None:
+        exact_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=None,
+            require_truncated_repair_context=False,
+            limit=3,
+        )
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        if option_tokens or positional_tokens:
+            supporting_runtime_argv_contract = {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            }
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content or "",
         supporting_context=related_context,
-        targeted_context={},
+        targeted_context={
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": supporting_runtime_argv_contract,
+        },
     )
     sections = [
         "Produce the full file content for exactly one file.",
@@ -880,19 +916,11 @@ def generate_content_retry_prompt(
         sections.append(file_requirement_summary)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
-    if session is not None and current_content is not None and review_feedback is not None:
-        exact_output_contracts = _source_backed_runtime_output_contracts(
-            session,
-            target_path=path,
-            repair_context=None,
-            require_truncated_repair_context=False,
-            limit=3,
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
         )
-        if exact_output_contracts:
-            sections.append(
-                "Exact supporting output contract:\n"
-                + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
-            )
     if runtime_hints:
         sections.append(
             "Targeted runtime hints: "
@@ -2169,10 +2197,22 @@ def _compact_repair_update_prompt(
         repair_context=repair_context,
     )
     if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
         sections.append(
             "Exact supporting output contract:\n"
             + "\n".join(f"- {item}" for item in exact_output_contracts[:2])
         )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2369,10 +2409,22 @@ def _compact_repair_retry_prompt(
         repair_context=repair_context,
     )
     if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
         sections.append(
             "Exact supporting output contract:\n"
             + "\n".join(f"- {item}" for item in exact_output_contracts[:2])
         )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     if repair_brief.get("allowed_files"):
         sections.append(
             "Allowed repair files: "
@@ -3134,6 +3186,28 @@ def _repair_semantic_values_from_sources(
     return expected_items[:4], observed_items[:4]
 
 
+def _runtime_output_contract_expected_values(contract_lines: Sequence[str]) -> list[str]:
+    values: list[str] = []
+    for raw_line in contract_lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        match = re.search(
+            r"Emit exact output text:\s*(?P<expected>'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\")\.?$",
+            line,
+        )
+        if match is None:
+            continue
+        try:
+            expected_value = ast.literal_eval(str(match.group("expected") or ""))
+        except (SyntaxError, ValueError):
+            continue
+        expected_text = str(expected_value or "").strip()
+        if expected_text and expected_text not in values:
+            values.append(expected_text)
+    return values[:4]
+
+
 def _repair_semantic_values_from_texts(
     texts: Sequence[str],
 ) -> tuple[list[str], list[str]]:
@@ -3500,7 +3574,12 @@ def _direct_main_runtime_contract(
             if token not in last_option_tail:
                 last_option_tail.append(token)
         if last_option_tail:
-            positional_tokens = last_option_tail[:limit]
+            for token in last_option_tail:
+                if token in positional_tokens:
+                    continue
+                positional_tokens.append(token)
+                if len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
             if len(positional_tokens) >= limit:
                 return option_tokens[:limit], positional_tokens[:limit]
     return option_tokens[:limit], positional_tokens[:limit]
@@ -3551,18 +3630,18 @@ def _exercised_runtime_argv_contract(
             if token not in last_option_tail:
                 last_option_tail.append(token)
         if last_option_tail:
-            positional_tokens = last_option_tail[:limit]
+            for token in last_option_tail:
+                if token in positional_tokens:
+                    continue
+                positional_tokens.append(token)
+                if len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
             if len(positional_tokens) >= limit:
                 return option_tokens[:limit], positional_tokens[:limit]
     return option_tokens[:limit], positional_tokens[:limit]
 
 
-def _direct_main_runtime_value_propagation_hint(
-    *,
-    expected_values: Sequence[str],
-    observed_values: Sequence[str],
-    positional_tokens: Sequence[str],
-) -> str | None:
+def _runtime_value_tokens(positional_tokens: Sequence[str]) -> list[str]:
     runtime_value_tokens: list[str] = []
     seen_tokens: set[str] = set()
     for raw in positional_tokens:
@@ -3572,6 +3651,48 @@ def _direct_main_runtime_value_propagation_hint(
             continue
         seen_tokens.add(normalized)
         runtime_value_tokens.append(token)
+    return runtime_value_tokens
+
+
+def _runtime_value_tokens_relevant_to_semantics(
+    *,
+    expected_values: Sequence[str],
+    observed_values: Sequence[str],
+    positional_tokens: Sequence[str],
+    current_content: str = "",
+) -> list[str]:
+    runtime_value_tokens = _runtime_value_tokens(positional_tokens)
+    if not runtime_value_tokens or not expected_values:
+        return runtime_value_tokens
+
+    lowered_current = str(current_content or "").lower()
+    expected_texts = [_repair_semantic_value_text(item).lower() for item in expected_values if _repair_semantic_value_text(item)]
+    observed_texts = [_repair_semantic_value_text(item).lower() for item in observed_values if _repair_semantic_value_text(item)]
+    relevant_tokens: list[str] = []
+    for token in runtime_value_tokens:
+        normalized = token.lower()
+        if not any(normalized in expected for expected in expected_texts):
+            continue
+        missing_from_observed = not observed_texts or any(normalized not in observed for observed in observed_texts)
+        missing_from_current = normalized not in lowered_current
+        if missing_from_observed or missing_from_current:
+            relevant_tokens.append(token)
+    return relevant_tokens or runtime_value_tokens
+
+
+def _direct_main_runtime_value_propagation_hint(
+    *,
+    expected_values: Sequence[str],
+    observed_values: Sequence[str],
+    positional_tokens: Sequence[str],
+    current_content: str = "",
+) -> str | None:
+    runtime_value_tokens = _runtime_value_tokens_relevant_to_semantics(
+        expected_values=expected_values,
+        observed_values=observed_values,
+        positional_tokens=positional_tokens,
+        current_content=current_content,
+    )
     if not runtime_value_tokens:
         return None
 
@@ -3592,6 +3713,12 @@ def _direct_main_runtime_value_propagation_hint(
         preview = ", ".join(repr(token) for token in dropped_tokens[:3])
         return (
             f"The expected runtime output includes exercised argv payload values like {preview} that the observed output drops. "
+            "Propagate the existing runtime value through the exercised branch instead of keeping a generic placeholder message or hardcoding the whole sample output."
+        )
+    if expected_values:
+        preview = ", ".join(repr(token) for token in runtime_value_tokens[:3])
+        return (
+            f"The exact runtime contract includes exercised argv payload values like {preview} that the current implementation still does not surface. "
             "Propagate the existing runtime value through the exercised branch instead of keeping a generic placeholder message or hardcoding the whole sample output."
         )
     return None
@@ -4654,6 +4781,22 @@ def _targeted_runtime_prompt_hints(
     lowered_current = str(current_content or "").lower()
     lowered_support = str(supporting_context or "").lower()
     repair_brief = targeted_context.get("repair_brief") or {}
+    supporting_output_contracts = [
+        str(item or "").strip()
+        for item in targeted_context.get("supporting_output_contracts", [])
+        if str(item or "").strip()
+    ]
+    supporting_runtime_contract = targeted_context.get("supporting_runtime_argv_contract") or {}
+    source_backed_option_tokens = [
+        str(item or "").strip()
+        for item in supporting_runtime_contract.get("option_tokens", [])
+        if str(item or "").strip()
+    ]
+    source_backed_positional_tokens = [
+        str(item or "").strip()
+        for item in supporting_runtime_contract.get("positional_tokens", [])
+        if str(item or "").strip()
+    ]
     expected_semantics, observed_semantics = _repair_semantic_values_from_sources(
         repair_brief=repair_brief,
         evidence_texts=[
@@ -4661,6 +4804,8 @@ def _targeted_runtime_prompt_hints(
             str(targeted_context.get("failure_summary") or "").strip(),
         ],
     )
+    if not expected_semantics and supporting_output_contracts:
+        expected_semantics = _runtime_output_contract_expected_values(supporting_output_contracts)
     has_semantic_contract = bool(expected_semantics or observed_semantics)
     focus_text = "\n".join(
         str(item or "")
@@ -4801,8 +4946,19 @@ def _targeted_runtime_prompt_hints(
         )
     direct_main_option_tokens, direct_main_positional_tokens = _direct_main_runtime_contract(supporting_context)
     exercised_option_tokens, exercised_positional_tokens = _exercised_runtime_argv_contract(supporting_context)
-    option_tokens = direct_main_option_tokens or exercised_option_tokens
+    option_tokens = direct_main_option_tokens or exercised_option_tokens or source_backed_option_tokens
     positional_tokens = direct_main_positional_tokens or exercised_positional_tokens
+    for token in source_backed_positional_tokens:
+        normalized = str(token or "").strip()
+        if not normalized or normalized in positional_tokens:
+            continue
+        positional_tokens.append(normalized)
+    hint_positional_tokens = _runtime_value_tokens_relevant_to_semantics(
+        expected_values=expected_semantics,
+        observed_values=observed_semantics,
+        positional_tokens=positional_tokens,
+        current_content=current_content,
+    )
     if option_tokens:
         option_preview = ", ".join(option_tokens[:3])
         hints.append(
@@ -4816,15 +4972,16 @@ def _targeted_runtime_prompt_hints(
                 )
             )
         )
-        if positional_tokens:
-            positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
+        if hint_positional_tokens:
+            positional_preview = ", ".join(repr(token) for token in hint_positional_tokens[:3])
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
     propagation_hint = _direct_main_runtime_value_propagation_hint(
         expected_values=expected_semantics,
         observed_values=observed_semantics,
-        positional_tokens=positional_tokens,
+        positional_tokens=hint_positional_tokens,
+        current_content=current_content,
     )
     if propagation_hint:
         hints.append(propagation_hint)
@@ -5725,6 +5882,49 @@ def _source_backed_runtime_output_contracts(
             if len(contracts) >= limit:
                 return contracts
     return contracts[:limit]
+
+
+def _source_backed_runtime_argv_contract(
+    session: SessionState | None,
+    *,
+    target_path: str,
+    limit: int = 6,
+) -> tuple[list[str], list[str]]:
+    if session is None:
+        return [], []
+    snapshot = session.workspace_snapshot
+    if snapshot is None:
+        return [], []
+
+    option_tokens: list[str] = []
+    positional_tokens: list[str] = []
+    for test_path in _candidate_test_contract_paths(session):
+        test_text = _workspace_file_excerpt(session, test_path)
+        if not test_text:
+            continue
+        if not _python_test_imports_reference_target(
+            session,
+            snapshot=snapshot,
+            test_path=test_path,
+            target_path=target_path,
+            test_text=test_text,
+        ):
+            continue
+        file_option_tokens, file_positional_tokens = _exercised_runtime_argv_contract(
+            test_text,
+            limit=limit,
+        )
+        for token in file_option_tokens:
+            if token not in option_tokens:
+                option_tokens.append(token)
+                if len(option_tokens) >= limit and len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
+        for token in file_positional_tokens:
+            if token not in positional_tokens:
+                positional_tokens.append(token)
+                if len(option_tokens) >= limit and len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
+    return option_tokens[:limit], positional_tokens[:limit]
 
 
 def _python_render_expression(node: ast.AST | None) -> str:
