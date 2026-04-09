@@ -14099,7 +14099,6 @@ class Planner:
         identifiers: list[str] = []
         patterns = (
             r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b",
-            r"(?<![A-Za-z0-9_])--?[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_](?![A-Za-z0-9_])",
             r"\b[A-Za-z_][A-Za-z0-9_]*(?=\()",
         )
         for text in texts:
