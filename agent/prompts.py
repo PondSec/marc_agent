@@ -5156,14 +5156,6 @@ def _targeted_runtime_prompt_hints(
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
-    propagation_hint = _direct_main_runtime_value_propagation_hint(
-        expected_values=expected_semantics,
-        observed_values=observed_semantics,
-        positional_tokens=hint_positional_tokens,
-        current_content=current_content,
-    )
-    if propagation_hint:
-        hints.append(propagation_hint)
     if has_semantic_contract:
         if option_tokens:
             hints.append(
@@ -5179,6 +5171,14 @@ def _targeted_runtime_prompt_hints(
         )
         if separator_hint:
             hints.append(separator_hint)
+    propagation_hint = _direct_main_runtime_value_propagation_hint(
+        expected_values=expected_semantics,
+        observed_values=observed_semantics,
+        positional_tokens=hint_positional_tokens,
+        current_content=current_content,
+    )
+    if propagation_hint:
+        hints.append(propagation_hint)
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure

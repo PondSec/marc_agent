@@ -4782,13 +4782,14 @@ class Planner:
             total_timeout_seconds=total_timeout_seconds,
             prompt_artifact=prompt_trace_path,
         )
+        strict_timeouts = prompt_variant == "compact" and model_name is not None
         outcome = invoke_model(
             lambda progress: self.llm.generate(
                 prompt,
                 model=model_name,
                 timeout=timeout_seconds,
                 total_timeout=total_timeout_seconds,
-                strict_timeouts=prompt_variant == "compact",
+                strict_timeouts=strict_timeouts,
                 num_ctx=num_ctx,
                 retries=0,
                 progress_callback=progress,
@@ -8554,6 +8555,12 @@ class Planner:
             allow_evidence_backed_behavior_adjustment=True,
         )
 
+    def _repair_review_prefers_primary_model(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        return getattr(repair_context, "repair_brief", None) is not None
+
     def _record_local_update_review_skip(
         self,
         session: SessionState,
@@ -8876,10 +8883,6 @@ class Planner:
             )
         primary_model = self._primary_generation_model_name()
         reserve_model = self._lightweight_generation_model_name()
-        if reserve_model is None and repair_review:
-            reserve_model = self._generation_recovery_model_name()
-            if reserve_model == primary_model:
-                reserve_model = None
         local_review_reason: str | None = None
         if focused_compact_review and not repair_review and reserve_model is None:
             local_review_reason = "single_model_compact_update"
@@ -8910,8 +8913,13 @@ class Planner:
             return review
         review_attempts: list[tuple[str | None, str, str]] = []
         if repair_review:
+            primary_first_repair_review = self._repair_review_prefers_primary_model(
+                session.active_repair_context,
+            )
+            if reserve_model is not None and not primary_first_repair_review:
+                review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
             review_attempts.append((primary_model, "tier_a", "primary_model_review"))
-            if reserve_model is not None:
+            if reserve_model is not None and primary_first_repair_review:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
         elif focused_compact_review:
             if reserve_model is not None:
