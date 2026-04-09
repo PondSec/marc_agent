@@ -18311,6 +18311,125 @@ def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(
     assert "When active runtime failure evidence for this file includes observed-vs-expected behavior deltas" in prompt
 
 
+def test_proposed_update_review_prompt_includes_exact_supporting_output_contracts_for_taskboard_runtime_repairs(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the taskboard CLI so the owner filter and no-match output satisfy runtime validation.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest tests/test_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard CLI behavior."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (tmp_path / "taskboard" / "cli.py").write_text(
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage, outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_stays_unchanged() -> None:\n"
+        "    output = run_cli([\"list\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_returns_only_matching_tasks() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"alice\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks found for owner zoe.'\n"
+            "tests/test_cli.py:36: AssertionError\n"
+        ),
+        failure_summary="taskboard/cli.py still drops the exercised owner-specific no-match output.",
+        repair_requirements=["Change taskboard/cli.py so the owner filter runtime output matches the tests."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-review-contracts",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found for the specified owner."],
+            implicated_symbols=["render_tasks", "main"],
+            implicated_region_hint="taskboard/cli.py",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        supporting_artifact_context="tests/test_cli.py exercises the owner-filter CLI contract.",
+        current_excerpt=(
+            "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+            "    if not tasks:\n"
+            "        return \"No tasks found for the specified owner.\"\n"
+            "    return \"\\n\".join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n"
+        ),
+        proposed_excerpt=(
+            "def render_tasks(tasks: list[dict[str, str]], owner: str | None = None) -> str:\n"
+            "    if not tasks and owner is not None:\n"
+            "        return f\"No tasks found for owner {owner}.\"\n"
+            "    return \"\\n\".join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n"
+        ),
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert '"exact_supporting_output_contract"' in prompt
+    assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+    assert "remaining argv payload 'zoe'" in prompt
+
+
 def test_proposed_update_review_prompt_includes_runtime_interaction_hints_for_js_toggle_repairs(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

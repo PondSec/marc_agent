@@ -1195,7 +1195,28 @@ def proposed_update_review_prompt(
             repair_context,
             target_path=path,
         )
+        exact_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if exact_output_contracts:
+            option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+                session,
+                target_path=path,
+            )
+            targeted_repair_context = {
+                **targeted_repair_context,
+                "supporting_output_contracts": exact_output_contracts,
+                "supporting_runtime_argv_contract": {
+                    "option_tokens": option_tokens,
+                    "positional_tokens": positional_tokens,
+                },
+            }
         review_context["active_repair"] = targeted_repair_context
+        if exact_output_contracts:
+            review_context["exact_supporting_output_contract"] = exact_output_contracts[:3]
         semantic_deltas = _repair_semantic_delta_lines(
             repair_context,
             limit=2,
@@ -6000,17 +6021,11 @@ def _source_backed_runtime_output_contracts(
     require_truncated_repair_context: bool = True,
     limit: int = 2,
 ) -> list[str]:
-    if (
-        session is None
-        or (
-            require_truncated_repair_context
-            and (
-                repair_context is None
-                or repair_context.verification_scope != "runtime"
-                or not _repair_context_has_truncated_semantic_markers(repair_context)
-            )
-        )
-    ):
+    if session is None:
+        return []
+    if repair_context is not None and repair_context.verification_scope != "runtime":
+        return []
+    if require_truncated_repair_context and repair_context is None:
         return []
     snapshot = session.workspace_snapshot
     if snapshot is None:
