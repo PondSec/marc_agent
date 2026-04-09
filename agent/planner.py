@@ -14041,6 +14041,7 @@ class Planner:
                 session,
                 current_content=current_content,
                 proposed_content=proposed_content,
+                repair_context=repair_context,
             )
         )
         candidates.extend(self._repair_identifiers_from_failure_evidence(repair_context))
@@ -14085,6 +14086,7 @@ class Planner:
         *,
         current_content: str,
         proposed_content: str,
+        repair_context: ValidationFailureEvidence | None = None,
     ) -> list[str]:
         if session is None:
             return []
@@ -14099,6 +14101,7 @@ class Planner:
         identifiers: list[str] = []
         patterns = (
             r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b",
+            r"(?<![A-Za-z0-9_])--?[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_](?![A-Za-z0-9_])",
             r"\b[A-Za-z_][A-Za-z0-9_]*(?=\()",
         )
         for text in texts:
@@ -14109,8 +14112,73 @@ class Planner:
                     candidate = str(match.group(0) or "").strip()
                     if not candidate or candidate not in content_markers:
                         continue
+                    if candidate.startswith("-") and not self._request_option_identifier_is_relevant(
+                        candidate,
+                        current_content=current_content,
+                        proposed_content=proposed_content,
+                        repair_context=repair_context,
+                    ):
+                        continue
                     identifiers.append(candidate)
         return self._unique_paths(identifiers)[:8]
+
+    def _request_option_identifier_is_relevant(
+        self,
+        identifier: str,
+        *,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None = None,
+    ) -> bool:
+        token = str(identifier or "").strip()
+        if not token:
+            return False
+
+        matching_lines = [
+            line.strip()
+            for line in f"{current_content}\n{proposed_content}".splitlines()
+            if token in line
+        ]
+        if not matching_lines:
+            return False
+
+        if any(not self._looks_like_option_declaration_line(line) for line in matching_lines):
+            return True
+
+        evidence_text = " ".join(
+            str(item or "").strip().lower()
+            for item in (
+                getattr(repair_context, "excerpt", ""),
+                getattr(repair_context, "failure_summary", ""),
+                getattr(repair_context, "summary", ""),
+            )
+            if str(item or "").strip()
+        )
+        return any(
+            marker in evidence_text
+            for marker in (
+                "unrecognized arguments",
+                "unrecognized argument",
+                "unknown option",
+                "no such option",
+                "unexpected option",
+            )
+        )
+
+    def _looks_like_option_declaration_line(self, line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "add_argument(",
+                "add_option(",
+                "addoption(",
+                ".option(",
+                "@click.option",
+            )
+        )
 
     def _target_specific_repair_identifiers(
         self,
