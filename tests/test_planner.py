@@ -27686,6 +27686,110 @@ def test_planner_reproduces_pytest_style_debug_issue_without_explicit_pytest_imp
     assert decision.tool_args["command"] == "python -m pytest"
 
 
+def test_planner_reports_confirmed_validation_success_when_validation_request_finds_no_defect(
+    tmp_path,
+):
+    package_dir = tmp_path / "checkout_app"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "totals.py").write_text(
+        "def build_checkout_summary(order):\n"
+        "    items = order.get('items', [])\n"
+        "    subtotal_cents = sum(item['price_cents'] * item.get('quantity', 1) for item in items)\n"
+        "    average_item_cents = round(subtotal_cents / len(items)) if items else 0\n"
+        "    return {\n"
+        "        'item_count': len(items),\n"
+        "        'subtotal_cents': subtotal_cents,\n"
+        "        'average_item_cents': average_item_cents,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_totals.py").write_text(
+        "from checkout_app.totals import build_checkout_summary\n\n"
+        "def test_empty_order_reports_zero_average_without_crashing():\n"
+        "    summary = build_checkout_summary({'items': []})\n"
+        "    assert summary['average_item_cents'] == 0\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    snapshot = RepoMemoryStore(config, WorkspaceManager(tmp_path)).build_snapshot("checkout validation success")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Validate checkout_app/totals.py against tests/test_totals.py. "
+            "Keep the implementation unchanged unless a real defect appears, "
+            "run python -m pytest tests/test_totals.py, and report the confirmed result."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "diagnose_issue", "reason": "Run the requested validation first."}],
+        target_paths=["checkout_app/totals.py", "tests/test_totals.py"],
+        target_name="checkout_app/totals.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m pytest tests/test_totals.py",
+    )
+    session.task_state.current_user_intent = "validate"
+    session.task_state.execution_strategy = "validation_inspection"
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "checkout_app/totals.py"},
+                success=True,
+                summary="Read checkout_app/totals.py.",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_totals.py"},
+                success=True,
+                summary="Read tests/test_totals.py.",
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="run_tests",
+                tool_args={"command": "python -m pytest tests/test_totals.py"},
+                success=True,
+                summary="Validation command exited with 0.",
+            ),
+        ]
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest tests/test_totals.py",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+
+    decision = planner._diagnose_issue_decision(
+        session.router_result,
+        session,
+        ["checkout_app/totals.py", "tests/test_totals.py"],
+        {"checkout_app/totals.py", "tests/test_totals.py"},
+    )
+
+    assert decision is not None
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Result: passed." in decision.final_response
+    assert "I did not change any files." in decision.final_response
+    assert "python -m pytest tests/test_totals.py" in decision.final_response
+
+
 def test_planner_runs_pending_changed_file_validation_with_expected_stdout(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[

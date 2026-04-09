@@ -2153,6 +2153,12 @@ class Planner:
                 final_response=None,
             )
 
+        if self._confirmed_validation_request_without_findings(session):
+            return self._final_decision(
+                "The requested validation completed without a confirmed defect.",
+                self._confirmed_validation_response(route, session),
+            )
+
         if self._diagnosis_attempted_without_findings(session) or route.intent == RouteIntent.DEBUG:
             return self._final_decision(
                 "There is not enough diagnostic evidence to apply a safe fix yet.",
@@ -3679,6 +3685,73 @@ class Planner:
             if run.verification_scope == "runtime" and run.status == "passed"
         }
         return bool(successful_runtime_checks) and not session.diagnostics
+
+    def _confirmed_validation_request_without_findings(self, session: SessionState) -> bool:
+        task_state = session.task_state
+        if task_state is None:
+            return False
+        current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
+        execution_strategy = str(getattr(task_state, "execution_strategy", "") or "").strip().lower()
+        if current_intent != "validate" and execution_strategy != "validation_inspection":
+            return False
+        if session.changed_files or session.diagnostics:
+            return False
+        return any(run.status == "passed" for run in session.validation_runs)
+
+    def _confirmed_validation_response(self, route: RouterOutput, session: SessionState) -> str:
+        language = self._session_language(session)
+        inspected = self._read_paths(session)[:4]
+        latest_pass = next(
+            (run for run in reversed(session.validation_runs) if run.status == "passed"),
+            None,
+        )
+        targets = route.entities.target_paths[:4]
+        lines = [
+            self._localized_text(
+                language,
+                de="Ich habe die angefragte Validierung ausgefuehrt und keinen bestaetigten Defekt gefunden.",
+                en="I ran the requested validation and did not find a confirmed defect.",
+            )
+        ]
+        if targets:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Geprueft: {', '.join(targets)}.",
+                    en=f"Checked: {', '.join(targets)}.",
+                )
+            )
+        if latest_pass is not None:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Befehl: {latest_pass.command}.",
+                    en=f"Command: {latest_pass.command}.",
+                )
+            )
+            lines.append(
+                self._localized_text(
+                    language,
+                    de="Ergebnis: bestanden.",
+                    en="Result: passed.",
+                )
+            )
+        lines.append(
+            self._localized_text(
+                language,
+                de="Ich habe keine Dateien geaendert.",
+                en="I did not change any files.",
+            )
+        )
+        if inspected:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Ich habe vor allem {', '.join(inspected)} untersucht.",
+                    en=f"I mainly inspected {', '.join(inspected)}.",
+                )
+            )
+        return "\n".join(lines)
 
     def _missing_issue_evidence_response(self, route: RouterOutput, session: SessionState) -> str:
         follow_up = session.follow_up_context
