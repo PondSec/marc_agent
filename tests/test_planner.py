@@ -7365,6 +7365,96 @@ def test_fallback_semantic_change_review_requires_root_cause_productive_change_a
     assert any("same failure signature" in issue.lower() for issue in review.suspicious_issues)
 
 
+def test_fallback_semantic_change_review_ignores_validation_targets_for_passed_validation_requests(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Validate checkout_app/totals.py against tests/test_totals.py. "
+            "Keep the implementation unchanged unless a real defect appears, "
+            "run python -m pytest tests/test_totals.py, and report the confirmed result."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            language_counts={"python": 2},
+            top_directories=["checkout_app", "tests"],
+            important_files=["checkout_app/totals.py", "tests/test_totals.py"],
+            focus_files=["checkout_app/totals.py", "tests/test_totals.py"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=["tests/test_totals.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[
+                ValidationCommand(
+                    command="python -m pytest tests/test_totals.py",
+                    kind="test",
+                    verification_scope="runtime",
+                )
+            ],
+            workflow_commands=[],
+            repo_summary="Small Python checkout workspace.",
+        ),
+        validation_status="passed",
+        changed_files=[FileChangeRecord(path="checkout_app/totals.py", operation="modify")],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="debug",
+            action_plan=[
+                {"step": 1, "action": "read_relevant_files", "reason": "Inspect the implicated code and tests."},
+                {"step": 2, "action": "run_validation", "reason": "Confirm the observed runtime behavior."},
+                {"step": 3, "action": "summarize_result", "reason": "Summarize the confirmed outcome honestly."},
+            ],
+            target_paths=["checkout_app/totals.py", "tests/test_totals.py"],
+            target_name="checkout_app/totals.py",
+        ),
+        verification_target="python -m pytest tests/test_totals.py",
+    )
+    session.task_state.current_user_intent = "validate"
+    session.task_state.target_artifacts = [
+        TaskArtifact(
+            path="checkout_app/totals.py",
+            name="totals.py",
+            kind="file",
+            role="primary_target",
+            confidence=1.0,
+        ),
+        TaskArtifact(
+            path="tests/test_totals.py",
+            name="test_totals.py",
+            kind="file",
+            role="validation_target",
+            confidence=1.0,
+        ),
+    ]
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest tests/test_totals.py",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+
+    pending_targets = planner._semantic_review_pending_snapshot_targets(session, deferred_targets=set())
+    review = planner._fallback_semantic_change_review(session)
+
+    assert pending_targets == []
+    assert review.requirements_satisfied is True
+    assert "validation passed" in review.summary.lower()
+
+
 def test_planner_does_not_repeat_identical_validation_without_progress(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

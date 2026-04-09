@@ -4126,20 +4126,20 @@ class Planner:
 
         task_state = session.task_state
         current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
-        if session.validation_status != "passed" or current_intent not in {"repair", "debug"}:
+        if session.validation_status != "passed" or current_intent not in {"validate", "repair", "debug"}:
             return pending_targets
 
-        supporting_doc_paths = {
+        non_actionable_context_paths = {
             path
             for artifact in getattr(task_state, "target_artifacts", []) or []
             for path in [str(getattr(artifact, "path", "") or "").strip()]
             if path
-            and str(getattr(artifact, "role", "") or "").strip().lower() == "supporting_context"
-            and self.validation_planner._is_documentation_path(path)
+            and str(getattr(artifact, "role", "") or "").strip().lower()
+            in {"supporting_context", "validation_target"}
         }
-        if not supporting_doc_paths:
+        if not non_actionable_context_paths:
             return pending_targets
-        return [path for path in pending_targets if path not in supporting_doc_paths]
+        return [path for path in pending_targets if path not in non_actionable_context_paths]
 
     def _path_matches_explicit_request(
         self,
