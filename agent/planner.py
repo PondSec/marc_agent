@@ -29,16 +29,21 @@ from agent.models import (
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
+    _best_contract_fragment_near_match,
     _direct_main_runtime_contract,
     _direct_python_script_runtime_contract,
     _format_similar_python_name_candidates,
     _line_focused_excerpt,
+    _literal_near_match_in_content,
     _python_line_binds_name,
     _python_similar_defined_name_candidates,
     _repair_semantic_values,
     _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
+    _runtime_output_contract_required_literals,
+    _source_backed_runtime_argv_contract,
+    _source_backed_runtime_output_contracts,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
@@ -12961,6 +12966,24 @@ class Planner:
     ) -> ProposedUpdateReview | None:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return None
+        exact_output_contract_review = self._runtime_output_contract_source_literal_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+            session=session,
+        )
+        if exact_output_contract_review is not None:
+            return exact_output_contract_review
+        payload_hardcoding_review = self._runtime_sample_payload_hardcoding_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+            session=session,
+        )
+        if payload_hardcoding_review is not None:
+            return payload_hardcoding_review
         if (
             self._is_runtime_support_repair_target(path, repair_context)
             and Path(path).suffix.lower() not in {".py", ".pyi"}
@@ -13036,6 +13059,188 @@ class Planner:
                 "Update the relevant function signature or behavior line that the failing traceback points to.",
                 *self._runtime_target_repair_hints(path, repair_context, evidence_lines=target_evidence),
             ],
+        )
+
+    def _runtime_output_contract_source_literal_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+        session: SessionState | None,
+    ) -> ProposedUpdateReview | None:
+        if session is None:
+            return None
+        supporting_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if not supporting_output_contracts:
+            return None
+
+        unresolved_contracts: list[tuple[str, str]] = []
+        for required_literal in _runtime_output_contract_required_literals(
+            supporting_output_contracts,
+            limit=6,
+        ):
+            required_text = str(required_literal or "").strip()
+            if not required_text or required_text in proposed_content:
+                continue
+            candidate = _literal_near_match_in_content(required_text, current_content)
+            if candidate and candidate == required_text:
+                candidate = None
+            if candidate is None:
+                fragment_match = _best_contract_fragment_near_match(required_text, current_content)
+                if fragment_match is None:
+                    continue
+                candidate, _fragment = fragment_match
+            if not candidate or not self._runtime_source_literal_remains_on_targeted_line(
+                candidate=candidate,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            ):
+                continue
+            unresolved_contracts.append((candidate, required_text))
+            if len(unresolved_contracts) >= 2:
+                break
+
+        if not unresolved_contracts:
+            return None
+
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        blocking_issues = [
+            (
+                f"The proposed update for {path} still leaves the near-match source literal {candidate!r} "
+                f"on the runtime-targeted path, so the exercised output cannot satisfy the exact supporting "
+                f"contract {required_text!r}."
+            )
+            for candidate, required_text in unresolved_contracts
+        ]
+        repair_hints = [
+            (
+                f"Replace or restructure the remaining source literal {candidate!r} so the exercised path can "
+                f"emit {required_text!r} without leaving the old placeholder behavior intact."
+            )
+            for candidate, required_text in unresolved_contracts
+        ]
+        repair_hints.extend(
+            self._runtime_target_repair_hints(
+                path,
+                repair_context,
+                evidence_lines=target_evidence,
+            )
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair still leaves a source literal that conflicts with the exact supporting runtime output contract."
+            ),
+            confidence=0.9,
+            blocking_issues=blocking_issues[:3],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
+
+    def _runtime_source_literal_remains_on_targeted_line(
+        self,
+        *,
+        candidate: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        candidate_text = str(candidate or "").strip()
+        if not candidate_text or candidate_text not in current_content or candidate_text not in proposed_content:
+            return False
+        current_lines = str(current_content or "").splitlines()
+        proposed_lines = str(proposed_content or "").splitlines()
+        line_hints = _repair_target_line_hints(
+            path="",
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        for hint in line_hints:
+            if not isinstance(hint, int) or hint <= 0:
+                continue
+            index = hint - 1
+            if index >= len(current_lines) or index >= len(proposed_lines):
+                continue
+            if candidate_text in current_lines[index] and candidate_text in proposed_lines[index]:
+                return True
+        return current_content.count(candidate_text) == 1 and proposed_content.count(candidate_text) >= 1
+
+    def _runtime_sample_payload_hardcoding_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+        session: SessionState | None,
+    ) -> ProposedUpdateReview | None:
+        if session is None:
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+            return None
+        supporting_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if not supporting_output_contracts:
+            return None
+        _option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+            limit=4,
+        )
+        if not positional_tokens:
+            return None
+        contract_text = "\n".join(supporting_output_contracts)
+        introduced_payload_literals = [
+            token
+            for token in positional_tokens
+            if token
+            and token not in current_content
+            and token in contract_text
+            and re.search(rf"['\"][^'\"]*{re.escape(token)}[^'\"]*['\"]", proposed_content)
+        ]
+        if not introduced_payload_literals:
+            return None
+        payload_preview = ", ".join(repr(token) for token in introduced_payload_literals[:3])
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        repair_hints = [
+            (
+                f"Propagate the remaining argv payload {payload_preview} through the exercised branch instead of "
+                f"embedding those sample values directly into {path}."
+            )
+        ]
+        repair_hints.extend(
+            self._runtime_target_repair_hints(
+                path,
+                repair_context,
+                evidence_lines=target_evidence,
+            )
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair hardcodes sample runtime payload values instead of propagating the exercised input through the repaired path."
+            ),
+            confidence=0.92,
+            blocking_issues=[
+                (
+                    f"The proposal for {path} introduces sample runtime payload value(s) {payload_preview} directly "
+                    "into source literals, which would bake the observed test input into the implementation."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
         )
 
     def _undefined_runtime_symbol_repair_review(
