@@ -931,6 +931,10 @@ class TaskStateUpdater:
                 explicit_paths.append(normalized)
         if not explicit_paths:
             return
+        explicit_paths = self._ground_explicit_paths_to_artifacts(
+            explicit_paths,
+            [*list(state.target_artifacts or []), *list(state.active_artifacts or [])],
+        )
         state.target_artifacts = self._canonicalize_artifacts_to_explicit_paths(
             state.target_artifacts,
             explicit_paths,
@@ -946,6 +950,49 @@ class TaskStateUpdater:
         )
         if canonical_target and canonical_target != verification_target:
             state.verification_target = canonical_target
+
+    def _ground_explicit_paths_to_artifacts(
+        self,
+        explicit_paths: list[str],
+        artifacts: list,
+    ) -> list[str]:
+        candidate_paths: list[str] = []
+        for artifact in artifacts or []:
+            normalized = self._normalize_request_path(getattr(artifact, "path", None) or getattr(artifact, "name", None))
+            if normalized and normalized not in candidate_paths:
+                candidate_paths.append(normalized)
+
+        grounded: list[str] = []
+        for explicit_path in explicit_paths:
+            exact_matches = [path for path in candidate_paths if path == explicit_path]
+            suffix_matches = [
+                path
+                for path in candidate_paths
+                if path.endswith(f"/{explicit_path}")
+                and not self._is_synthetic_workspace_prefixed_candidate(explicit_path, path)
+            ]
+            basename_matches = [
+                path
+                for path in candidate_paths
+                if "/" not in explicit_path
+                and Path(path).name == explicit_path
+                and not self._is_synthetic_workspace_prefixed_candidate(explicit_path, path)
+            ]
+            resolved = explicit_path
+            if len(exact_matches) == 1:
+                resolved = exact_matches[0]
+            elif len(suffix_matches) == 1:
+                resolved = suffix_matches[0]
+            elif len(basename_matches) == 1:
+                resolved = basename_matches[0]
+            if resolved not in grounded:
+                grounded.append(resolved)
+        return grounded
+
+    def _is_synthetic_workspace_prefixed_candidate(self, explicit_path: str, candidate_path: str) -> bool:
+        explicit = self._normalize_request_path(explicit_path).lower()
+        candidate = self._normalize_request_path(candidate_path).lower()
+        return bool(explicit) and bool(candidate) and candidate.startswith("workspace/") and not explicit.startswith("workspace/")
 
     def _canonicalize_artifacts_to_explicit_paths(
         self,

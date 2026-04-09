@@ -1662,6 +1662,58 @@ def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_pa
     assert understanding.semantic_resolution == "minimal_inference"
 
 
+def test_task_state_timeout_fallback_preserves_explicit_validation_request_against_existing_artifacts(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["checkout_app", "tests"],
+        important_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        focus_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_totals.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["checkout_app/totals.py"],
+        repo_map=["checkout_app/", "tests/"],
+        service_files=[],
+        import_hotspots=[],
+        symbol_index={},
+        project_labels=["python"],
+        likely_commands=["python -m pytest tests/test_totals.py"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small checkout totals module with pytest coverage.",
+    )
+    prompt = (
+        "Validate checkout_app/totals.py against tests/test_totals.py. "
+        "Keep the implementation unchanged unless a real defect appears, "
+        "run python -m pytest tests/test_totals.py, and report the confirmed result."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "validate"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "test"
+    assert task_state.output_expectation == (
+        "Run the most relevant validation for the active implementation and report the result honestly."
+    )
+    assert task_state.target_artifacts[0].path == "checkout_app/totals.py"
+    assert any(
+        artifact.path == "tests/test_totals.py" and artifact.role == "validation_target"
+        for artifact in task_state.target_artifacts
+    )
+    assert route.intent == RouteIntent.DEBUG
+    assert route.needs_clarification is False
+    assert task_state.semantic_resolution == "minimal_inference"
+
+
 def test_task_state_timeout_fallback_preserves_clear_debug_request(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
 
@@ -2247,6 +2299,88 @@ def test_task_state_updater_reconciles_explain_misclassification_for_existing_re
     assert "Apply the requested change" in task_state.output_expectation
     assert "Apply the requested change" in (task_state.verification_target or "")
     assert route.intent == RouteIntent.UPDATE
+
+
+def test_task_state_updater_keeps_explicit_validation_request_on_semantic_path(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["checkout_app", "tests"],
+        important_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        focus_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_totals.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["checkout_app/totals.py"],
+        repo_map=["checkout_app/", "tests/"],
+        service_files=[],
+        import_hotspots=[],
+        symbol_index={},
+        project_labels=["python"],
+        likely_commands=["python -m pytest tests/test_totals.py"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small checkout totals module with pytest coverage.",
+    )
+    prompt = (
+        "Validate checkout_app/totals.py against tests/test_totals.py. "
+        "Keep the implementation unchanged unless a real defect appears, "
+        "run python -m pytest tests/test_totals.py, and report the confirmed result."
+    )
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": "Validate checkout_app/totals.py against tests/test_totals.py.",
+        "active_goal": "Run the existing totals validation and confirm whether checkout_app/totals.py already matches the tests.",
+        "goal_relation": "new_task",
+        "output_expectation": "Run the most relevant validation for the active implementation and report the result honestly.",
+        "current_user_intent": "validate",
+        "execution_strategy": "validation_inspection",
+        "open_problem": None,
+        "verification_target": "python -m pytest tests/test_totals.py",
+        "target_artifacts": [
+            {"path": "checkout_app/totals.py", "name": "totals.py", "kind": "file", "role": "primary_target", "confidence": 0.92},
+            {"path": "tests/test_totals.py", "name": "test_totals.py", "kind": "test", "role": "validation_target", "confidence": 0.9},
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.84,
+        "next_action": "test",
+        "next_best_action": "test",
+        "execution_outline": [
+            "Inspect checkout_app/totals.py and tests/test_totals.py only as needed.",
+            "Run python -m pytest tests/test_totals.py.",
+            "Report whether the current implementation already satisfies the tests or needs a fix.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        prompt,
+        snapshot=snapshot,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.current_user_intent == "validate"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "test"
+    assert task_state.next_best_action == "test"
+    assert task_state.output_expectation == payload["output_expectation"]
+    assert task_state.verification_target == "python -m pytest tests/test_totals.py"
+    assert task_state.target_artifacts[0].path == "checkout_app/totals.py"
+    assert route.intent == RouteIntent.DEBUG
+    assert route.needs_clarification is False
 
 
 def test_task_state_a2_restores_grounded_code_scope_when_semantic_state_collapses_to_documentation(tmp_path):
