@@ -23439,6 +23439,32 @@ def test_generation_recovery_model_name_uses_live_inventory_for_single_model_run
     assert planner._generation_recovery_model_name() == "qwen3:8b"
 
 
+def test_generation_model_names_resolve_missing_large_configured_models_against_live_inventory(tmp_path):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    planner = Planner(
+        InventoryLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:14b",
+                router_model_name="qwen2.5-coder:14b",
+                model_candidates=("qwen2.5-coder:14b", "qwen2.5-coder:7b", "qwen3:8b"),
+            )
+        ),
+        "",
+    )
+
+    assert planner._primary_generation_model_name() == "qwen2.5-coder:7b"
+    assert planner._lightweight_generation_model_name() is None
+    assert planner._generation_recovery_model_name() == "qwen3:8b"
+
+
 def test_planner_review_retry_uses_live_reserve_model_after_same_model_noop_runtime_retries(
     tmp_path,
     monkeypatch,

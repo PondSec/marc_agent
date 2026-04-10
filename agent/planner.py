@@ -61,6 +61,7 @@ from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 from llm.ollama_client import OllamaGenerationError
+from llm.model_selection import select_primary_model, select_router_model
 from llm.provider import LLMProvider
 from llm.runtime_resilience import (
     ExecutionAttemptRecord,
@@ -7389,24 +7390,39 @@ class Planner:
         return max(int(configured), minimum)
 
     def _primary_generation_model_name(self) -> str | None:
+        primary, _ = self._resolved_generation_model_names()
+        return primary
+
+    def _resolved_generation_model_names(self) -> tuple[str | None, str | None]:
         config = getattr(self.llm, "config", None)
         if config is None:
-            return None
-        candidate = str(getattr(config, "model_name", "") or "").strip()
-        return candidate or None
+            return None, None
+        preferred_primary = str(getattr(config, "model_name", "") or "").strip()
+        preferred_router = str(getattr(config, "router_model_name", "") or "").strip()
+        live_candidates = self._live_generation_model_candidates()
+        if not live_candidates:
+            primary = preferred_primary or None
+            router = preferred_router or None
+        else:
+            primary = select_primary_model(
+                preferred_model=preferred_primary or preferred_router,
+                installed_names=live_candidates,
+            )
+            router = select_router_model(
+                preferred_router=preferred_router or None,
+                installed_names=live_candidates,
+                primary_model=primary,
+            )
+        if router == primary:
+            router = None
+        return (primary or None, router or None)
 
     def _backend_identifier(self) -> str:
         return "ollama"
 
     def _lightweight_generation_model_name(self) -> str | None:
-        config = getattr(self.llm, "config", None)
-        if config is None:
-            return None
-        candidate = str(getattr(config, "router_model_name", "") or "").strip()
-        primary = str(getattr(config, "model_name", "") or "").strip()
-        if not candidate or candidate == primary:
-            return None
-        return candidate
+        _, router = self._resolved_generation_model_names()
+        return router
 
     def _live_generation_model_candidates(self) -> list[str]:
         list_models = getattr(self.llm, "list_models_safe", None)
