@@ -35,6 +35,7 @@ from agent.prompts import (
     _format_similar_python_name_candidates,
     _line_focused_excerpt,
     _literal_near_match_in_content,
+    _python_cli_runtime_value_threading_hint,
     _python_line_binds_name,
     _python_similar_defined_name_candidates,
     _repair_semantic_values,
@@ -13080,6 +13081,11 @@ class Planner:
         )
         if not supporting_output_contracts:
             return None
+        _option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+            limit=4,
+        )
 
         unresolved_contracts: list[tuple[str, str]] = []
         for required_literal in _runtime_output_contract_required_literals(
@@ -13121,12 +13127,24 @@ class Planner:
             for candidate, required_text in unresolved_contracts
         ]
         repair_hints = [
+            threading_hint
+            for threading_hint in [
+                _python_cli_runtime_value_threading_hint(
+                    current_content=current_content,
+                    runtime_value_tokens=positional_tokens,
+                )
+            ]
+            if threading_hint
+        ]
+        repair_hints.extend(
+            [
             (
                 f"Replace or restructure the remaining source literal {candidate!r} so the exercised path can "
                 f"emit {required_text!r} without leaving the old placeholder behavior intact."
             )
             for candidate, required_text in unresolved_contracts
-        ]
+            ]
+        )
         repair_hints.extend(
             self._runtime_target_repair_hints(
                 path,

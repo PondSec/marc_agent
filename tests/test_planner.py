@@ -17681,6 +17681,7 @@ def test_validation_repair_relevance_review_rejects_partial_taskboard_contract_f
     assert review.safe_to_write is False
     assert "exact supporting runtime output contract" in review.summary
     assert any("No tasks found for the specified owner." in issue for issue in review.blocking_issues)
+    assert any("computes tasks from parsed CLI value(s) like args.owner" in hint for hint in review.repair_hints)
 
 
 def test_validation_repair_relevance_review_rejects_unresolved_undefined_symbol(tmp_path):
