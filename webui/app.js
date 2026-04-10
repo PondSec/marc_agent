@@ -105,6 +105,20 @@ const state = {
     page: "workspace",
     sessionLoading: false,
     workspaceModalOpen: false,
+    runQueue: {
+      open: false,
+      submitting: false,
+      prompt: "",
+      accessMode: "approval",
+      dryRun: false,
+      modelName: "",
+      agentProfile: "a2",
+      executionProfile: "balanced",
+      workspaceId: null,
+      sessionId: null,
+      clearComposer: false,
+      blockingSessionId: null,
+    },
     workspaceMode: "create",
     editingWorkspaceId: null,
     workspaceName: "",
@@ -389,6 +403,20 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
   state.ui.page = preserveRoute ? state.ui.page : "workspace";
   state.ui.sessionLoading = false;
   state.ui.workspaceModalOpen = false;
+  state.ui.runQueue = {
+    open: false,
+    submitting: false,
+    prompt: "",
+    accessMode: state.composer.accessMode,
+    dryRun: state.composer.dryRun,
+    modelName: state.composer.modelName || state.config?.model_name || "",
+    agentProfile: state.composer.agentProfile,
+    executionProfile: state.composer.executionProfile,
+    workspaceId: null,
+    sessionId: null,
+    clearComposer: false,
+    blockingSessionId: null,
+  };
   state.ui.chatScroll.positions = {};
   resetDiffViewer();
   resetChatScrollState();
@@ -687,15 +715,151 @@ function closeDiffPanel() {
   renderApp();
 }
 
+function submissionSessionId(sourceState = state) {
+  if (!sourceState.activeSessionId) {
+    return null;
+  }
+  if (isSessionRunning(sourceState.activeSession)) {
+    return null;
+  }
+  return sourceState.activeSessionId;
+}
+
+function findBlockingRunForSubmission(sourceState = state) {
+  if (isSessionRunning(sourceState.activeSession)) {
+    return sourceState.activeSession;
+  }
+  return (sourceState.sessions || []).find((session) => isSessionRunning(session)) || null;
+}
+
+function buildTaskRequestBody({
+  prompt,
+  workspaceId,
+  accessMode,
+  dryRun = state.composer.dryRun,
+  modelName = state.composer.modelName || state.config?.model_name || null,
+  agentProfile = state.composer.agentProfile,
+  executionProfile = state.composer.executionProfile,
+  sessionId = null,
+  enqueueIfBusy = false,
+} = {}) {
+  return {
+    prompt,
+    session_id: sessionId,
+    workspace_id: workspaceId,
+    enqueue_if_busy: enqueueIfBusy,
+    access_mode: accessMode,
+    dry_run: dryRun,
+    verbose: true,
+    model_name: modelName,
+    agent_profile: agentProfile,
+    execution_profile: executionProfile,
+  };
+}
+
+function openRunQueueModal({
+  prompt,
+  accessMode,
+  dryRun,
+  modelName,
+  agentProfile,
+  executionProfile,
+  workspaceId,
+  sessionId,
+  clearComposer = false,
+  blockingSession = null,
+} = {}) {
+  state.ui.runQueue = {
+    open: true,
+    submitting: false,
+    prompt,
+    accessMode,
+    dryRun,
+    modelName,
+    agentProfile,
+    executionProfile,
+    workspaceId,
+    sessionId,
+    clearComposer,
+    blockingSessionId: blockingSession?.id || null,
+  };
+  renderApp();
+}
+
+function closeRunQueueModal() {
+  state.ui.runQueue = {
+    open: false,
+    submitting: false,
+    prompt: "",
+    accessMode: state.composer.accessMode,
+    dryRun: state.composer.dryRun,
+    modelName: state.composer.modelName || state.config?.model_name || "",
+    agentProfile: state.composer.agentProfile,
+    executionProfile: state.composer.executionProfile,
+    workspaceId: null,
+    sessionId: null,
+    clearComposer: false,
+    blockingSessionId: null,
+  };
+  renderApp();
+}
+
+async function queuePromptRun() {
+  if (!state.ui.runQueue.open || state.ui.runQueue.submitting) {
+    return;
+  }
+  const pending = { ...state.ui.runQueue };
+  if (!pending.prompt || !pending.workspaceId) {
+    closeRunQueueModal();
+    return;
+  }
+
+  state.ui.runQueue.submitting = true;
+  renderApp();
+
+  try {
+    const session = await fetchJSON("/api/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        buildTaskRequestBody({
+          prompt: pending.prompt,
+          workspaceId: pending.workspaceId,
+          accessMode: pending.accessMode,
+          dryRun: pending.dryRun,
+          modelName: pending.modelName,
+          agentProfile: pending.agentProfile,
+          executionProfile: pending.executionProfile,
+          sessionId: pending.sessionId,
+          enqueueIfBusy: true,
+        }),
+      ),
+    });
+    if (pending.clearComposer) {
+      state.composer.prompt = "";
+    }
+    await refreshSessions({ force: true, source: "manual" });
+    closeRunQueueModal();
+    await openSession(session.id);
+    showToast("Run wurde in die Warteschlange gesetzt.", "success");
+  } catch (error) {
+    state.ui.runQueue.submitting = false;
+    renderApp();
+    showToast(`Run konnte nicht eingereiht werden: ${error.message}`, "error");
+  }
+}
+
 async function submitPrompt({ promptOverride = null, accessModeOverride = null } = {}) {
   const prompt = String(promptOverride ?? state.composer.prompt).trim();
   const workspaceId = state.activeSession?.workspace_id || state.selectedWorkspaceId;
+  const accessMode = accessModeOverride || state.composer.accessMode;
+  const dryRun = state.composer.dryRun;
+  const modelName = state.composer.modelName || state.config?.model_name || null;
+  const agentProfile = state.composer.agentProfile;
+  const executionProfile = state.composer.executionProfile;
+  let sessionId = submissionSessionId();
   if (!prompt) {
     showToast("Bitte schreibe zuerst eine Nachricht.", "error");
-    return;
-  }
-  if (isSessionRunning(state.activeSession)) {
-    showToast("Warte bitte, bis der aktuelle Agent-Schritt abgeschlossen ist.", "error");
     return;
   }
   if (!workspaceId) {
@@ -703,18 +867,35 @@ async function submitPrompt({ promptOverride = null, accessModeOverride = null }
     openWorkspaceModal("create");
     return;
   }
+  await refreshSessions({ force: true, source: "manual" });
+  const blockingSession = findBlockingRunForSubmission();
+  if (blockingSession) {
+    openRunQueueModal({
+      prompt,
+      accessMode,
+      dryRun,
+      modelName,
+      agentProfile,
+      executionProfile,
+      workspaceId,
+      sessionId,
+      clearComposer: promptOverride === null,
+      blockingSession,
+    });
+    return;
+  }
+  sessionId = submissionSessionId();
 
-  const body = {
+  const body = buildTaskRequestBody({
     prompt,
-    session_id: state.activeSessionId,
-    workspace_id: workspaceId,
-    access_mode: accessModeOverride || state.composer.accessMode,
-    dry_run: state.composer.dryRun,
-    verbose: true,
-    model_name: state.composer.modelName || state.config?.model_name || null,
-    agent_profile: state.composer.agentProfile,
-    execution_profile: state.composer.executionProfile,
-  };
+    workspaceId,
+    accessMode,
+    dryRun,
+    modelName,
+    agentProfile,
+    executionProfile,
+    sessionId,
+  });
 
   try {
     const session = await fetchJSON("/api/tasks", {
@@ -728,6 +909,23 @@ async function submitPrompt({ promptOverride = null, accessModeOverride = null }
     await refreshSessions();
     await openSession(session.id);
   } catch (error) {
+    if (error?.status === 409) {
+      await refreshSessions({ force: true, source: "manual" });
+      sessionId = submissionSessionId();
+      openRunQueueModal({
+        prompt,
+        accessMode,
+        dryRun,
+        modelName,
+        agentProfile,
+        executionProfile,
+        workspaceId,
+        sessionId,
+        clearComposer: promptOverride === null,
+        blockingSession: findBlockingRunForSubmission(),
+      });
+      return;
+    }
     showToast(`Nachricht konnte nicht gesendet werden: ${error.message}`, "error");
   }
 }
@@ -1366,6 +1564,16 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "close-run-queue-modal") {
+    closeRunQueueModal();
+    return;
+  }
+
+  if (action === "queue-prompt-run") {
+    queuePromptRun();
+    return;
+  }
+
   if (action === "close-workspace-modal") {
     closeWorkspaceModal();
     return;
@@ -1784,6 +1992,7 @@ function renderApp() {
   root.innerHTML = settingsPage
     ? `
         ${renderSettingsPage()}
+        ${renderRunQueueModal()}
         ${renderWorkspaceModal()}
         ${renderTerminalModal()}
         ${renderToast()}
@@ -1799,6 +2008,7 @@ function renderApp() {
             ${renderChatInput()}
           </main>
         </div>
+        ${renderRunQueueModal()}
         ${renderWorkspaceModal()}
         ${renderTerminalModal()}
         ${renderToast()}
@@ -4808,6 +5018,61 @@ function formatBooleanSetting(value) {
   return value ? "Ja" : "Nein";
 }
 
+function renderRunQueueModal() {
+  if (!state.ui.runQueue.open) {
+    return "";
+  }
+
+  const queueState = state.ui.runQueue;
+  const blockingSession =
+    (state.activeSession && state.activeSession.id === queueState.blockingSessionId
+      ? state.activeSession
+      : null) || state.sessions.find((session) => session.id === queueState.blockingSessionId) || null;
+  const blockingLabel = blockingSession?.title || blockingSession?.task || "Ein anderer Lauf";
+  const queuedAhead = state.sessions.filter(
+    (session) => session.status === "queued" && session.id !== queueState.blockingSessionId,
+  ).length;
+  const waitingCopy =
+    queuedAhead > 0
+      ? `Vor diesem Auftrag warten bereits ${queuedAhead} weitere Eintraege.`
+      : "Dieser Auftrag startet automatisch, sobald der aktuelle Lauf fertig ist.";
+  const targetCopy = queueState.sessionId
+    ? "Der neue Auftrag bleibt in diesem Chat und wird spaeter automatisch gestartet."
+    : "Der neue Auftrag wird als eigener Chat in die Warteschlange gesetzt.";
+
+  return `
+    <div class="modal-backdrop" data-action="close-run-queue-modal"></div>
+    <div class="modal-layer">
+      <section class="modal-card">
+        <header class="modal-head">
+          <div>
+            <p class="modal-kicker">Run-Steuerung</p>
+            <h3>Nur ein Run gleichzeitig</h3>
+          </div>
+          <button class="icon-button modal-close" type="button" data-action="close-run-queue-modal" aria-label="Schliessen">
+            <span class="modal-close-glyph" aria-hidden="true">X</span>
+          </button>
+        </header>
+        <div class="modal-body">
+          <div class="modal-preview-card">
+            <span>Blockierender Lauf</span>
+            <strong>${escapeHtml(shorten(blockingLabel, 96))}</strong>
+            <small>Es darf immer nur ein Run gleichzeitig aktiv sein.</small>
+          </div>
+          <p class="modal-note">${escapeHtml(waitingCopy)}</p>
+          <p class="modal-note">${escapeHtml(targetCopy)}</p>
+        </div>
+        <footer class="modal-actions">
+          <button class="button-secondary" type="button" data-action="close-run-queue-modal">Warten</button>
+          <button class="button-primary" type="button" data-action="queue-prompt-run" ${queueState.submitting ? "disabled" : ""}>
+            ${queueState.submitting ? "Wird eingereiht..." : "In Warteschlange setzen"}
+          </button>
+        </footer>
+      </section>
+    </div>
+  `;
+}
+
 function renderWorkspaceModal() {
   if (!state.ui.workspaceModalOpen) {
     return "";
@@ -7614,11 +7879,13 @@ if (typeof module !== "undefined" && module.exports) {
     buildPhaseSteps,
     buildSessionOverview,
     buildValidationSnapshot,
+    findBlockingRunForSubmission,
     createRefreshController,
     describeLogRecord,
     messageDisplayState,
     parseUiRoute,
     shouldStartRefresh,
+    submissionSessionId,
     updateRefreshBackoff,
     formatSessionElapsed,
     phaseStepKey,
