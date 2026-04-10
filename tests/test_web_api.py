@@ -566,6 +566,55 @@ def test_available_models_do_not_expand_semantic_candidates_from_installed_inven
     assert updated.model_candidates == ("qwen2.5-coder:7b",)
 
 
+def test_task_run_refreshes_stale_model_config_from_live_inventory(tmp_path):
+    config = build_test_config(
+        tmp_path,
+        model_name="qwen2.5-coder:14b",
+        router_model_name="qwen2.5-coder:14b",
+    )
+    config.ensure_state_dirs()
+
+    with patch("server.app._fetch_installed_ollama_models", return_value=[]):
+        app = create_app(config)
+
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    observed: dict[str, str | None] = {}
+    started = Event()
+
+    def fake_run_task(self, task, session=None, *, should_stop=None):
+        observed["model_name"] = self.config.model_name
+        observed["router_model_name"] = self.config.router_model_name
+        session.status = "completed"
+        session.final_response = "Fertig"
+        session.touch()
+        self.session_store.save(session)
+        started.set()
+        return session
+
+    with patch(
+        "llm.model_selection.fetch_installed_ollama_models",
+        return_value=[
+            {"name": "qwen2.5-coder:7b"},
+            {"name": "qwen3:8b"},
+            {"name": "qwen3:14b"},
+        ],
+    ), patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        response = client.post(
+            "/api/tasks",
+            json={
+                "prompt": "starte einen lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+            },
+        )
+        assert started.wait(timeout=2)
+
+    assert response.status_code == 202
+    assert observed["model_name"] == "qwen2.5-coder:7b"
+    assert observed["router_model_name"] == "qwen2.5-coder:7b"
+
+
 def test_allowed_model_candidates_falls_back_when_config_has_no_model_candidates_attr():
     class LegacyConfig:
         pass
