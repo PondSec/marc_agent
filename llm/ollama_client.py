@@ -910,7 +910,7 @@ class OllamaClient:
             minimum_floor = 130
         elif parameter_hint >= 7:
             extra_buffer = 40
-            minimum_floor = 80
+            minimum_floor = 100
             startup_share_numerator = 2
             startup_share_denominator = 3
         elif parameter_hint > 0:
@@ -946,6 +946,8 @@ class OllamaClient:
             adjusted_total = max(adjusted_total, 1200)
         elif parameter_hint >= 14:
             adjusted_total = max(adjusted_total, 150)
+        elif parameter_hint >= 7:
+            adjusted_total = max(adjusted_total, 120)
         return adjusted_total
 
     @staticmethod
