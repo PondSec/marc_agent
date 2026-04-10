@@ -8885,11 +8885,19 @@ class Planner:
         return timeout, max(timeout + 60, 90)
 
     def _compact_primary_semantic_review_budget(self) -> tuple[int, int]:
-        timeout = max(self._llm_timeout(35), 35)
+        timeout = max(self._llm_timeout(60), 60)
         # Single-model deployments still benefit from the compact review path, but
-        # they need a slightly larger warm-start window because there is no faster
-        # reserve model to absorb the first semantic-review hop.
-        return timeout, max(timeout + 75, 120)
+        # the same local model must warm up again for a structured JSON review right
+        # after generation. Reuse the longer review-style budget so small CPU-backed
+        # models do not fail during startup before the semantic gate can even run.
+        return timeout, max(self._llm_timeout(210), 210)
+
+    def _primary_semantic_review_followup_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(60), 60)
+        # If the compact same-model semantic review still fails to start, the full
+        # follow-up should remain meaningfully different instead of collapsing to the
+        # short generic JSON-review budget that already proved too small in live runs.
+        return timeout, max(self._llm_timeout(180), 180)
 
     def _review_generated_update(
         self,
@@ -15252,13 +15260,18 @@ class Planner:
 
         for model_name, capability_tier, strategy, timeout, num_ctx, prompt_variant in review_attempts:
             prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
+            strict_timeouts = prompt_variant == "compact"
             if prompt_variant == "compact":
                 if strategy == "primary_model_compact_generation":
                     timeout, total_timeout = self._compact_primary_semantic_review_budget()
+                    strict_timeouts = False
                 else:
                     timeout, total_timeout = self._compact_reserve_review_budget()
             else:
-                total_timeout = max(timeout + 20, timeout * 2)
+                if model_name == primary_model and reserve_model is None:
+                    timeout, total_timeout = self._primary_semantic_review_followup_budget()
+                else:
+                    total_timeout = max(timeout + 20, timeout * 2)
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,
@@ -15267,7 +15280,7 @@ class Planner:
                     retries=0,
                     timeout=timeout,
                     total_timeout=total_timeout,
-                    strict_timeouts=prompt_variant == "compact",
+                    strict_timeouts=strict_timeouts,
                     num_ctx=num_ctx,
                     progress_callback=progress,
                 ),

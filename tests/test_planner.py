@@ -800,12 +800,87 @@ def test_small_single_model_semantic_review_uses_compact_primary_attempt_for_sim
 
     assert len(llm.generate_json_calls) == 1
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
-    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 35
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 120
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 210
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert session.validation_runs[-1].verification_scope == "semantic"
     assert session.validation_runs[-1].status == "passed"
+
+
+def test_small_single_model_semantic_review_uses_extended_full_followup_after_compact_start_failure(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 3, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_03.txt"],
+        target_name="smoke_live_run_03.txt",
+    )
+    session = SessionState(
+        task="Create smoke_live_run_03.txt with a short smoke-test status note.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_03.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_03.txt").write_text("smoke test ready\n", encoding="utf-8")
+
+    safe_review = {
+        "requirements_satisfied": True,
+        "summary": "The changed artifact satisfies the explicit request.",
+        "confidence": 0.82,
+        "missing_requirements": [],
+        "suspicious_issues": [],
+        "file_hints": [],
+        "repair_hints": [],
+    }
+
+    def fake_generate_json(*args, **kwargs):
+        llm.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if len(llm.generate_json_calls) == 1:
+            raise OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 80.0 seconds",
+                reason="startup_timeout",
+                elapsed=80.0,
+                idle_for=80.0,
+                retryable=True,
+                model_name=kwargs.get("model"),
+                startup_timeout_seconds=80,
+                inactivity_timeout_seconds=60,
+                total_timeout_seconds=210,
+                first_output_received=False,
+            )
+        return safe_review
+
+    llm.generate_json = fake_generate_json
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert len(llm.generate_json_calls) == 2
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 210
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 180
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_generation"
 
 
 def test_explicit_create_constraint_review_blocks_exact_text_line_mismatch(tmp_path):
