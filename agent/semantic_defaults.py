@@ -461,12 +461,15 @@ def is_clear_low_risk_build_request(text: str) -> bool:
         _NEED_CREATE_SIGNALS,
         prefix=True,
     )
-    has_change_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True) or _contains_term(
+    update_signal = _contains_term(
         normalized,
         tokens,
         _UPDATE_REQUEST_TOKENS,
         prefix=True,
     )
+    if update_signal and _is_scope_limiter_change_guardrail(normalized):
+        update_signal = False
+    has_change_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True) or update_signal
     has_delivery_signal = _contains_implementation_noun(normalized)
     has_medium_signal = infer_requested_extension(normalized) is not None
     has_named_scope = bool(infer_scope_tokens(normalized))
@@ -475,6 +478,24 @@ def is_clear_low_risk_build_request(text: str) -> bool:
         and not has_change_signal
         and (has_delivery_signal or has_medium_signal)
         and has_named_scope
+    )
+
+
+def _is_scope_limiter_change_guardrail(normalized: str) -> bool:
+    text = str(normalized or "").strip()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "sonst nichts",
+            "nichts sonst",
+            "nothing else",
+            "anything else",
+            "any other",
+            "do not change anything else",
+            "don't change anything else",
+        )
     )
 
 

@@ -2740,6 +2740,60 @@ def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_e
     assert route.action_plan[0].action.value == "create_artifact"
 
 
+def test_task_state_local_short_circuit_keeps_explicit_create_intent_despite_scope_limiter_phrase(
+    tmp_path,
+):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"text": 1},
+        top_directories=[],
+        important_files=["smoke_a2_live.txt"],
+        focus_files=["smoke_a2_live.txt"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["general repository"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="One existing smoke file.",
+    )
+    prompt = (
+        "Erstelle im aktuellen Workspace die Datei smoke_status_note.txt mit einer kurzen "
+        "Smoke-Statusnotiz in einer Zeile. Aendere sonst nichts."
+    )
+    llm = ScriptedLLM()
+    llm.config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    session = SessionState(task=prompt, workspace_root=str(tmp_path))
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        prompt,
+        snapshot=snapshot,
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts if artifact.path}
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "create"
+    assert task_state.target_artifacts[0].path == "smoke_status_note.txt"
+    assert artifact_roles["smoke_status_note.txt"] == "primary_target"
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_name == "smoke_status_note.txt"
+    assert route.entities.target_paths[0] == "smoke_status_note.txt"
+
+
 def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
     invalid_payload = {
         "latest_user_turn": "Update README.md to document the CLI.",
