@@ -13146,6 +13146,106 @@ def test_targeted_runtime_prompt_hints_ignore_interleaved_direct_main_option_val
     assert not any("'Dr.', 'Hello', 'WORLD'" in hint for hint in hints)
 
 
+def test_targeted_runtime_prompt_hints_call_out_when_parsed_cli_value_needs_threading():
+    current_cli = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def list_tasks(owner=None):\n"
+        "    return [] if owner else ['x']\n\n"
+        "def render_tasks(tasks):\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(tasks)\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--owner')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    tasks = list_tasks(args.owner)\n"
+        "    print(render_tasks(tasks))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="taskboard/cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from taskboard.cli import main\n\n"
+            "def test_owner_filter_prints_specific_no_match_message():\n"
+            "    assert main(['--owner', 'zoe']) == 'No tasks found for owner zoe.'\n"
+        ),
+        targeted_context={
+            "failure_summary": (
+                "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: "
+                "No tasks found for owner zoe. but observed Validation currently produces: "
+                "No tasks found for the specified owner."
+            ),
+            "excerpt": "AssertionError: 'No tasks found for the specified owner.' != 'No tasks found for owner zoe.'",
+            "failure_focus": [],
+            "file_hints": ["taskboard/cli.py", "tests/test_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: No tasks found for owner zoe."],
+                "observed_semantics": ["Validation currently produces: No tasks found for the specified owner."],
+            },
+            "supporting_output_contracts": ["Emit exact output text: 'No tasks found for owner zoe.'."],
+            "supporting_runtime_argv_contract": {
+                "option_tokens": ["--owner"],
+                "positional_tokens": ["zoe"],
+            },
+        },
+    )
+
+    assert any("computes tasks from parsed CLI value(s) like args.owner" in hint for hint in hints)
+    assert any("list_tasks(args.owner)" in hint for hint in hints)
+    assert any("render_tasks(tasks)" in hint for hint in hints)
+
+
+def test_targeted_runtime_prompt_hints_skip_threading_hint_when_consumer_already_receives_cli_value():
+    current_cli = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def list_tasks(owner=None):\n"
+        "    return [] if owner else ['x']\n\n"
+        "def render_tasks(tasks, owner=None):\n"
+        "    if not tasks and owner:\n"
+        "        return f'No tasks found for owner {owner}.'\n"
+        "    return '\\n'.join(tasks)\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--owner')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    tasks = list_tasks(args.owner)\n"
+        "    print(render_tasks(tasks, args.owner))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="taskboard/cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from taskboard.cli import main\n\n"
+            "def test_owner_filter_prints_specific_no_match_message():\n"
+            "    assert main(['--owner', 'zoe']) == 'No tasks found for owner zoe.'\n"
+        ),
+        targeted_context={
+            "failure_summary": (
+                "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: "
+                "No tasks found for owner zoe. but observed Validation currently produces: "
+                "No tasks found for the specified owner."
+            ),
+            "excerpt": "AssertionError: 'No tasks found for the specified owner.' != 'No tasks found for owner zoe.'",
+            "failure_focus": [],
+            "file_hints": ["taskboard/cli.py", "tests/test_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: No tasks found for owner zoe."],
+                "observed_semantics": ["Validation currently produces: No tasks found for the specified owner."],
+            },
+            "supporting_output_contracts": ["Emit exact output text: 'No tasks found for owner zoe.'."],
+            "supporting_runtime_argv_contract": {
+                "option_tokens": ["--owner"],
+                "positional_tokens": ["zoe"],
+            },
+        },
+    )
+
+    assert not any("computes tasks from parsed CLI value(s) like args.owner" in hint for hint in hints)
+
+
 def test_targeted_runtime_prompt_hints_call_out_separator_only_runtime_deltas():
     current_cli = (
         "def main(argv=None):\n"

@@ -3834,6 +3834,147 @@ def _runtime_value_tokens_relevant_to_semantics(
     return relevant_tokens or runtime_value_tokens
 
 
+def _assignment_target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name) and str(target.id or "").strip():
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [
+            element.id
+            for element in target.elts
+            if isinstance(element, ast.Name) and str(element.id or "").strip()
+        ]
+    return []
+
+
+def _python_cli_parse_arg_bindings(function_node: ast.AST) -> set[str]:
+    bindings: set[str] = set()
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        if not isinstance(func, ast.Attribute) or func.attr not in {"parse_args", "parse_known_args"}:
+            continue
+        for target in node.targets:
+            bindings.update(_assignment_target_names(target))
+    return {binding for binding in bindings if binding}
+
+
+def _python_parse_arg_attrs(node: ast.AST, parse_arg_bindings: set[str]) -> set[str]:
+    attrs: set[str] = set()
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Name)
+            and child.value.id in parse_arg_bindings
+            and str(child.attr or "").strip()
+        ):
+            attrs.add(child.attr)
+    return attrs
+
+
+def _python_call_name(func: ast.AST) -> str:
+    if isinstance(func, ast.Name):
+        return str(func.id or "").strip()
+    if isinstance(func, ast.Attribute) and str(func.attr or "").strip():
+        return str(func.attr or "").strip()
+    return "helper"
+
+
+def _python_call_argument_names(node: ast.Call) -> set[str]:
+    names: set[str] = set()
+    for candidate in [*node.args, *(keyword.value for keyword in node.keywords if keyword.value is not None)]:
+        if isinstance(candidate, ast.Name) and str(candidate.id or "").strip():
+            names.add(candidate.id)
+    return names
+
+
+def _python_cli_runtime_value_threading_hint(
+    *,
+    current_content: str,
+    runtime_value_tokens: Sequence[str],
+) -> str | None:
+    if not runtime_value_tokens:
+        return None
+    try:
+        module = ast.parse(str(current_content or ""))
+    except SyntaxError:
+        return None
+
+    for function_node in module.body:
+        if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        parse_arg_bindings = _python_cli_parse_arg_bindings(function_node)
+        if not parse_arg_bindings:
+            continue
+
+        threaded_values: dict[str, dict[str, object]] = {}
+        assignments = [
+            node
+            for node in ast.walk(function_node)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+        ]
+        assignments.sort(key=lambda node: getattr(node, "lineno", 0))
+        for assignment in assignments:
+            target_name = str(assignment.targets[0].id or "").strip()
+            if not target_name:
+                continue
+            source_attrs = sorted(_python_parse_arg_attrs(assignment.value, parse_arg_bindings))
+            if not source_attrs:
+                continue
+            source_call = ast.get_source_segment(current_content, assignment.value) or (
+                f"{_python_call_name(assignment.value.func)}(...)"
+            )
+            threaded_values[target_name] = {
+                "attrs": source_attrs,
+                "producer_call": source_call,
+                "producer_line": getattr(assignment, "lineno", 0),
+            }
+
+        if not threaded_values:
+            continue
+
+        calls = [node for node in ast.walk(function_node) if isinstance(node, ast.Call)]
+        calls.sort(key=lambda node: getattr(node, "lineno", 0))
+        for call in calls:
+            if _python_parse_arg_attrs(call, parse_arg_bindings):
+                continue
+            call_arg_names = _python_call_argument_names(call)
+            if not call_arg_names:
+                continue
+            for value_name in sorted(call_arg_names):
+                threaded_value = threaded_values.get(value_name)
+                if threaded_value is None:
+                    continue
+                producer_line = int(threaded_value.get("producer_line") or 0)
+                if getattr(call, "lineno", 0) <= producer_line:
+                    continue
+                attrs = [
+                    str(attr or "").strip()
+                    for attr in threaded_value.get("attrs", [])
+                    if str(attr or "").strip()
+                ]
+                if not attrs:
+                    continue
+                attr_preview = ", ".join(f"args.{attr}" for attr in attrs[:2])
+                producer_call = str(threaded_value.get("producer_call") or "").strip()
+                consumer_call = ast.get_source_segment(current_content, call) or (
+                    f"{_python_call_name(call.func)}({value_name})"
+                )
+                return (
+                    f"The exercised branch already computes {value_name} from parsed CLI value(s) like "
+                    f"{attr_preview} in {producer_call}, but the later {consumer_call} call does not "
+                    "receive those parsed values. If the output contract depends on that runtime input, "
+                    "thread the existing parsed value through the downstream helper or compose the output "
+                    "at the caller instead of hardcoding a sample payload."
+                )
+    return None
+
+
 def _direct_main_runtime_value_propagation_hint(
     *,
     expected_values: Sequence[str],
@@ -5156,6 +5297,12 @@ def _targeted_runtime_prompt_hints(
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
+            threading_hint = _python_cli_runtime_value_threading_hint(
+                current_content=current_content,
+                runtime_value_tokens=hint_positional_tokens,
+            )
+            if threading_hint:
+                hints.append(threading_hint)
     if has_semantic_contract:
         if option_tokens:
             hints.append(
