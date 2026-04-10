@@ -41,14 +41,16 @@ class SessionStore:
         self._refresh_last_session(session_id)
         return True
 
-    def list_sessions(self, limit: int = 100) -> list[SessionState]:
+    def list_sessions(self, limit: int | None = 100) -> list[SessionState]:
         session_files = sorted(
             self.session_dir.glob("*.json"),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
+        if limit is not None:
+            session_files = session_files[:limit]
         sessions: list[SessionState] = []
-        for path in session_files[:limit]:
+        for path in session_files:
             sessions.append(
                 SessionState.model_validate_json(path.read_text(encoding="utf-8"))
             )
