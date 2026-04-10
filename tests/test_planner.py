@@ -930,6 +930,47 @@ def test_generate_file_content_uses_deterministic_exact_text_contract_for_create
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_contract"
 
 
+def test_generate_file_content_uses_deterministic_exact_text_contract_for_two_line_conjunction_request(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_alpha.txt"],
+        target_name="smoke_alpha.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_alpha.txt mit genau zwei Zeilen: "
+            "alpha und beta. Aendere sonst nichts."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    generation = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="smoke_alpha.txt",
+        current_content=None,
+    )
+
+    assert generation.content == "alpha\nbeta"
+    assert generation.source == "deterministic_exact_text_contract"
+    assert llm.generate_calls == []
+
+
 def test_retry_update_after_review_failure_uses_deterministic_exact_text_contract(tmp_path):
     llm = ScriptedLLM(
         config=AppConfig(
@@ -1019,6 +1060,46 @@ def test_planner_deterministic_exact_text_create_review_flags_mismatched_lines(t
     assert session.validation_runs[-1].status == "failed"
     assert session.active_repair_context is not None
     assert "trailing whitespace" in (session.active_repair_context.failure_summary or "").lower()
+
+
+def test_planner_deterministic_exact_text_create_review_handles_two_line_conjunction_request(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_02.txt"],
+        target_name="smoke_live_run_02.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_02.txt mit genau zwei Zeilen: "
+            "alpha und beta. Aendere sonst nichts."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_02.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_02.txt").write_text("alpha  \nbeta", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "failed"
+    assert session.active_repair_context is not None
+    assert "trailing whitespace" in (session.active_repair_context.failure_summary or "").lower()
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_create_review"
 
 
 def test_semantic_change_review_rejects_unbound_web_contracts_before_model_review(tmp_path):

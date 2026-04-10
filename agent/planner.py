@@ -12777,12 +12777,48 @@ class Planner:
             lines.append(tail)
 
         if expected_count is not None and len(lines) != expected_count:
+            fallback = self._parse_conjoined_exact_line_contract_body(
+                segment,
+                expected_count=expected_count,
+            )
+            if fallback:
+                return fallback
             return []
         if not 2 <= len(lines) <= 8:
             return []
         if trailing_remainder and not self._line_contract_remainder_looks_like_followup(trailing_remainder):
             return []
         return lines
+
+    def _parse_conjoined_exact_line_contract_body(
+        self,
+        text: str,
+        *,
+        expected_count: int,
+    ) -> list[str]:
+        if expected_count < 2 or expected_count > 4:
+            return []
+        segment = str(text or "").strip()
+        if not segment or any(marker in segment for marker in {",", ";", "\n"}):
+            return []
+
+        head = segment
+        remainder = ""
+        for index, char in enumerate(segment):
+            if char in ".!?" and self._line_contract_sentence_break(segment, index):
+                head = segment[:index]
+                remainder = segment[index + 1 :]
+                break
+        if remainder and not self._line_contract_remainder_looks_like_followup(remainder):
+            return []
+
+        parts = [
+            self._clean_exact_line_item(raw_part, terminal=True)
+            for raw_part in re.split(r"\s+(?:and|und)\s+", head, flags=re.IGNORECASE)
+        ]
+        if len(parts) != expected_count or any(not part for part in parts):
+            return []
+        return parts
 
     def _clean_exact_line_item(self, raw: str, *, terminal: bool) -> str:
         candidate = str(raw or "").strip()
