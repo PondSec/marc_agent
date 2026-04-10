@@ -501,6 +501,10 @@ class RepoMemoryStore:
         if not python_tests:
             return None
 
+        saw_pytest_naming = any(
+            self._is_pytest_style_python_test_file(path)
+            for path in python_tests
+        )
         saw_pytest_signal = False
         saw_unittest_signal = False
         for relative_path in python_tests[:12]:
@@ -536,6 +540,14 @@ class RepoMemoryStore:
                 source="python-test-files",
                 priority=10,
                 reason="unittest-style Python tests detected in the repository.",
+            )
+        if saw_pytest_naming:
+            return ValidationCommand(
+                command="python -m pytest",
+                kind="test",
+                source="python-test-files",
+                priority=10,
+                reason="pytest-style Python test file naming detected in the repository.",
             )
         return None
 
@@ -927,6 +939,13 @@ class RepoMemoryStore:
             or name.endswith(".spec.ts")
             or name.endswith(".spec.js")
         )
+
+    def _is_pytest_style_python_test_file(self, relative_path: str) -> bool:
+        if Path(relative_path).suffix.lower() != ".py":
+            return False
+        rel = relative_path.lower()
+        name = Path(relative_path).name.lower()
+        return "/tests/" in f"/{rel}" or name.startswith("test_") or name.endswith("_test.py")
 
     def _is_build_file(self, relative_path: str) -> bool:
         rel = relative_path.lower()

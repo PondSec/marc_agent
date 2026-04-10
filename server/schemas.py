@@ -13,6 +13,7 @@ class TaskCreateRequest(StrictModel):
     prompt: str = Field(..., min_length=1)
     session_id: str | None = None
     workspace_id: str | None = None
+    enqueue_if_busy: bool = False
     access_mode: Literal["safe", "approval", "full"] | None = None
     dry_run: bool | None = None
     read_only: bool | None = None

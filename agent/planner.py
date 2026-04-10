@@ -29,12 +29,22 @@ from agent.models import (
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
+    _best_contract_fragment_near_match,
     _direct_main_runtime_contract,
     _direct_python_script_runtime_contract,
+    _format_similar_python_name_candidates,
     _line_focused_excerpt,
+    _literal_near_match_in_content,
+    _python_cli_runtime_value_threading_hint,
+    _python_line_binds_name,
+    _python_similar_defined_name_candidates,
+    _repair_semantic_values,
     _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
+    _runtime_output_contract_required_literals,
+    _source_backed_runtime_argv_contract,
+    _source_backed_runtime_output_contracts,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
@@ -2149,6 +2159,12 @@ class Planner:
                 final_response=None,
             )
 
+        if self._confirmed_validation_request_without_findings(session):
+            return self._final_decision(
+                "The requested validation completed without a confirmed defect.",
+                self._confirmed_validation_response(route, session),
+            )
+
         if self._diagnosis_attempted_without_findings(session) or route.intent == RouteIntent.DEBUG:
             return self._final_decision(
                 "There is not enough diagnostic evidence to apply a safe fix yet.",
@@ -3676,6 +3692,73 @@ class Planner:
         }
         return bool(successful_runtime_checks) and not session.diagnostics
 
+    def _confirmed_validation_request_without_findings(self, session: SessionState) -> bool:
+        task_state = session.task_state
+        if task_state is None:
+            return False
+        current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
+        execution_strategy = str(getattr(task_state, "execution_strategy", "") or "").strip().lower()
+        if current_intent != "validate" and execution_strategy != "validation_inspection":
+            return False
+        if session.changed_files or session.diagnostics:
+            return False
+        return any(run.status == "passed" for run in session.validation_runs)
+
+    def _confirmed_validation_response(self, route: RouterOutput, session: SessionState) -> str:
+        language = self._session_language(session)
+        inspected = self._read_paths(session)[:4]
+        latest_pass = next(
+            (run for run in reversed(session.validation_runs) if run.status == "passed"),
+            None,
+        )
+        targets = route.entities.target_paths[:4]
+        lines = [
+            self._localized_text(
+                language,
+                de="Ich habe die angefragte Validierung ausgefuehrt und keinen bestaetigten Defekt gefunden.",
+                en="I ran the requested validation and did not find a confirmed defect.",
+            )
+        ]
+        if targets:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Geprueft: {', '.join(targets)}.",
+                    en=f"Checked: {', '.join(targets)}.",
+                )
+            )
+        if latest_pass is not None:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Befehl: {latest_pass.command}.",
+                    en=f"Command: {latest_pass.command}.",
+                )
+            )
+            lines.append(
+                self._localized_text(
+                    language,
+                    de="Ergebnis: bestanden.",
+                    en="Result: passed.",
+                )
+            )
+        lines.append(
+            self._localized_text(
+                language,
+                de="Ich habe keine Dateien geaendert.",
+                en="I did not change any files.",
+            )
+        )
+        if inspected:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Ich habe vor allem {', '.join(inspected)} untersucht.",
+                    en=f"I mainly inspected {', '.join(inspected)}.",
+                )
+            )
+        return "\n".join(lines)
+
     def _missing_issue_evidence_response(self, route: RouterOutput, session: SessionState) -> str:
         follow_up = session.follow_up_context
         previous_task = str(follow_up.previous_task or "").strip() if follow_up else ""
@@ -4122,20 +4205,20 @@ class Planner:
 
         task_state = session.task_state
         current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
-        if session.validation_status != "passed" or current_intent not in {"repair", "debug"}:
+        if session.validation_status != "passed" or current_intent not in {"validate", "repair", "debug"}:
             return pending_targets
 
-        supporting_doc_paths = {
+        non_actionable_context_paths = {
             path
             for artifact in getattr(task_state, "target_artifacts", []) or []
             for path in [str(getattr(artifact, "path", "") or "").strip()]
             if path
-            and str(getattr(artifact, "role", "") or "").strip().lower() == "supporting_context"
-            and self.validation_planner._is_documentation_path(path)
+            and str(getattr(artifact, "role", "") or "").strip().lower()
+            in {"supporting_context", "validation_target"}
         }
-        if not supporting_doc_paths:
+        if not non_actionable_context_paths:
             return pending_targets
-        return [path for path in pending_targets if path not in supporting_doc_paths]
+        return [path for path in pending_targets if path not in non_actionable_context_paths]
 
     def _path_matches_explicit_request(
         self,
@@ -4676,6 +4759,41 @@ class Planner:
                 source="deterministic_exact_text_contract",
                 repair_strategy_used=repair_strategy,
             )
+        deterministic_literal_delta = self._deterministic_runtime_literal_delta_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_literal_delta is not None:
+            self._log(
+                "content_generation_skipped",
+                path=path,
+                update=current_content is not None,
+                reason="deterministic_runtime_literal_delta",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="completed",
+                    capability_tier=deterministic_literal_delta.capability_tier,
+                    recovery_strategy=deterministic_literal_delta.recovery_strategy,
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(deterministic_literal_delta.content),
+                    validation_possible=True,
+                    summary="Artifact generation used a deterministic runtime literal delta recovery.",
+                    attempts=[],
+                ),
+            )
+            return ContentGenerationResult(
+                content=deterministic_literal_delta.content,
+                source="deterministic_runtime_literal_delta",
+                repair_strategy_used=repair_strategy,
+            )
 
         model_name = self._content_generation_model_name(
             route,
@@ -4743,13 +4861,14 @@ class Planner:
             total_timeout_seconds=total_timeout_seconds,
             prompt_artifact=prompt_trace_path,
         )
+        strict_timeouts = prompt_variant == "compact" and model_name is not None
         outcome = invoke_model(
             lambda progress: self.llm.generate(
                 prompt,
                 model=model_name,
                 timeout=timeout_seconds,
                 total_timeout=total_timeout_seconds,
-                strict_timeouts=prompt_variant == "compact",
+                strict_timeouts=strict_timeouts,
                 num_ctx=num_ctx,
                 retries=0,
                 progress_callback=progress,
@@ -5574,6 +5693,7 @@ class Planner:
         *,
         retained_progress_issue: ExecutionFailure | None = None,
     ) -> tuple[int, int, int]:
+        cold_start_recovery = issue.no_start_failure
         progress_timeout_recovery = (
             issue.timeout_like and issue.had_progress
         ) or (
@@ -5584,15 +5704,27 @@ class Planner:
         )
         if attempt.prompt_kind == "resume":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 3072 if attempt.model_name is None else 2048
         elif attempt.prompt_kind == "compact":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 2048
         else:
             base_timeout = 75 if issue.timeout_like else 60
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 4096 if attempt.model_name is None else 3072
         return (
             max(self._llm_timeout(base_timeout), base_timeout),
@@ -5769,6 +5901,14 @@ class Planner:
             current_content=current_content,
             repair_context=session.active_repair_context,
         )
+        if direct_main_recovery is None:
+            direct_main_recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=session.active_repair_context,
+            )
         if direct_main_recovery is not None:
             self._log(
                 "content_generation_recovery_started",
@@ -8136,17 +8276,11 @@ class Planner:
     ) -> bool:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return False
-
-        candidate_paths = list(
-            dict.fromkeys(
-                [
-                    str(candidate or "").strip()
-                    for candidate in getattr(repair_context, "file_hints", []) or []
-                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
-                ]
-            )
+        support_texts = self._runtime_support_contract_texts(
+            session,
+            repair_context=repair_context,
         )
-        if not candidate_paths:
+        if not support_texts:
             return False
 
         stdout_capture_markers = (
@@ -8157,11 +8291,113 @@ class Planner:
             "patch('sys.stdout'",
             'patch("sys.stdout"',
         )
-        for candidate in candidate_paths[:4]:
-            excerpt = self._current_or_last_read_excerpt(session, path=candidate)
-            if any(marker in excerpt for marker in stdout_capture_markers):
+        for excerpt in support_texts:
+            lowered_excerpt = excerpt.lower()
+            if any(marker in lowered_excerpt for marker in stdout_capture_markers):
                 return True
         return False
+
+    def _runtime_support_contract_texts(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+        limit: int = 4,
+    ) -> list[str]:
+        if repair_context is None:
+            return []
+        candidate_paths = list(
+            dict.fromkeys(
+                [
+                    str(candidate or "").strip()
+                    for candidate in [
+                        *(getattr(repair_context, "file_hints", []) or []),
+                        *(getattr(repair_context, "artifact_paths", []) or []),
+                    ]
+                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+                ]
+            )
+        )
+        texts: list[str] = []
+        for candidate in candidate_paths[:limit]:
+            content = self._session_or_current_file_content(session, candidate)
+            if content:
+                texts.append(content)
+        return texts
+
+    def _supporting_runtime_contract_requires_zero_exit_status(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        support_texts = self._runtime_support_contract_texts(
+            session,
+            repair_context=repair_context,
+        )
+        if not support_texts:
+            return False
+        stdout_capture_markers = (
+            "redirect_stdout(",
+            ".getvalue().strip(",
+            ".getvalue().strip()",
+            "capsys.readouterr(",
+            "patch('sys.stdout'",
+            'patch("sys.stdout"',
+        )
+        for excerpt in support_texts:
+            lowered_excerpt = excerpt.lower()
+            if not any(marker in lowered_excerpt for marker in stdout_capture_markers):
+                continue
+            for match in re.finditer(
+                r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:__main__\.)?main\(",
+                excerpt,
+            ):
+                capture_name = str(match.group("name") or "").strip()
+                if not capture_name:
+                    continue
+                if re.search(rf"assert\s+{re.escape(capture_name)}\s*==\s*0\b", excerpt):
+                    return True
+                if re.search(
+                    rf"self\.assertEqual\(\s*{re.escape(capture_name)}\s*,\s*0\s*\)",
+                    excerpt,
+                ):
+                    return True
+                if re.search(
+                    rf"self\.assertEqual\(\s*0\s*,\s*{re.escape(capture_name)}\s*\)",
+                    excerpt,
+                ):
+                    return True
+        return False
+
+    def _repair_context_returns_output_instead_of_success_status(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return False
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        observed_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "observed_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if "0" not in expected_values:
+            return False
+        return any(
+            value
+            and value not in {"0", "''", '""', "None", "null", "undefined"}
+            for value in observed_values
+        )
 
     def _repair_update_addresses_stdout_contract(
         self,
@@ -8265,6 +8501,29 @@ class Planner:
         proposed_content: str,
         reserve_model: str | None,
     ) -> bool:
+        return self._compact_single_model_repair_review_candidate(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+            respect_attempt_history=True,
+            allow_evidence_backed_behavior_adjustment=False,
+        )
+
+    def _compact_single_model_repair_review_candidate(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+        respect_attempt_history: bool,
+        allow_evidence_backed_behavior_adjustment: bool,
+    ) -> bool:
         repair_context = session.active_repair_context
         if repair_context is None or current_content is None:
             return False
@@ -8301,11 +8560,14 @@ class Planner:
             return False
         if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
             return False
-        if self._repair_update_is_evidence_backed_behavior_adjustment(
-            path=normalized_path,
-            current_content=current_content,
-            proposed_content=proposed_content,
-            repair_context=repair_context,
+        if (
+            not allow_evidence_backed_behavior_adjustment
+            and self._repair_update_is_evidence_backed_behavior_adjustment(
+                path=normalized_path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
         ):
             return False
         if allowed_files and normalized_path not in allowed_files:
@@ -8327,10 +8589,11 @@ class Planner:
         }
         if len(unresolved_competing_scope) > 1:
             return False
-        if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
-            return False
-        if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
-            return False
+        if respect_attempt_history:
+            if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
+                return False
+            if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
+                return False
 
         changed_line_count = self._compact_repair_change_line_count(
             current_content=current_content,
@@ -8342,6 +8605,72 @@ class Planner:
             return False
 
         return True
+
+    def _should_skip_retry_model_backed_repair_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+        review_feedback: ProposedUpdateReview,
+    ) -> bool:
+        if review_feedback.safe_to_write:
+            return False
+        if review_feedback.preservation_risks:
+            return False
+        if self._review_rejection_looks_like_scope_broadening(review_feedback):
+            return False
+        return self._compact_single_model_repair_review_candidate(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+            respect_attempt_history=False,
+            allow_evidence_backed_behavior_adjustment=True,
+        )
+
+    def _repair_review_prefers_primary_model(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        return getattr(repair_context, "repair_brief", None) is not None
+
+    def _record_local_update_review_skip(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        reason: str,
+        model: str | None,
+        summary: str,
+    ) -> None:
+        self._log(
+            "proposed_update_review_skipped",
+            path=path,
+            reason=reason,
+            model=model,
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="proposed_update_review",
+                task_class="proposed_update_review",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=True,
+                summary=summary,
+                attempts=[],
+            ),
+        )
 
     def _repair_no_effective_change_review(
         self,
@@ -8633,10 +8962,6 @@ class Planner:
             )
         primary_model = self._primary_generation_model_name()
         reserve_model = self._lightweight_generation_model_name()
-        if reserve_model is None and repair_review:
-            reserve_model = self._generation_recovery_model_name()
-            if reserve_model == primary_model:
-                reserve_model = None
         local_review_reason: str | None = None
         if focused_compact_review and not repair_review and reserve_model is None:
             local_review_reason = "single_model_compact_update"
@@ -8657,34 +8982,24 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
             )
-            self._log(
-                "proposed_update_review_skipped",
+            self._record_local_update_review_skip(
+                session,
                 path=path,
                 reason=local_review_reason,
                 model=primary_model,
-            )
-            self._append_runtime_execution(
-                session,
-                build_execution_run_record(
-                    operation_name="proposed_update_review",
-                    task_class="proposed_update_review",
-                    final_state="degraded_success",
-                    capability_tier="tier_d",
-                    recovery_strategy="deterministic_fallback",
-                    degraded=True,
-                    honest_blocked=False,
-                    artifact_bytes_generated=0,
-                    validation_possible=True,
-                    summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
-                    attempts=[],
-                ),
+                summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
             )
             return review
         review_attempts: list[tuple[str | None, str, str]] = []
         if repair_review:
-            if reserve_model is not None:
+            primary_first_repair_review = self._repair_review_prefers_primary_model(
+                session.active_repair_context,
+            )
+            if reserve_model is not None and not primary_first_repair_review:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
             review_attempts.append((primary_model, "tier_a", "primary_model_review"))
+            if reserve_model is not None and primary_first_repair_review:
+                review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
         elif focused_compact_review:
             if reserve_model is not None:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
@@ -9076,6 +9391,60 @@ class Planner:
             content=patched_content,
             review=review,
             recovery_strategy="deterministic_direct_main_contract",
+        )
+
+    def _deterministic_cli_stdout_exit_contract_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        del review_feedback
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        if not self._supporting_runtime_contract_requires_stdout_emission(
+            session,
+            repair_context=repair_context,
+        ):
+            return None
+        if not self._supporting_runtime_contract_requires_zero_exit_status(
+            session,
+            repair_context=repair_context,
+        ):
+            return None
+        if not self._repair_context_returns_output_instead_of_success_status(repair_context):
+            return None
+
+        patched_content = self._apply_cli_stdout_exit_contract_patch(current_content)
+        if patched_content is None or patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_cli_stdout_exit_contract",
         )
 
     def _direct_python_script_expected_output(
@@ -9480,6 +9849,331 @@ class Planner:
             recovery_strategy="deterministic_direct_python_script_contract",
         )
 
+    def _deterministic_runtime_literal_delta_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+
+        def looks_truncated(value: str) -> bool:
+            candidate = str(value or "").strip()
+            return "..." in candidate or "…" in candidate
+
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        lines = str(current_content or "").splitlines(keepends=True)
+        focused_indexes = [
+            hint - 1
+            for hint in line_hints
+            if isinstance(hint, int) and 0 < hint <= len(lines)
+        ]
+
+        replacement_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        expected_values, observed_values = _repair_semantic_values(repair_context)
+        for observed, expected in zip(observed_values, expected_values, strict=False):
+            observed_text = str(observed or "").strip()
+            expected_text = str(expected or "").strip()
+            if not observed_text or not expected_text or observed_text == expected_text:
+                continue
+            if looks_truncated(observed_text) or looks_truncated(expected_text):
+                continue
+            pair = (observed_text, expected_text)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            replacement_pairs.append(pair)
+        mismatch_patterns = (
+            re.compile(r"assert ['\"](?P<observed>.+?)['\"] == ['\"](?P<expected>.+?)['\"]"),
+            re.compile(r"AssertionError:\s*['\"](?P<observed>.+?)['\"] != ['\"](?P<expected>.+?)['\"]"),
+        )
+        evidence_texts = [
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ]
+        for evidence_text in evidence_texts:
+            if not evidence_text:
+                continue
+            for pattern in mismatch_patterns:
+                for match in pattern.finditer(evidence_text):
+                    observed = str(match.group("observed") or "")
+                    expected = str(match.group("expected") or "")
+                    if not observed or not expected or observed == expected:
+                        continue
+                    if looks_truncated(observed) or looks_truncated(expected):
+                        continue
+                    pair = (observed, expected)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    replacement_pairs.append(pair)
+        for delta in _repair_semantic_delta_lines(
+            repair_context,
+            limit=2,
+            path=path,
+            current_content=current_content,
+        ):
+            text = str(delta or "").strip()
+            if not text:
+                continue
+            replace_match = re.search(
+                r"Replace observed-only text ['\"](?P<observed>.+?)['\"] with expected text ['\"](?P<expected>.+?)['\"]",
+                text,
+            )
+            if replace_match is None:
+                continue
+            observed = str(replace_match.group("observed") or "").strip()
+            expected = str(replace_match.group("expected") or "").strip()
+            if not observed or not expected or observed == expected:
+                continue
+            if looks_truncated(observed) or looks_truncated(expected):
+                continue
+            pair = (observed, expected)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            replacement_pairs.append(pair)
+
+        for observed, expected in replacement_pairs:
+
+            patched_content: str | None = None
+            if focused_indexes:
+                updated_lines = list(lines)
+                changed = False
+                for index in focused_indexes:
+                    line = updated_lines[index]
+                    if observed not in line:
+                        continue
+                    updated_lines[index] = line.replace(observed, expected)
+                    changed = True
+                if changed:
+                    patched_content = "".join(updated_lines)
+            if patched_content is None and current_content.count(observed) == 1:
+                patched_content = current_content.replace(observed, expected, 1)
+
+            if patched_content is None or patched_content == current_content:
+                continue
+            if Path(path).suffix.lower() in {".py", ".pyi"}:
+                try:
+                    ast.parse(patched_content)
+                except SyntaxError:
+                    continue
+
+            review = self._local_pre_write_update_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=patched_content,
+                repair_context=repair_context,
+            )
+            if not review.safe_to_write:
+                continue
+            return DeterministicUpdateRecovery(
+                content=patched_content,
+                review=review,
+                recovery_strategy="deterministic_runtime_literal_delta",
+            )
+        return None
+
+    def _deterministic_runtime_similar_function_name_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None or review_feedback is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        undefined_symbol = self._undefined_runtime_symbol(repair_context)
+        if not undefined_symbol:
+            return None
+        review_text = self._proposed_update_review_text(review_feedback)
+        if undefined_symbol not in review_text or "undefined" not in review_text:
+            return None
+
+        similar_candidates = _python_similar_defined_name_candidates(current_content, undefined_symbol)
+        if not similar_candidates:
+            return None
+        if not self._similar_python_name_candidate_is_unambiguous(undefined_symbol, similar_candidates):
+            return None
+
+        candidate_name, candidate_kind, _lineno = similar_candidates[0]
+        if candidate_kind != "function":
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        target_indexes: list[int] = []
+        for hint in line_hints:
+            if not isinstance(hint, int) or hint <= 0:
+                continue
+            candidate_index = hint - 1
+            if 0 <= candidate_index < len(lines) and undefined_symbol in lines[candidate_index]:
+                target_indexes.append(candidate_index)
+                continue
+            search_start = max(candidate_index - 2, 0)
+            search_end = min(candidate_index + 3, len(lines))
+            nearby_match = next(
+                (
+                    index
+                    for index in range(search_start, search_end)
+                    if undefined_symbol in lines[index]
+                    and not _python_line_binds_name(lines[index], undefined_symbol)
+                ),
+                None,
+            )
+            if nearby_match is not None:
+                target_indexes.append(nearby_match)
+        target_indexes = sorted(set(target_indexes))
+        if not target_indexes:
+            target_indexes = [
+                index
+                for index, raw_line in enumerate(lines)
+                if undefined_symbol in raw_line and not _python_line_binds_name(raw_line, undefined_symbol)
+            ]
+            if len(target_indexes) != 1:
+                return None
+
+        bare_symbol_replacement = None
+        if self._python_function_accepts_zero_args(current_content, candidate_name):
+            bare_symbol_replacement = f"{candidate_name}()"
+
+        call_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b(?=\s*\()")
+        bare_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b(?!\s*\()")
+        updated_lines = list(lines)
+        changed = False
+        for index in target_indexes:
+            raw_line = updated_lines[index]
+            if not raw_line.strip() or _python_line_binds_name(raw_line, undefined_symbol):
+                continue
+            replaced_line = call_pattern.sub(candidate_name, raw_line)
+            if bare_pattern.search(replaced_line):
+                if bare_symbol_replacement is None:
+                    return None
+                replaced_line = bare_pattern.sub(bare_symbol_replacement, replaced_line)
+            if replaced_line != raw_line:
+                updated_lines[index] = replaced_line
+                changed = True
+        if not changed:
+            return None
+
+        patched_content = "".join(updated_lines)
+        if patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_runtime_similar_function_name",
+        )
+
+    def _similar_python_name_candidate_is_unambiguous(
+        self,
+        target_name: str,
+        candidates: list[tuple[str, str, int | None]],
+    ) -> bool:
+        if not candidates:
+            return False
+        top_name, top_kind, _ = candidates[0]
+        top_score = self._similar_python_name_score(target_name, top_name, top_kind)
+        if top_score < 0.95:
+            return False
+        if len(candidates) == 1:
+            return True
+        second_name, second_kind, _ = candidates[1]
+        second_score = self._similar_python_name_score(target_name, second_name, second_kind)
+        return top_score - second_score >= 0.12
+
+    def _similar_python_name_score(
+        self,
+        target_name: str,
+        candidate_name: str,
+        candidate_kind: str,
+    ) -> float:
+        normalized_target = str(target_name or "").strip().lower()
+        normalized_candidate = str(candidate_name or "").strip().lower()
+        if not normalized_target or not normalized_candidate or normalized_candidate == normalized_target:
+            return 0.0
+        score = difflib.SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_candidate.startswith(normalized_target):
+            score += 0.35
+        elif normalized_target.startswith(normalized_candidate):
+            score += 0.1
+        if normalized_target in normalized_candidate:
+            score += 0.1
+        if normalized_candidate.replace("_", "") == normalized_target.replace("_", ""):
+            score += 0.15
+        if candidate_kind == "function":
+            score += 0.08
+        elif candidate_kind == "import":
+            score += 0.04
+        return score
+
+    def _python_function_accepts_zero_args(
+        self,
+        content: str,
+        function_name: str,
+    ) -> bool:
+        target = str(function_name or "").strip()
+        if not target:
+            return False
+        try:
+            module = ast.parse(str(content or ""))
+        except SyntaxError:
+            return False
+        for node in ast.walk(module):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != target:
+                continue
+            positional_args = [
+                *getattr(node.args, "posonlyargs", []),
+                *getattr(node.args, "args", []),
+            ]
+            required_positional = max(len(positional_args) - len(node.args.defaults), 0)
+            required_kwonly = sum(1 for item in node.args.kwonlyargs if item is not None) - sum(
+                1 for default in node.args.kw_defaults if default is not None
+            )
+            return required_positional == 0 and required_kwonly <= 0
+        return False
+
     def _deterministic_runtime_repair_decision(
         self,
         route: RouterOutput,
@@ -9499,7 +10193,23 @@ class Planner:
             repair_context=repair_context,
         )
         if recovery is None:
+            recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
             recovery = self._deterministic_direct_python_script_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
+            recovery = self._deterministic_runtime_literal_delta_recovery(
                 route,
                 session,
                 path=path,
@@ -9675,6 +10385,56 @@ class Planner:
         if not expected_output or not payload_output or expected_output != payload_output:
             return None
         return expected_output
+
+    def _apply_cli_stdout_exit_contract_patch(
+        self,
+        current_content: str,
+    ) -> str | None:
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = list(lines[start:end])
+        if not block_lines:
+            return None
+        if any(
+            "print(" in line or "sys.stdout.write(" in line.lower() or "stdout.write(" in line.lower()
+            for line in block_lines
+        ):
+            return None
+
+        signature_line = block_lines[0]
+        if "->" in signature_line and "-> int:" not in signature_line:
+            block_lines[0] = re.sub(r"->\s*[^:]+:", "-> int:", signature_line)
+
+        changed = False
+        for index in range(1, len(block_lines)):
+            raw_line = block_lines[index]
+            stripped = raw_line.lstrip()
+            indent = raw_line[: len(raw_line) - len(stripped)]
+            if not stripped.startswith("return "):
+                continue
+            expr = stripped[len("return ") :].rstrip("\n").strip()
+            if not expr:
+                continue
+            if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", expr) or expr in {"None", "True", "False"}:
+                continue
+            if "\\" in expr:
+                return None
+            block_lines[index : index + 1] = [
+                f"{indent}print({expr})\n",
+                f"{indent}return 0\n",
+            ]
+            changed = True
+
+        if not changed:
+            return None
+        updated_content = "".join([*lines[:start], *block_lines, *lines[end:]])
+        if updated_content == current_content:
+            return None
+        return updated_content
 
     def _apply_direct_main_contract_patch(
         self,
@@ -10676,7 +11436,25 @@ class Planner:
             repair_context=repair_context,
         )
         if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_runtime_similar_function_name_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
             deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_cli_stdout_exit_contract_recovery(
                 route,
                 session,
                 path=path,
@@ -10692,6 +11470,14 @@ class Planner:
                 current_content=current_content,
                 repair_context=repair_context,
                 review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_runtime_literal_delta_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
             )
         if deterministic_recovery is not None:
             effective_repair_strategy = self._review_retry_repair_strategy(
@@ -11044,14 +11830,42 @@ class Planner:
                 strategy=strategy,
                 characters=len(cleaned),
             )
-            review = self._pre_write_update_review(
+            if self._should_skip_retry_model_backed_repair_review(
                 route,
                 session,
                 path=path,
                 current_content=current_content,
                 proposed_content=cleaned,
-                repair_context=repair_context,
-            )
+                reserve_model=reserve_model,
+                review_feedback=last_review,
+            ):
+                self._record_local_update_review_skip(
+                    session,
+                    path=path,
+                    reason="single_model_compact_repair_followup",
+                    model=primary_model,
+                    summary=(
+                        "A guided single-model repair follow-up reused deterministic local preservation checks "
+                        "instead of repeating the same model-backed review hop."
+                    ),
+                )
+                review = self._local_pre_write_update_review(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content or "",
+                    proposed_content=cleaned,
+                    repair_context=repair_context,
+                )
+            else:
+                review = self._pre_write_update_review(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                    proposed_content=cleaned,
+                    repair_context=repair_context,
+                )
             if review.safe_to_write:
                 return UpdateReviewRetryResult(
                     content=cleaned,
@@ -12153,6 +12967,24 @@ class Planner:
     ) -> ProposedUpdateReview | None:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return None
+        exact_output_contract_review = self._runtime_output_contract_source_literal_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+            session=session,
+        )
+        if exact_output_contract_review is not None:
+            return exact_output_contract_review
+        payload_hardcoding_review = self._runtime_sample_payload_hardcoding_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+            session=session,
+        )
+        if payload_hardcoding_review is not None:
+            return payload_hardcoding_review
         if (
             self._is_runtime_support_repair_target(path, repair_context)
             and Path(path).suffix.lower() not in {".py", ".pyi"}
@@ -12230,6 +13062,205 @@ class Planner:
             ],
         )
 
+    def _runtime_output_contract_source_literal_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+        session: SessionState | None,
+    ) -> ProposedUpdateReview | None:
+        if session is None:
+            return None
+        supporting_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if not supporting_output_contracts:
+            return None
+        _option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+            limit=4,
+        )
+
+        unresolved_contracts: list[tuple[str, str]] = []
+        for required_literal in _runtime_output_contract_required_literals(
+            supporting_output_contracts,
+            limit=6,
+        ):
+            required_text = str(required_literal or "").strip()
+            if not required_text or required_text in proposed_content:
+                continue
+            candidate = _literal_near_match_in_content(required_text, current_content)
+            if candidate and candidate == required_text:
+                candidate = None
+            if candidate is None:
+                fragment_match = _best_contract_fragment_near_match(required_text, current_content)
+                if fragment_match is None:
+                    continue
+                candidate, _fragment = fragment_match
+            if not candidate or not self._runtime_source_literal_remains_on_targeted_line(
+                candidate=candidate,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            ):
+                continue
+            unresolved_contracts.append((candidate, required_text))
+            if len(unresolved_contracts) >= 2:
+                break
+
+        if not unresolved_contracts:
+            return None
+
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        blocking_issues = [
+            (
+                f"The proposed update for {path} still leaves the near-match source literal {candidate!r} "
+                f"on the runtime-targeted path, so the exercised output cannot satisfy the exact supporting "
+                f"contract {required_text!r}."
+            )
+            for candidate, required_text in unresolved_contracts
+        ]
+        repair_hints = [
+            threading_hint
+            for threading_hint in [
+                _python_cli_runtime_value_threading_hint(
+                    current_content=current_content,
+                    runtime_value_tokens=positional_tokens,
+                )
+            ]
+            if threading_hint
+        ]
+        repair_hints.extend(
+            [
+            (
+                f"Replace or restructure the remaining source literal {candidate!r} so the exercised path can "
+                f"emit {required_text!r} without leaving the old placeholder behavior intact."
+            )
+            for candidate, required_text in unresolved_contracts
+            ]
+        )
+        repair_hints.extend(
+            self._runtime_target_repair_hints(
+                path,
+                repair_context,
+                evidence_lines=target_evidence,
+            )
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair still leaves a source literal that conflicts with the exact supporting runtime output contract."
+            ),
+            confidence=0.9,
+            blocking_issues=blocking_issues[:3],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
+
+    def _runtime_source_literal_remains_on_targeted_line(
+        self,
+        *,
+        candidate: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        candidate_text = str(candidate or "").strip()
+        if not candidate_text or candidate_text not in current_content or candidate_text not in proposed_content:
+            return False
+        current_lines = str(current_content or "").splitlines()
+        proposed_lines = str(proposed_content or "").splitlines()
+        line_hints = _repair_target_line_hints(
+            path="",
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        for hint in line_hints:
+            if not isinstance(hint, int) or hint <= 0:
+                continue
+            index = hint - 1
+            if index >= len(current_lines) or index >= len(proposed_lines):
+                continue
+            if candidate_text in current_lines[index] and candidate_text in proposed_lines[index]:
+                return True
+        return current_content.count(candidate_text) == 1 and proposed_content.count(candidate_text) >= 1
+
+    def _runtime_sample_payload_hardcoding_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+        session: SessionState | None,
+    ) -> ProposedUpdateReview | None:
+        if session is None:
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+            return None
+        supporting_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if not supporting_output_contracts:
+            return None
+        _option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+            limit=4,
+        )
+        if not positional_tokens:
+            return None
+        contract_text = "\n".join(supporting_output_contracts)
+        introduced_payload_literals = [
+            token
+            for token in positional_tokens
+            if token
+            and token not in current_content
+            and token in contract_text
+            and re.search(rf"['\"][^'\"]*{re.escape(token)}[^'\"]*['\"]", proposed_content)
+        ]
+        if not introduced_payload_literals:
+            return None
+        payload_preview = ", ".join(repr(token) for token in introduced_payload_literals[:3])
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        repair_hints = [
+            (
+                f"Propagate the remaining argv payload {payload_preview} through the exercised branch instead of "
+                f"embedding those sample values directly into {path}."
+            )
+        ]
+        repair_hints.extend(
+            self._runtime_target_repair_hints(
+                path,
+                repair_context,
+                evidence_lines=target_evidence,
+            )
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair hardcodes sample runtime payload values instead of propagating the exercised input through the repaired path."
+            ),
+            confidence=0.92,
+            blocking_issues=[
+                (
+                    f"The proposal for {path} introduces sample runtime payload value(s) {payload_preview} directly "
+                    "into source literals, which would bake the observed test input into the implementation."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
+
     def _undefined_runtime_symbol_repair_review(
         self,
         *,
@@ -12243,8 +13274,17 @@ class Planner:
         undefined_symbol = self._undefined_runtime_symbol(repair_context)
         if not undefined_symbol:
             return None
-        current_uses = [line.strip() for line in str(current_content or "").splitlines() if undefined_symbol in line]
-        proposed_uses = [line.strip() for line in str(proposed_content or "").splitlines() if undefined_symbol in line]
+        symbol_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b")
+        current_uses = [
+            line.strip()
+            for line in str(current_content or "").splitlines()
+            if symbol_pattern.search(line)
+        ]
+        proposed_uses = [
+            line.strip()
+            for line in str(proposed_content or "").splitlines()
+            if symbol_pattern.search(line)
+        ]
         if not current_uses and not proposed_uses:
             return None
         if current_uses and not proposed_uses:
@@ -12253,6 +13293,16 @@ class Planner:
             return None
         evidence_lines = self._runtime_target_evidence_lines(path, repair_context)
         evidence_hint = f" near {' | '.join(evidence_lines[:2])}" if evidence_lines else ""
+        similar_candidates = _python_similar_defined_name_candidates(current_content, undefined_symbol)
+        similar_hint = ""
+        reuse_hint = ""
+        if similar_candidates:
+            formatted_candidates = _format_similar_python_name_candidates(similar_candidates)
+            similar_hint = f" Existing same-file definitions with similar names: {formatted_candidates}."
+            reuse_hint = (
+                f"Prefer reusing the closest matching same-file definition when it already fits the missing behavior: "
+                f"{formatted_candidates}."
+            )
         return ProposedUpdateReview(
             safe_to_write=False,
             summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
@@ -12261,10 +13311,12 @@ class Planner:
                 (
                     f"The runtime failure still reports '{undefined_symbol}' as undefined in {path}, "
                     f"but the proposal neither binds/imports '{undefined_symbol}' nor removes its failing usage{evidence_hint}."
+                    f"{similar_hint}"
                 )
             ],
             preservation_risks=[],
             repair_hints=[
+                *([reuse_hint] if reuse_hint else []),
                 f"Either import or otherwise bind '{undefined_symbol}' in {path}, or remove the failing usage from the implicated line.",
                 *self._runtime_target_repair_hints(path, repair_context, evidence_lines=evidence_lines),
             ],
@@ -13212,6 +14264,7 @@ class Planner:
                 session,
                 current_content=current_content,
                 proposed_content=proposed_content,
+                repair_context=repair_context,
             )
         )
         candidates.extend(self._repair_identifiers_from_failure_evidence(repair_context))
@@ -13256,6 +14309,7 @@ class Planner:
         *,
         current_content: str,
         proposed_content: str,
+        repair_context: ValidationFailureEvidence | None = None,
     ) -> list[str]:
         if session is None:
             return []
@@ -13281,8 +14335,73 @@ class Planner:
                     candidate = str(match.group(0) or "").strip()
                     if not candidate or candidate not in content_markers:
                         continue
+                    if candidate.startswith("-") and not self._request_option_identifier_is_relevant(
+                        candidate,
+                        current_content=current_content,
+                        proposed_content=proposed_content,
+                        repair_context=repair_context,
+                    ):
+                        continue
                     identifiers.append(candidate)
         return self._unique_paths(identifiers)[:8]
+
+    def _request_option_identifier_is_relevant(
+        self,
+        identifier: str,
+        *,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None = None,
+    ) -> bool:
+        token = str(identifier or "").strip()
+        if not token:
+            return False
+
+        matching_lines = [
+            line.strip()
+            for line in f"{current_content}\n{proposed_content}".splitlines()
+            if token in line
+        ]
+        if not matching_lines:
+            return False
+
+        if any(not self._looks_like_option_declaration_line(line) for line in matching_lines):
+            return True
+
+        evidence_text = " ".join(
+            str(item or "").strip().lower()
+            for item in (
+                getattr(repair_context, "excerpt", ""),
+                getattr(repair_context, "failure_summary", ""),
+                getattr(repair_context, "summary", ""),
+            )
+            if str(item or "").strip()
+        )
+        return any(
+            marker in evidence_text
+            for marker in (
+                "unrecognized arguments",
+                "unrecognized argument",
+                "unknown option",
+                "no such option",
+                "unexpected option",
+            )
+        )
+
+    def _looks_like_option_declaration_line(self, line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "add_argument(",
+                "add_option(",
+                "addoption(",
+                ".option(",
+                "@click.option",
+            )
+        )
 
     def _target_specific_repair_identifiers(
         self,

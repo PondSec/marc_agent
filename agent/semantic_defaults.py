@@ -394,6 +394,21 @@ def _contains_implementation_noun(normalized: str) -> bool:
     return _contains_term(normalized, tokens, _IMPLEMENTATION_NOUNS)
 
 
+def _contains_create_request_signal(normalized: str, tokens: list[str]) -> bool:
+    for term in _CREATE_SIGNALS:
+        if " " in term:
+            if term in normalized:
+                return True
+            continue
+        if term == "implement":
+            if "implement" in tokens or any(token.startswith("implementier") for token in tokens):
+                return True
+            continue
+        if any(token.startswith(term) for token in tokens):
+            return True
+    return False
+
+
 def infer_requested_extension(*texts: str | None) -> str | None:
     normalized = " ".join(normalize_text(text or "") for text in texts if text)
     for extension, phrases in _EXPLICIT_EXTENSION_PHRASES:
@@ -440,7 +455,7 @@ def is_clear_low_risk_build_request(text: str) -> bool:
     if not normalized:
         return False
     tokens = _text_tokens(normalized)
-    has_create_signal = _contains_term(normalized, tokens, _CREATE_SIGNALS, prefix=True) or _contains_term(
+    has_create_signal = _contains_create_request_signal(normalized, tokens) or _contains_term(
         normalized,
         tokens,
         _NEED_CREATE_SIGNALS,

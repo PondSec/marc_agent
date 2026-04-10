@@ -12,6 +12,7 @@ const {
   buildSessionOverview,
   buildValidationSnapshot,
   createRefreshController,
+  findBlockingRunForSubmission,
   formatSessionElapsed,
   parseUiRoute,
   renderRichText,
@@ -19,6 +20,7 @@ const {
   sessionBadgeText,
   sessionStatusTone,
   shouldStartRefresh,
+  submissionSessionId,
   updateRefreshBackoff,
 } = require("../webui/app.js");
 
@@ -112,6 +114,52 @@ test("buildSessionOverview gibt fertige Threads als sauberen Erfolgszustand aus"
 
   assert.equal(overview.tone, "success");
   assert.match(overview.summary, /getrennt|Validierung/i);
+});
+
+test("submissionSessionId verwendet keine laufende Session fuer neue Auftraege", () => {
+  assert.equal(
+    submissionSessionId({
+      activeSessionId: "session-1",
+      activeSession: makeSession({ id: "session-1", status: "running" }),
+    }),
+    null,
+  );
+
+  assert.equal(
+    submissionSessionId({
+      activeSessionId: "session-1",
+      activeSession: makeSession({ id: "session-1", status: "completed" }),
+    }),
+    "session-1",
+  );
+});
+
+test("findBlockingRunForSubmission erkennt aktive und globale Run-Blocker", () => {
+  const active = makeSession({ id: "active", status: "running" });
+  assert.equal(
+    findBlockingRunForSubmission({
+      activeSession: active,
+      sessions: [],
+    })?.id,
+    "active",
+  );
+
+  const queued = makeSession({ id: "queued", status: "queued" });
+  assert.equal(
+    findBlockingRunForSubmission({
+      activeSession: makeSession({ id: "done", status: "completed" }),
+      sessions: [makeSession({ id: "done", status: "completed" }), queued],
+    })?.id,
+    "queued",
+  );
+
+  assert.equal(
+    findBlockingRunForSubmission({
+      activeSession: makeSession({ id: "done", status: "completed" }),
+      sessions: [makeSession({ id: "done", status: "completed" })],
+    }),
+    null,
+  );
 });
 
 test("formatSessionElapsed formatiert kurze und laengere Laufzeiten stabil", () => {

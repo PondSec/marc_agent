@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 from pathlib import Path
 import re
@@ -770,11 +771,33 @@ def generate_content_retry_prompt(
             )
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
         related_context = _related_file_context(session, path) if session is not None else "none"
+        exact_output_contracts: list[str] = []
+        supporting_runtime_argv_contract: dict[str, list[str]] = {}
+        if session is not None and current_content is not None and review_feedback is not None:
+            exact_output_contracts = _source_backed_runtime_output_contracts(
+                session,
+                target_path=path,
+                repair_context=None,
+                require_truncated_repair_context=False,
+                limit=3,
+            )
+            option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+                session,
+                target_path=path,
+            )
+            if option_tokens or positional_tokens:
+                supporting_runtime_argv_contract = {
+                    "option_tokens": option_tokens,
+                    "positional_tokens": positional_tokens,
+                }
         runtime_hints = _targeted_runtime_prompt_hints(
             path=path,
             current_content=current_content or "",
             supporting_context=related_context,
-            targeted_context={},
+            targeted_context={
+                "supporting_output_contracts": exact_output_contracts,
+                "supporting_runtime_argv_contract": supporting_runtime_argv_contract,
+            },
         )
         sections = [
             "Produce the full file content for exactly one file.",
@@ -792,6 +815,11 @@ def generate_content_retry_prompt(
             sections.append(file_requirement_summary)
         if session is not None:
             sections.append(f"Related file hints: {related_context}")
+            if exact_output_contracts:
+                sections.append(
+                    "Exact supporting output contract:\n"
+                    + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+                )
             if runtime_hints:
                 sections.append(
                     "Targeted runtime hints: "
@@ -841,11 +869,33 @@ def generate_content_retry_prompt(
 
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     related_context = _related_file_context(session, path) if session is not None else "none"
+    exact_output_contracts: list[str] = []
+    supporting_runtime_argv_contract: dict[str, list[str]] = {}
+    if session is not None and current_content is not None and review_feedback is not None:
+        exact_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=None,
+            require_truncated_repair_context=False,
+            limit=3,
+        )
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        if option_tokens or positional_tokens:
+            supporting_runtime_argv_contract = {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            }
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content or "",
         supporting_context=related_context,
-        targeted_context={},
+        targeted_context={
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": supporting_runtime_argv_contract,
+        },
     )
     sections = [
         "Produce the full file content for exactly one file.",
@@ -866,6 +916,11 @@ def generate_content_retry_prompt(
         sections.append(file_requirement_summary)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+        )
     if runtime_hints:
         sections.append(
             "Targeted runtime hints: "
@@ -1140,7 +1195,28 @@ def proposed_update_review_prompt(
             repair_context,
             target_path=path,
         )
+        exact_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if exact_output_contracts:
+            option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+                session,
+                target_path=path,
+            )
+            targeted_repair_context = {
+                **targeted_repair_context,
+                "supporting_output_contracts": exact_output_contracts,
+                "supporting_runtime_argv_contract": {
+                    "option_tokens": option_tokens,
+                    "positional_tokens": positional_tokens,
+                },
+            }
         review_context["active_repair"] = targeted_repair_context
+        if exact_output_contracts:
+            review_context["exact_supporting_output_contract"] = exact_output_contracts[:3]
         semantic_deltas = _repair_semantic_delta_lines(
             repair_context,
             limit=2,
@@ -2136,6 +2212,29 @@ def _compact_repair_update_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        limit=3,
+    )
+    if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+        )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2148,6 +2247,7 @@ def _compact_repair_update_prompt(
         repair_context=repair_context,
         review_feedback=review_feedback,
         supporting_context=related_context,
+        supporting_output_contracts=exact_output_contracts,
     )
     sections.extend(
         [
@@ -2247,6 +2347,25 @@ def _compact_repair_retry_prompt(
         max_files=support_max_files,
     )
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        limit=3,
+    )
+    if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     runtime_hints = _targeted_runtime_prompt_hints(
         path=path,
         current_content=current_content,
@@ -2259,6 +2378,7 @@ def _compact_repair_retry_prompt(
         repair_context=repair_context,
         review_feedback=review_feedback,
         supporting_context=related_context,
+        supporting_output_contracts=exact_output_contracts,
     )
 
     sections = [
@@ -2326,6 +2446,11 @@ def _compact_repair_retry_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+        )
     if repair_brief.get("allowed_files"):
         sections.append(
             "Allowed repair files: "
@@ -2403,6 +2528,25 @@ def _focused_full_repair_update_prompt(
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
+    exact_output_contracts = _source_backed_runtime_output_contracts(
+        session,
+        target_path=path,
+        repair_context=repair_context,
+        limit=3,
+    )
+    if exact_output_contracts:
+        option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+        )
+        targeted_context = {
+            **targeted_context,
+            "supporting_output_contracts": exact_output_contracts,
+            "supporting_runtime_argv_contract": {
+                "option_tokens": option_tokens,
+                "positional_tokens": positional_tokens,
+            },
+        }
     repair_brief = targeted_context.get("repair_brief") or {}
     support_excerpt_limit = 500 if repair_context.verification_scope == "runtime" else 220
     support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
@@ -2425,6 +2569,7 @@ def _focused_full_repair_update_prompt(
         repair_context=repair_context,
         review_feedback=review_feedback,
         supporting_context=related_context,
+        supporting_output_contracts=exact_output_contracts,
     )
     working_memory = _compact_working_memory(session)
     noop_followup = _review_feedback_indicates_noop_repair(review_feedback)
@@ -2575,6 +2720,11 @@ def _focused_full_repair_update_prompt(
             sections.append("Repair focus: " + " ".join(region_parts))
     if related_context != "none":
         sections.append(f"Supporting file hints: {related_context}")
+    if exact_output_contracts:
+        sections.append(
+            "Exact supporting output contract:\n"
+            + "\n".join(f"- {item}" for item in exact_output_contracts[:3])
+        )
     diagnostic_context = _diagnostic_context(session)
     if diagnostic_context and not noop_followup:
         sections.append(f"Diagnostic context: {diagnostic_context}")
@@ -3087,6 +3237,131 @@ def _repair_semantic_values_from_sources(
     return expected_items[:4], observed_items[:4]
 
 
+def _runtime_output_contract_required_literals(
+    contract_lines: Sequence[str],
+    *,
+    limit: int = 8,
+) -> list[str]:
+    values: list[str] = []
+    for raw_line in contract_lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        payload = ""
+        if line.startswith("Emit exact output text:"):
+            payload = line.partition(":")[2]
+        elif line.startswith("Emit exact output lines in order:"):
+            payload = line.partition(":")[2]
+        else:
+            continue
+        for literal_text in re.findall(r"""'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*" """.strip(), payload):
+            try:
+                expected_value = ast.literal_eval(literal_text)
+            except (SyntaxError, ValueError):
+                continue
+            expected_text = str(expected_value or "").strip()
+            if expected_text and expected_text not in values:
+                values.append(expected_text)
+            if len(values) >= limit:
+                return values[:limit]
+    return values[:limit]
+
+
+def _runtime_output_contract_expected_values(contract_lines: Sequence[str]) -> list[str]:
+    values = _runtime_output_contract_required_literals(contract_lines, limit=8)
+    return values[:4]
+
+
+def _content_string_literal_candidates(
+    current_content: str,
+    *,
+    limit: int = 80,
+) -> list[str]:
+    content = str(current_content or "")
+    if not content:
+        return []
+
+    literals: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"""(?P<literal>'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")""", content):
+        token = str(match.group("literal") or "").strip()
+        if not token:
+            continue
+        try:
+            value = ast.literal_eval(token)
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(value, str):
+            continue
+        normalized = " ".join(str(value or "").split())
+        if not normalized or len(normalized) > 160 or normalized in seen:
+            continue
+        seen.add(normalized)
+        literals.append(normalized)
+        if len(literals) >= limit:
+            break
+    return literals
+
+
+def _output_contract_fragment_candidates(
+    required_literal: str,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    normalized = " ".join(str(required_literal or "").split())
+    if not normalized:
+        return []
+    fragments: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        cleaned = re.sub(r"^[*-]\s*", "", " ".join(str(candidate or "").split())).strip()
+        if len(cleaned) < 4 or cleaned in seen:
+            return
+        seen.add(cleaned)
+        fragments.append(cleaned)
+
+    _add(normalized)
+    _add(re.sub(r"^[*-]\s*", "", normalized))
+    for part in re.split(r"[\[\]\(\)\|,:]", normalized):
+        _add(part)
+        if len(fragments) >= limit:
+            break
+    return fragments[:limit]
+
+
+def _best_contract_fragment_near_match(
+    required_literal: str,
+    current_content: str,
+) -> tuple[str, str] | None:
+    candidates = _content_string_literal_candidates(current_content)
+    if not candidates:
+        return None
+
+    contract_fragments = _output_contract_fragment_candidates(required_literal)
+    exact_fragment_set = {fragment.lower() for fragment in contract_fragments}
+    best_match: tuple[str, str] | None = None
+    best_score = 0.0
+    for fragment in contract_fragments:
+        normalized_fragment = fragment.lower()
+        for candidate in candidates:
+            normalized_candidate = candidate.lower()
+            if not normalized_candidate or normalized_candidate == normalized_fragment:
+                continue
+            if normalized_candidate in exact_fragment_set:
+                continue
+            score = difflib.SequenceMatcher(None, normalized_candidate, normalized_fragment).ratio()
+            if normalized_fragment in normalized_candidate or normalized_candidate in normalized_fragment:
+                score += 0.08
+            if len(set(normalized_fragment.split()) & set(normalized_candidate.split())) >= 2:
+                score += 0.08
+            if score < 0.78 or score <= best_score:
+                continue
+            best_score = score
+            best_match = (candidate, fragment)
+    return best_match
+
+
 def _repair_semantic_values_from_texts(
     texts: Sequence[str],
 ) -> tuple[list[str], list[str]]:
@@ -3453,10 +3728,295 @@ def _direct_main_runtime_contract(
             if token not in last_option_tail:
                 last_option_tail.append(token)
         if last_option_tail:
-            positional_tokens = last_option_tail[:limit]
+            for token in last_option_tail:
+                if token in positional_tokens:
+                    continue
+                positional_tokens.append(token)
+                if len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
             if len(positional_tokens) >= limit:
                 return option_tokens[:limit], positional_tokens[:limit]
     return option_tokens[:limit], positional_tokens[:limit]
+
+
+def _exercised_runtime_argv_contract(
+    supporting_context: str,
+    *,
+    limit: int = 6,
+) -> tuple[list[str], list[str]]:
+    direct_option_tokens, direct_positional_tokens = _direct_main_runtime_contract(
+        supporting_context,
+        limit=limit,
+    )
+    if direct_option_tokens or direct_positional_tokens:
+        return direct_option_tokens, direct_positional_tokens
+
+    text = str(supporting_context or "")
+    option_tokens: list[str] = []
+    positional_tokens: list[str] = []
+    for match in re.finditer(r"(?:[A-Za-z_][A-Za-z0-9_\.]*)\(\s*(\[[^\]]*\])\s*\)", text):
+        raw_argv = str(match.group(1) or "").strip()
+        if not raw_argv:
+            continue
+        try:
+            values = ast.literal_eval(raw_argv)
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(values, (list, tuple)):
+            continue
+
+        saw_option = False
+        last_option_tail: list[str] = []
+        for value in values:
+            token = str(value or "").strip()
+            if not token:
+                continue
+            if token.startswith("-"):
+                saw_option = True
+                last_option_tail = []
+                if token not in option_tokens:
+                    option_tokens.append(token)
+                    if len(option_tokens) >= limit and positional_tokens:
+                        return option_tokens[:limit], positional_tokens[:limit]
+                continue
+            if not saw_option:
+                continue
+            if token not in last_option_tail:
+                last_option_tail.append(token)
+        if last_option_tail:
+            for token in last_option_tail:
+                if token in positional_tokens:
+                    continue
+                positional_tokens.append(token)
+                if len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
+            if len(positional_tokens) >= limit:
+                return option_tokens[:limit], positional_tokens[:limit]
+    return option_tokens[:limit], positional_tokens[:limit]
+
+
+def _runtime_value_tokens(positional_tokens: Sequence[str]) -> list[str]:
+    runtime_value_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for raw in positional_tokens:
+        token = str(raw or "").strip().strip("'\"")
+        normalized = token.lower()
+        if len(normalized) < 2 or normalized in seen_tokens:
+            continue
+        seen_tokens.add(normalized)
+        runtime_value_tokens.append(token)
+    return runtime_value_tokens
+
+
+def _runtime_value_tokens_relevant_to_semantics(
+    *,
+    expected_values: Sequence[str],
+    observed_values: Sequence[str],
+    positional_tokens: Sequence[str],
+    current_content: str = "",
+) -> list[str]:
+    runtime_value_tokens = _runtime_value_tokens(positional_tokens)
+    if not runtime_value_tokens or not expected_values:
+        return runtime_value_tokens
+
+    lowered_current = str(current_content or "").lower()
+    expected_texts = [_repair_semantic_value_text(item).lower() for item in expected_values if _repair_semantic_value_text(item)]
+    observed_texts = [_repair_semantic_value_text(item).lower() for item in observed_values if _repair_semantic_value_text(item)]
+    relevant_tokens: list[str] = []
+    for token in runtime_value_tokens:
+        normalized = token.lower()
+        if not any(normalized in expected for expected in expected_texts):
+            continue
+        missing_from_observed = bool(observed_texts) and any(normalized not in observed for observed in observed_texts)
+        missing_from_current = normalized not in lowered_current
+        if missing_from_observed or missing_from_current:
+            relevant_tokens.append(token)
+    return relevant_tokens or runtime_value_tokens
+
+
+def _assignment_target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name) and str(target.id or "").strip():
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [
+            element.id
+            for element in target.elts
+            if isinstance(element, ast.Name) and str(element.id or "").strip()
+        ]
+    return []
+
+
+def _python_cli_parse_arg_bindings(function_node: ast.AST) -> set[str]:
+    bindings: set[str] = set()
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        if not isinstance(func, ast.Attribute) or func.attr not in {"parse_args", "parse_known_args"}:
+            continue
+        for target in node.targets:
+            bindings.update(_assignment_target_names(target))
+    return {binding for binding in bindings if binding}
+
+
+def _python_parse_arg_attrs(node: ast.AST, parse_arg_bindings: set[str]) -> set[str]:
+    attrs: set[str] = set()
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Name)
+            and child.value.id in parse_arg_bindings
+            and str(child.attr or "").strip()
+        ):
+            attrs.add(child.attr)
+    return attrs
+
+
+def _python_call_name(func: ast.AST) -> str:
+    if isinstance(func, ast.Name):
+        return str(func.id or "").strip()
+    if isinstance(func, ast.Attribute) and str(func.attr or "").strip():
+        return str(func.attr or "").strip()
+    return "helper"
+
+
+def _python_call_argument_names(node: ast.Call) -> set[str]:
+    names: set[str] = set()
+    for candidate in [*node.args, *(keyword.value for keyword in node.keywords if keyword.value is not None)]:
+        if isinstance(candidate, ast.Name) and str(candidate.id or "").strip():
+            names.add(candidate.id)
+    return names
+
+
+def _python_cli_runtime_value_threading_hint(
+    *,
+    current_content: str,
+    runtime_value_tokens: Sequence[str],
+) -> str | None:
+    if not runtime_value_tokens:
+        return None
+    try:
+        module = ast.parse(str(current_content or ""))
+    except SyntaxError:
+        return None
+
+    for function_node in module.body:
+        if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        parse_arg_bindings = _python_cli_parse_arg_bindings(function_node)
+        if not parse_arg_bindings:
+            continue
+
+        threaded_values: dict[str, dict[str, object]] = {}
+        assignments = [
+            node
+            for node in ast.walk(function_node)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+        ]
+        assignments.sort(key=lambda node: getattr(node, "lineno", 0))
+        for assignment in assignments:
+            target_name = str(assignment.targets[0].id or "").strip()
+            if not target_name:
+                continue
+            source_attrs = sorted(_python_parse_arg_attrs(assignment.value, parse_arg_bindings))
+            if not source_attrs:
+                continue
+            source_call = ast.get_source_segment(current_content, assignment.value) or (
+                f"{_python_call_name(assignment.value.func)}(...)"
+            )
+            threaded_values[target_name] = {
+                "attrs": source_attrs,
+                "producer_call": source_call,
+                "producer_line": getattr(assignment, "lineno", 0),
+            }
+
+        if not threaded_values:
+            continue
+
+        calls = [node for node in ast.walk(function_node) if isinstance(node, ast.Call)]
+        calls.sort(key=lambda node: getattr(node, "lineno", 0))
+        for call in calls:
+            if _python_parse_arg_attrs(call, parse_arg_bindings):
+                continue
+            call_arg_names = _python_call_argument_names(call)
+            if not call_arg_names:
+                continue
+            for value_name in sorted(call_arg_names):
+                threaded_value = threaded_values.get(value_name)
+                if threaded_value is None:
+                    continue
+                producer_line = int(threaded_value.get("producer_line") or 0)
+                if getattr(call, "lineno", 0) <= producer_line:
+                    continue
+                attrs = [
+                    str(attr or "").strip()
+                    for attr in threaded_value.get("attrs", [])
+                    if str(attr or "").strip()
+                ]
+                if not attrs:
+                    continue
+                attr_preview = ", ".join(f"args.{attr}" for attr in attrs[:2])
+                producer_call = str(threaded_value.get("producer_call") or "").strip()
+                consumer_call = ast.get_source_segment(current_content, call) or (
+                    f"{_python_call_name(call.func)}({value_name})"
+                )
+                return (
+                    f"The exercised branch already computes {value_name} from parsed CLI value(s) like "
+                    f"{attr_preview} in {producer_call}, but the later {consumer_call} call does not "
+                    "receive those parsed values. If the output contract depends on that runtime input, "
+                    "thread the existing parsed value through the downstream helper or compose the output "
+                    "at the caller instead of hardcoding a sample payload."
+                )
+    return None
+
+
+def _direct_main_runtime_value_propagation_hint(
+    *,
+    expected_values: Sequence[str],
+    observed_values: Sequence[str],
+    positional_tokens: Sequence[str],
+    current_content: str = "",
+) -> str | None:
+    runtime_value_tokens = _runtime_value_tokens_relevant_to_semantics(
+        expected_values=expected_values,
+        observed_values=observed_values,
+        positional_tokens=positional_tokens,
+        current_content=current_content,
+    )
+    if not runtime_value_tokens:
+        return None
+
+    for expected_value, observed_value in zip(expected_values, observed_values):
+        expected_text = _repair_semantic_value_text(expected_value)
+        observed_text = _repair_semantic_value_text(observed_value)
+        if not expected_text or not observed_text or expected_text == observed_text:
+            continue
+        expected_lower = expected_text.lower()
+        observed_lower = observed_text.lower()
+        dropped_tokens = [
+            token
+            for token in runtime_value_tokens
+            if token.lower() in expected_lower and token.lower() not in observed_lower
+        ]
+        if not dropped_tokens:
+            continue
+        preview = ", ".join(repr(token) for token in dropped_tokens[:3])
+        return (
+            f"The expected runtime output includes exercised argv payload values like {preview} that the observed output drops. "
+            "Propagate the existing runtime value through the exercised branch instead of keeping a generic placeholder message or hardcoding the whole sample output."
+        )
+    if expected_values:
+        preview = ", ".join(repr(token) for token in runtime_value_tokens[:3])
+        return (
+            f"The exact runtime contract includes exercised argv payload values like {preview} that the current implementation still does not surface. "
+            "Propagate the existing runtime value through the exercised branch instead of keeping a generic placeholder message or hardcoding the whole sample output."
+        )
+    return None
 
 
 def _direct_main_option_contract_present(supporting_context: str) -> bool:
@@ -3642,6 +4202,7 @@ def _repair_required_literal_anchors(
     path: str,
     current_content: str,
     repair_context: ValidationFailureEvidence,
+    supporting_output_contracts: Sequence[str] | None = None,
     limit: int = 3,
 ) -> list[str]:
     focus_text = "\n".join(
@@ -3687,8 +4248,6 @@ def _repair_required_literal_anchors(
         if line and references_target and line not in requirement_lines:
             requirement_lines.append(line)
     requirements = _literal_validation_requirements(requirement_lines)
-    if not requirements:
-        return []
 
     anchors: list[str] = []
     seen: set[tuple[str, int]] = set()
@@ -3719,6 +4278,30 @@ def _repair_required_literal_anchors(
         else:
             anchors.append(
                 f"Ensure the exact required literal {literal!r} appears verbatim in {path}."
+            )
+        if len(anchors) >= limit:
+            break
+    if len(anchors) >= limit:
+        return anchors[:limit]
+
+    for required_literal in _runtime_output_contract_required_literals(
+        supporting_output_contracts or [],
+        limit=max(limit * 2, 6),
+    ):
+        if current_content.count(required_literal) > 0:
+            continue
+        near_match = _literal_near_match_in_content(required_literal, current_content)
+        if near_match and near_match != required_literal:
+            anchors.append(
+                f"Replace near-match literal {near_match!r} with the exact required literal {required_literal!r} in {path}."
+            )
+        else:
+            fragment_match = _best_contract_fragment_near_match(required_literal, current_content)
+            if fragment_match is None:
+                continue
+            candidate, fragment = fragment_match
+            anchors.append(
+                f"Replace near-match source literal {candidate!r} with the exact contract fragment {fragment!r} in {path} so the exercised output can satisfy the supporting contract {required_literal!r}."
             )
         if len(anchors) >= limit:
             break
@@ -3789,6 +4372,7 @@ def _mandatory_mutation_anchors(
     repair_context: ValidationFailureEvidence,
     review_feedback: ProposedUpdateReview | None,
     supporting_context: str = "",
+    supporting_output_contracts: Sequence[str] | None = None,
 ) -> list[str]:
     anchors: list[str] = []
     direct_script_anchor = _direct_python_script_execution_anchor(
@@ -3858,6 +4442,7 @@ def _mandatory_mutation_anchors(
         path=path,
         current_content=current_content,
         repair_context=repair_context,
+        supporting_output_contracts=supporting_output_contracts,
     ):
         anchors.append(literal_anchor)
 
@@ -4137,6 +4722,103 @@ def _python_line_binds_name(line: str, name: str) -> bool:
     return False
 
 
+def _python_similar_defined_name_candidates(
+    content: str,
+    name: str,
+    *,
+    limit: int = 3,
+) -> list[tuple[str, str, int | None]]:
+    target = str(name or "").strip()
+    if not target:
+        return []
+    try:
+        module = ast.parse(str(content or ""))
+    except SyntaxError:
+        return []
+
+    normalized_target = target.lower()
+    seen: dict[str, tuple[str, int | None, float]] = {}
+
+    def _register(candidate: str, kind: str, lineno: int | None) -> None:
+        cleaned = str(candidate or "").strip()
+        if not cleaned:
+            return
+        normalized_candidate = cleaned.lower()
+        if normalized_candidate == normalized_target:
+            return
+        ratio = difflib.SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_candidate.startswith(normalized_target):
+            ratio += 0.35
+        elif normalized_target.startswith(normalized_candidate):
+            ratio += 0.1
+        if normalized_target in normalized_candidate:
+            ratio += 0.1
+        if normalized_candidate.replace("_", "") == normalized_target.replace("_", ""):
+            ratio += 0.15
+        if ratio < 0.72:
+            return
+        if kind == "function":
+            ratio += 0.08
+        elif kind == "import":
+            ratio += 0.04
+        existing = seen.get(cleaned)
+        if existing is None or ratio > existing[2]:
+            seen[cleaned] = (kind, lineno, ratio)
+
+    def _register_target(node: ast.AST | None, kind: str, lineno: int | None) -> None:
+        if node is None:
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            _register(node.id, kind, lineno)
+            return
+        if isinstance(node, (ast.Tuple, ast.List)):
+            for item in node.elts:
+                _register_target(item, kind, lineno)
+            return
+        if isinstance(node, ast.Starred):
+            _register_target(node.value, kind, lineno)
+
+    for node in ast.walk(module):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _register(node.name, "function", getattr(node, "lineno", None))
+        elif isinstance(node, ast.ClassDef):
+            _register(node.name, "class", getattr(node, "lineno", None))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                alias_name = alias.asname or alias.name.split(".", 1)[0]
+                _register(alias_name, "import", getattr(node, "lineno", None))
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                alias_name = alias.asname or alias.name
+                _register(alias_name, "import", getattr(node, "lineno", None))
+        elif isinstance(node, ast.Assign):
+            for target_node in node.targets:
+                _register_target(target_node, "variable", getattr(node, "lineno", None))
+        elif isinstance(node, ast.AnnAssign):
+            _register_target(node.target, "variable", getattr(node, "lineno", None))
+        elif isinstance(node, ast.AugAssign):
+            _register_target(node.target, "variable", getattr(node, "lineno", None))
+
+    ranked = sorted(
+        (
+            (candidate, kind, lineno, score)
+            for candidate, (kind, lineno, score) in seen.items()
+        ),
+        key=lambda item: (-item[3], item[2] is None, item[2] or 0, item[0]),
+    )
+    return [(candidate, kind, lineno) for candidate, kind, lineno, _score in ranked[:limit]]
+
+
+def _format_similar_python_name_candidates(candidates: list[tuple[str, str, int | None]]) -> str:
+    formatted: list[str] = []
+    for candidate, kind, lineno in candidates:
+        details = kind
+        if lineno is not None:
+            details += f", line {lineno}"
+        formatted.append(f"{candidate} ({details})")
+    return ", ".join(formatted)
+
+
 def _undefined_runtime_symbol_anchor(
     *,
     path: str,
@@ -4161,13 +4843,23 @@ def _undefined_runtime_symbol_anchor(
         implicated_lines.append(f"{index}: {line}")
         if len(implicated_lines) >= 2:
             break
+    similar_candidates = _python_similar_defined_name_candidates(current_content, symbol_name)
+    similar_hint = ""
+    if similar_candidates:
+        formatted = _format_similar_python_name_candidates(similar_candidates)
+        similar_hint = (
+            f"\nExisting same-file definitions with similar names: {formatted}. "
+            "Reuse one if it already matches the failing intent instead of inventing a new symbol."
+        )
     if implicated_lines:
         return (
             f"Resolve the undefined symbol '{symbol_name}' in {path}; either import/bind it before use or remove the failing use from these current lines:\n"
             + "\n".join(implicated_lines)
+            + similar_hint
         )
     return (
         f"Resolve the undefined symbol '{symbol_name}' in {path}; either import/bind it before its current use or remove that failing use if it is unnecessary."
+        + similar_hint
     )
 
 
@@ -4409,6 +5101,22 @@ def _targeted_runtime_prompt_hints(
     lowered_current = str(current_content or "").lower()
     lowered_support = str(supporting_context or "").lower()
     repair_brief = targeted_context.get("repair_brief") or {}
+    supporting_output_contracts = [
+        str(item or "").strip()
+        for item in targeted_context.get("supporting_output_contracts", [])
+        if str(item or "").strip()
+    ]
+    supporting_runtime_contract = targeted_context.get("supporting_runtime_argv_contract") or {}
+    source_backed_option_tokens = [
+        str(item or "").strip()
+        for item in supporting_runtime_contract.get("option_tokens", [])
+        if str(item or "").strip()
+    ]
+    source_backed_positional_tokens = [
+        str(item or "").strip()
+        for item in supporting_runtime_contract.get("positional_tokens", [])
+        if str(item or "").strip()
+    ]
     expected_semantics, observed_semantics = _repair_semantic_values_from_sources(
         repair_brief=repair_brief,
         evidence_texts=[
@@ -4416,6 +5124,8 @@ def _targeted_runtime_prompt_hints(
             str(targeted_context.get("failure_summary") or "").strip(),
         ],
     )
+    if not expected_semantics and supporting_output_contracts:
+        expected_semantics = _runtime_output_contract_expected_values(supporting_output_contracts)
     has_semantic_contract = bool(expected_semantics or observed_semantics)
     focus_text = "\n".join(
         str(item or "")
@@ -4554,17 +5264,45 @@ def _targeted_runtime_prompt_hints(
         hints.append(
             "The test calls main([...]) directly. Treat the provided list as argv itself; do not skip its first item as though it were a launcher or program name."
         )
-    option_tokens, positional_tokens = _direct_main_runtime_contract(supporting_context)
+    direct_main_option_tokens, direct_main_positional_tokens = _direct_main_runtime_contract(supporting_context)
+    exercised_option_tokens, exercised_positional_tokens = _exercised_runtime_argv_contract(supporting_context)
+    option_tokens = direct_main_option_tokens or exercised_option_tokens or source_backed_option_tokens
+    positional_tokens = direct_main_positional_tokens or exercised_positional_tokens
+    for token in source_backed_positional_tokens:
+        normalized = str(token or "").strip()
+        if not normalized or normalized in positional_tokens:
+            continue
+        positional_tokens.append(normalized)
+    hint_positional_tokens = _runtime_value_tokens_relevant_to_semantics(
+        expected_values=expected_semantics,
+        observed_values=observed_semantics,
+        positional_tokens=positional_tokens,
+        current_content=current_content,
+    )
     if option_tokens:
         option_preview = ", ".join(option_tokens[:3])
         hints.append(
-            f"The failing main([...]) call exercises exact option tokens like {option_preview}. Recognize those tokens verbatim; do not drop leading hyphens or rewrite them into lookalike spellings."
+            (
+                f"The failing main([...]) call exercises exact option tokens like {option_preview}. "
+                "Recognize those tokens verbatim; do not drop leading hyphens or rewrite them into lookalike spellings."
+                if direct_main_option_tokens
+                else (
+                    f"The failing runtime example exercises exact option tokens like {option_preview}. "
+                    "Recognize those tokens verbatim and preserve their effect through the exercised branch."
+                )
+            )
         )
-        if positional_tokens:
-            positional_preview = ", ".join(repr(token) for token in positional_tokens[:3])
+        if hint_positional_tokens:
+            positional_preview = ", ".join(repr(token) for token in hint_positional_tokens[:3])
             hints.append(
                 f"After handling those options, derive the behavior from the remaining argv payload {positional_preview} instead of hardcoding the sample argv values into the source."
             )
+            threading_hint = _python_cli_runtime_value_threading_hint(
+                current_content=current_content,
+                runtime_value_tokens=hint_positional_tokens,
+            )
+            if threading_hint:
+                hints.append(threading_hint)
     if has_semantic_contract:
         if option_tokens:
             hints.append(
@@ -4580,6 +5318,14 @@ def _targeted_runtime_prompt_hints(
         )
         if separator_hint:
             hints.append(separator_hint)
+    propagation_hint = _direct_main_runtime_value_propagation_hint(
+        expected_values=expected_semantics,
+        observed_values=observed_semantics,
+        positional_tokens=hint_positional_tokens,
+        current_content=current_content,
+    )
+    if propagation_hint:
+        hints.append(propagation_hint)
     if not has_argparse_runtime:
         return hints[:6]
     patched_runtime_argv = "__main__.sys.argv" in lowered_support or "__main__.sys.argv" in lowered_failure
@@ -5209,6 +5955,296 @@ def _python_test_call_contract(
     if isinstance(parent, ast.Assert):
         return f"preserve compatibility with {rendered_call}"
     return ""
+
+
+def _repair_context_has_truncated_semantic_markers(
+    repair_context: ValidationFailureEvidence | None,
+) -> bool:
+    if repair_context is None:
+        return False
+    texts: list[str] = [
+        str(repair_context.excerpt or "").strip(),
+        str(repair_context.failure_summary or "").strip(),
+        str(repair_context.summary or "").strip(),
+    ]
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        texts.extend(str(item or "").strip() for item in getattr(brief, "expected_semantics", []) or [])
+        texts.extend(str(item or "").strip() for item in getattr(brief, "observed_semantics", []) or [])
+    return any("..." in text or "…" in text for text in texts if text)
+
+
+def _runtime_output_contract_focus_tokens(
+    repair_context: ValidationFailureEvidence | None,
+) -> set[str]:
+    if repair_context is None:
+        return set()
+    stopwords = {
+        "actual",
+        "assert",
+        "assertion",
+        "behavior",
+        "command",
+        "current",
+        "currently",
+        "expected",
+        "failed",
+        "failure",
+        "output",
+        "produce",
+        "runtime",
+        "scope",
+        "should",
+        "still",
+        "summary",
+        "test",
+        "tests",
+        "validation",
+    }
+    texts: list[str] = [
+        str(repair_context.excerpt or "").strip(),
+        str(repair_context.failure_summary or "").strip(),
+        str(repair_context.summary or "").strip(),
+    ]
+    brief = getattr(repair_context, "repair_brief", None)
+    if brief is not None:
+        texts.extend(str(item or "").strip() for item in getattr(brief, "expected_semantics", []) or [])
+        texts.extend(str(item or "").strip() for item in getattr(brief, "observed_semantics", []) or [])
+    tokens: set[str] = set()
+    for text in texts:
+        for token in re.findall(r"[A-Za-z0-9_]+", text):
+            normalized = token.strip().lower()
+            if len(normalized) < 4 or normalized in stopwords:
+                continue
+            tokens.add(normalized)
+    return tokens
+
+
+def _python_test_imports_reference_target(
+    session: SessionState,
+    *,
+    snapshot: WorkspaceSnapshot,
+    test_path: str,
+    target_path: str,
+    test_text: str,
+) -> bool:
+    try:
+        tree = ast.parse(test_text)
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        provider_candidates = _resolve_import_from_provider_paths(
+            test_path,
+            module=str(node.module or "").strip(),
+            level=int(getattr(node, "level", 0) or 0),
+            snapshot=snapshot,
+        )
+        if any(
+            _python_provider_references_target(
+                session,
+                snapshot=snapshot,
+                provider_path=provider_path,
+                target_path=target_path,
+            )
+            for provider_path in provider_candidates
+        ):
+            return True
+    return False
+
+
+def _python_string_output_contract_literal(node: ast.AST) -> str | list[str] | None:
+    try:
+        value = ast.literal_eval(node)
+    except (SyntaxError, ValueError):
+        return None
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, (list, tuple)) and value and all(isinstance(item, str) and str(item).strip() for item in value):
+        return [str(item) for item in value]
+    return None
+
+
+def _python_output_contract_left_kind(
+    node: ast.AST,
+    *,
+    splitline_names: set[str],
+) -> str | None:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "splitlines":
+        return "output_lines"
+    if isinstance(node, ast.Name):
+        name = str(node.id or "").strip().lower()
+        if node.id in splitline_names or name in {"lines", "output_lines"}:
+            return "output_lines"
+        if name in {"output", "result", "message", "text"}:
+            return "output_text"
+    rendered = _python_render_expression(node).lower()
+    if ".splitlines(" in rendered:
+        return "output_lines"
+    return None
+
+
+def _render_python_output_contract(
+    *,
+    left: ast.AST,
+    expected: str | list[str],
+    splitline_names: set[str],
+) -> str | None:
+    kind = _python_output_contract_left_kind(left, splitline_names=splitline_names)
+    if kind == "output_lines" and isinstance(expected, list):
+        preview = " | ".join(repr(item) for item in expected[:4])
+        return f"Emit exact output lines in order: {preview}."
+    if kind == "output_text" and isinstance(expected, str):
+        return f"Emit exact output text: {expected!r}."
+    return None
+
+
+def _python_test_output_contract_lines(
+    test_text: str,
+    *,
+    focus_tokens: set[str],
+    limit: int,
+) -> list[str]:
+    try:
+        tree = ast.parse(test_text)
+    except SyntaxError:
+        return []
+
+    scored_contracts: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    order = 0
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        splitline_names: set[str] = set()
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if (
+                isinstance(target, ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "splitlines"
+            ):
+                splitline_names.add(target.id)
+
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assert):
+                continue
+            test = node.test
+            if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+                continue
+            if not isinstance(test.ops[0], ast.Eq):
+                continue
+            expected = _python_string_output_contract_literal(test.comparators[0])
+            if expected is None:
+                continue
+            contract = _render_python_output_contract(
+                left=test.left,
+                expected=expected,
+                splitline_names=splitline_names,
+            )
+            if not contract or contract in seen:
+                continue
+            normalized = contract.lower()
+            score = sum(1 for token in focus_tokens if token in normalized)
+            if focus_tokens and score <= 0:
+                continue
+            seen.add(contract)
+            scored_contracts.append((score, order, contract))
+            order += 1
+
+    return [contract for _, _, contract in sorted(scored_contracts, key=lambda item: (-item[0], item[1]))[:limit]]
+
+
+def _source_backed_runtime_output_contracts(
+    session: SessionState | None,
+    *,
+    target_path: str,
+    repair_context: ValidationFailureEvidence | None,
+    require_truncated_repair_context: bool = True,
+    limit: int = 2,
+) -> list[str]:
+    if session is None:
+        return []
+    if repair_context is not None and repair_context.verification_scope != "runtime":
+        return []
+    if require_truncated_repair_context and repair_context is None:
+        return []
+    snapshot = session.workspace_snapshot
+    if snapshot is None:
+        return []
+
+    focus_tokens = _runtime_output_contract_focus_tokens(repair_context)
+    contracts: list[str] = []
+    for test_path in _candidate_test_contract_paths(session):
+        test_text = _workspace_file_excerpt(session, test_path)
+        if not test_text:
+            continue
+        if not _python_test_imports_reference_target(
+            session,
+            snapshot=snapshot,
+            test_path=test_path,
+            target_path=target_path,
+            test_text=test_text,
+        ):
+            continue
+        for contract in _python_test_output_contract_lines(
+            test_text,
+            focus_tokens=focus_tokens,
+            limit=limit,
+        ):
+            if contract not in contracts:
+                contracts.append(contract)
+            if len(contracts) >= limit:
+                return contracts
+    return contracts[:limit]
+
+
+def _source_backed_runtime_argv_contract(
+    session: SessionState | None,
+    *,
+    target_path: str,
+    limit: int = 6,
+) -> tuple[list[str], list[str]]:
+    if session is None:
+        return [], []
+    snapshot = session.workspace_snapshot
+    if snapshot is None:
+        return [], []
+
+    option_tokens: list[str] = []
+    positional_tokens: list[str] = []
+    for test_path in _candidate_test_contract_paths(session):
+        test_text = _workspace_file_excerpt(session, test_path)
+        if not test_text:
+            continue
+        if not _python_test_imports_reference_target(
+            session,
+            snapshot=snapshot,
+            test_path=test_path,
+            target_path=target_path,
+            test_text=test_text,
+        ):
+            continue
+        file_option_tokens, file_positional_tokens = _exercised_runtime_argv_contract(
+            test_text,
+            limit=limit,
+        )
+        for token in file_option_tokens:
+            if token not in option_tokens:
+                option_tokens.append(token)
+                if len(option_tokens) >= limit and len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
+        for token in file_positional_tokens:
+            if token not in positional_tokens:
+                positional_tokens.append(token)
+                if len(option_tokens) >= limit and len(positional_tokens) >= limit:
+                    return option_tokens[:limit], positional_tokens[:limit]
+    return option_tokens[:limit], positional_tokens[:limit]
 
 
 def _python_render_expression(node: ast.AST | None) -> str:

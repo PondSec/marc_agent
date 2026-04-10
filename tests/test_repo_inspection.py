@@ -92,6 +92,31 @@ def test_repo_snapshot_detects_unittest_command_from_python_test_files_without_m
     assert any(item.command == "python -m unittest" for item in snapshot.validation_commands)
 
 
+def test_repo_snapshot_detects_pytest_command_from_pytest_style_test_files_without_manifest(tmp_path):
+    (tmp_path / "checkout_app").mkdir()
+    (tmp_path / "checkout_app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "checkout_app" / "totals.py").write_text(
+        "def build_checkout_summary(order):\n"
+        "    return {'item_count': len(order.get(\"items\", []))}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_totals.py").write_text(
+        "from checkout_app.totals import build_checkout_summary\n\n"
+        "def test_empty_order_has_zero_items():\n"
+        "    assert build_checkout_summary({'items': []})['item_count'] == 0\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    memory = RepoMemoryStore(config, WorkspaceManager(tmp_path))
+
+    snapshot = memory.build_snapshot("checkout crash tests")
+
+    assert any(item.command == "python -m pytest" for item in snapshot.validation_commands)
+
+
 def test_repo_snapshot_infers_entrypoint_from_main_symbol_when_name_is_not_builtin(tmp_path):
     (tmp_path / "normalize_cli.py").write_text(
         "def main(argv=None):\n"

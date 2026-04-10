@@ -538,6 +538,7 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
                 request.prompt,
                 session_id=request.session_id,
                 workspace_id=request.workspace_id,
+                enqueue_if_busy=request.enqueue_if_busy,
                 overrides=request.model_dump(
                     include={
                         "access_mode",

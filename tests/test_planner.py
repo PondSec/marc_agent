@@ -45,6 +45,7 @@ from agent.prompts import (
 )
 from agent.task_schema import TaskArtifact
 from agent.task_state import TaskState
+from agent.verification import ValidationPlanner
 from agent.memory import RepoMemoryStore
 from agent.decision import ExecutionDecisionPolicy
 from config.settings import AppConfig
@@ -1351,7 +1352,7 @@ def test_planner_uses_local_review_fallback_for_compact_single_model_repairs(tmp
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
-def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_available(tmp_path):
+def test_planner_prefers_primary_model_backed_review_for_repairs_when_available(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
             {
@@ -1432,11 +1433,11 @@ def test_planner_prefers_lightweight_model_backed_review_for_repairs_when_availa
 
     assert review.safe_to_write is True
     assert len(llm.generate_json_calls) == 1
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is False
     assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 90
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
-    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
@@ -1539,12 +1540,11 @@ def test_planner_repair_review_escalates_to_primary_after_lightweight_timeout(tm
 
     assert review.safe_to_write is True
     assert len(llm.generate_json_calls) == 2
-    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:14b"
-    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
-    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
-    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 210
-    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:14b"
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 90
+    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
     assert session.runtime_executions[-1]["task_class"] == "proposed_update_review"
 
 
@@ -3702,7 +3702,7 @@ def test_planner_uses_compact_primary_generation_for_small_existing_updates_with
 
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert kwargs["model"] is None
-    assert kwargs["strict_timeouts"] is True
+    assert kwargs["strict_timeouts"] is False
     assert kwargs["num_ctx"] == 2048
     assert "Latest user request:" in prompt
     assert '"current_write_requirements"' in prompt
@@ -7363,6 +7363,96 @@ def test_fallback_semantic_change_review_requires_root_cause_productive_change_a
     assert "Productive code change for the latest repair" in review.missing_requirements
     assert "Independent verification after the latest repair" in review.missing_requirements
     assert any("same failure signature" in issue.lower() for issue in review.suspicious_issues)
+
+
+def test_fallback_semantic_change_review_ignores_validation_targets_for_passed_validation_requests(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Validate checkout_app/totals.py against tests/test_totals.py. "
+            "Keep the implementation unchanged unless a real defect appears, "
+            "run python -m pytest tests/test_totals.py, and report the confirmed result."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=2,
+            language_counts={"python": 2},
+            top_directories=["checkout_app", "tests"],
+            important_files=["checkout_app/totals.py", "tests/test_totals.py"],
+            focus_files=["checkout_app/totals.py", "tests/test_totals.py"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=["tests/test_totals.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[
+                ValidationCommand(
+                    command="python -m pytest tests/test_totals.py",
+                    kind="test",
+                    verification_scope="runtime",
+                )
+            ],
+            workflow_commands=[],
+            repo_summary="Small Python checkout workspace.",
+        ),
+        validation_status="passed",
+        changed_files=[FileChangeRecord(path="checkout_app/totals.py", operation="modify")],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="debug",
+            action_plan=[
+                {"step": 1, "action": "read_relevant_files", "reason": "Inspect the implicated code and tests."},
+                {"step": 2, "action": "run_validation", "reason": "Confirm the observed runtime behavior."},
+                {"step": 3, "action": "summarize_result", "reason": "Summarize the confirmed outcome honestly."},
+            ],
+            target_paths=["checkout_app/totals.py", "tests/test_totals.py"],
+            target_name="checkout_app/totals.py",
+        ),
+        verification_target="python -m pytest tests/test_totals.py",
+    )
+    session.task_state.current_user_intent = "validate"
+    session.task_state.target_artifacts = [
+        TaskArtifact(
+            path="checkout_app/totals.py",
+            name="totals.py",
+            kind="file",
+            role="primary_target",
+            confidence=1.0,
+        ),
+        TaskArtifact(
+            path="tests/test_totals.py",
+            name="test_totals.py",
+            kind="file",
+            role="validation_target",
+            confidence=1.0,
+        ),
+    ]
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest tests/test_totals.py",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+
+    pending_targets = planner._semantic_review_pending_snapshot_targets(session, deferred_targets=set())
+    review = planner._fallback_semantic_change_review(session)
+
+    assert pending_targets == []
+    assert review.requirements_satisfied is True
+    assert "validation passed" in review.summary.lower()
 
 
 def test_planner_does_not_repeat_identical_validation_without_progress(tmp_path):
@@ -11681,6 +11771,258 @@ def test_runtime_repair_read_scope_stays_on_locked_target_when_entrypoint_was_al
     assert decision.tool_args["path"] == "normalize_cli.py"
 
 
+def test_deterministic_runtime_repair_decision_uses_cli_stdout_exit_contract_recovery(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Review incident timeline', 'owner': 'bob', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> str:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        return render_tasks(tasks)\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from __future__ import annotations\n\n"
+        "from io import StringIO\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv: list[str]) -> str:\n"
+        "    stream = StringIO()\n"
+        "    with redirect_stdout(stream):\n"
+        "        exit_code = main(argv)\n"
+        "    assert exit_code == 0\n"
+        "    return stream.getvalue().strip()\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["main", "render_tasks", "build_parser"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI contract."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py::test_default_list_output_stays_unchanged\n"
+            "E       AssertionError: assert 'Escalate billing ticket\\nReview incident timeline' == 0\n"
+        ),
+        failure_summary=(
+            "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: 0 "
+            "but observed Validation currently produces: Escalate billing ticket\nReview incident timeline."
+        ),
+        repair_requirements=["Change taskboard/cli.py so the CLI prints the result and returns a success status."],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[28],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-cli-stdout-exit-contract",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: 0"],
+            observed_semantics=[
+                "Validation currently produces: Escalate billing ticket\nReview incident timeline"
+            ],
+            implicated_symbols=["main"],
+            implicated_region_hint="taskboard/cli.py:line 28",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    decision = planner._deterministic_runtime_repair_decision(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "write_file"
+    repaired = decision.tool_args["content"]
+    assert "print(render_tasks(tasks))" in repaired
+    assert "return 0" in repaired
+    assert "return render_tasks(tasks)" not in repaired
+
+
+def test_retry_update_after_review_failure_uses_cli_stdout_exit_contract_recovery(tmp_path):
+    llm = ScriptedLLM(text_payloads=["__should_not_run__"])
+    planner = Planner(llm, "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Review incident timeline', 'owner': 'bob', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> str:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        return render_tasks(tasks)\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from __future__ import annotations\n\n"
+        "from io import StringIO\n"
+        "from contextlib import redirect_stdout\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv: list[str]) -> str:\n"
+        "    stream = StringIO()\n"
+        "    with redirect_stdout(stream):\n"
+        "        exit_code = main(argv)\n"
+        "    assert exit_code == 0\n"
+        "    return stream.getvalue().strip()\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the taskboard CLI contract after the latest failed validation.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["main", "render_tasks"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI contract."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py::test_default_list_output_stays_unchanged\n"
+            "E       AssertionError: assert 'Escalate billing ticket\\nReview incident timeline' == 0\n"
+        ),
+        failure_summary=(
+            "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: 0 "
+            "but observed Validation currently produces: Escalate billing ticket\nReview incident timeline."
+        ),
+        repair_requirements=["Change taskboard/cli.py so the CLI prints the result and returns a success status."],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[28],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-cli-stdout-exit-contract-retry",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: 0"],
+            observed_semantics=[
+                "Validation currently produces: Escalate billing ticket\nReview incident timeline"
+            ],
+            implicated_symbols=["main"],
+            implicated_region_hint="taskboard/cli.py:line 28",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair changes the file, but not the lines tied to the failed runtime behavior.",
+            confidence=0.88,
+            blocking_issues=[
+                "The proposal for taskboard/cli.py leaves the implicated identifier lines unchanged: main"
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Update the relevant function signature or behavior line that the failing traceback points to."
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert result.recovery_strategy == "deterministic_cli_stdout_exit_contract"
+    assert "print(render_tasks(tasks))" in result.content
+    assert "return 0" in result.content
+    assert llm.generate_calls == []
+
+
 def test_full_repair_retry_prompt_surfaces_stdout_capture_and_direct_main_argv_contract(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
@@ -12804,6 +13146,106 @@ def test_targeted_runtime_prompt_hints_ignore_interleaved_direct_main_option_val
     assert not any("'Dr.', 'Hello', 'WORLD'" in hint for hint in hints)
 
 
+def test_targeted_runtime_prompt_hints_call_out_when_parsed_cli_value_needs_threading():
+    current_cli = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def list_tasks(owner=None):\n"
+        "    return [] if owner else ['x']\n\n"
+        "def render_tasks(tasks):\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(tasks)\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--owner')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    tasks = list_tasks(args.owner)\n"
+        "    print(render_tasks(tasks))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="taskboard/cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from taskboard.cli import main\n\n"
+            "def test_owner_filter_prints_specific_no_match_message():\n"
+            "    assert main(['--owner', 'zoe']) == 'No tasks found for owner zoe.'\n"
+        ),
+        targeted_context={
+            "failure_summary": (
+                "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: "
+                "No tasks found for owner zoe. but observed Validation currently produces: "
+                "No tasks found for the specified owner."
+            ),
+            "excerpt": "AssertionError: 'No tasks found for the specified owner.' != 'No tasks found for owner zoe.'",
+            "failure_focus": [],
+            "file_hints": ["taskboard/cli.py", "tests/test_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: No tasks found for owner zoe."],
+                "observed_semantics": ["Validation currently produces: No tasks found for the specified owner."],
+            },
+            "supporting_output_contracts": ["Emit exact output text: 'No tasks found for owner zoe.'."],
+            "supporting_runtime_argv_contract": {
+                "option_tokens": ["--owner"],
+                "positional_tokens": ["zoe"],
+            },
+        },
+    )
+
+    assert any("computes tasks from parsed CLI value(s) like args.owner" in hint for hint in hints)
+    assert any("list_tasks(args.owner)" in hint for hint in hints)
+    assert any("render_tasks(tasks)" in hint for hint in hints)
+
+
+def test_targeted_runtime_prompt_hints_skip_threading_hint_when_consumer_already_receives_cli_value():
+    current_cli = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def list_tasks(owner=None):\n"
+        "    return [] if owner else ['x']\n\n"
+        "def render_tasks(tasks, owner=None):\n"
+        "    if not tasks and owner:\n"
+        "        return f'No tasks found for owner {owner}.'\n"
+        "    return '\\n'.join(tasks)\n\n"
+        "def main(argv=None):\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('--owner')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    tasks = list_tasks(args.owner)\n"
+        "    print(render_tasks(tasks, args.owner))\n"
+    )
+    hints = _targeted_runtime_prompt_hints(
+        path="taskboard/cli.py",
+        current_content=current_cli,
+        supporting_context=(
+            "from taskboard.cli import main\n\n"
+            "def test_owner_filter_prints_specific_no_match_message():\n"
+            "    assert main(['--owner', 'zoe']) == 'No tasks found for owner zoe.'\n"
+        ),
+        targeted_context={
+            "failure_summary": (
+                "taskboard/cli.py still produces the wrong behavior: expected Validation should produce: "
+                "No tasks found for owner zoe. but observed Validation currently produces: "
+                "No tasks found for the specified owner."
+            ),
+            "excerpt": "AssertionError: 'No tasks found for the specified owner.' != 'No tasks found for owner zoe.'",
+            "failure_focus": [],
+            "file_hints": ["taskboard/cli.py", "tests/test_cli.py"],
+            "repair_brief": {
+                "expected_semantics": ["Validation should produce: No tasks found for owner zoe."],
+                "observed_semantics": ["Validation currently produces: No tasks found for the specified owner."],
+            },
+            "supporting_output_contracts": ["Emit exact output text: 'No tasks found for owner zoe.'."],
+            "supporting_runtime_argv_contract": {
+                "option_tokens": ["--owner"],
+                "positional_tokens": ["zoe"],
+            },
+        },
+    )
+
+    assert not any("computes tasks from parsed CLI value(s) like args.owner" in hint for hint in hints)
+
+
 def test_targeted_runtime_prompt_hints_call_out_separator_only_runtime_deltas():
     current_cli = (
         "def main(argv=None):\n"
@@ -13325,6 +13767,999 @@ def test_deterministic_direct_python_script_runtime_recovery_preserves_punctuate
     assert "print(' '.join(args[2:]) + args[1])" in result.content
     assert "capitalize" not in result.content
     assert "['--suffix', '!']" not in result.content
+
+
+def test_deterministic_runtime_literal_delta_recovery_rewrites_explicit_runtime_literal_mismatch(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    tasks = TASKS\n"
+        "    if owner:\n"
+        "        tasks = [task for task in tasks if task['owner'] == owner]\n"
+        "    return tasks\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner', type=str)\n"
+        "    return parser\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the taskboard no-match output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["render_tasks", "build_parser"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'",
+        failure_summary="taskboard/cli.py still returns the generic no-match message.",
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[17],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=["render_tasks"],
+            implicated_region_hint="taskboard/cli.py:line 17",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is not None
+    assert result.recovery_strategy == "deterministic_runtime_literal_delta"
+    assert "No tasks found for owner zoe." in result.content
+    assert "build_parser" in result.content
+
+
+def test_deterministic_runtime_literal_delta_recovery_prefers_exact_semantics_over_truncated_pytest_diff(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(task="Repair the taskboard no-match output.", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py ..F\n"
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+        ),
+        failure_summary="taskboard/cli.py still produces the wrong owner-specific no-match output.",
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[3],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match-truncated-diff",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=["render_tasks"],
+            implicated_region_hint="taskboard/cli.py:line 3",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert result is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert "fou...or owner zoe." not in result.content
+
+
+def test_deterministic_runtime_literal_delta_recovery_uses_validation_planner_pytest_source_semantics(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the taskboard no-match output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py ..F\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert repair_context.repair_brief is not None
+    assert repair_context.repair_brief.expected_semantics == [
+        "Validation should produce: No tasks found for owner zoe."
+    ]
+    assert repair_context.repair_brief.observed_semantics == [
+        "Validation currently produces: No tasks found."
+    ]
+    assert result is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert "fou...or owner zoe." not in result.content
+
+
+def test_deterministic_runtime_literal_delta_recovery_keeps_mixed_pytest_failures_local(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "__________________ test_default_list_output_kept ___________________\n\n"
+            "    def test_default_list_output_kept() -> None:\n"
+            '        output = run_cli(["list"])\n'
+            "        lines = output.splitlines()\n"
+            "        assert lines == [\n"
+            "            '- Escalate billing ticket (alice) [todo]',\n"
+            "            '- Rotate API token (bob) [doing]',\n"
+            "            '- Draft outage summary (alice) [done]',\n"
+            "        ]\n"
+            "E       AssertionError: assert ['Escalate bi...tage summary'] == ['- Escalate ...lice) [done]']\n\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+
+    result = planner._deterministic_runtime_literal_delta_recovery(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert repair_context.repair_brief is not None
+    assert repair_context.repair_brief.expected_semantics == [
+        "Validation should produce: ['- Escalate ...lice) [done]']",
+        "Validation should produce: No tasks found for owner zoe.",
+    ]
+    assert repair_context.repair_brief.observed_semantics == [
+        "Validation currently produces: ['Escalate bi...tage summary']",
+        "Validation currently produces: No tasks found.",
+    ]
+    assert result is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert "fou...or owner zoe." not in result.content
+
+
+def test_compact_repair_prompts_surface_exact_supporting_output_contracts_for_truncated_taskboard_diffs(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_kept() -> None:\n"
+        "    output = run_cli(['list'])\n"
+        "    lines = output.splitlines()\n"
+        "    assert lines == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli(['list', '--owner', 'zoe'])\n"
+        "    assert output == 'No tasks found for owner zoe.'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "__________________ test_default_list_output_kept ___________________\n\n"
+            "    def test_default_list_output_kept() -> None:\n"
+            '        output = run_cli(["list"])\n'
+            "        lines = output.splitlines()\n"
+            "        assert lines == [\n"
+            "            '- Escalate billing ticket (alice) [todo]',\n"
+            "            '- Rotate API token (bob) [doing]',\n"
+            "            '- Draft outage summary (alice) [done]',\n"
+            "        ]\n"
+            "E       AssertionError: assert ['Escalate bi...tage summary'] == ['- Escalate ...lice) [done]']\n\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+    assert repair_context is not None
+
+    compact_update_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+    compact_retry_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair was a no-op.",
+            confidence=0.95,
+            blocking_issues=[
+                "The proposal for taskboard/cli.py left the failing behavior unchanged."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the emitted output contract in taskboard/cli.py."],
+        ),
+        mode="compact",
+    )
+
+    for prompt in (compact_update_prompt, compact_retry_prompt):
+        assert "Exact supporting output contract:" in prompt
+        assert "Emit exact output lines in order:" in prompt
+        assert "- Escalate billing ticket (alice) [todo]" in prompt
+        assert "- Rotate API token (bob) [doing]" in prompt
+        assert "- Draft outage summary (alice) [done]" in prompt
+        assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+
+
+def test_general_retry_prompt_surfaces_exact_supporting_output_contracts_for_taskboard_noop_retry(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        print(render_tasks(tasks))\n"
+        "        return 0\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_stays_unchanged() -> None:\n"
+        "    output = run_cli([\"list\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_returns_only_matching_tasks() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"alice\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Implement the missing owner filter for the taskboard CLI. "
+            "Keep the default output unchanged, support the no-match message, and run python -m pytest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py", "README.md"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the requested owner filter behavior."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed update is a no-op or only an equivalent restatement, so writing it would preserve the same current behavior.",
+            confidence=0.9,
+            blocking_issues=["The proposal for taskboard/cli.py does not make a productive change (file hash unchanged)."],
+            preservation_risks=[],
+            repair_hints=[
+                "Make a real change in taskboard/cli.py that addresses the requested output behavior.",
+                "Do not resubmit equivalent content.",
+            ],
+        ),
+        mode="compact",
+    )
+
+    assert "Exact supporting output contract:" in prompt
+    assert "Emit exact output lines in order:" in prompt
+    assert "- Escalate billing ticket (alice) [todo]" in prompt
+    assert "- Rotate API token (bob) [doing]" in prompt
+    assert "- Draft outage summary (alice) [done]" in prompt
+    assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+    assert "remaining argv payload 'zoe'" in prompt
+    assert "The exact runtime contract includes exercised argv payload values like 'zoe'" in prompt
+
+
+def test_compact_repair_retry_prompt_anchors_taskboard_source_near_matches_from_exact_output_contracts(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage, outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(f'- {task[\"title\"]} ({task[\"owner\"]}) [{task[\"status\"]}]' for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        print(render_tasks(tasks))\n"
+        "        return 0\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_stays_unchanged() -> None:\n"
+        "    output = run_cli([\"list\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_returns_only_matching_tasks() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"alice\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Implement the missing owner filter for the taskboard CLI. "
+            "Keep the default output unchanged, support the no-match message, and run python -m pytest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py", "README.md"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Implement the requested owner filter behavior."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "___________________ test_default_list_output_stays_unchanged ___________________\n"
+            ">       assert output.splitlines() == [\n"
+            "E       AssertionError: assert ['- Escalate ...lice) [done]'] == ['- Escalate ...lice) [done]']\n"
+            "E         At index 2 diff: '- Draft outage, outage summary (alice) [done]' != '- Draft outage summary (alice) [done]'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks found for owner zoe.'\n"
+            "tests/test_cli.py:36: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+    assert repair_context is not None
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair was a no-op.",
+            confidence=0.95,
+            blocking_issues=[
+                "The proposal for taskboard/cli.py left the failing behavior unchanged."
+            ],
+            preservation_risks=[],
+            repair_hints=["Change the emitted output contract in taskboard/cli.py."],
+        ),
+        mode="compact",
+    )
+
+    assert "Exact supporting output contract:" in prompt
+    assert (
+        "Replace near-match source literal 'Draft outage, outage summary' "
+        "with the exact contract fragment 'Draft outage summary' in taskboard/cli.py"
+    ) in prompt
+    assert (
+        "Replace near-match source literal 'No tasks found for the specified owner.' "
+        "with the exact contract fragment 'No tasks found for owner zoe.' in taskboard/cli.py"
+    ) in prompt
+
+
+def test_runtime_repair_prompt_surfaces_wrapper_argv_value_propagation_hint_for_owner_output(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli(['list', '--owner', 'zoe'])\n"
+        "    assert output == 'No tasks found for owner zoe.'\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Implement the missing owner filter for the taskboard CLI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks fou...or owner zoe.'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+    assert repair_context is not None
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "remaining argv payload 'zoe'" in prompt
+    assert "Propagate the existing runtime value through the exercised branch" in prompt
+    assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+
+
+def test_retry_update_after_review_failure_uses_deterministic_runtime_literal_delta_recovery(tmp_path):
+    llm = ScriptedLLM(text_payloads=["__should_not_run__"])
+    planner = Planner(llm, "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the taskboard no-match output.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["render_tasks"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt="AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'",
+        failure_summary="taskboard/cli.py still returns the generic no-match message.",
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[4],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match-retry",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=["render_tasks"],
+            implicated_region_hint="taskboard/cli.py:line 4",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair is a no-op or only a formal rewrite, so writing it would only repeat the same failing state.",
+            confidence=0.93,
+            blocking_issues=[
+                "The proposed repair does not make a productive change to taskboard/cli.py for runtime:assertion_mismatch:taskboard-owner-no-match-retry (file hash unchanged)."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Change the locked repair target in a way that alters the failing behavior instead of resubmitting an equivalent file."
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_escalated",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert "No tasks found for owner zoe." in result.content
+    assert llm.generate_calls == []
+
+
+def test_retry_update_after_review_failure_uses_deterministic_similar_function_name_recovery(tmp_path):
+    llm = ScriptedLLM(text_payloads=["__should_not_run__"])
+    planner = Planner(llm, "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner')\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build\n"
+        "    return parser.parse_args(argv)\n"
+    )
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "cli.py").write_text(current_content, encoding="utf-8")
+    session = SessionState(
+        task="Repair the failing taskboard CLI runtime error.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "symbol_index": {"taskboard/cli.py": ["build_parser", "main"]},
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI module."}],
+        target_paths=["taskboard/cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/taskboard/cli.py", line 9, in main\n'
+            "    parser = build\n"
+            "NameError: name 'build' is not defined\n"
+        ),
+        failure_summary="NameError: name 'build' is not defined.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[9],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime path can complete successfully.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:build-nameerror-deterministic-retry",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["The symbol 'build' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'build' before it is bound or imported. Current use: parser = build"
+            ],
+            implicated_symbols=["build", "build_parser", "main"],
+            implicated_region_hint="taskboard/cli.py:line 9",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
+            confidence=0.92,
+            blocking_issues=[
+                "The runtime failure still reports 'build' as undefined in taskboard/cli.py, but the proposal neither binds/imports 'build' nor removes its failing usage. Existing same-file definitions with similar names: build_parser (function, line 5)."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Prefer reusing the closest matching same-file definition when it already fits the missing behavior: build_parser (function, line 5).",
+                "Either import or otherwise bind 'build' in taskboard/cli.py, or remove the failing usage from the implicated line.",
+            ],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content is not None
+    assert result.recovery_strategy == "deterministic_runtime_similar_function_name"
+    assert "parser = build_parser()" in result.content
+    assert llm.generate_calls == []
 
 
 def test_retry_update_after_review_failure_uses_verbatim_direct_python_script_recovery_for_dynamic_suffix_branch(
@@ -15997,6 +17432,258 @@ def test_validation_repair_relevance_review_surfaces_target_runtime_evidence(tmp
     assert any("argument handling" in hint.lower() for hint in review.repair_hints)
 
 
+def test_validation_repair_relevance_review_ignores_request_option_tokens_for_literal_runtime_fixes(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage, outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n"
+    )
+    proposed_content = (
+        current_content.replace("Draft outage, outage summary", "Draft outage summary")
+        .replace(
+            "No tasks found for the specified owner.",
+            "No tasks found for owner zoe.",
+        )
+    )
+    session = SessionState(
+        task=(
+            "Repair taskboard/cli.py so the default list output stays unchanged, "
+            "--owner filtering works, and the no-match message includes the requested owner "
+            "as required by tests/test_cli.py."
+        ),
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard CLI output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m pytest tests/test_cli.py",
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "___________________ test_default_list_output_stays_unchanged ___________________\n"
+            "E         At index 2 diff: '- Draft outage, outage summary (alice) [done]' != '- Draft outage summary (alice) [done]'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks fou...or owner zoe.'\n"
+            "tests/test_cli.py:36: AssertionError\n"
+        ),
+        failure_summary=(
+            "taskboard/cli.py still produces the wrong behavior across multiple validation assertions: "
+            "Validation should produce: ['- Escalate ...lice) [done]'] but Validation currently produces: "
+            "['- Escalate ...lice) [done]']; Validation should produce: No tasks found for owner zoe. "
+            "but Validation currently produces: No tasks fou...cified owner.."
+        ),
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[16, 17, 24],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime or test path can complete successfully.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-output-review",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=[
+                "Validation should produce: ['- Escalate ...lice) [done]']",
+                "Validation should produce: No tasks found for owner zoe.",
+            ],
+            observed_semantics=[
+                "Validation currently produces: ['- Escalate ...lice) [done]']",
+                "Validation currently produces: No tasks fou...cified owner.",
+            ],
+            implicated_symbols=[],
+            implicated_region_hint="taskboard/cli.py",
+            repair_constraints=["Keep unrelated CLI behavior unchanged."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
+
+
+def test_validation_repair_relevance_review_rejects_partial_taskboard_contract_fix(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage, outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        print(render_tasks(tasks))\n"
+        "        return 0\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    proposed_content = current_content.replace(
+        "Draft outage, outage summary",
+        "Draft outage summary",
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_stays_unchanged() -> None:\n"
+        "    output = run_cli([\"list\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_returns_only_matching_tasks() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"alice\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Repair taskboard/cli.py so the default list output stays unchanged, "
+            "--owner filtering works, and the no-match message includes the requested owner."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py", "README.md"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard CLI output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m pytest tests/test_cli.py",
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "___________________ test_default_list_output_stays_unchanged ___________________\n"
+            "E         At index 2 diff: '- Draft outage, outage summary (alice) [done]' != '- Draft outage summary (alice) [done]'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks found for owner zoe.'\n"
+            "tests/test_cli.py:36: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+
+    review = planner._validation_repair_relevance_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "exact supporting runtime output contract" in review.summary
+    assert any("No tasks found for the specified owner." in issue for issue in review.blocking_issues)
+    assert any("computes tasks from parsed CLI value(s) like args.owner" in hint for hint in review.repair_hints)
+
+
 def test_validation_repair_relevance_review_rejects_unresolved_undefined_symbol(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     repair_context = ValidationFailureEvidence(
@@ -16896,7 +18583,7 @@ def test_primary_compact_repair_review_uses_compact_repair_runtime_budget(tmp_pa
     assert kwargs["strict_timeouts"] is False
 
 
-def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(tmp_path, monkeypatch):
+def test_runtime_repair_review_uses_primary_review_when_router_matches_primary(tmp_path, monkeypatch):
     class InventoryLLM(ScriptedLLM):
         def list_models_safe(self):
             return [
@@ -16991,12 +18678,12 @@ def test_runtime_repair_review_uses_recovery_model_when_router_matches_primary(t
 
     assert review.safe_to_write is True
     kwargs = llm.generate_json_calls[0]["kwargs"]
-    assert kwargs["model"] == "qwen3:8b"
+    assert kwargs["model"] == "qwen2.5-coder:7b"
     assert kwargs["num_ctx"] == 2048
     assert kwargs["timeout"] == 60
     assert kwargs["total_timeout"] == 210
-    assert kwargs["strict_timeouts"] is True
-    assert session.runtime_executions[-1]["recovery_strategy"] == "reserve_model_review"
+    assert kwargs["strict_timeouts"] is False
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_review"
 
 
 def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(tmp_path):
@@ -17064,6 +18751,125 @@ def test_proposed_update_review_prompt_includes_runtime_failure_behavior_deltas(
     assert '"hard_source_constraint": false' in prompt
     assert "Do not promote repair_brief, runtime_evidence, validation_failure_evidence, or generation_relevant_constraint examples" in prompt
     assert "When active runtime failure evidence for this file includes observed-vs-expected behavior deltas" in prompt
+
+
+def test_proposed_update_review_prompt_includes_exact_supporting_output_contracts_for_taskboard_runtime_repairs(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the taskboard CLI so the owner filter and no-match output satisfy runtime validation.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest tests/test_cli.py"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard CLI behavior."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+    (tmp_path / "taskboard").mkdir()
+    (tmp_path / "taskboard" / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (tmp_path / "taskboard" / "cli.py").write_text(
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage, outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_default_list_output_stays_unchanged() -> None:\n"
+        "    output = run_cli([\"list\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Rotate API token (bob) [doing]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_returns_only_matching_tasks() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"alice\"])\n"
+        "    assert output.splitlines() == [\n"
+        "        '- Escalate billing ticket (alice) [todo]',\n"
+        "        '- Draft outage summary (alice) [done]',\n"
+        "    ]\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session.active_repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks found for owner zoe.'\n"
+            "tests/test_cli.py:36: AssertionError\n"
+        ),
+        failure_summary="taskboard/cli.py still drops the exercised owner-specific no-match output.",
+        repair_requirements=["Change taskboard/cli.py so the owner filter runtime output matches the tests."],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-review-contracts",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found for the specified owner."],
+            implicated_symbols=["render_tasks", "main"],
+            implicated_region_hint="taskboard/cli.py",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    prompt = proposed_update_review_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        supporting_artifact_context="tests/test_cli.py exercises the owner-filter CLI contract.",
+        current_excerpt=(
+            "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+            "    if not tasks:\n"
+            "        return \"No tasks found for the specified owner.\"\n"
+            "    return \"\\n\".join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n"
+        ),
+        proposed_excerpt=(
+            "def render_tasks(tasks: list[dict[str, str]], owner: str | None = None) -> str:\n"
+            "    if not tasks and owner is not None:\n"
+            "        return f\"No tasks found for owner {owner}.\"\n"
+            "    return \"\\n\".join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n"
+        ),
+        diff_excerpt="diff",
+        mode="compact",
+    )
+
+    assert '"exact_supporting_output_contract"' in prompt
+    assert "Emit exact output text: 'No tasks found for owner zoe.'" in prompt
+    assert "remaining argv payload 'zoe'" in prompt
 
 
 def test_proposed_update_review_prompt_includes_runtime_interaction_hints_for_js_toggle_repairs(tmp_path):
@@ -18010,6 +19816,108 @@ def test_validation_repair_relevance_review_still_rejects_literal_anchor_when_im
     assert review is not None
     assert review.safe_to_write is False
     assert any("--keep-case" in issue for issue in review.blocking_issues)
+
+
+def test_validation_repair_relevance_review_accepts_cli_output_message_fix_despite_test_helper_trace(
+    tmp_path,
+):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    tasks = TASKS\n"
+        "    if owner:\n"
+        "        tasks = [task for task in tasks if task['owner'] == owner]\n"
+        "    return tasks\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found.'\n"
+        "    return '\\n'.join(task['title'] for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n"
+    )
+    proposed_content = current_content.replace(
+        "        return 'No tasks found.'\n",
+        "        return 'No tasks found for owner zoe.'\n",
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    return main(argv)\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task=(
+            "Implement the missing owner filter for the taskboard CLI. "
+            "Keep the default output unchanged, support the no-match message, and run python -m pytest."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 3,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "tests/test_cli.py ..F\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found.' == 'No tasks found for owner zoe.'\n"
+        ),
+        failure_summary="taskboard/cli.py still produces the wrong behavior for the owner-specific no-match output.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        repair_brief=RepairBrief(
+            failure_type="assertion_mismatch",
+            failure_signature="runtime:assertion_mismatch:taskboard-owner-no-match",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["Validation should produce: No tasks found for owner zoe."],
+            observed_semantics=["Validation currently produces: No tasks found."],
+            implicated_symbols=[],
+            implicated_region_hint="taskboard/cli.py",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._validation_repair_relevance_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+        session=session,
+    )
+
+    assert review is None
 
 
 def test_pre_write_update_review_rejects_css_root_state_without_completed_web_contract(
@@ -19041,6 +20949,127 @@ def test_pre_write_update_review_rejects_direct_main_option_fix_with_inexact_tok
     assert "exact direct main([...]) option tokens" in review.summary
     assert any("--keep-case" in issue for issue in review.blocking_issues)
     assert any("remaining argv payload" in hint for hint in review.repair_hints)
+
+
+def test_pre_write_update_review_rejects_hardcoded_taskboard_runtime_payload_value(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    verification = ValidationPlanner()
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'Escalate billing ticket', 'owner': 'alice', 'status': 'todo'},\n"
+        "    {'title': 'Rotate API token', 'owner': 'bob', 'status': 'doing'},\n"
+        "    {'title': 'Draft outage summary', 'owner': 'alice', 'status': 'done'},\n"
+        "]\n\n"
+        "def list_tasks(owner: str | None = None) -> list[dict[str, str]]:\n"
+        "    if owner is None:\n"
+        "        return TASKS\n"
+        "    return [task for task in TASKS if task['owner'] == owner]\n\n"
+        "def render_tasks(tasks: list[dict[str, str]]) -> str:\n"
+        "    if not tasks:\n"
+        "        return 'No tasks found for the specified owner.'\n"
+        "    return '\\n'.join(f\"- {task['title']} ({task['owner']}) [{task['status']}]\" for task in tasks)\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--owner', type=str)\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build_parser()\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        tasks = list_tasks(args.owner)\n"
+        "        print(render_tasks(tasks))\n"
+        "        return 0\n"
+        "    raise ValueError(f'Unsupported command: {args.command}')\n"
+    )
+    proposed_content = current_content.replace(
+        "No tasks found for the specified owner.",
+        "No tasks found for owner zoe.",
+    )
+    pkg = tmp_path / "taskboard"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text('"""Taskboard CLI package."""\n', encoding="utf-8")
+    (pkg / "cli.py").write_text(current_content, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_cli.py").write_text(
+        "from contextlib import redirect_stdout\n"
+        "from io import StringIO\n\n"
+        "from taskboard.cli import main\n\n"
+        "def run_cli(argv):\n"
+        "    buffer = StringIO()\n"
+        "    with redirect_stdout(buffer):\n"
+        "        assert main(argv) == 0\n"
+        "    return buffer.getvalue().strip()\n\n"
+        "def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+        "    output = run_cli([\"list\", \"--owner\", \"zoe\"])\n"
+        "    assert output == \"No tasks found for owner zoe.\"\n",
+        encoding="utf-8",
+    )
+    session = SessionState(
+        task="Repair the taskboard CLI no-match output without hardcoding the exercised owner value.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "file_count": 4,
+                "important_files": ["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py", "README.md"],
+                "focus_files": ["taskboard/cli.py"],
+                "test_files": ["tests/test_cli.py"],
+                "entrypoints": ["taskboard/cli.py"],
+                "project_labels": ["python"],
+                "likely_commands": ["python -m pytest"],
+            }
+        ),
+    )
+    session.changed_files.append(FileChangeRecord(path="taskboard/cli.py", operation="modify"))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing taskboard CLI output."}],
+        target_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m pytest tests/test_cli.py",
+    )
+    failed_run = ValidationRunRecord(
+        command="python -m pytest tests/test_cli.py",
+        kind="test",
+        verification_scope="runtime",
+        status="failed",
+        edit_generation=1,
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "=================================== FAILURES ===================================\n"
+            "______________ test_owner_filter_prints_specific_no_match_message ______________\n\n"
+            "    def test_owner_filter_prints_specific_no_match_message() -> None:\n"
+            '        output = run_cli(["list", "--owner", "zoe"])\n'
+            '>       assert output == "No tasks found for owner zoe."\n'
+            "E       AssertionError: assert 'No tasks found for the specified owner.' == 'No tasks found for owner zoe.'\n"
+            "tests/test_cli.py:19: AssertionError\n"
+        ),
+    )
+    repair_context = verification.build_failure_evidence(session, failed_run)
+    session.active_repair_context = repair_context
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+    )
+
+    assert review.safe_to_write is False
+    assert "hardcodes sample runtime payload values" in review.summary
+    assert any("'zoe'" in issue for issue in review.blocking_issues)
+    assert any("remaining argv payload 'zoe'" in hint for hint in review.repair_hints)
 
 
 def test_pre_write_update_review_discards_unsupported_runtime_literal_blocker_from_model_review(
@@ -21104,6 +23133,115 @@ def test_planner_review_retry_keeps_same_model_and_escalates_follow_up_to_full_f
     assert "add import sys before using it" in llm.generate_calls[1]["args"][0]
 
 
+def test_review_guided_retry_uses_local_review_for_single_model_followup_repairs(tmp_path, monkeypatch):
+    llm = ScriptedLLM(
+        text_payloads=[
+            "def main():\n    return 'compact'\n",
+            "def main(argv=None):\n    return argv\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(task="Fix app.py", workspace_root=str(tmp_path))
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing runtime behavior."}],
+        target_paths=["app.py"],
+        target_name="app.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    pre_write_calls = {"count": 0}
+    local_review_calls = {"count": 0}
+
+    def fake_pre_write(*_args, **_kwargs):
+        pre_write_calls["count"] += 1
+        raise AssertionError("model-backed pre-write review should be skipped for the guided single-model retry")
+
+    def fake_local_review(*_args, **_kwargs):
+        local_review_calls["count"] += 1
+        if local_review_calls["count"] == 1:
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary="Compact retry still leaves the runtime argv repair incomplete.",
+                confidence=0.9,
+                blocking_issues=["The proposal references sys.argv without importing sys."],
+                preservation_risks=[],
+                repair_hints=["If you reference sys.argv, add import sys before using it."],
+            )
+        return ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.86,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        )
+
+    monkeypatch.setattr(planner, "_pre_write_update_review", fake_pre_write)
+    monkeypatch.setattr(planner, "_local_pre_write_update_review", fake_local_review)
+
+    repair_context = ValidationFailureEvidence(
+        command="python -m unittest tests.test_app",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["app.py", "tests/test_app.py"],
+        summary="Validation command exited with 1.",
+        excerpt="TypeError: main() takes 0 positional arguments but 1 was given",
+        failure_summary="TypeError: main() takes 0 positional arguments but 1 was given",
+        expected_features=[],
+        missing_features=[],
+        file_hints=["app.py", "tests/test_app.py"],
+        line_hints=[12],
+        action_hints=["Prefer a targeted fix over broad refactors."],
+        repair_requirements=["Change app.py so the failing runtime path succeeds."],
+        evidence_signature="sig-single-model-guided-followup",
+        repair_brief=RepairBrief(
+            failure_type="type_error",
+            failure_signature="runtime:type_error:single-model-guided-followup",
+            primary_target="app.py",
+            locked_target="app.py",
+            expected_semantics=["Validation should allow argv to be passed into main()."],
+            observed_semantics=["Validation currently raises when argv is passed into main()."],
+            implicated_symbols=["main"],
+            implicated_region_hint="app.py",
+            repair_constraints=["Keep the repair on app.py."],
+            allowed_files=["app.py"],
+            forbidden_files=["tests/test_app.py"],
+        ),
+    )
+    session.active_repair_context = repair_context
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="app.py",
+        current_content="def main():\n    pass\n",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="Lines unchanged.",
+            confidence=0.8,
+            blocking_issues=["The proposal leaves the implicated identifier lines unchanged."],
+            preservation_risks=[],
+            repair_hints=["Change the implicated callable."],
+        ),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        prior_attempts=[],
+    )
+
+    assert result.content == "def main(argv=None):\n    return argv"
+    assert pre_write_calls["count"] == 0
+    assert local_review_calls["count"] == 2
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[0]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is False
+
+
 def test_planner_repair_followup_retry_budget_expands_for_single_model_runtime(tmp_path):
     planner = Planner(
         ScriptedLLM(
@@ -22972,6 +25110,216 @@ def test_review_guided_retry_prompt_surfaces_undefined_runtime_symbol_guidance(t
     assert "Resolve the undefined symbol 'sys' in tests/test_wordfreq.py" in prompt
     assert "6:         sys.stdin = io.StringIO('hello world hello')" in prompt
     assert "Either import or otherwise bind 'sys' before its current use" in prompt
+
+
+def test_review_guided_retry_prompt_surfaces_similar_same_file_definition_for_undefined_symbol(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the failing taskboard CLI runtime error.",
+        workspace_root=str(tmp_path),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the failing CLI module."}],
+        target_paths=["taskboard/cli.py"],
+        target_name="taskboard/cli.py",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="python -m pytest tests/test_cli.py")
+
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner')\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build\n"
+        "    return parser.parse_args(argv)\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/taskboard/cli.py", line 9, in main\n'
+            "    parser = build\n"
+            "NameError: name 'build' is not defined\n"
+        ),
+        failure_summary="NameError: name 'build' is not defined.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[9],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime path can complete successfully.",
+            "Bind or import 'build' before its failing use in taskboard/cli.py, or remove that use if it is unnecessary.",
+        ],
+        evidence_signature="sig-runtime-build-nameerror-prompt",
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:build-nameerror-prompt",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["The symbol 'build' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'build' before it is bound or imported. Current use: parser = build"
+            ],
+            implicated_symbols=["build", "build_parser", "main"],
+            implicated_region_hint="taskboard/cli.py:line 9",
+            repair_constraints=[
+                "Bind or import 'build' before its failing use in taskboard/cli.py, or remove that use if it is unnecessary."
+            ],
+            allowed_files=["taskboard/cli.py", "tests/test_cli.py"],
+            forbidden_files=["README.md"],
+        ),
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="taskboard/cli.py",
+        current_content=current_content,
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
+            confidence=0.91,
+            blocking_issues=[
+                "The runtime failure still reports 'build' as undefined in taskboard/cli.py, but the proposal neither binds/imports 'build' nor removes its failing usage."
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Either import or otherwise bind 'build' in taskboard/cli.py, or remove the failing usage from the implicated line."
+            ],
+        ),
+        mode="compact",
+    )
+
+    assert "Resolve the undefined symbol 'build' in taskboard/cli.py" in prompt
+    assert "parser = build" in prompt
+    assert "Existing same-file definitions with similar names: build_parser (function, line 5)." in prompt
+
+
+def test_undefined_runtime_symbol_review_mentions_similar_same_file_definition(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner')\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build\n"
+        "    return parser.parse_args(argv)\n"
+    )
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/taskboard/cli.py", line 9, in main\n'
+            "    parser = build\n"
+            "NameError: name 'build' is not defined\n"
+        ),
+        failure_summary="NameError: name 'build' is not defined.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[9],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime path can complete successfully.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:build-nameerror-review",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["The symbol 'build' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'build' before it is bound or imported. Current use: parser = build"
+            ],
+            implicated_symbols=["build", "build_parser", "main"],
+            implicated_region_hint="taskboard/cli.py:line 9",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._undefined_runtime_symbol_repair_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=current_content,
+        repair_context=repair_context,
+    )
+
+    assert review is not None
+    assert "build_parser (function, line 5)" in review.blocking_issues[0]
+    assert any("build_parser (function, line 5)" in hint for hint in review.repair_hints)
+
+
+def test_undefined_runtime_symbol_review_allows_boundary_safe_same_file_function_reuse(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    current_content = (
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        "    parser = argparse.ArgumentParser(prog='taskboard')\n"
+        "    parser.add_argument('--owner')\n"
+        "    return parser\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = build\n"
+        "    return parser.parse_args(argv)\n"
+    )
+    proposed_content = current_content.replace("parser = build\n", "parser = build_parser()\n")
+    repair_context = ValidationFailureEvidence(
+        command="python -m pytest tests/test_cli.py",
+        verification_scope="runtime",
+        status="failed",
+        artifact_paths=["taskboard/cli.py", "tests/test_cli.py"],
+        summary="Validation command exited with 1.",
+        excerpt=(
+            "Traceback (most recent call last):\n"
+            '  File "/tmp/taskboard/cli.py", line 9, in main\n'
+            "    parser = build\n"
+            "NameError: name 'build' is not defined\n"
+        ),
+        failure_summary="NameError: name 'build' is not defined.",
+        file_hints=["taskboard/cli.py", "tests/test_cli.py"],
+        line_hints=[9],
+        repair_requirements=[
+            "Change taskboard/cli.py so the failing runtime path can complete successfully.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="runtime_failure",
+            failure_signature="runtime:runtime_failure:build-nameerror-boundary-safe",
+            primary_target="taskboard/cli.py",
+            locked_target="taskboard/cli.py",
+            expected_semantics=["The symbol 'build' should be bound or imported before it is used."],
+            observed_semantics=[
+                "The current runtime path uses 'build' before it is bound or imported. Current use: parser = build"
+            ],
+            implicated_symbols=["build", "build_parser", "main"],
+            implicated_region_hint="taskboard/cli.py:line 9",
+            repair_constraints=["Keep the fix local to taskboard/cli.py."],
+            allowed_files=["taskboard/cli.py"],
+            forbidden_files=["tests/test_cli.py"],
+        ),
+    )
+
+    review = planner._undefined_runtime_symbol_repair_review(
+        path="taskboard/cli.py",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=repair_context,
+    )
+
+    assert review is None
 
 
 def test_runtime_repair_review_ignores_called_process_error_summary_noise(tmp_path):
@@ -24884,7 +27232,7 @@ def test_planner_recovers_from_retryable_no_start_with_same_model_retry(tmp_path
     assert len(llm.generate_calls) == 2
     assert llm.generate_calls[1]["kwargs"]["model"] is None
     assert llm.generate_calls[1]["kwargs"]["timeout"] >= 60
-    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 210
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 240
     assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 4096
 
 
@@ -24914,6 +27262,34 @@ def test_planner_extends_compact_primary_generation_budget_for_repairs(tmp_path)
 
     assert timeout_seconds == 60
     assert total_timeout_seconds == 210
+
+
+def test_planner_extends_generation_retry_budget_after_no_start_failure(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+
+    timeout_seconds, total_timeout_seconds, num_ctx = planner._content_generation_runtime_for_attempt(
+        GenerationRecoveryAttempt(
+            strategy="retry_same_model",
+            prompt_kind="full",
+            model_name=None,
+            capability_tier="tier_a",
+        ),
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="low",
+            retryable=True,
+            raw_reason="startup_timeout",
+        ),
+    )
+
+    assert timeout_seconds == 75
+    assert total_timeout_seconds == 240
+    assert num_ctx == 4096
 
 
 def test_planner_extends_compact_resume_budget_after_timeout_progress(tmp_path):
@@ -25716,6 +28092,175 @@ def test_planner_reproduces_direct_cli_contract_with_expected_stdout(tmp_path):
     assert decision.tool_name == "run_tests"
     assert decision.tool_args["command"] == "python normalize_cli.py --keep-case hello world"
     assert decision.tool_args["expected_stdout"] == "hello world"
+
+
+def test_planner_reproduces_pytest_style_debug_issue_without_explicit_pytest_import(tmp_path):
+    package_dir = tmp_path / "checkout_app"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "totals.py").write_text(
+        "def build_checkout_summary(order):\n"
+        "    items = order.get('items', [])\n"
+        "    subtotal_cents = sum(item['price_cents'] * item.get('quantity', 1) for item in items)\n"
+        "    average_item_cents = round(subtotal_cents / len(items))\n"
+        "    return {\n"
+        "        'item_count': len(items),\n"
+        "        'subtotal_cents': subtotal_cents,\n"
+        "        'average_item_cents': average_item_cents,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_totals.py").write_text(
+        "from checkout_app.totals import build_checkout_summary\n\n"
+        "def test_empty_order_reports_zero_average_without_crashing():\n"
+        "    summary = build_checkout_summary({'items': []})\n"
+        "    assert summary['average_item_cents'] == 0\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    snapshot = RepoMemoryStore(config, WorkspaceManager(tmp_path)).build_snapshot("checkout crash tests")
+
+    assert "python -m pytest" in snapshot.likely_commands
+
+    llm = ScriptedLLM()
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Fix the checkout crash when an empty order is summarized.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "diagnose_issue", "reason": "Reproduce the failing checkout test before editing."}],
+        target_paths=["checkout_app/totals.py", "tests/test_totals.py"],
+        target_name="checkout_app/totals.py",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.validation_plan = planner.validation_planner.build_plan(
+        session.task,
+        snapshot,
+        changed_files=[],
+        session=session,
+    )
+
+    decision = planner._diagnose_issue_decision(
+        session.router_result,
+        session,
+        ["checkout_app/totals.py", "tests/test_totals.py"],
+        {"checkout_app/totals.py", "tests/test_totals.py"},
+    )
+
+    assert decision is not None
+    assert decision.tool_name == "run_tests"
+    assert decision.tool_args["command"] == "python -m pytest"
+
+
+def test_planner_reports_confirmed_validation_success_when_validation_request_finds_no_defect(
+    tmp_path,
+):
+    package_dir = tmp_path / "checkout_app"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "totals.py").write_text(
+        "def build_checkout_summary(order):\n"
+        "    items = order.get('items', [])\n"
+        "    subtotal_cents = sum(item['price_cents'] * item.get('quantity', 1) for item in items)\n"
+        "    average_item_cents = round(subtotal_cents / len(items)) if items else 0\n"
+        "    return {\n"
+        "        'item_count': len(items),\n"
+        "        'subtotal_cents': subtotal_cents,\n"
+        "        'average_item_cents': average_item_cents,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_totals.py").write_text(
+        "from checkout_app.totals import build_checkout_summary\n\n"
+        "def test_empty_order_reports_zero_average_without_crashing():\n"
+        "    summary = build_checkout_summary({'items': []})\n"
+        "    assert summary['average_item_cents'] == 0\n",
+        encoding="utf-8",
+    )
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    snapshot = RepoMemoryStore(config, WorkspaceManager(tmp_path)).build_snapshot("checkout validation success")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Validate checkout_app/totals.py against tests/test_totals.py. "
+            "Keep the implementation unchanged unless a real defect appears, "
+            "run python -m pytest tests/test_totals.py, and report the confirmed result."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="debug",
+        action_plan=[{"step": 1, "action": "diagnose_issue", "reason": "Run the requested validation first."}],
+        target_paths=["checkout_app/totals.py", "tests/test_totals.py"],
+        target_name="checkout_app/totals.py",
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        payload,
+        verification_target="python -m pytest tests/test_totals.py",
+    )
+    session.task_state.current_user_intent = "validate"
+    session.task_state.execution_strategy = "validation_inspection"
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "checkout_app/totals.py"},
+                success=True,
+                summary="Read checkout_app/totals.py.",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_totals.py"},
+                success=True,
+                summary="Read tests/test_totals.py.",
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="run_tests",
+                tool_args={"command": "python -m pytest tests/test_totals.py"},
+                success=True,
+                summary="Validation command exited with 0.",
+            ),
+        ]
+    )
+    session.validation_runs.append(
+        ValidationRunRecord(
+            command="python -m pytest tests/test_totals.py",
+            kind="test",
+            verification_scope="runtime",
+            status="passed",
+        )
+    )
+
+    decision = planner._diagnose_issue_decision(
+        session.router_result,
+        session,
+        ["checkout_app/totals.py", "tests/test_totals.py"],
+        {"checkout_app/totals.py", "tests/test_totals.py"},
+    )
+
+    assert decision is not None
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Result: passed." in decision.final_response
+    assert "I did not change any files." in decision.final_response
+    assert "python -m pytest tests/test_totals.py" in decision.final_response
 
 
 def test_planner_runs_pending_changed_file_validation_with_expected_stdout(tmp_path):
