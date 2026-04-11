@@ -281,6 +281,29 @@ _EXPLANATION_REQUEST_TOKENS = (
     "zusammen",
 )
 
+_DIRECT_CHAT_GREETING_TOKENS = (
+    "guten abend",
+    "guten morgen",
+    "guten tag",
+    "hallo",
+    "hello",
+    "hey",
+    "hi",
+    "moin",
+    "servus",
+)
+
+_DIRECT_CHAT_INTRO_FRAGMENTS = (
+    "was kannst du",
+    "was machst du",
+    "wer bist du",
+    "what can you do",
+    "what do you do",
+    "who are you",
+    "wie heisst du",
+    "wie heißt du",
+)
+
 _UPDATE_REQUEST_TOKENS = (
     "aender",
     "änder",
@@ -543,9 +566,48 @@ def looks_like_debug_request(text: str) -> bool:
     return has_fix_signal or has_problem_signal
 
 
+def fallback_direct_chat_response(text: str) -> str | None:
+    normalized = " ".join(str(text or "").lower().split()).strip("!?., ")
+    if not normalized:
+        return None
+    if normalized in _DIRECT_CHAT_GREETING_TOKENS:
+        return (
+            "Hallo. Ich bin bereit.\n\n"
+            "Wenn du magst, kann ich den Code analysieren, eine Aenderung planen oder etwas im Projekt umsetzen."
+        )
+    normalized_padded = f" {normalized} "
+    if any(
+        normalized == fragment
+        or f" {fragment} " in normalized_padded
+        for fragment in _DIRECT_CHAT_INTRO_FRAGMENTS
+    ):
+        return (
+            "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.\n\n"
+            "Ich kann Code analysieren, Aenderungen planen und auf Basis des validierten Router-Outputs ausfuehren."
+        )
+    tokens = _text_tokens(normalized)
+    asks_about_self = any(
+        token.startswith(prefix)
+        for prefix in ("erzaehl", "erzähl", "sag", "tell")
+        for token in tokens
+    )
+    if asks_about_self and any(
+        phrase in normalized
+        for phrase in ("about yourself", "ueber dich", "über dich")
+    ):
+        return (
+            "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.\n\n"
+            "Ich kann Code analysieren, Aenderungen planen und auf Basis des validierten Router-Outputs ausfuehren."
+        )
+    return None
+
+
 def looks_like_explanation_request(text: str) -> bool:
     normalized = normalize_text(text)
-    return bool(normalized) and any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
+    return bool(normalized) and (
+        fallback_direct_chat_response(text) is not None
+        or any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
+    )
 
 
 def looks_like_update_request(text: str) -> bool:

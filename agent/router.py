@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from agent.models import SessionState, WorkspaceSnapshot
 from agent.prompts import router_prompt, router_repair_prompt, router_system_prompt
+from agent.semantic_defaults import fallback_direct_chat_response
 from agent.semantic_guardrails import build_minimal_router_output
 from agent.semantic_runtime import (
     annotate_semantic_record,
@@ -421,41 +422,11 @@ class IntentRouter:
         )
 
     def _fallback_direct_response(self, user_input: str) -> str | None:
+        direct_response = fallback_direct_chat_response(user_input)
+        if direct_response is not None:
+            return direct_response
         normalized = " ".join(str(user_input or "").lower().split()).strip("!?., ")
-        if not normalized:
-            return None
-        greetings = {
-            "hallo",
-            "hello",
-            "hi",
-            "hey",
-            "moin",
-            "servus",
-            "guten morgen",
-            "guten tag",
-            "guten abend",
-        }
-        if normalized in greetings:
-            return (
-                "Hallo. Ich bin bereit.\n\n"
-                "Wenn du magst, kann ich den Code analysieren, eine Aenderung planen oder etwas im Projekt umsetzen."
-            )
-        intro_fragments = (
-            "wer bist du",
-            "who are you",
-            "was kannst du",
-            "what can you do",
-            "was machst du",
-            "what do you do",
-            "hilfe",
-            "help",
-        )
-        normalized_padded = f" {normalized} "
-        if any(
-            normalized == fragment
-            or f" {fragment} " in normalized_padded
-            for fragment in intro_fragments
-        ):
+        if normalized in {"hilfe", "help"}:
             return (
                 "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.\n\n"
                 "Ich kann Code analysieren, Aenderungen planen und auf Basis des validierten Router-Outputs ausfuehren."

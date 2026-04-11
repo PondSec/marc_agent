@@ -5,7 +5,12 @@ import re
 from typing import Any
 
 from agent.models import SessionState, WorkspaceSnapshot
-from agent.semantic_defaults import infer_artifact_name_hint, infer_requested_extension, infer_scope_tokens
+from agent.semantic_defaults import (
+    fallback_direct_chat_response,
+    infer_artifact_name_hint,
+    infer_requested_extension,
+    infer_scope_tokens,
+)
 from agent.task_state import TaskState
 from agent.task_schema import TaskArtifact, TaskUnderstanding
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
@@ -53,6 +58,7 @@ class ExecutionDecisionPolicy:
         target_name = self._target_name(understanding, target_paths)
         search_terms = self._search_terms(understanding, target_paths, target_name)
         relevant_extensions = self._relevant_extensions(understanding, target_paths)
+        direct_response = fallback_direct_chat_response(understanding.original_request)
 
         if self._should_clarify(
             understanding,
@@ -90,7 +96,7 @@ class ExecutionDecisionPolicy:
                 repo_context_needed=False,
                 search_terms=search_terms,
                 relevant_extensions=relevant_extensions,
-                direct_response=None,
+                direct_response=direct_response,
             )
             self._log(
                 "execution_decision",
@@ -133,7 +139,7 @@ class ExecutionDecisionPolicy:
             repo_context_needed=self._repo_context_needed(intent),
             search_terms=search_terms,
             relevant_extensions=relevant_extensions,
-            direct_response=None,
+            direct_response=direct_response,
         )
         self._log(
             "execution_decision",
@@ -490,8 +496,10 @@ class ExecutionDecisionPolicy:
         session: SessionState | None,
         intent: RouteIntent,
     ) -> list[str]:
-        candidates: list[str] = [
-            item.path
+        if fallback_direct_chat_response(understanding.original_request) is not None:
+            return []
+        candidate_artifacts = [
+            item
             for item in understanding.target_artifacts
             if item.path
             and (
@@ -499,21 +507,14 @@ class ExecutionDecisionPolicy:
                 or item.role in {"primary_target", "validation_target", "supporting_context"}
             )
         ]
+        candidates: list[str] = [str(item.path) for item in candidate_artifacts if item.path]
         if intent == RouteIntent.CREATE:
             explicit_request_paths = self._explicit_request_paths(understanding.original_request)
             if explicit_request_paths:
-                merged_candidates = list(explicit_request_paths)
-                merged_candidate_keys = {
-                    self._path_merge_key(candidate)
-                    for candidate in merged_candidates
-                    if candidate
-                }
-                for candidate in candidates:
-                    candidate_key = self._path_merge_key(candidate)
-                    if candidate and candidate_key not in merged_candidate_keys:
-                        merged_candidates.append(candidate)
-                        merged_candidate_keys.add(candidate_key)
-                candidates = merged_candidates
+                candidates = self._merge_create_candidates_with_request_paths(
+                    candidate_artifacts,
+                    explicit_request_paths,
+                )
         if candidates:
             return self._unique_paths(candidates)[:8]
         if intent == RouteIntent.CREATE:
@@ -533,6 +534,39 @@ class ExecutionDecisionPolicy:
             if candidate and candidate not in paths:
                 paths.append(candidate)
         return paths[:8]
+
+    def _merge_create_candidates_with_request_paths(
+        self,
+        candidate_artifacts: list[TaskArtifact],
+        explicit_request_paths: list[str],
+    ) -> list[str]:
+        explicit_by_key = {
+            self._path_merge_key(candidate): candidate
+            for candidate in explicit_request_paths
+            if candidate
+        }
+        merged: list[str] = []
+        seen: set[str] = set()
+        insert_after_primary = 0
+        for artifact in candidate_artifacts:
+            candidate = str(artifact.path or "").strip()
+            if not candidate:
+                continue
+            candidate_key = self._path_merge_key(candidate)
+            if candidate_key in seen:
+                continue
+            merged.append(explicit_by_key.pop(candidate_key, candidate))
+            seen.add(candidate_key)
+            if artifact.role == "primary_target":
+                insert_after_primary = len(merged)
+        for candidate in explicit_request_paths:
+            candidate_key = self._path_merge_key(candidate)
+            if not candidate or candidate_key in seen:
+                continue
+            merged.insert(insert_after_primary, candidate)
+            seen.add(candidate_key)
+            insert_after_primary += 1
+        return merged
 
     def _path_merge_key(self, value: str | None) -> str:
         return str(value or "").strip().replace("\\", "/").lower()

@@ -1690,6 +1690,47 @@ def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     assert task_state.semantic_resolution == "minimal_inference"
 
 
+def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    session = SessionState(
+        task="super danke. und was kannst du mir über dich erzählen wer bist du wie heißt du und was kannst du?",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="Programmiere mir eine Website über Hamburger.",
+            previous_root_goal="Create the requested website files.",
+            previous_active_goal="Create Index.html, script.js, and styles.css for the website.",
+            previous_next_action="create",
+            previous_requested_outcome="A small runnable website with the named files.",
+            target_paths=["Index.html", "script.js", "styles.css"],
+            changed_files=["Index.html", "script.js", "styles.css"],
+            read_files=["Index.html", "script.js", "styles.css"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts == []
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.needs_clarification is False
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert "Coding-Agent" in (route.direct_response or "")
+
+
 def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_path):
     interpreter = TaskInterpreter(ScriptedLLM(fail=True, fail_message="timed out"))
 
