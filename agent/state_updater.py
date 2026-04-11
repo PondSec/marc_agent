@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from agent.prompts import task_state_system_prompt, task_state_update_prompt
-from agent.semantic_defaults import fallback_direct_chat_response
+from agent.semantic_defaults import classify_conversation_request
 from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
@@ -807,7 +807,7 @@ class TaskStateUpdater:
         state: TaskState,
     ) -> bool:
         del session
-        if fallback_direct_chat_response(user_input) is None:
+        if classify_conversation_request(user_input) is None:
             return False
         if state.needs_clarification:
             return False

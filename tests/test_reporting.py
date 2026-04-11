@@ -161,6 +161,113 @@ def test_reporter_requires_task_state_without_semantic_fallback(tmp_path):
         reporter.render_final_response(session, draft_response="Hallo")
 
 
+def test_reporter_does_not_append_project_intro_for_general_conversation(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="weißt du was ein Hamburger ist?",
+        workspace_root=str(tmp_path),
+        status="completed",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="weißt du was ein Hamburger ist?",
+            root_goal="Answer the user's normal question.",
+            active_goal="Answer the normal conversation directly without repository work.",
+            goal_relation="new_task",
+            output_expectation="A direct conversational answer.",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.82,
+            next_action="explain",
+            execution_outline=["Answer directly"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.router_result = Planner(
+        ScriptedLLM(
+            json_payloads=[
+                {
+                    "user_goal": "Answer the user's normal question.",
+                    "intent": "explain",
+                    "entities": {
+                        "target_type": None,
+                        "target_name": None,
+                        "target_paths": [],
+                        "attributes": [],
+                        "constraints": [],
+                    },
+                    "requested_outcome": "Answer the user's normal conversation directly without repository work.",
+                    "action_plan": [
+                        {
+                            "step": 1,
+                            "action": "respond_directly",
+                            "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                        }
+                    ],
+                    "needs_clarification": False,
+                    "clarification_questions": [],
+                    "confidence": 0.74,
+                    "safe_to_execute": True,
+                    "repo_context_needed": False,
+                    "search_terms": [],
+                    "relevant_extensions": [],
+                    "direct_response": None,
+                }
+            ]
+        ),
+        "",
+    ).validate_router_output(
+        {
+            "user_goal": "Answer the user's normal question.",
+            "intent": "explain",
+            "entities": {
+                "target_type": None,
+                "target_name": None,
+                "target_paths": [],
+                "attributes": [],
+                "constraints": [],
+            },
+            "requested_outcome": "Answer the user's normal conversation directly without repository work.",
+            "action_plan": [
+                {
+                    "step": 1,
+                    "action": "respond_directly",
+                    "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                }
+            ],
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.74,
+            "safe_to_execute": True,
+            "repo_context_needed": False,
+            "search_terms": [],
+            "relevant_extensions": [],
+            "direct_response": None,
+        }
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(
+        session,
+        draft_response="Ein Hamburger ist ein warmes Sandwich mit einem Bratling im Broetchen.",
+    )
+
+    assert "Hamburger" in response
+    assert "analyze, change, or answer in this project" not in response
+
+
 def test_reporter_marks_partial_unvalidated_changes_honestly(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

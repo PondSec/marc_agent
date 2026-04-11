@@ -1728,7 +1728,7 @@ def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat
     assert route.needs_clarification is False
     assert route.repo_context_needed is False
     assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
-    assert "Coding-Agent" in (route.direct_response or "")
+    assert route.direct_response is None
 
 
 def test_task_state_a2_short_circuits_clear_direct_chat_follow_up_without_model_calls(tmp_path):
@@ -1773,8 +1773,32 @@ def test_task_state_a2_short_circuits_clear_direct_chat_follow_up_without_model_
     assert task_state.needs_clarification is False
     assert route.intent == RouteIntent.EXPLAIN
     assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
-    assert "Coding-Agent" in (route.direct_response or "")
+    assert route.direct_response is None
     assert llm.generate_json_calls == []
+
+
+def test_task_state_timeout_fallback_treats_general_knowledge_question_as_conversation_not_repo_task(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    task_state = updater.update_task_state(
+        "weißt du was ein Hamburger ist?",
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task="weißt du was ein Hamburger ist?", workspace_root=str(tmp_path)),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts == []
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
 
 
 def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_path):

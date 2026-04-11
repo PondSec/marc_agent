@@ -14,8 +14,8 @@ import re
 from typing import Any, Literal
 
 from agent.semantic_defaults import (
+    classify_conversation_request,
     extract_scope_constraints,
-    fallback_direct_chat_response,
     has_follow_up_reference,
     infer_artifact_name_hint,
     infer_requested_extension,
@@ -536,11 +536,12 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
     explicit_path = _extract_explicit_path(request)
     requested_extension = infer_requested_extension(request)
     artifact_name_hint = infer_artifact_name_hint(request)
-    if fallback_direct_chat_response(request) is not None:
+    conversation = classify_conversation_request(request)
+    if conversation is not None:
         return MinimalSemanticSignal(
             intent="explain",
             goal_relation="new_task",
-            confidence=0.82,
+            confidence=max(conversation.confidence, 0.72),
             use_context=False,
             needs_clarification=False,
             requested_extension=requested_extension,

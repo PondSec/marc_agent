@@ -333,6 +333,7 @@ def route_payload(
     repo_context_needed=True,
     target_name=None,
     search_terms=None,
+    requested_outcome=None,
 ):
     return {
         "user_goal": "Handle the user request safely.",
@@ -344,7 +345,7 @@ def route_payload(
             "attributes": [],
             "constraints": [],
         },
-        "requested_outcome": "Produce the requested result.",
+        "requested_outcome": requested_outcome or "Produce the requested result.",
         "action_plan": action_plan,
         "needs_clarification": needs_clarification,
         "clarification_questions": clarification_questions or [],
@@ -464,6 +465,37 @@ def test_planner_returns_direct_response_from_router(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert "lokaler Agent" in (decision.final_response or "")
+
+
+def test_planner_generates_freeform_answer_for_conversation_route_without_hardcoded_direct_response(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="explain",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "respond_directly",
+                        "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                    }
+                ],
+                direct_response=None,
+                repo_context_needed=False,
+                requested_outcome="Answer the user's normal conversation directly without repository work.",
+            )
+        ],
+        text_payloads=["Ein Hamburger ist ein warmes Sandwich mit einem Bratling in einem aufgeschnittenen Broetchen."],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(task="weißt du was ein Hamburger ist?", workspace_root=str(tmp_path))
+    commit_task_state_and_route(planner, session, payload)
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Hamburger" in (decision.final_response or "")
+    assert llm.generate_calls
 
 
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):

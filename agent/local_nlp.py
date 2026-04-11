@@ -8,9 +8,19 @@ import re
 from typing import Literal
 
 
-FallbackIntent = Literal["create", "debug", "explain", "inspect", "plan", "search", "unknown", "update"]
+FallbackIntent = Literal["conversation", "create", "debug", "explain", "inspect", "plan", "search", "unknown", "update"]
 
 _SEED_EXAMPLES: dict[FallbackIntent, tuple[str, ...]] = {
+    "conversation": (
+        "hallo wie geht es dir",
+        "wer bist du",
+        "wie heisst du",
+        "was kannst du",
+        "tell me about yourself",
+        "what is a hamburger",
+        "can you explain what a hamburger is",
+        "weißt du was ein hamburger ist",
+    ),
     "create": (
         "ich brauche ein snake spiel in html",
         "schreib mir ein asteroids spiel in html",

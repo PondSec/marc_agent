@@ -8,6 +8,7 @@ import re
 import shlex
 
 from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
+from agent.semantic_defaults import classify_conversation_request
 from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
@@ -1069,6 +1070,20 @@ def _single_file_boundary_instruction(path: str, target_paths: list[str] | None)
 
 
 def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
+    if (
+        classify_conversation_request(session.task) is not None
+        and not session.changed_files
+        and not session.tool_calls
+    ):
+        return "\n".join(
+            [
+                "Answer the user's latest message directly and naturally.",
+                "This is normal conversation, not a repository task.",
+                f"User message: {json.dumps(session.task, ensure_ascii=False)}",
+                "Use general knowledge when needed.",
+                "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
+            ]
+        )
     recent_notes = session.notes[-12:]
     recent_calls = _compact_recent_calls(session)
     report_context = {

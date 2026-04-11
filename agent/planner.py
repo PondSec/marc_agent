@@ -56,6 +56,7 @@ from agent.prompts import (
     semantic_change_review_system_prompt,
 )
 from agent.router import IntentRouter
+from agent.semantic_defaults import classify_conversation_request
 from agent.semantic_runtime import availability_recovery_model
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
@@ -760,6 +761,12 @@ class Planner:
         route = session.router_result
         if route is not None and route.direct_response and not session.tool_calls:
             return route.direct_response
+        if self._is_conversation_request(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die normale Frage erkannt, aber die freie Antwort konnte in diesem Lauf nicht stabil erzeugt werden.",
+                en="I recognized this as normal conversation, but I could not generate a stable free-form answer in this run.",
+            )
         if session.changed_files and self._functional_validation_missing(session):
             return self._localized_text(
                 language,
@@ -823,6 +830,13 @@ class Planner:
         inspected = self._read_paths(session)[:4]
         language = self._session_language(session)
         lines: list[str] = []
+
+        if self._is_conversation_request(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die Frage als normale Unterhaltung erkannt, aber die freie Antwort konnte gerade nicht stabil erzeugt werden.",
+                en="I recognized the question as normal conversation, but I could not generate a stable free-form answer just now.",
+            )
 
         if session.changed_files:
             lines.append(
@@ -923,6 +937,13 @@ class Planner:
             )
 
         return "\n\n".join(part for part in lines if part)
+
+    def _is_conversation_request(self, session: SessionState) -> bool:
+        return (
+            not session.changed_files
+            and not session.tool_calls
+            and classify_conversation_request(session.task) is not None
+        )
 
     def _draft_create_decision(
         self,

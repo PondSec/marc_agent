@@ -6,7 +6,7 @@ from typing import Any
 
 from agent.models import SessionState, WorkspaceSnapshot
 from agent.semantic_defaults import (
-    fallback_direct_chat_response,
+    classify_conversation_request,
     infer_artifact_name_hint,
     infer_requested_extension,
     infer_scope_tokens,
@@ -58,7 +58,6 @@ class ExecutionDecisionPolicy:
         target_name = self._target_name(understanding, target_paths)
         search_terms = self._search_terms(understanding, target_paths, target_name)
         relevant_extensions = self._relevant_extensions(understanding, target_paths)
-        direct_response = fallback_direct_chat_response(understanding.original_request)
 
         if self._should_clarify(
             understanding,
@@ -96,7 +95,7 @@ class ExecutionDecisionPolicy:
                 repo_context_needed=False,
                 search_terms=search_terms,
                 relevant_extensions=relevant_extensions,
-                direct_response=direct_response,
+                direct_response=None,
             )
             self._log(
                 "execution_decision",
@@ -139,7 +138,7 @@ class ExecutionDecisionPolicy:
             repo_context_needed=self._repo_context_needed(intent),
             search_terms=search_terms,
             relevant_extensions=relevant_extensions,
-            direct_response=direct_response,
+            direct_response=None,
         )
         self._log(
             "execution_decision",
@@ -496,7 +495,7 @@ class ExecutionDecisionPolicy:
         session: SessionState | None,
         intent: RouteIntent,
     ) -> list[str]:
-        if fallback_direct_chat_response(understanding.original_request) is not None:
+        if classify_conversation_request(understanding.original_request) is not None:
             return []
         candidate_artifacts = [
             item

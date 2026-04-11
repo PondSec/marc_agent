@@ -18,6 +18,7 @@ _CREATE_SIGNALS = (
     "build",
     "create",
     "erstell",
+    "anleg",
     "generate",
     "implement",
     "add",
@@ -238,9 +239,14 @@ _PROBLEM_REPORT_TOKENS = (
     "crash",
     "error",
     "exception",
+    "fail",
+    "failed",
+    "failing",
+    "fails",
     "fehler",
     "geht nicht",
     "kaputt",
+    "not working",
     "problem",
     "stacktrace",
     "terminal",
@@ -279,29 +285,6 @@ _EXPLANATION_REQUEST_TOKENS = (
     "wie funktioniert",
     "wieso",
     "zusammen",
-)
-
-_DIRECT_CHAT_GREETING_TOKENS = (
-    "guten abend",
-    "guten morgen",
-    "guten tag",
-    "hallo",
-    "hello",
-    "hey",
-    "hi",
-    "moin",
-    "servus",
-)
-
-_DIRECT_CHAT_INTRO_FRAGMENTS = (
-    "was kannst du",
-    "was machst du",
-    "wer bist du",
-    "what can you do",
-    "what do you do",
-    "who are you",
-    "wie heisst du",
-    "wie heißt du",
 )
 
 _UPDATE_REQUEST_TOKENS = (
@@ -368,6 +351,147 @@ _FRONTEND_SCOPE_TOKENS = (
     "ui only",
 )
 
+_QUESTION_WORD_TOKENS = (
+    "how",
+    "wann",
+    "warum",
+    "was",
+    "what",
+    "when",
+    "wer",
+    "where",
+    "wie",
+    "wieso",
+    "wo",
+    "who",
+    "why",
+)
+
+_SECOND_PERSON_TOKENS = (
+    "dich",
+    "dir",
+    "du",
+    "dein",
+    "deine",
+    "you",
+    "your",
+)
+
+_REPO_CONTEXT_TOKENS = (
+    "auth",
+    "branch",
+    "code",
+    "komponente",
+    "commit",
+    "component",
+    "config",
+    "datei",
+    "diff",
+    "endpoint",
+    "file",
+    "function",
+    "handler",
+    "klasse",
+    "class",
+    "logik",
+    "logic",
+    "method",
+    "modul",
+    "module",
+    "project",
+    "projekt",
+    "repo",
+    "repository",
+    "route",
+    "selector",
+    "source",
+    "test",
+    "workspace",
+)
+
+_REPO_ACTION_TOKENS = (
+    "analysier",
+    "analysiere",
+    "check",
+    "erklaer",
+    "erklär",
+    "explain",
+    "find",
+    "inspect",
+    "lese",
+    "locate",
+    "look through",
+    "read",
+    "review",
+    "search",
+    "show",
+    "such",
+    "summarize",
+    "where is",
+    "wo ist",
+    "wo steckt",
+    "zusammen",
+)
+
+_DEICTIC_TASK_OBJECT_TOKENS = (
+    "das",
+    "dies",
+    "dieses",
+    "es",
+    "it",
+    "that",
+    "this",
+)
+
+_DIRECT_TASK_REQUEST_TOKENS = (
+    "analys",
+    "analyz",
+    "build",
+    "check",
+    "create",
+    "debug",
+    "delete",
+    "find",
+    "fix",
+    "inspect",
+    "inspiz",
+    "les",
+    "locate",
+    "modify",
+    "read",
+    "remove",
+    "repair",
+    "review",
+    "run",
+    "search",
+    "show",
+    "start",
+    "such",
+    "update",
+)
+
+_GENERIC_EXECUTION_TOKENS = (
+    "do",
+    "mach",
+    "make",
+    "tu",
+)
+
+_AMBIGUOUS_CONTEXT_REFERENCE_TOKENS = (
+    "da",
+    "darin",
+    "drin",
+    "here",
+    "hier",
+    "inside",
+    "there",
+)
+
+_CODE_PATH_RE = re.compile(
+    r"([\w./-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|html|css|sh|toml|ya?ml|go|rs|java|kt|rb|ini|cfg|conf|env|log|sql|xml|svg|csv))",
+    flags=re.IGNORECASE,
+)
+
 
 PrimarySemanticIntent = Literal["create", "debug", "explain", "update"]
 
@@ -378,6 +502,11 @@ class ObviousRequestClassification:
     confidence: float
     requested_extension: str | None = None
     artifact_name_hint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationClassification:
+    confidence: float
 
 
 def normalize_text(text: str) -> str:
@@ -410,6 +539,14 @@ def _contains_term(
         if term in tokens:
             return True
     return False
+
+
+def _looks_like_actionable_request(normalized: str, tokens: list[str]) -> bool:
+    if _contains_term(normalized, tokens, _DIRECT_TASK_REQUEST_TOKENS, prefix=True):
+        return True
+    has_deictic_object = _contains_term(normalized, tokens, _DEICTIC_TASK_OBJECT_TOKENS)
+    has_generic_execution = _contains_term(normalized, tokens, _GENERIC_EXECUTION_TOKENS, prefix=True)
+    return has_deictic_object and has_generic_execution
 
 
 def _contains_implementation_noun(normalized: str) -> bool:
@@ -566,48 +703,61 @@ def looks_like_debug_request(text: str) -> bool:
     return has_fix_signal or has_problem_signal
 
 
-def fallback_direct_chat_response(text: str) -> str | None:
-    normalized = " ".join(str(text or "").lower().split()).strip("!?., ")
+def classify_conversation_request(text: str) -> ConversationClassification | None:
+    normalized = normalize_text(text)
     if not normalized:
         return None
-    if normalized in _DIRECT_CHAT_GREETING_TOKENS:
-        return (
-            "Hallo. Ich bin bereit.\n\n"
-            "Wenn du magst, kann ich den Code analysieren, eine Aenderung planen oder etwas im Projekt umsetzen."
-        )
-    normalized_padded = f" {normalized} "
-    if any(
-        normalized == fragment
-        or f" {fragment} " in normalized_padded
-        for fragment in _DIRECT_CHAT_INTRO_FRAGMENTS
-    ):
-        return (
-            "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.\n\n"
-            "Ich kann Code analysieren, Aenderungen planen und auf Basis des validierten Router-Outputs ausfuehren."
-        )
     tokens = _text_tokens(normalized)
-    asks_about_self = any(
-        token.startswith(prefix)
-        for prefix in ("erzaehl", "erzähl", "sag", "tell")
-        for token in tokens
-    )
-    if asks_about_self and any(
-        phrase in normalized
-        for phrase in ("about yourself", "ueber dich", "über dich")
+    if not tokens:
+        return None
+    if _CODE_PATH_RE.search(str(text or "")):
+        return None
+    if (
+        is_clear_low_risk_build_request(text)
+        or looks_like_debug_request(text)
+        or looks_like_update_request(text)
+        or looks_like_validation_request(text)
+        or looks_like_correction_request(text)
+        or looks_like_hardening_request(text)
+        or looks_like_scope_narrowing_request(text)
     ):
-        return (
-            "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.\n\n"
-            "Ich kann Code analysieren, Aenderungen planen und auf Basis des validierten Router-Outputs ausfuehren."
-        )
+        return None
+    nlp_prediction = classify_fallback_intent(text)
+    if nlp_prediction.intent in {"create", "debug", "inspect", "plan", "search", "update"} and nlp_prediction.confidence >= 0.38:
+        return None
+    has_repo_context = _contains_term(normalized, tokens, _REPO_CONTEXT_TOKENS)
+    has_repo_action = _contains_term(normalized, tokens, _REPO_ACTION_TOKENS, prefix=True)
+    question_like = normalized.endswith("?") or (tokens and tokens[0] in _QUESTION_WORD_TOKENS)
+    addresses_agent = _contains_term(normalized, tokens, _SECOND_PERSON_TOKENS)
+    actionable_request = _looks_like_actionable_request(normalized, tokens)
+    ambiguous_context_question = (
+        question_like
+        and nlp_prediction.intent != "conversation"
+        and _contains_term(normalized, tokens, _AMBIGUOUS_CONTEXT_REFERENCE_TOKENS)
+    )
+    repo_grounded_explanation = (
+        any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
+        and (has_repo_context or _contains_implementation_noun(normalized))
+    )
+    if (
+        repo_grounded_explanation
+        or (has_repo_context and has_repo_action)
+        or actionable_request
+        or ambiguous_context_question
+    ):
+        return None
+    if nlp_prediction.intent == "conversation" and nlp_prediction.confidence >= 0.34:
+        return ConversationClassification(confidence=max(nlp_prediction.confidence, 0.46))
+    if question_like and addresses_agent:
+        return ConversationClassification(confidence=max(nlp_prediction.confidence, 0.48))
+    if question_like and not has_repo_context and nlp_prediction.intent in {"conversation", "unknown", "explain"}:
+        return ConversationClassification(confidence=max(nlp_prediction.confidence, 0.44))
     return None
 
 
 def looks_like_explanation_request(text: str) -> bool:
     normalized = normalize_text(text)
-    return bool(normalized) and (
-        fallback_direct_chat_response(text) is not None
-        or any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
-    )
+    return bool(normalized) and any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
 
 
 def looks_like_update_request(text: str) -> bool:
