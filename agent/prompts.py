@@ -1082,6 +1082,8 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
                 "Stay on the exact topic of the latest message and answer that question, not a different greeting or a prior turn.",
                 "Prefer a short, plain, factual answer over creative detail or embellishment.",
                 "If you are unsure about a fact, say so briefly instead of inventing specifics.",
+                "Answer as the local workspace agent, not as the underlying model or vendor.",
+                "If the user asks who you are, describe your role here instead of claiming a model-family identity.",
                 "If the user asks about your capabilities here, describe what you can do in this workspace.",
                 f"User message: {json.dumps(session.task, ensure_ascii=False)}",
                 "Use general knowledge when needed.",

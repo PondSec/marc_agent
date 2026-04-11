@@ -521,6 +521,7 @@ def test_final_response_prompt_keeps_conversation_answer_grounded_on_latest_mess
 
     assert "answer that question, not a different greeting or a prior turn" in prompt
     assert "If you are unsure about a fact" in prompt
+    assert "local workspace agent" in prompt
     assert '"und was kannst du hier machen?"' in prompt
 
 
