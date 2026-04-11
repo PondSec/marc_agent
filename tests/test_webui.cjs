@@ -8,6 +8,8 @@ const {
   buildThreadPresentationView,
   buildUiRoute,
   buildWorkspaceShellView,
+  workspaceModalTargetPathFrom,
+  workspaceGitBranchSuggestions,
   buildPhaseSteps,
   buildSessionOverview,
   buildValidationSnapshot,
@@ -374,6 +376,75 @@ test("buildWorkspaceShellView kapselt Toolbar-Entscheidungen zentral", () => {
   assert.equal(view.canDeleteSession, false);
   assert.equal(view.canDownloadHandoff, false);
   assert.match(view.subtitle, /alpha|\/tmp\/alpha/i);
+});
+
+test("workspaceModalTargetPathFrom verwendet lokale Repos direkt statt eines abgeleiteten Workspace-Pfads", () => {
+  assert.equal(
+    workspaceModalTargetPathFrom({
+      workspaceMode: "create",
+      workspaceSource: "git",
+      workspaceName: "alpha-copy",
+      workspaceGitInspection: {
+        source_kind: "local_path",
+        resolved_path: "/srv/repos/alpha",
+      },
+    }),
+    "/srv/repos/alpha",
+  );
+});
+
+test("workspaceGitBranchSuggestions fuehrt Branches dedupliziert und in stabiler Reihenfolge zusammen", () => {
+  assert.deepEqual(
+    workspaceGitBranchSuggestions({
+      workspaceGitBranch: "feature/ui-shell",
+      workspaceGitInspection: {
+        current_branch: "feature/ui-shell",
+        default_branch: "main",
+        local_branches: ["feature/ui-shell", "main", "develop"],
+        remote_branches: ["origin/main", "origin/develop", "origin/main"],
+      },
+      workspaceGitStatus: {
+        current_branch: "feature/ui-shell",
+        configured_branch: "develop",
+        default_branch: "main",
+        local_branches: ["develop", "release"],
+        remote_branches: ["origin/release", "origin/main"],
+      },
+    }),
+    ["feature/ui-shell", "main", "develop", "origin/main", "origin/develop", "release", "origin/release"],
+  );
+});
+
+test("buildWorkspaceShellView zeigt Git-Metadaten und Sync-Aktionen fuer verbundene Projekte", () => {
+  const view = buildWorkspaceShellView({
+    config: { model_name: "qwen3-coder:30b" },
+    composer: {
+      modelName: "",
+      accessMode: "approval",
+      executionProfile: "balanced",
+    },
+    workspaces: [
+      {
+        id: "ws-1",
+        name: "alpha",
+        path: "/tmp/alpha",
+        git_sync_source: "https://example.invalid/alpha.git",
+        git_branch: "develop",
+        git_remote_name: "origin",
+        last_git_sync_at: "2026-04-11T08:00:00.000Z",
+      },
+    ],
+    sessions: [],
+    selectedWorkspaceId: "ws-1",
+    activeSession: null,
+  });
+
+  const gitMeta = view.metaItems.find((item) => item.label === "Git");
+
+  assert.ok(gitMeta);
+  assert.equal(gitMeta.value, "develop");
+  assert.equal(view.canSyncGit, true);
+  assert.match(view.subtitle, /Git .*develop/i);
 });
 
 test("buildReferenceHeroView erzeugt im Startzustand Welcome-Feeds aus dem Workspace-Kontext", () => {
