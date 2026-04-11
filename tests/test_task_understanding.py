@@ -1731,6 +1731,52 @@ def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat
     assert "Coding-Agent" in (route.direct_response or "")
 
 
+def test_task_state_a2_short_circuits_clear_direct_chat_follow_up_without_model_calls(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
+    session = SessionState(
+        task="und was kannst du hier machen?",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+        follow_up_context=FollowUpContext(
+            previous_task="Programmiere mir eine Website über Hamburger.",
+            previous_root_goal="Create the requested website files.",
+            previous_active_goal="Create Index.html, script.js, and styles.css for the website.",
+            previous_next_action="create",
+            previous_requested_outcome="A small runnable website with the named files.",
+            target_paths=["Index.html", "script.js", "styles.css"],
+            changed_files=["Index.html", "script.js", "styles.css"],
+            read_files=["Index.html", "script.js", "styles.css"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert "Coding-Agent" in (route.direct_response or "")
+    assert llm.generate_json_calls == []
+
+
 def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_path):
     interpreter = TaskInterpreter(ScriptedLLM(fail=True, fail_message="timed out"))
 
