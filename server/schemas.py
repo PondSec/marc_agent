@@ -76,16 +76,79 @@ class WorkspaceRecord(StrictModel):
     path: str
     created_at: str
     updated_at: str
+    git_sync_source: str | None = None
+    git_branch: str | None = None
+    git_remote_name: str | None = None
+    last_git_sync_at: str | None = None
 
 
 class WorkspaceCreateRequest(StrictModel):
     name: str = Field(..., min_length=1, max_length=80)
     path: str = Field(..., min_length=1)
+    git_sync_source: str | None = Field(default=None, min_length=1)
+    git_branch: str | None = Field(default=None, min_length=1, max_length=120)
+    git_remote_name: str | None = Field(default=None, min_length=1, max_length=80)
+    sync_on_create: bool = False
 
 
 class WorkspaceUpdateRequest(StrictModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     path: str | None = Field(default=None, min_length=1)
+    git_sync_source: str | None = Field(default=None, min_length=1)
+    git_branch: str | None = Field(default=None, min_length=1, max_length=120)
+    git_remote_name: str | None = Field(default=None, min_length=1, max_length=80)
+    sync_on_save: bool | None = None
+
+
+class GitRepositoryCandidate(StrictModel):
+    name: str
+    path: str
+    remote_url: str | None = None
+    current_branch: str | None = None
+    local_branches: list[str] = Field(default_factory=list)
+    remote_branches: list[str] = Field(default_factory=list)
+    has_uncommitted_changes: bool = False
+
+
+class GitSourceInspectionResponse(StrictModel):
+    source: str
+    source_kind: Literal["local_path", "remote_url"]
+    resolved_path: str | None = None
+    remote_url: str | None = None
+    current_branch: str | None = None
+    default_branch: str | None = None
+    local_branches: list[str] = Field(default_factory=list)
+    remote_branches: list[str] = Field(default_factory=list)
+    has_uncommitted_changes: bool = False
+
+
+class WorkspaceGitStatus(StrictModel):
+    workspace_id: str
+    workspace_path: str
+    is_repo: bool
+    configured_source: str | None = None
+    remote_name: str | None = None
+    remote_url: str | None = None
+    current_branch: str | None = None
+    configured_branch: str | None = None
+    default_branch: str | None = None
+    local_branches: list[str] = Field(default_factory=list)
+    remote_branches: list[str] = Field(default_factory=list)
+    has_uncommitted_changes: bool = False
+    ahead_by: int = 0
+    behind_by: int = 0
+    last_synced_at: str | None = None
+
+
+class WorkspaceGitSyncRequest(StrictModel):
+    git_sync_source: str | None = Field(default=None, min_length=1)
+    git_branch: str | None = Field(default=None, min_length=1, max_length=120)
+    git_remote_name: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class WorkspaceGitSyncResponse(StrictModel):
+    workspace: WorkspaceRecord
+    git: WorkspaceGitStatus
 
 
 class TerminalSessionCreateRequest(StrictModel):

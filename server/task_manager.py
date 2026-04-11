@@ -19,6 +19,7 @@ from agent.session import SessionStore
 from config.settings import AccessMode, AppConfig
 from runtime.logger import AgentLogger
 from runtime.workspace import WorkspaceError, WorkspaceManager
+from server.git_integration import GitIntegrationError, GitWorkspaceService
 from server.schemas import LogRecord, SessionSummary, WorkspaceInspectResponse
 from server.workspace_store import WorkspaceStore
 
@@ -84,6 +85,10 @@ class TaskManager:
         self.base_config.ensure_state_dirs()
         self.session_store = SessionStore(self.base_config.session_dir_path)
         self.workspace_store = WorkspaceStore(self.base_config.state_root / "workspaces.json")
+        self.git_service = GitWorkspaceService(
+            self.base_config.workspace_path,
+            state_dir_name=self.base_config.state_dir_name,
+        )
         self._active_session_dir = self.base_config.state_root / "active_sessions"
         self._active_session_dir.mkdir(parents=True, exist_ok=True)
         self._clear_orphaned_active_session_leases()
@@ -465,8 +470,43 @@ class TaskManager:
     def list_workspaces(self):
         return self.workspace_store.list_workspaces()
 
-    def create_workspace(self, name: str, path: str):
-        workspace = self.workspace_store.create(name, path)
+    def create_workspace(
+        self,
+        name: str,
+        path: str,
+        *,
+        git_sync_source: str | None = None,
+        git_branch: str | None = None,
+        git_remote_name: str | None = None,
+        sync_on_create: bool = False,
+    ):
+        existing_before = next(
+            (
+                item
+                for item in self.workspace_store.list_workspaces()
+                if item.path == str(Path(path).expanduser().resolve())
+            ),
+            None,
+        )
+        workspace = self.workspace_store.create(
+            name,
+            path,
+            git_sync_source=git_sync_source,
+            git_branch=git_branch,
+            git_remote_name=git_remote_name,
+        )
+        if sync_on_create:
+            try:
+                return self.sync_workspace_git(
+                    workspace.id,
+                    git_sync_source=git_sync_source,
+                    git_branch=git_branch,
+                    git_remote_name=git_remote_name,
+                )[0]
+            except WorkspaceOperationError:
+                if existing_before is None:
+                    self.workspace_store.delete(workspace.id)
+                raise
         Path(workspace.path).mkdir(parents=True, exist_ok=True)
         return workspace
 
@@ -476,13 +516,96 @@ class TaskManager:
         *,
         name: str | None = None,
         path: str | None = None,
+        git_sync_source: str | None = None,
+        git_branch: str | None = None,
+        git_remote_name: str | None = None,
+        sync_on_save: bool = False,
     ):
-        workspace = self.workspace_store.update(workspace_id, name=name, path=path)
+        workspace = self.workspace_store.update(
+            workspace_id,
+            name=name,
+            path=path,
+            git_sync_source=git_sync_source,
+            git_branch=git_branch,
+            git_remote_name=git_remote_name,
+        )
         if workspace is None:
             return None
-        Path(workspace.path).mkdir(parents=True, exist_ok=True)
+        if sync_on_save:
+            workspace, _ = self.sync_workspace_git(
+                workspace.id,
+                git_sync_source=git_sync_source,
+                git_branch=git_branch,
+                git_remote_name=git_remote_name,
+            )
+        else:
+            Path(workspace.path).mkdir(parents=True, exist_ok=True)
         self._refresh_session_workspace_labels(workspace.id, workspace.name, workspace.path)
         return workspace
+
+    def discover_git_repositories(self):
+        workspace_paths = [workspace.path for workspace in self.workspace_store.list_workspaces()]
+        try:
+            return self.git_service.discover_repositories(workspace_paths=workspace_paths)
+        except GitIntegrationError as exc:
+            raise WorkspaceOperationError(str(exc)) from exc
+
+    def inspect_git_source(self, source: str):
+        try:
+            return self.git_service.inspect_source(source)
+        except GitIntegrationError as exc:
+            raise WorkspaceOperationError(str(exc)) from exc
+
+    def workspace_git_status(self, workspace_id: str):
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError("Workspace not found.")
+        try:
+            return self.git_service.workspace_status(workspace)
+        except GitIntegrationError as exc:
+            raise WorkspaceOperationError(str(exc)) from exc
+
+    def sync_workspace_git(
+        self,
+        workspace_id: str,
+        *,
+        git_sync_source: str | None = None,
+        git_branch: str | None = None,
+        git_remote_name: str | None = None,
+    ):
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError("Workspace not found.")
+        sessions = [
+            session
+            for session in self.session_store.list_sessions(limit=10_000)
+            if session.workspace_id == workspace_id
+        ]
+        with self._lock:
+            if any(self._is_active(session.id) for session in sessions):
+                raise WorkspaceBusyError(
+                    "The workspace still has a running chat and cannot be synchronized from git yet."
+                )
+            try:
+                result = self.git_service.sync_workspace(
+                    workspace,
+                    sync_source=git_sync_source,
+                    branch=git_branch,
+                    remote_name=git_remote_name,
+                )
+            except GitIntegrationError as exc:
+                raise WorkspaceOperationError(str(exc)) from exc
+            updated = self.workspace_store.update(
+                workspace_id,
+                git_sync_source=result.sync_source if result.sync_source is not None else workspace.git_sync_source,
+                git_branch=result.branch,
+                git_remote_name=result.remote_name,
+                last_git_sync_at=utc_now(),
+            )
+            assert updated is not None
+            self._refresh_session_workspace_labels(updated.id, updated.name, updated.path)
+            status = self.git_service.workspace_status(updated)
+            return updated, status
 
     def delete_session(self, session_id: str) -> bool:
         session = self.session_store.load(session_id)
