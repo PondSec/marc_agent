@@ -86,6 +86,7 @@ class TaskManager:
         self.workspace_store = WorkspaceStore(self.base_config.state_root / "workspaces.json")
         self._active_session_dir = self.base_config.state_root / "active_sessions"
         self._active_session_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_orphaned_active_session_leases()
         self._heal_workspace_store_from_workspace_root()
         self._sync_workspace_state_to_base()
         self._lock = Lock()
@@ -98,6 +99,7 @@ class TaskManager:
         *,
         session_id: str | None = None,
         workspace_id: str | None = None,
+        enqueue_if_busy: bool = False,
         overrides: dict[str, Any] | None = None,
     ) -> SessionSummary:
         existing = self.session_store.load(session_id) if session_id else None
@@ -116,6 +118,11 @@ class TaskManager:
             if target_session_id and self._is_active(target_session_id):
                 raise TaskAlreadyRunningError(
                     f"Session {target_session_id} is already running."
+                )
+            self._ensure_queue_progress_locked(preferred_session_id=target_session_id)
+            if self._active_session_ids_locked() and not enqueue_if_busy:
+                raise TaskAlreadyRunningError(
+                    "Another run is already active. Wait for it to finish or queue the next run."
                 )
 
             session = existing or SessionState(
@@ -190,17 +197,8 @@ class TaskManager:
             session.append_message("user", prompt)
             session.touch()
             self.session_store.save(session)
-            self._touch_active_session_lease(session.id)
-
-            stop_event = Event()
-            self._stop_events[session.id] = stop_event
-            thread = Thread(
-                target=self._run_task_thread,
-                args=(config, prompt, session, stop_event),
-                daemon=True,
-            )
-            self._threads[session.id] = thread
-            thread.start()
+            if not self._active_session_ids_locked():
+                self._launch_task_locked(config, prompt, session)
 
         return self._summary_for_session(session)
 
@@ -553,6 +551,8 @@ class TaskManager:
                 )
             workspace_root.mkdir(parents=True, exist_ok=True)
             for child in workspace_root.iterdir():
+                if child.name == self.base_config.state_dir_name:
+                    continue
                 if child.is_dir() and not child.is_symlink():
                     shutil.rmtree(child)
                 else:
@@ -592,14 +592,7 @@ class TaskManager:
 
     def active_sessions(self) -> list[str]:
         with self._lock:
-            inactive = [
-                session_id
-                for session_id, thread in self._threads.items()
-                if not thread.is_alive()
-            ]
-            for session_id in inactive:
-                self._threads.pop(session_id, None)
-            return sorted({*self._threads.keys(), *self._fresh_active_session_leases()})
+            return self._active_session_ids_locked()
 
     def _run_task_thread(
         self,
@@ -640,6 +633,7 @@ class TaskManager:
             with self._lock:
                 self._threads.pop(session.id, None)
                 self._stop_events.pop(session.id, None)
+                self._start_next_queued_task_locked()
 
     def _config_with_overrides(
         self,
@@ -758,6 +752,75 @@ class TaskManager:
             runtime_options=session.runtime_options,
         )
 
+    def _launch_task_locked(
+        self,
+        config: AppConfig,
+        prompt: str,
+        session: SessionState,
+    ) -> None:
+        self._touch_active_session_lease(session.id)
+        stop_event = Event()
+        self._stop_events[session.id] = stop_event
+        thread = Thread(
+            target=self._run_task_thread,
+            args=(config, prompt, session, stop_event),
+            daemon=True,
+        )
+        self._threads[session.id] = thread
+        thread.start()
+
+    def _start_next_queued_task_locked(self) -> bool:
+        if self._active_session_ids_locked():
+            return False
+        queued_sessions = self._queued_sessions_locked()
+        if not queued_sessions:
+            return False
+        session = queued_sessions[0]
+        config = self._config_with_overrides(
+            session.runtime_options,
+            workspace_root=session.workspace_root,
+        )
+        self._launch_task_locked(config, session.task, session)
+        return True
+
+    def _ensure_queue_progress_locked(self, preferred_session_id: str | None = None) -> None:
+        if self._active_session_ids_locked():
+            return
+        queued_sessions = self._queued_sessions_locked()
+        if not queued_sessions:
+            return
+        if preferred_session_id and queued_sessions[0].id == preferred_session_id:
+            return
+        session = queued_sessions[0]
+        config = self._config_with_overrides(
+            session.runtime_options,
+            workspace_root=session.workspace_root,
+        )
+        self._launch_task_locked(config, session.task, session)
+
+    def _queued_sessions_locked(self) -> list[SessionState]:
+        queued_sessions: list[SessionState] = []
+        for session in self.session_store.list_sessions(limit=None):
+            if self._is_active(session.id):
+                continue
+            session = self._normalize_session_workspace(session)
+            session = self._normalize_inactive_session(session)
+            if session.status == "queued":
+                queued_sessions.append(session)
+        queued_sessions.sort(key=lambda item: (item.updated_at, item.created_at, item.id))
+        return queued_sessions
+
+    def _active_session_ids_locked(self) -> list[str]:
+        inactive = [
+            session_id
+            for session_id, thread in self._threads.items()
+            if not thread.is_alive()
+        ]
+        for session_id in inactive:
+            self._threads.pop(session_id, None)
+            self._stop_events.pop(session_id, None)
+        return sorted({*self._threads.keys(), *self._fresh_active_session_leases()})
+
     def _is_active(self, session_id: str) -> bool:
         thread = self._threads.get(session_id)
         if thread is not None and thread.is_alive():
@@ -766,6 +829,10 @@ class TaskManager:
 
     def _active_session_lease_path(self, session_id: str) -> Path:
         return self._active_session_dir / f"{session_id}.lease"
+
+    def _clear_orphaned_active_session_leases(self) -> None:
+        for lease in self._active_session_dir.glob("*.lease"):
+            lease.unlink(missing_ok=True)
 
     def _touch_active_session_lease(self, session_id: str) -> None:
         path = self._active_session_lease_path(session_id)
@@ -1010,7 +1077,7 @@ class TaskManager:
             ):
                 updates["status"] = "completed"
 
-        if session.status in {"queued", "running"}:
+        if session.status == "running":
             if session.final_response:
                 updates["status"] = "completed"
             elif self._is_stale_session(session):
@@ -1022,6 +1089,8 @@ class TaskManager:
                     "Bitte starte den Chat erneut."
                 )
                 updates["final_response"] = message
+        elif session.status == "queued" and session.final_response:
+            updates["status"] = "completed"
 
         if not updates:
             return session

@@ -9,7 +9,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from agent.prompts import task_state_system_prompt, task_state_update_prompt
-from agent.semantic_guardrails import build_minimal_task_state
+from agent.semantic_defaults import classify_conversation_request
+from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
     availability_recovery_model,
@@ -66,6 +67,37 @@ class TaskStateUpdater:
         initial_mode = self._initial_prompt_mode(session)
         local_state = self._fallback_state(user_input, snapshot=snapshot, session=session)
         strict_semantic_execution = self._requires_semantic_model_execution(session, local_state)
+        if self._should_short_circuit_direct_chat(
+            user_input=user_input,
+            session=session,
+            state=local_state,
+        ):
+            self._log(
+                "task_state_local_short_circuit",
+                strategy="deterministic_fallback",
+                reason="direct_chat_request",
+            )
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="Task understanding used deterministic direct-chat inference instead of invoking semantic model execution.",
+                        attempts=[],
+                    ),
+                    semantic_resolution="minimal_inference",
+                ),
+            )
+            self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
+            return local_state
         if self._should_short_circuit_with_local_state(
             initial_mode=initial_mode,
             session=session,
@@ -209,7 +241,7 @@ class TaskStateUpdater:
             error=str(outcome.exception),
             failure=failure.to_dict() if failure is not None else None,
         )
-        if failure is not None and failure.no_start_failure:
+        if failure is not None and failure.timeout_like:
             refreshed_candidates = self._model_candidates(refresh_live_inventory=True)
             if refreshed_candidates:
                 model_candidates = refreshed_candidates
@@ -767,6 +799,22 @@ class TaskStateUpdater:
             return False
         return float(state.confidence or 0.0) >= 0.65
 
+    def _should_short_circuit_direct_chat(
+        self,
+        *,
+        user_input: str,
+        session,
+        state: TaskState,
+    ) -> bool:
+        del session
+        if classify_conversation_request(user_input) is None:
+            return False
+        if state.needs_clarification:
+            return False
+        if str(state.current_user_intent or "").strip() != "explain":
+            return False
+        return str(state.next_best_action or state.next_action or "").strip() == "explain"
+
     def _agent_profile(self, session) -> str:
         if session is None:
             return ""
@@ -898,7 +946,7 @@ class TaskStateUpdater:
         candidates = list(reserve_models or [])
         if failure is None:
             return candidates[0] if candidates else None
-        if failure.no_start_failure:
+        if failure.timeout_like:
             return availability_recovery_model(primary_model, candidates)
         return candidates[0] if candidates else None
 
@@ -914,10 +962,138 @@ class TaskStateUpdater:
         session.runtime_executions = session.runtime_executions[-20:]
 
     def _finalize_state(self, state: TaskState, *, semantic_resolution: str) -> TaskState:
+        self._ground_explicit_request_paths(state)
         state.semantic_resolution = semantic_resolution
         state.secondary_semantics_limited = secondary_semantics_limited(semantic_resolution)
         state.semantic_inference_mode = "conservative" if semantic_resolution == "minimal_inference" else "full"
         return state
+
+    def _ground_explicit_request_paths(self, state: TaskState) -> None:
+        request = str(state.latest_user_turn or "").strip()
+        if not request:
+            return
+        explicit_paths: list[str] = []
+        for raw_path in _extract_explicit_paths(request):
+            normalized = self._normalize_request_path(raw_path)
+            if normalized and normalized not in explicit_paths:
+                explicit_paths.append(normalized)
+        if not explicit_paths:
+            return
+        explicit_paths = self._ground_explicit_paths_to_artifacts(
+            explicit_paths,
+            [*list(state.target_artifacts or []), *list(state.active_artifacts or [])],
+        )
+        state.target_artifacts = self._canonicalize_artifacts_to_explicit_paths(
+            state.target_artifacts,
+            explicit_paths,
+        )
+        state.active_artifacts = self._canonicalize_artifacts_to_explicit_paths(
+            state.active_artifacts,
+            explicit_paths,
+        )
+        verification_target = str(state.verification_target or "").strip()
+        canonical_target = self._canonicalize_explicit_request_path(
+            verification_target,
+            explicit_paths,
+        )
+        if canonical_target and canonical_target != verification_target:
+            state.verification_target = canonical_target
+
+    def _ground_explicit_paths_to_artifacts(
+        self,
+        explicit_paths: list[str],
+        artifacts: list,
+    ) -> list[str]:
+        candidate_paths: list[str] = []
+        for artifact in artifacts or []:
+            normalized = self._normalize_request_path(getattr(artifact, "path", None) or getattr(artifact, "name", None))
+            if normalized and normalized not in candidate_paths:
+                candidate_paths.append(normalized)
+
+        grounded: list[str] = []
+        for explicit_path in explicit_paths:
+            exact_matches = [path for path in candidate_paths if path == explicit_path]
+            suffix_matches = [
+                path
+                for path in candidate_paths
+                if path.endswith(f"/{explicit_path}")
+                and not self._is_synthetic_workspace_prefixed_candidate(explicit_path, path)
+            ]
+            basename_matches = [
+                path
+                for path in candidate_paths
+                if "/" not in explicit_path
+                and Path(path).name == explicit_path
+                and not self._is_synthetic_workspace_prefixed_candidate(explicit_path, path)
+            ]
+            resolved = explicit_path
+            if len(exact_matches) == 1:
+                resolved = exact_matches[0]
+            elif len(suffix_matches) == 1:
+                resolved = suffix_matches[0]
+            elif len(basename_matches) == 1:
+                resolved = basename_matches[0]
+            if resolved not in grounded:
+                grounded.append(resolved)
+        return grounded
+
+    def _is_synthetic_workspace_prefixed_candidate(self, explicit_path: str, candidate_path: str) -> bool:
+        explicit = self._normalize_request_path(explicit_path).lower()
+        candidate = self._normalize_request_path(candidate_path).lower()
+        return bool(explicit) and bool(candidate) and candidate.startswith("workspace/") and not explicit.startswith("workspace/")
+
+    def _canonicalize_artifacts_to_explicit_paths(
+        self,
+        artifacts: list,
+        explicit_paths: list[str],
+    ) -> list:
+        normalized_artifacts = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for artifact in artifacts or []:
+            path = self._normalize_request_path(getattr(artifact, "path", None))
+            canonical_path = self._canonicalize_explicit_request_path(path, explicit_paths)
+            updates: dict[str, str | None] = {}
+            if canonical_path:
+                updates["path"] = canonical_path
+                if not str(getattr(artifact, "name", "") or "").strip() or path != canonical_path:
+                    updates["name"] = Path(canonical_path).name
+            elif path:
+                updates["path"] = path
+            normalized_artifact = artifact.model_copy(update=updates) if updates else artifact
+            identity = (
+                str(getattr(normalized_artifact, "path", "") or ""),
+                str(getattr(normalized_artifact, "name", "") or ""),
+                str(getattr(normalized_artifact, "kind", "") or ""),
+                str(getattr(normalized_artifact, "role", "") or ""),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            normalized_artifacts.append(normalized_artifact)
+        return normalized_artifacts
+
+    def _canonicalize_explicit_request_path(
+        self,
+        path: str | None,
+        explicit_paths: list[str],
+    ) -> str:
+        normalized_path = self._normalize_request_path(path)
+        if not normalized_path:
+            return ""
+        for explicit_path in explicit_paths:
+            if normalized_path == explicit_path:
+                return explicit_path
+            if normalized_path.endswith(f"/{explicit_path}"):
+                return explicit_path
+            if "/" not in explicit_path and Path(normalized_path).name == explicit_path:
+                return explicit_path
+        return normalized_path
+
+    def _normalize_request_path(self, path: str | None) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
 
     def _model_candidates(self, *, refresh_live_inventory: bool = False) -> list[str]:
         config = getattr(self.llm, "config", None)

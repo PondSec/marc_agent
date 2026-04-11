@@ -53,6 +53,55 @@ def test_no_start_recovery_prefers_full_retry_then_full_reserve_before_minimal_g
     ]
 
 
+def test_progress_timeout_recovery_prefers_resume_even_without_partial_text():
+    policy = ExecutionRecoveryPolicy(
+        task_class="task_state_generation",
+        allow_same_backend_retry=True,
+        allow_resume_after_progress=True,
+        allow_smaller_faster_model=True,
+        allow_reduce_request_complexity=True,
+        allow_deterministic_fallback=False,
+        max_same_backend_retries=1,
+        max_total_attempts=4,
+    )
+    failure = ExecutionFailure(
+        failure_class="total_timeout",
+        state="failed_total_timeout",
+        had_progress=True,
+        first_output_received=True,
+        model_identifier="qwen2.5-coder:7b",
+        backend_identifier="ollama",
+        context_pressure_estimate="low",
+        retryable=True,
+        raw_reason="total_timeout",
+        characters=248,
+        activity_count=70,
+        partial_text="",
+    )
+
+    decisions = policy.plan_recovery(
+        failure,
+        primary_model="qwen2.5-coder:7b",
+        faster_model="qwen3:8b",
+        history=[],
+    )
+    accepted = [
+        (
+            decision.candidate.strategy,
+            decision.candidate.prompt_variant,
+            decision.candidate.model_identifier,
+        )
+        for decision in decisions
+        if decision.accepted
+    ]
+
+    assert accepted[:3] == [
+        ("resume_after_progress", "resume", "qwen2.5-coder:7b"),
+        ("switch_to_faster_model", "full", "qwen3:8b"),
+        ("honest_block", "blocked", None),
+    ]
+
+
 class FakeClock:
     def __init__(self) -> None:
         self._value = 0.0
@@ -181,6 +230,51 @@ def test_invoke_model_allows_delayed_response_before_timeout(monkeypatch):
     assert outcome.value == "hello"
     assert outcome.attempt.state == "completed"
     assert outcome.attempt.output_characters >= 5
+
+
+def test_invoke_model_watchdog_uses_provider_reported_effective_timeouts(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_resilience.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime_resilience.time, "sleep", clock.sleep)
+    blocker = threading.Event()
+
+    def hanging_invoke(progress):
+        progress(
+            {
+                "type": "status",
+                "stage": "request_started",
+                "model": "qwen2.5-coder:14b",
+                "startup_timeout": 10,
+                "inactivity_timeout": 6,
+                "total_timeout": 12,
+            }
+        )
+        blocker.wait(timeout=60)
+        return "never"
+
+    outcome = runtime_resilience.invoke_model(
+        hanging_invoke,
+        operation_name="task_state_generation",
+        task_class="task_state_generation",
+        attempt_number=1,
+        capability_tier="tier_a",
+        recovery_strategy="retry_same_backend",
+        prompt_variant="full",
+        model_identifier="qwen2.5-coder:14b",
+        backend_identifier="ollama",
+        startup_timeout_seconds=4,
+        inactivity_timeout_seconds=2,
+        total_timeout_seconds=5,
+    )
+
+    assert outcome.value is None
+    assert outcome.exception is not None
+    assert outcome.attempt.failure is not None
+    assert outcome.attempt.failure.failure_class == "startup_timeout"
+    assert 10.0 <= outcome.attempt.failure.elapsed_seconds < 11.0
+    assert outcome.attempt.failure.startup_timeout_seconds == 10
+    assert outcome.attempt.failure.inactivity_timeout_seconds == 6
+    assert outcome.attempt.failure.total_timeout_seconds == 12
 
 
 def test_invoke_model_watchdog_tracks_terminal_outcomes_across_multiple_attempts(monkeypatch):

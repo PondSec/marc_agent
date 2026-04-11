@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -66,6 +67,26 @@ class TaskArtifact(StrictModel):
     kind: str | None = None
     role: str | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_scalar_artifact(cls, value):
+        if isinstance(value, cls) or isinstance(value, dict):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return value
+        basename = Path(text).name or text
+        looks_like_path = "/" in text or "\\" in text or bool(Path(text).suffix)
+        payload = {
+            "name": basename,
+            "confidence": 0.6,
+        }
+        if looks_like_path:
+            payload["path"] = text
+            payload["kind"] = "file"
+            payload["role"] = "primary_target"
+        return payload
 
     @model_validator(mode="after")
     def normalize(self) -> TaskArtifact:

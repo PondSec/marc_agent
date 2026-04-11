@@ -160,7 +160,21 @@ def test_router_fallback_still_answers_simple_intro_questions():
 
     assert route.intent == RouteIntent.EXPLAIN
     assert route.safe_to_execute is True
-    assert "Coding-Agent" in (route.direct_response or "")
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
+
+
+def test_router_fallback_treats_general_question_as_conversation_without_repo_context():
+    router = IntentRouter(ScriptedLLM(fail=True))
+
+    route = router.interpret_user_request("weißt du was ein Hamburger ist?", None)
+
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.safe_to_execute is True
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
 
 
 def test_router_fallback_preserves_clear_create_request_after_model_failure():

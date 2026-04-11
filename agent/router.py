@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from agent.models import SessionState, WorkspaceSnapshot
 from agent.prompts import router_prompt, router_repair_prompt, router_system_prompt
+from agent.semantic_defaults import classify_conversation_request
 from agent.semantic_guardrails import build_minimal_router_output
 from agent.semantic_runtime import (
     annotate_semantic_record,
@@ -49,29 +50,10 @@ class IntentRouter:
     ) -> RouterOutput:
         self._log("router_input", raw_user_input=user_input)
         trimmed = str(user_input or "").strip()
-        direct_response = self._fallback_direct_response(trimmed)
-        if direct_response is not None:
-            route = RouterOutput(
-                user_goal=trimmed,
-                intent=RouteIntent.EXPLAIN,
-                requested_outcome="Provide a short direct answer without repository work.",
-                action_plan=[
-                    {
-                        "step": 1,
-                        "action": RouteActionName.RESPOND_DIRECTLY,
-                        "reason": "This is a simple conversational request that does not require tool execution.",
-                    }
-                ],
-                needs_clarification=False,
-                clarification_questions=[],
-                confidence=0.3,
-                safe_to_execute=True,
-                repo_context_needed=False,
-                search_terms=[],
-                relevant_extensions=[],
-                direct_response=direct_response,
-            )
-            self._log("router_fast_path", router_result=route.model_dump(), source="direct_response_only")
+        conversation = classify_conversation_request(trimmed)
+        if conversation is not None:
+            route = self._conversation_route(trimmed, confidence=conversation.confidence)
+            self._log("router_fast_path", router_result=route.model_dump(), source="conversation_fast_path")
             return route
         payload: dict[str, Any] | None = None
         prompt = router_prompt(user_input, snapshot, session=session, mode="full")
@@ -390,28 +372,9 @@ class IntentRouter:
         session: SessionState | None = None,
     ) -> RouterOutput:
         trimmed = str(user_input or "").strip() or "Unklarer Nutzerwunsch"
-        direct_response = self._fallback_direct_response(trimmed)
-        if direct_response is not None:
-            return RouterOutput(
-                user_goal=trimmed,
-                intent=RouteIntent.EXPLAIN,
-                requested_outcome="Provide a short direct answer without repository work.",
-                action_plan=[
-                    {
-                        "step": 1,
-                        "action": RouteActionName.RESPOND_DIRECTLY,
-                        "reason": "This is a simple conversational request that does not require tool execution.",
-                    }
-                ],
-                needs_clarification=False,
-                clarification_questions=[],
-                confidence=0.3,
-                safe_to_execute=True,
-                repo_context_needed=False,
-                search_terms=[],
-                relevant_extensions=[],
-                direct_response=direct_response,
-            )
+        conversation = classify_conversation_request(trimmed)
+        if conversation is not None:
+            return self._conversation_route(trimmed, confidence=conversation.confidence)
         return build_minimal_router_output(
             trimmed,
             session=session,
@@ -420,47 +383,27 @@ class IntentRouter:
             semantic_resolution="minimal_inference",
         )
 
-    def _fallback_direct_response(self, user_input: str) -> str | None:
-        normalized = " ".join(str(user_input or "").lower().split()).strip("!?., ")
-        if not normalized:
-            return None
-        greetings = {
-            "hallo",
-            "hello",
-            "hi",
-            "hey",
-            "moin",
-            "servus",
-            "guten morgen",
-            "guten tag",
-            "guten abend",
-        }
-        if normalized in greetings:
-            return (
-                "Hallo. Ich bin bereit.\n\n"
-                "Wenn du magst, kann ich den Code analysieren, eine Aenderung planen oder etwas im Projekt umsetzen."
-            )
-        intro_fragments = (
-            "wer bist du",
-            "who are you",
-            "was kannst du",
-            "what can you do",
-            "was machst du",
-            "what do you do",
-            "hilfe",
-            "help",
+    def _conversation_route(self, user_input: str, *, confidence: float) -> RouterOutput:
+        return RouterOutput(
+            user_goal=str(user_input or "").strip() or "Unklarer Nutzerwunsch",
+            intent=RouteIntent.EXPLAIN,
+            requested_outcome="Answer the user's normal conversation directly without repository work.",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": RouteActionName.RESPOND_DIRECTLY,
+                    "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                }
+            ],
+            needs_clarification=False,
+            clarification_questions=[],
+            confidence=max(float(confidence or 0.0), 0.44),
+            safe_to_execute=True,
+            repo_context_needed=False,
+            search_terms=[],
+            relevant_extensions=[],
+            direct_response=None,
         )
-        normalized_padded = f" {normalized} "
-        if any(
-            normalized == fragment
-            or f" {fragment} " in normalized_padded
-            for fragment in intro_fragments
-        ):
-            return (
-                "Ich bin dein lokaler Coding-Agent fuer diesen Workspace.\n\n"
-                "Ich kann Code analysieren, Aenderungen planen und auf Basis des validierten Router-Outputs ausfuehren."
-            )
-        return None
 
     def _append_runtime_execution(self, session: SessionState | None, record: dict[str, Any]) -> None:
         if session is None:

@@ -25,6 +25,7 @@ from agent.reporting import SessionReporter
 from agent.session import SessionStore
 from agent.verification import ValidationPlanner
 from config.settings import AppConfig
+from llm.model_selection import with_available_models
 from llm.ollama_client import OllamaClient
 from llm.schemas import AgentActionType, AgentDecision
 from runtime.logger import AgentLogger
@@ -54,21 +55,21 @@ READ_LIKE_TOOLS = {"inspect_workspace", "list_files", "search_in_files", "read_f
 
 class AgentCore:
     def __init__(self, config: AppConfig):
-        self.config = config
+        self.config = with_available_models(config)
         self.config.ensure_state_dirs()
         self.workspace = WorkspaceManager(
-            config.workspace_root,
-            allow_outside_root=config.full_access,
+            self.config.workspace_root,
+            allow_outside_root=self.config.full_access,
         )
-        self.safety = SafetyManager(config, self.workspace)
+        self.safety = SafetyManager(self.config, self.workspace)
         self.memory = self._build_memory_store()
-        self.session_store = SessionStore(config.session_dir_path)
+        self.session_store = SessionStore(self.config.session_dir_path)
         self.failure_analyzer = FailureAnalyzer(
             self.workspace,
             max_excerpt=self.config.max_read_chars,
         )
         self.validation_planner = ValidationPlanner()
-        self.reporter = SessionReporter(config)
+        self.reporter = SessionReporter(self.config)
 
     def inspect_workspace(self, focus: str | None = None) -> str:
         snapshot = self.memory.build_snapshot(focus)
@@ -719,6 +720,11 @@ class AgentCore:
                 "command": command.command,
                 "cwd": command.cwd,
                 "timeout": self.config.shell_timeout,
+                **(
+                    {"expected_stdout": command.expected_stdout}
+                    if command.expected_stdout is not None
+                    else {}
+                ),
             },
             expected_outcome=f"Run the next {command.kind} validation step.",
             final_response=None,

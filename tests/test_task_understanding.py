@@ -16,6 +16,7 @@ from agent.prompts import (
     _prioritized_compact_payload,
     task_state_update_prompt,
 )
+from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
 from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
@@ -121,6 +122,32 @@ class ProgressTimeoutThenSuccessLLM(ScriptedLLM):
                 first_output_received=True,
                 characters=240,
                 activity_count=40,
+            )
+        return super().generate_json(*args, **kwargs)
+
+
+class ProgressTimeoutWithoutPartialThenSuccessLLM(ScriptedLLM):
+    def __init__(self, payload: dict, *, config=None):
+        super().__init__(json_payloads=[payload])
+        self.config = config
+        self._raised = False
+
+    def generate_json(self, *args, **kwargs):
+        self.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if not self._raised:
+            self._raised = True
+            raise OllamaGenerationError(
+                "timed out waiting for model completion after 72.0 seconds",
+                reason="total_timeout",
+                retryable=True,
+                model_name=str(kwargs.get("model") or "") or None,
+                startup_timeout_seconds=72,
+                inactivity_timeout_seconds=18,
+                total_timeout_seconds=72,
+                partial_text="",
+                first_output_received=True,
+                characters=248,
+                activity_count=70,
             )
         return super().generate_json(*args, **kwargs)
 
@@ -534,6 +561,49 @@ def test_execution_policy_routes_implement_request_to_update_even_if_mode_is_ins
     assert route.entities.target_paths == ["index.html", "styles.css", "app.js"]
     assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
     assert any(step.action == RouteActionName.UPDATE_ARTIFACT for step in route.action_plan)
+
+
+def test_execution_policy_restores_explicit_create_paths_when_task_state_narrows_scope(tmp_path):
+    task_state = TaskState(
+        latest_user_turn=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        root_goal="Create the requested website files.",
+        active_goal="Create the requested website files.",
+        goal_relation="new_task",
+        output_expectation="A small runnable website with the named files.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        open_problem=None,
+        verification_target="Create the initial implementation and run the most relevant validation or entry command.",
+        target_artifacts=[
+            TaskArtifact(path="index.html", name="index.html", kind=".html", role="primary_target", confidence=0.9),
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.9,
+        next_action="create",
+        next_best_action="create",
+        execution_outline=["Create the requested website files.", "Validate the result."],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=SessionState(task=task_state.latest_user_turn, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_paths == ["Index.html", "script.js", "styles.css"]
+    assert route.entities.target_name == "Index.html"
 
 
 def test_execution_policy_requests_clarification_on_low_confidence_high_risk():
@@ -1620,6 +1690,117 @@ def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     assert task_state.semantic_resolution == "minimal_inference"
 
 
+def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    session = SessionState(
+        task="super danke. und was kannst du mir über dich erzählen wer bist du wie heißt du und was kannst du?",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="Programmiere mir eine Website über Hamburger.",
+            previous_root_goal="Create the requested website files.",
+            previous_active_goal="Create Index.html, script.js, and styles.css for the website.",
+            previous_next_action="create",
+            previous_requested_outcome="A small runnable website with the named files.",
+            target_paths=["Index.html", "script.js", "styles.css"],
+            changed_files=["Index.html", "script.js", "styles.css"],
+            read_files=["Index.html", "script.js", "styles.css"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts == []
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.needs_clarification is False
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
+
+
+def test_task_state_a2_short_circuits_clear_direct_chat_follow_up_without_model_calls(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
+    session = SessionState(
+        task="und was kannst du hier machen?",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+        follow_up_context=FollowUpContext(
+            previous_task="Programmiere mir eine Website über Hamburger.",
+            previous_root_goal="Create the requested website files.",
+            previous_active_goal="Create Index.html, script.js, and styles.css for the website.",
+            previous_next_action="create",
+            previous_requested_outcome="A small runnable website with the named files.",
+            target_paths=["Index.html", "script.js", "styles.css"],
+            changed_files=["Index.html", "script.js", "styles.css"],
+            read_files=["Index.html", "script.js", "styles.css"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_timeout_fallback_treats_general_knowledge_question_as_conversation_not_repo_task(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    task_state = updater.update_task_state(
+        "weißt du was ein Hamburger ist?",
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task="weißt du was ein Hamburger ist?", workspace_root=str(tmp_path)),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts == []
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
+
+
 def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_path):
     interpreter = TaskInterpreter(ScriptedLLM(fail=True, fail_message="timed out"))
 
@@ -1633,6 +1814,58 @@ def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_pa
     assert understanding.recommended_mode == "create"
     assert understanding.needs_clarification is False
     assert understanding.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_timeout_fallback_preserves_explicit_validation_request_against_existing_artifacts(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["checkout_app", "tests"],
+        important_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        focus_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_totals.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["checkout_app/totals.py"],
+        repo_map=["checkout_app/", "tests/"],
+        service_files=[],
+        import_hotspots=[],
+        symbol_index={},
+        project_labels=["python"],
+        likely_commands=["python -m pytest tests/test_totals.py"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small checkout totals module with pytest coverage.",
+    )
+    prompt = (
+        "Validate checkout_app/totals.py against tests/test_totals.py. "
+        "Keep the implementation unchanged unless a real defect appears, "
+        "run python -m pytest tests/test_totals.py, and report the confirmed result."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "validate"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "test"
+    assert task_state.output_expectation == (
+        "Run the most relevant validation for the active implementation and report the result honestly."
+    )
+    assert task_state.target_artifacts[0].path == "checkout_app/totals.py"
+    assert any(
+        artifact.path == "tests/test_totals.py" and artifact.role == "validation_target"
+        for artifact in task_state.target_artifacts
+    )
+    assert route.intent == RouteIntent.DEBUG
+    assert route.needs_clarification is False
+    assert task_state.semantic_resolution == "minimal_inference"
 
 
 def test_task_state_timeout_fallback_preserves_clear_debug_request(tmp_path):
@@ -1790,6 +2023,44 @@ def test_task_state_timeout_fallback_prefers_cli_helper_over_package_init_for_cl
     assert "greet_cli/__init__.py" not in {artifact.path for artifact in task_state.target_artifacts}
 
 
+def test_task_state_timeout_fallback_excludes_package_init_for_existing_cli_feature_request_without_dunder_main(
+    tmp_path,
+):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"python": 3, "markdown": 1},
+        top_directories=["taskboard", "tests"],
+        important_files=["README.md", "taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+        focus_files=["taskboard/cli.py", "tests/test_cli.py", "taskboard/__init__.py"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=["tests/test_cli.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["taskboard/cli.py"],
+        repo_map=["taskboard/", "tests/"],
+        project_labels=["python"],
+        likely_commands=["python -m pytest"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small CLI package with one taskboard entrypoint and pytest coverage.",
+    )
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Implement the missing owner filter for the taskboard CLI. "
+        "Keep the default output unchanged, support the no-match message, and finish only when python -m pytest passes."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+
+    artifact_paths = [artifact.path for artifact in task_state.target_artifacts]
+    assert artifact_paths[0] == "taskboard/cli.py"
+    assert {"taskboard/cli.py", "tests/test_cli.py"} <= set(artifact_paths)
+    assert "taskboard/__init__.py" not in set(artifact_paths)
+
+
 def test_task_state_model_normalizes_route_style_aliases():
     state = TaskState.model_validate(
         {
@@ -1910,6 +2181,119 @@ def test_task_state_updater_keeps_empty_workspace_create_requests_out_of_debug_f
     assert task_state.next_action == "create"
     assert route.intent == RouteIntent.CREATE
     assert route.action_plan[0].action.value == "create_artifact"
+
+
+def test_minimal_task_state_extracts_named_config_file_path_in_german_request(tmp_path):
+    state = build_minimal_task_state(
+        "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen.",
+        session=None,
+        snapshot=empty_snapshot(tmp_path),
+        semantic_resolution="minimal_inference",
+    )
+
+    assert state.target_artifacts
+    assert state.target_artifacts[0].path == "smoke.ini"
+    assert state.target_artifacts[0].name == "smoke.ini"
+
+
+def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_request(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen.",
+        "root_goal": "Create smoke.ini with three exact lines.",
+        "active_goal": "Create smoke.ini with the requested content.",
+        "goal_relation": "new_task",
+        "output_expectation": "Return the created path and a short validation note.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "workspace/smoke.ini",
+        "target_artifacts": [
+            {
+                "path": "workspace/smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.98,
+            }
+        ],
+        "active_artifacts": [
+            {
+                "path": "workspace/smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.98,
+            }
+        ],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.98,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": [],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.target_artifacts[0].path == "smoke.ini"
+    assert task_state.active_artifacts[0].path == "smoke.ini"
+    assert task_state.verification_target == "smoke.ini"
+    assert route.entities.target_paths[0] == "smoke.ini"
+
+
+def test_task_state_updater_accepts_null_clarification_questions_without_blocking_create(tmp_path):
+    payload = {
+        "latest_user_turn": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen und sonst nichts: [smoke], enabled=true, level=2.",
+        "root_goal": "Erstelle im aktuellen Workspace eine Datei namens smoke.ini mit exakt diesen drei Zeilen und sonst nichts: [smoke], enabled=true, level=2.",
+        "active_goal": "Erstelle die Datei smoke.ini.",
+        "goal_relation": "continue",
+        "output_expectation": "Pfad der erstellten Datei und eine knappe Validierung.",
+        "current_user_intent": "implement",
+        "execution_strategy": None,
+        "verification_target": None,
+        "target_artifacts": [
+            {
+                "path": "smoke.ini",
+                "name": "smoke.ini",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 1.0,
+            }
+        ],
+        "constraints": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 1.0,
+        "next_action": "create",
+        "needs_clarification": False,
+        "clarification_questions": None,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        payload["latest_user_turn"],
+        snapshot=empty_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.needs_clarification is False
+    assert task_state.clarification_questions == []
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.target_artifacts[0].path == "smoke.ini"
+    assert route.intent == RouteIntent.CREATE
+    assert route.needs_clarification is False
 
 
 def test_task_state_updater_clears_spurious_clarification_from_confident_executable_payload(tmp_path):
@@ -2069,6 +2453,88 @@ def test_task_state_updater_reconciles_explain_misclassification_for_existing_re
     assert "Apply the requested change" in task_state.output_expectation
     assert "Apply the requested change" in (task_state.verification_target or "")
     assert route.intent == RouteIntent.UPDATE
+
+
+def test_task_state_updater_keeps_explicit_validation_request_on_semantic_path(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=2,
+        language_counts={"python": 2},
+        top_directories=["checkout_app", "tests"],
+        important_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        focus_files=["checkout_app/totals.py", "tests/test_totals.py"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=["tests/test_totals.py"],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["checkout_app/totals.py"],
+        repo_map=["checkout_app/", "tests/"],
+        service_files=[],
+        import_hotspots=[],
+        symbol_index={},
+        project_labels=["python"],
+        likely_commands=["python -m pytest tests/test_totals.py"],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small checkout totals module with pytest coverage.",
+    )
+    prompt = (
+        "Validate checkout_app/totals.py against tests/test_totals.py. "
+        "Keep the implementation unchanged unless a real defect appears, "
+        "run python -m pytest tests/test_totals.py, and report the confirmed result."
+    )
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": "Validate checkout_app/totals.py against tests/test_totals.py.",
+        "active_goal": "Run the existing totals validation and confirm whether checkout_app/totals.py already matches the tests.",
+        "goal_relation": "new_task",
+        "output_expectation": "Run the most relevant validation for the active implementation and report the result honestly.",
+        "current_user_intent": "validate",
+        "execution_strategy": "validation_inspection",
+        "open_problem": None,
+        "verification_target": "python -m pytest tests/test_totals.py",
+        "target_artifacts": [
+            {"path": "checkout_app/totals.py", "name": "totals.py", "kind": "file", "role": "primary_target", "confidence": 0.92},
+            {"path": "tests/test_totals.py", "name": "test_totals.py", "kind": "test", "role": "validation_target", "confidence": 0.9},
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.84,
+        "next_action": "test",
+        "next_best_action": "test",
+        "execution_outline": [
+            "Inspect checkout_app/totals.py and tests/test_totals.py only as needed.",
+            "Run python -m pytest tests/test_totals.py.",
+            "Report whether the current implementation already satisfies the tests or needs a fix.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        prompt,
+        snapshot=snapshot,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.current_user_intent == "validate"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "test"
+    assert task_state.next_best_action == "test"
+    assert task_state.output_expectation == payload["output_expectation"]
+    assert task_state.verification_target == "python -m pytest tests/test_totals.py"
+    assert task_state.target_artifacts[0].path == "checkout_app/totals.py"
+    assert route.intent == RouteIntent.DEBUG
+    assert route.needs_clarification is False
 
 
 def test_task_state_a2_restores_grounded_code_scope_when_semantic_state_collapses_to_documentation(tmp_path):
@@ -2428,6 +2894,60 @@ def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_e
     assert route.action_plan[0].action.value == "create_artifact"
 
 
+def test_task_state_local_short_circuit_keeps_explicit_create_intent_despite_scope_limiter_phrase(
+    tmp_path,
+):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"text": 1},
+        top_directories=[],
+        important_files=["smoke_a2_live.txt"],
+        focus_files=["smoke_a2_live.txt"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["general repository"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="One existing smoke file.",
+    )
+    prompt = (
+        "Erstelle im aktuellen Workspace die Datei smoke_status_note.txt mit einer kurzen "
+        "Smoke-Statusnotiz in einer Zeile. Aendere sonst nichts."
+    )
+    llm = ScriptedLLM()
+    llm.config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    session = SessionState(task=prompt, workspace_root=str(tmp_path))
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        prompt,
+        snapshot=snapshot,
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts if artifact.path}
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "create"
+    assert task_state.target_artifacts[0].path == "smoke_status_note.txt"
+    assert artifact_roles["smoke_status_note.txt"] == "primary_target"
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_name == "smoke_status_note.txt"
+    assert route.entities.target_paths[0] == "smoke_status_note.txt"
+
+
 def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
     invalid_payload = {
         "latest_user_turn": "Update README.md to document the CLI.",
@@ -2450,6 +2970,86 @@ def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):
     assert task_state.semantic_resolution == "minimal_inference"
     assert task_state.current_user_intent == "implement"
     assert task_state.next_action == "modify"
+
+
+def test_task_state_updater_accepts_string_active_artifact_shorthand(tmp_path):
+    payload = {
+        "latest_user_turn": "Ergaenze einen Theme-Umschalter.",
+        "root_goal": "Implement a theme switcher.",
+        "active_goal": "Implement a theme switcher.",
+        "goal_relation": "continue",
+        "output_expectation": "A working theme switcher.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "A functional theme switcher.",
+        "target_artifacts": [
+            {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "app.js", "name": "app.js", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+        ],
+        "active_artifacts": ["index.html", "app.js", "styles.css"],
+        "constraints": ["No external libraries."],
+        "assumptions": ["The project uses index.html, app.js, and styles.css."],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.92,
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "execution_outline": ["Inspect existing files.", "Implement the theme switcher."],
+        "needs_clarification": False,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        "Ergaenze einen Theme-Umschalter.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert [artifact.path for artifact in task_state.active_artifacts[:3]] == [
+        "index.html",
+        "app.js",
+        "styles.css",
+    ]
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "app.js",
+        "styles.css",
+    }
+
+
+def test_task_state_infers_confidence_for_structured_semantic_state_without_explicit_confidence(tmp_path):
+    payload = {
+        "latest_user_turn": "Ergaenze einen Theme-Umschalter.",
+        "root_goal": "Implement a theme switcher.",
+        "active_goal": "Implement a theme switcher.",
+        "goal_relation": "continue",
+        "output_expectation": "A working theme switcher.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "verification_target": "index.html, app.js, styles.css",
+        "target_artifacts": [
+            {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "app.js", "name": "app.js", "kind": "file", "role": "primary_target", "confidence": 1.0},
+            {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 1.0},
+        ],
+        "active_artifacts": ["index.html", "app.js", "styles.css"],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "needs_clarification": False,
+    }
+
+    task_state = TaskStateUpdater(ScriptedLLM(json_payloads=[payload])).update_task_state(
+        "Ergaenze einen Theme-Umschalter.",
+        snapshot=build_snapshot(tmp_path),
+    )
+
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.confidence >= 0.58
+    assert route.needs_clarification is False
+    assert route.intent == RouteIntent.UPDATE
 
 
 def test_task_state_timeout_fallback_clarifies_vague_request_without_specialized_strategy(tmp_path):
@@ -3269,6 +3869,64 @@ def test_task_state_resumes_after_progress_timeout_before_blocking(tmp_path):
     assert resume_call["kwargs"]["num_ctx"] == 2048
     assert "Partial JSON from the timed-out attempt" in resume_call["args"][0]
     assert '"goal_relation": "new_task"' in resume_call["args"][0]
+
+
+def test_task_state_retries_same_model_after_progress_timeout_without_partial_text(tmp_path):
+    payload = {
+        "latest_user_turn": "Repair app.js menu toggle behavior.",
+        "root_goal": "Repair the menu toggle behavior.",
+        "active_goal": "Fix app.js so the menu toggle updates both interaction states correctly.",
+        "goal_relation": "continue",
+        "output_expectation": "A repaired app.js plus a passing node test.",
+        "current_user_intent": "repair",
+        "execution_strategy": "debug_repair",
+        "verification_target": "node --test tests/test_menu_toggle.cjs",
+        "target_artifacts": [
+            {
+                "path": "app.js",
+                "name": "app.js",
+                "kind": "file",
+                "role": "primary_target",
+                "confidence": 0.92,
+            }
+        ],
+        "constraints": ["Keep the change local to app.js."],
+        "ambiguity_level": "low",
+        "risk_level": "medium",
+        "confidence": 0.84,
+        "next_action": "modify",
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen3:14b",
+        router_model_name="qwen2.5-coder:7b",
+        model_candidates=("qwen2.5-coder:7b", "qwen3:8b", "qwen3:14b"),
+    )
+    llm = ProgressTimeoutWithoutPartialThenSuccessLLM(payload, config=config)
+    updater = TaskStateUpdater(llm, timeout=18, num_ctx=4096)
+    session = SessionState(
+        task="Repair app.js menu toggle behavior.",
+        workspace_root=str(tmp_path),
+    )
+
+    task_state = updater.update_task_state(
+        "Repair app.js menu toggle behavior.",
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.next_action == "modify"
+    assert len(llm.generate_json_calls) >= 2
+    first_call = llm.generate_json_calls[0]["kwargs"]
+    resume_call = llm.generate_json_calls[-1]
+    assert first_call["model"] == "qwen2.5-coder:7b"
+    assert resume_call["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert resume_call["kwargs"]["total_timeout"] == 114
+    assert resume_call["kwargs"]["strict_timeouts"] is False
+    assert "Partial JSON from the timed-out attempt" not in resume_call["args"][0]
 
 
 def test_task_state_contract_handles_backend_correction():

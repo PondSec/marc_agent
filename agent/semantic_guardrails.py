@@ -14,6 +14,7 @@ import re
 from typing import Any, Literal
 
 from agent.semantic_defaults import (
+    classify_conversation_request,
     extract_scope_constraints,
     has_follow_up_reference,
     infer_artifact_name_hint,
@@ -104,7 +105,7 @@ _EMPTY_WORKSPACE_CREATE_MARKERS = (
     "need an",
 )
 _PATH_RE = re.compile(
-    r"([\w./-]+\.(py|js|ts|tsx|jsx|json|md|html|css|sh|toml|ya?ml|go|rs|java|kt|rb))",
+    r"([\w./-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|html|css|sh|toml|ya?ml|go|rs|java|kt|rb|ini|cfg|conf|env|log|sql|xml|svg|csv))",
     flags=re.IGNORECASE,
 )
 _CONVENTIONAL_ARTIFACT_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -165,6 +166,7 @@ def build_minimal_task_state(
         request,
         signal=signal,
         anchor_artifacts=context["artifacts"],
+        snapshot=snapshot,
     )
     if (
         signal.intent == "update"
@@ -195,7 +197,7 @@ def build_minimal_task_state(
     elif signal.intent == "create" and any(str(item.path or "").strip() for item in signal_targets):
         target_artifacts = signal_targets
     else:
-        target_artifacts = inferred_snapshot_targets or signal_targets
+        target_artifacts = _merge_target_artifacts(inferred_snapshot_targets, signal_targets)
     if unresolved_explicit_symbols:
         target_artifacts = []
         signal = MinimalSemanticSignal(
@@ -534,6 +536,18 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
     explicit_path = _extract_explicit_path(request)
     requested_extension = infer_requested_extension(request)
     artifact_name_hint = infer_artifact_name_hint(request)
+    conversation = classify_conversation_request(request)
+    if conversation is not None:
+        return MinimalSemanticSignal(
+            intent="explain",
+            goal_relation="new_task",
+            confidence=max(conversation.confidence, 0.72),
+            use_context=False,
+            needs_clarification=False,
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+            explicit_path=explicit_path,
+        )
     explicit_follow_up = has_follow_up_reference(request)
     deictic = _looks_like_deictic_request(normalized)
     scope_change = looks_like_scope_narrowing_request(request)
@@ -715,16 +729,21 @@ def _target_artifacts_for_signal(
     *,
     signal: MinimalSemanticSignal,
     anchor_artifacts: list[TaskArtifact],
+    snapshot=None,
 ) -> list[TaskArtifact]:
     explicit_paths = _extract_explicit_paths(request)
     if explicit_paths:
+        resolved_paths = [
+            _resolve_explicit_path_against_snapshot(explicit_path, snapshot)
+            for explicit_path in explicit_paths
+        ]
         has_non_doc_primary = any(
             not _looks_like_test_artifact(explicit_path)
             and Path(explicit_path).suffix.lower() not in {".md", ".markdown", ".rst", ".txt"}
-            for explicit_path in explicit_paths
+            for explicit_path in resolved_paths
         )
         artifacts: list[TaskArtifact] = []
-        for index, explicit_path in enumerate(explicit_paths[:6]):
+        for index, explicit_path in enumerate(resolved_paths[:6]):
             if _looks_like_test_artifact(explicit_path):
                 role = "validation_target"
             elif has_non_doc_primary and Path(explicit_path).suffix.lower() in {".md", ".markdown", ".rst", ".txt"}:
@@ -769,6 +788,39 @@ def _target_artifacts_for_signal(
                 )
             ]
     return []
+
+
+def _merge_target_artifacts(*groups: list[TaskArtifact]) -> list[TaskArtifact]:
+    merged: list[TaskArtifact] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for artifact in group:
+            key = (
+                str(artifact.path or "").strip().lower(),
+                str(artifact.name or "").strip().lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(artifact)
+    return merged[:6]
+
+
+def _resolve_explicit_path_against_snapshot(path: str, snapshot) -> str:
+    candidate = str(path or "").strip()
+    if not candidate or snapshot is None:
+        return candidate
+    normalized = candidate.replace("\\", "/")
+    if "/" in normalized:
+        return normalized
+    matches = [
+        snapshot_path
+        for snapshot_path in _snapshot_match_candidate_paths(snapshot)
+        if Path(snapshot_path).name.lower() == Path(normalized).name.lower()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return normalized
 
 
 def _collect_context_artifacts(session) -> list[TaskArtifact]:
@@ -1265,6 +1317,12 @@ def _snapshot_target_artifacts(request: str, snapshot) -> list[TaskArtifact]:
         and path not in manifests
         and Path(path).suffix.lower() not in {".md", ".rst", ".txt"}
     ]
+    if request_targets_cli_entrypoint:
+        selected_primary_paths = [
+            path
+            for path in selected_primary_paths
+            if not (_is_package_init_path(path) and path not in explicit_request_paths)
+        ]
     selected_support_paths = [
         path
         for path in selected

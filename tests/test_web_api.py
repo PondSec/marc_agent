@@ -566,6 +566,55 @@ def test_available_models_do_not_expand_semantic_candidates_from_installed_inven
     assert updated.model_candidates == ("qwen2.5-coder:7b",)
 
 
+def test_task_run_refreshes_stale_model_config_from_live_inventory(tmp_path):
+    config = build_test_config(
+        tmp_path,
+        model_name="qwen2.5-coder:14b",
+        router_model_name="qwen2.5-coder:14b",
+    )
+    config.ensure_state_dirs()
+
+    with patch("server.app._fetch_installed_ollama_models", return_value=[]):
+        app = create_app(config)
+
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    observed: dict[str, str | None] = {}
+    started = Event()
+
+    def fake_run_task(self, task, session=None, *, should_stop=None):
+        observed["model_name"] = self.config.model_name
+        observed["router_model_name"] = self.config.router_model_name
+        session.status = "completed"
+        session.final_response = "Fertig"
+        session.touch()
+        self.session_store.save(session)
+        started.set()
+        return session
+
+    with patch(
+        "llm.model_selection.fetch_installed_ollama_models",
+        return_value=[
+            {"name": "qwen2.5-coder:7b"},
+            {"name": "qwen3:8b"},
+            {"name": "qwen3:14b"},
+        ],
+    ), patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        response = client.post(
+            "/api/tasks",
+            json={
+                "prompt": "starte einen lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+            },
+        )
+        assert started.wait(timeout=2)
+
+    assert response.status_code == 202
+    assert observed["model_name"] == "qwen2.5-coder:7b"
+    assert observed["router_model_name"] == "qwen2.5-coder:7b"
+
+
 def test_allowed_model_candidates_falls_back_when_config_has_no_model_candidates_attr():
     class LegacyConfig:
         pass
@@ -874,6 +923,160 @@ def test_stop_requested_updates_running_session(tmp_path):
         assert any(item["event"] == "task_stop_requested" for item in logs_response.json())
 
 
+def test_second_task_requires_queue_when_another_run_is_active(tmp_path):
+    config = build_test_config(tmp_path, max_iterations=2, shell_timeout=1)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    started = Event()
+    release = Event()
+
+    def fake_run_task(self, task, session=None, *, should_stop=None):
+        assert session is not None
+        session.status = "running"
+        session.touch()
+        self.session_store.save(session)
+
+        if task == "erster lauf":
+            started.set()
+            assert release.wait(timeout=2)
+
+        session.status = "completed"
+        session.final_response = f"Fertig: {task}"
+        session.touch()
+        self.session_store.save(session)
+        return session
+
+    with patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        workspace = create_test_workspace(client, tmp_path)
+        first_response = client.post(
+            "/api/tasks",
+            json={
+                "prompt": "erster lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+            },
+        )
+
+        assert first_response.status_code == 202
+        first_session_id = first_response.json()["id"]
+        assert started.wait(timeout=2)
+
+        second_response = client.post(
+            "/api/tasks",
+            json={
+                "prompt": "zweiter lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+            },
+        )
+
+        assert second_response.status_code == 409
+        assert "queue the next run" in second_response.json()["detail"].lower()
+
+        sessions_response = client.get("/api/sessions")
+        assert sessions_response.status_code == 200
+        assert all(session["task"] != "zweiter lauf" for session in sessions_response.json())
+
+        release.set()
+
+        deadline = time.time() + 5
+        first_payload = None
+        while time.time() < deadline:
+            session_response = client.get(f"/api/sessions/{first_session_id}")
+            assert session_response.status_code == 200
+            first_payload = session_response.json()
+            if first_payload["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        assert first_payload is not None
+        assert first_payload["status"] == "completed"
+
+
+def test_queued_task_starts_after_active_run_finishes(tmp_path):
+    config = build_test_config(tmp_path, max_iterations=2, shell_timeout=1)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+
+    first_started = Event()
+    second_started = Event()
+    release_first = Event()
+    started_order: list[str] = []
+
+    def fake_run_task(self, task, session=None, *, should_stop=None):
+        assert session is not None
+        started_order.append(task)
+        session.status = "running"
+        session.touch()
+        self.session_store.save(session)
+
+        if task == "erster lauf":
+            first_started.set()
+            assert release_first.wait(timeout=2)
+        elif task == "zweiter lauf":
+            second_started.set()
+
+        session.status = "completed"
+        session.final_response = f"Fertig: {task}"
+        session.touch()
+        self.session_store.save(session)
+        return session
+
+    with patch("server.task_manager.AgentCore.run_task", new=fake_run_task):
+        workspace = create_test_workspace(client, tmp_path)
+        first_response = client.post(
+            "/api/tasks",
+            json={
+                "prompt": "erster lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+            },
+        )
+
+        assert first_response.status_code == 202
+        assert first_started.wait(timeout=2)
+
+        second_response = client.post(
+            "/api/tasks",
+            json={
+                "prompt": "zweiter lauf",
+                "dry_run": True,
+                "workspace_id": workspace["id"],
+                "enqueue_if_busy": True,
+            },
+        )
+
+        assert second_response.status_code == 202
+        second_payload = second_response.json()
+        second_session_id = second_payload["id"]
+        assert second_payload["status"] == "queued"
+        assert not second_started.wait(timeout=0.2)
+
+        queued_session_response = client.get(f"/api/sessions/{second_session_id}")
+        assert queued_session_response.status_code == 200
+        assert queued_session_response.json()["status"] == "queued"
+
+        release_first.set()
+        assert second_started.wait(timeout=2)
+
+        deadline = time.time() + 5
+        completed_payload = None
+        while time.time() < deadline:
+            session_response = client.get(f"/api/sessions/{second_session_id}")
+            assert session_response.status_code == 200
+            completed_payload = session_response.json()
+            if completed_payload["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        assert completed_payload is not None
+        assert completed_payload["status"] == "completed"
+        assert started_order[:2] == ["erster lauf", "zweiter lauf"]
+
+
 def test_follow_up_task_clears_old_execution_state_but_keeps_last_paths(tmp_path):
     config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
@@ -1045,6 +1248,20 @@ def test_stale_active_lease_does_not_block_stale_session_detection(tmp_path):
     assert not lease_path.exists()
 
 
+def test_app_start_clears_orphaned_active_session_leases(tmp_path):
+    config = build_test_config(tmp_path, llm_timeout=1)
+    config.ensure_state_dirs()
+
+    orphaned_lease = config.state_root / "active_sessions" / "orphaned-session.lease"
+    orphaned_lease.parent.mkdir(parents=True, exist_ok=True)
+    orphaned_lease.touch()
+
+    app = create_app(config)
+
+    assert not orphaned_lease.exists()
+    assert app.state.task_manager.active_sessions() == []
+
+
 def test_delete_session_removes_chat_metadata_and_logs(tmp_path):
     config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()
@@ -1147,6 +1364,29 @@ def test_clear_workspace_contents_removes_files_but_keeps_workspace(tmp_path):
     assert workspaces_response.json()[0]["id"] == workspace["id"]
     assert workspace_root.exists()
     assert list(workspace_root.iterdir()) == []
+
+
+def test_clear_workspace_contents_preserves_internal_state_dir(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    nested_dir = workspace_root / "src"
+    nested_dir.mkdir()
+    (nested_dir / "main.py").write_text("print('ready')\n", encoding="utf-8")
+    state_dir = workspace_root / config.state_dir_name
+    (state_dir / "sessions").mkdir(parents=True)
+    (state_dir / "sessions" / "keep.json").write_text("{}", encoding="utf-8")
+
+    response = client.post(f"/api/workspaces/{workspace['id']}/clear")
+
+    assert response.status_code == 204
+    assert workspace_root.exists()
+    assert sorted(item.name for item in workspace_root.iterdir()) == [config.state_dir_name]
+    assert (state_dir / "sessions" / "keep.json").exists()
 
 
 def test_workspaces_are_recovered_from_workspace_root_when_store_is_empty(tmp_path):

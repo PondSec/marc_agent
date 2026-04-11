@@ -21,6 +21,7 @@ from agent.models import (
     RepairAttemptRecord,
     SemanticChangeReview,
     SessionState,
+    ValidationCommand,
     ValidationFailureEvidence,
     ValidationRunRecord,
     WorkspaceSnapshot,
@@ -28,10 +29,22 @@ from agent.models import (
 from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
+    _best_contract_fragment_near_match,
     _direct_main_runtime_contract,
+    _direct_python_script_runtime_contract,
+    _format_similar_python_name_candidates,
     _line_focused_excerpt,
+    _literal_near_match_in_content,
+    _python_cli_runtime_value_threading_hint,
+    _python_line_binds_name,
+    _python_similar_defined_name_candidates,
+    _repair_semantic_values,
+    _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
+    _runtime_output_contract_required_literals,
+    _source_backed_runtime_argv_contract,
+    _source_backed_runtime_output_contracts,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
@@ -43,10 +56,13 @@ from agent.prompts import (
     semantic_change_review_system_prompt,
 )
 from agent.router import IntentRouter
+from agent.semantic_defaults import classify_conversation_request
+from agent.semantic_runtime import availability_recovery_model
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 from llm.ollama_client import OllamaGenerationError
+from llm.model_selection import select_primary_model, select_router_model
 from llm.provider import LLMProvider
 from llm.runtime_resilience import (
     ExecutionAttemptRecord,
@@ -119,6 +135,48 @@ LIGHTWEIGHT_UPDATE_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+EXACT_TEXT_CONTRACT_SUFFIXES = {
+    ".conf",
+    ".cfg",
+    ".csv",
+    ".env",
+    ".ini",
+    ".log",
+    ".text",
+    ".tsv",
+    ".txt",
+}
+EXACT_LINE_COUNT_HINTS = {
+    "1": 1,
+    "one": 1,
+    "eins": 1,
+    "eine": 1,
+    "einen": 1,
+    "einem": 1,
+    "einer": 1,
+    "2": 2,
+    "two": 2,
+    "zwei": 2,
+    "3": 3,
+    "three": 3,
+    "drei": 3,
+    "4": 4,
+    "four": 4,
+    "vier": 4,
+    "5": 5,
+    "five": 5,
+    "fuenf": 5,
+    "fünf": 5,
+    "6": 6,
+    "six": 6,
+    "sechs": 6,
+    "7": 7,
+    "seven": 7,
+    "sieben": 7,
+    "8": 8,
+    "eight": 8,
+    "acht": 8,
+}
 MAX_LIGHTWEIGHT_UPDATE_CHARS = 8_000
 MAX_LIGHTWEIGHT_UPDATE_LINES = 260
 MAX_LIGHTWEIGHT_UPDATE_TARGETS = 6
@@ -127,6 +185,25 @@ MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES = 6
 MIN_LIGHTWEIGHT_UPDATE_CONFIDENCE = 0.72
 MIN_COMPACT_PRIMARY_UPDATE_CONFIDENCE = 0.55
 DEFERRED_UPDATE_TARGET_NOTE_PREFIX = "deferred_update_target:"
+WEB_CONTRACT_HTML_SUFFIXES = {".html", ".htm"}
+WEB_CONTRACT_CSS_SUFFIXES = {".css", ".less", ".scss"}
+WEB_CONTRACT_SCRIPT_SUFFIXES = {".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"}
+WEB_CONTRACT_SUFFIXES = (
+    WEB_CONTRACT_HTML_SUFFIXES
+    | WEB_CONTRACT_CSS_SUFFIXES
+    | WEB_CONTRACT_SCRIPT_SUFFIXES
+)
+WEB_CONTRACT_BEHAVIORAL_HTML_TAGS = {
+    "button",
+    "details",
+    "dialog",
+    "form",
+    "input",
+    "option",
+    "select",
+    "summary",
+    "textarea",
+}
 
 
 @dataclass(slots=True)
@@ -190,6 +267,37 @@ class MutationAssessment:
     changed_line_count: int = 0
 
 
+@dataclass(slots=True)
+class WebContractInventory:
+    html_ids: set[str] = field(default_factory=set)
+    html_id_classes: dict[str, set[str]] = field(default_factory=dict)
+    html_behavioral_ids: set[str] = field(default_factory=set)
+    html_root_classes: set[str] = field(default_factory=set)
+    css_id_selectors: set[str] = field(default_factory=set)
+    css_class_selectors: set[str] = field(default_factory=set)
+    css_root_state_classes: set[str] = field(default_factory=set)
+    js_id_refs: set[str] = field(default_factory=set)
+    js_declared_ids: set[str] = field(default_factory=set)
+    js_class_tokens: set[str] = field(default_factory=set)
+    js_root_state_classes: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
+class WebContractFinding:
+    kind: str
+    token: str
+    source_paths: tuple[str, ...]
+    summary: str
+
+
+@dataclass(slots=True)
+class PythonSequencePrefixContract:
+    variable_expression: str
+    slice_length: int
+    literal_tokens: tuple[str, ...]
+    lineno: int
+
+
 class Planner:
     def __init__(
         self,
@@ -213,9 +321,21 @@ class Planner:
         self.task_state_updater = TaskStateUpdater(
             llm,
             logger=logger,
-            model_name=getattr(llm_config, "model_name", None),
+            model_name=(
+                getattr(llm_config, "router_model_name", None)
+                or getattr(llm_config, "model_name", None)
+            ),
             timeout=max(int(getattr(llm_config, "router_timeout", self._llm_timeout(18))), 18),
-            num_ctx=max(int(getattr(llm_config, "ollama_num_ctx", self._llm_num_ctx(4096))), 1024),
+            num_ctx=max(
+                int(
+                    getattr(
+                        llm_config,
+                        "router_num_ctx",
+                        getattr(llm_config, "ollama_num_ctx", self._llm_num_ctx(4096)),
+                    )
+                ),
+                1024,
+            ),
         )
         self.decision_policy = ExecutionDecisionPolicy(logger=logger)
         self.validation_planner = ValidationPlanner()
@@ -383,7 +503,8 @@ class Planner:
             if command is not None:
                 return self._validation_decision(
                     "Changed files must go through the remaining validation plan.",
-                    command,
+                    command.command,
+                    expected_stdout=command.expected_stdout,
                 )
             if self._requirements_review_missing(session):
                 self._run_semantic_change_review(route, session)
@@ -607,7 +728,11 @@ class Planner:
             if step.action == RouteActionName.RUN_VALIDATION and session.changed_files:
                 command = self._pick_validation_command(session)
                 if command is not None:
-                    return self._validation_decision(step.reason, command)
+                    return self._validation_decision(
+                        step.reason,
+                        command.command,
+                        expected_stdout=command.expected_stdout,
+                    )
 
             if step.action == RouteActionName.SUMMARIZE_RESULT:
                 return self._final_decision(
@@ -636,6 +761,12 @@ class Planner:
         route = session.router_result
         if route is not None and route.direct_response and not session.tool_calls:
             return route.direct_response
+        if self._is_conversation_request(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die normale Frage erkannt, aber die freie Antwort konnte in diesem Lauf nicht stabil erzeugt werden.",
+                en="I recognized this as normal conversation, but I could not generate a stable free-form answer in this run.",
+            )
         if session.changed_files and self._functional_validation_missing(session):
             return self._localized_text(
                 language,
@@ -699,6 +830,13 @@ class Planner:
         inspected = self._read_paths(session)[:4]
         language = self._session_language(session)
         lines: list[str] = []
+
+        if self._is_conversation_request(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die Frage als normale Unterhaltung erkannt, aber die freie Antwort konnte gerade nicht stabil erzeugt werden.",
+                en="I recognized the question as normal conversation, but I could not generate a stable free-form answer just now.",
+            )
 
         if session.changed_files:
             lines.append(
@@ -800,6 +938,13 @@ class Planner:
 
         return "\n\n".join(part for part in lines if part)
 
+    def _is_conversation_request(self, session: SessionState) -> bool:
+        return (
+            not session.changed_files
+            and not session.tool_calls
+            and classify_conversation_request(session.task) is not None
+        )
+
     def _draft_create_decision(
         self,
         route: RouterOutput,
@@ -884,6 +1029,15 @@ class Planner:
                 target,
                 repair_context,
             )
+        deterministic_repair_decision = self._deterministic_runtime_repair_decision(
+            route,
+            session,
+            path=target,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_repair_decision is not None:
+            return deterministic_repair_decision
         strategies = self._repair_generation_strategies(session, repair_context, target)
         if repair_context is not None and not strategies:
             final_failure_reason = (
@@ -1637,6 +1791,27 @@ class Planner:
             return ESCALATED_REPAIR_STRATEGY
         return repair_strategy
 
+    def _prefer_reserve_after_initial_primary_noop(
+        self,
+        *,
+        review_feedback: ProposedUpdateReview,
+        repair_context: ValidationFailureEvidence | None,
+        primary_model: str | None,
+        reserve_model: str | None,
+        prior_attempts: list[ExecutionAttemptRecord],
+    ) -> bool:
+        primary = str(primary_model or "").strip()
+        reserve = str(reserve_model or "").strip()
+        if (
+            repair_context is None
+            or not primary
+            or not reserve
+            or reserve == primary
+            or not self._review_feedback_is_noop(review_feedback)
+        ):
+            return False
+        return any(str(item.model_identifier or "").strip() == primary for item in prior_attempts)
+
     def _record_noop_review_attempt(
         self,
         session: SessionState,
@@ -1999,13 +2174,29 @@ class Planner:
 
         command = self._next_diagnostic_command(session)
         if command is not None and not self._command_already_ran(session, command):
+            command_spec = self._diagnostic_command_spec(session, command)
             return AgentDecision(
                 thought_summary="Reproduce the issue with the strongest available runtime or validation command before editing.",
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="run_tests",
-                tool_args={"command": command, "cwd": ".", "timeout": 120},
+                tool_args={
+                    "command": command,
+                    "cwd": ".",
+                    "timeout": 120,
+                    **(
+                        {"expected_stdout": command_spec.expected_stdout}
+                        if command_spec is not None and command_spec.expected_stdout is not None
+                        else {}
+                    ),
+                },
                 expected_outcome="Reproduce the reported issue and collect concrete diagnostics.",
                 final_response=None,
+            )
+
+        if self._confirmed_validation_request_without_findings(session):
+            return self._final_decision(
+                "The requested validation completed without a confirmed defect.",
+                self._confirmed_validation_response(route, session),
             )
 
         if self._diagnosis_attempted_without_findings(session) or route.intent == RouteIntent.DEBUG:
@@ -2104,7 +2295,8 @@ class Planner:
         if command is not None:
             return self._validation_decision(
                 "Only rerun validation after a substantive repair mutation has been prepared.",
-                command,
+                command.command,
+                expected_stdout=command.expected_stdout,
             )
 
         blocker = self._validation_repair_blocker_message(failed_run, repair_context)
@@ -3358,17 +3550,51 @@ class Planner:
         self,
         thought_summary: str,
         command: str,
+        *,
+        expected_stdout: str | None = None,
     ) -> AgentDecision:
         return AgentDecision(
             thought_summary=thought_summary,
             action_type=AgentActionType.CALL_TOOL,
             tool_name="run_tests",
-            tool_args={"command": command, "cwd": ".", "timeout": 120},
+            tool_args={
+                "command": command,
+                "cwd": ".",
+                "timeout": 120,
+                **({"expected_stdout": expected_stdout} if expected_stdout is not None else {}),
+            },
             expected_outcome="Run the next validation step for the current changes.",
             final_response=None,
         )
 
-    def _pick_validation_command(self, session: SessionState) -> str | None:
+    def _diagnostic_command_spec(
+        self,
+        session: SessionState,
+        command: str,
+    ) -> ValidationCommand | None:
+        identity = self.validation_planner.command_identity(command)
+        if not identity:
+            return None
+        for item in session.validation_plan:
+            if self.validation_planner.command_identity(item.command) == identity:
+                return item
+        snapshot = session.workspace_snapshot
+        if snapshot is not None:
+            validation_plan = self.validation_planner.build_plan(
+                session.task,
+                snapshot,
+                changed_files=[],
+                session=session,
+            )
+            for item in validation_plan:
+                if self.validation_planner.command_identity(item.command) == identity:
+                    return item
+        for item in self.validation_planner.build_diagnostic_plan(session):
+            if self.validation_planner.command_identity(item.command) == identity:
+                return item
+        return None
+
+    def _pick_validation_command(self, session: SessionState) -> ValidationCommand | None:
         passed = {
             self.validation_planner.command_identity(run.command)
             for run in session.validation_runs
@@ -3377,11 +3603,11 @@ class Planner:
         for item in session.validation_plan:
             identity = self.validation_planner.command_identity(item.command)
             if identity not in passed and self.validation_planner.can_repeat_command(session, item.command):
-                return item.command
+                return item
         for command in session.verification_commands:
             identity = self.validation_planner.command_identity(command)
             if command and identity not in passed and self.validation_planner.can_repeat_command(session, command):
-                return command
+                return ValidationCommand(command=command)
         snapshot = session.workspace_snapshot
         if snapshot is None:
             return None
@@ -3394,11 +3620,11 @@ class Planner:
         for item in fallback_plan:
             identity = self.validation_planner.command_identity(item.command)
             if identity not in passed and self.validation_planner.can_repeat_command(session, item.command):
-                return item.command
+                return item
         for command in snapshot.likely_commands:
             identity = self.validation_planner.command_identity(command)
             if command and identity not in passed and self.validation_planner.can_repeat_command(session, command):
-                return command
+                return ValidationCommand(command=command)
         return None
 
     def _diagnostic_file_candidates(
@@ -3499,6 +3725,73 @@ class Planner:
             if run.verification_scope == "runtime" and run.status == "passed"
         }
         return bool(successful_runtime_checks) and not session.diagnostics
+
+    def _confirmed_validation_request_without_findings(self, session: SessionState) -> bool:
+        task_state = session.task_state
+        if task_state is None:
+            return False
+        current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
+        execution_strategy = str(getattr(task_state, "execution_strategy", "") or "").strip().lower()
+        if current_intent != "validate" and execution_strategy != "validation_inspection":
+            return False
+        if session.changed_files or session.diagnostics:
+            return False
+        return any(run.status == "passed" for run in session.validation_runs)
+
+    def _confirmed_validation_response(self, route: RouterOutput, session: SessionState) -> str:
+        language = self._session_language(session)
+        inspected = self._read_paths(session)[:4]
+        latest_pass = next(
+            (run for run in reversed(session.validation_runs) if run.status == "passed"),
+            None,
+        )
+        targets = route.entities.target_paths[:4]
+        lines = [
+            self._localized_text(
+                language,
+                de="Ich habe die angefragte Validierung ausgefuehrt und keinen bestaetigten Defekt gefunden.",
+                en="I ran the requested validation and did not find a confirmed defect.",
+            )
+        ]
+        if targets:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Geprueft: {', '.join(targets)}.",
+                    en=f"Checked: {', '.join(targets)}.",
+                )
+            )
+        if latest_pass is not None:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Befehl: {latest_pass.command}.",
+                    en=f"Command: {latest_pass.command}.",
+                )
+            )
+            lines.append(
+                self._localized_text(
+                    language,
+                    de="Ergebnis: bestanden.",
+                    en="Result: passed.",
+                )
+            )
+        lines.append(
+            self._localized_text(
+                language,
+                de="Ich habe keine Dateien geaendert.",
+                en="I did not change any files.",
+            )
+        )
+        if inspected:
+            lines.append(
+                self._localized_text(
+                    language,
+                    de=f"Ich habe vor allem {', '.join(inspected)} untersucht.",
+                    en=f"I mainly inspected {', '.join(inspected)}.",
+                )
+            )
+        return "\n".join(lines)
 
     def _missing_issue_evidence_response(self, route: RouterOutput, session: SessionState) -> str:
         follow_up = session.follow_up_context
@@ -3946,20 +4239,20 @@ class Planner:
 
         task_state = session.task_state
         current_intent = str(getattr(task_state, "current_user_intent", "") or "").strip().lower()
-        if session.validation_status != "passed" or current_intent not in {"repair", "debug"}:
+        if session.validation_status != "passed" or current_intent not in {"validate", "repair", "debug"}:
             return pending_targets
 
-        supporting_doc_paths = {
+        non_actionable_context_paths = {
             path
             for artifact in getattr(task_state, "target_artifacts", []) or []
             for path in [str(getattr(artifact, "path", "") or "").strip()]
             if path
-            and str(getattr(artifact, "role", "") or "").strip().lower() == "supporting_context"
-            and self.validation_planner._is_documentation_path(path)
+            and str(getattr(artifact, "role", "") or "").strip().lower()
+            in {"supporting_context", "validation_target"}
         }
-        if not supporting_doc_paths:
+        if not non_actionable_context_paths:
             return pending_targets
-        return [path for path in pending_targets if path not in supporting_doc_paths]
+        return [path for path in pending_targets if path not in non_actionable_context_paths]
 
     def _path_matches_explicit_request(
         self,
@@ -4465,6 +4758,77 @@ class Planner:
         repair_context: ValidationFailureEvidence | None = None,
         repair_strategy: str | None = None,
     ) -> ContentGenerationResult:
+        deterministic_exact_text = self._deterministic_exact_text_contract_generation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_exact_text is not None:
+            self._log(
+                "content_generation_skipped",
+                path=path,
+                update=current_content is not None,
+                reason="deterministic_exact_text_contract",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="completed",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_exact_text_contract",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(deterministic_exact_text.content),
+                    validation_possible=True,
+                    summary="Artifact generation used a deterministic exact-text contract instead of a model guess.",
+                    attempts=[],
+                ),
+            )
+            return ContentGenerationResult(
+                content=deterministic_exact_text.content,
+                source="deterministic_exact_text_contract",
+                repair_strategy_used=repair_strategy,
+            )
+        deterministic_literal_delta = self._deterministic_runtime_literal_delta_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if deterministic_literal_delta is not None:
+            self._log(
+                "content_generation_skipped",
+                path=path,
+                update=current_content is not None,
+                reason="deterministic_runtime_literal_delta",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="content_generation",
+                    task_class="content_generation",
+                    final_state="completed",
+                    capability_tier=deterministic_literal_delta.capability_tier,
+                    recovery_strategy=deterministic_literal_delta.recovery_strategy,
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(deterministic_literal_delta.content),
+                    validation_possible=True,
+                    summary="Artifact generation used a deterministic runtime literal delta recovery.",
+                    attempts=[],
+                ),
+            )
+            return ContentGenerationResult(
+                content=deterministic_literal_delta.content,
+                source="deterministic_runtime_literal_delta",
+                repair_strategy_used=repair_strategy,
+            )
+
         model_name = self._content_generation_model_name(
             route,
             session,
@@ -4531,13 +4895,14 @@ class Planner:
             total_timeout_seconds=total_timeout_seconds,
             prompt_artifact=prompt_trace_path,
         )
+        strict_timeouts = prompt_variant == "compact" and model_name is not None
         outcome = invoke_model(
             lambda progress: self.llm.generate(
                 prompt,
                 model=model_name,
                 timeout=timeout_seconds,
                 total_timeout=total_timeout_seconds,
-                strict_timeouts=prompt_variant == "compact",
+                strict_timeouts=strict_timeouts,
                 num_ctx=num_ctx,
                 retries=0,
                 progress_callback=progress,
@@ -4588,17 +4953,6 @@ class Planner:
                         strategy=repair_strategy,
                         review=review,
                     )
-                    if recorded_noop_review:
-                        return ContentGenerationResult(
-                            source="failed",
-                            failure=self._build_update_review_failure(
-                                session,
-                                path,
-                                review,
-                                current_content=current_content,
-                            ),
-                            repair_strategy_used=repair_strategy,
-                        )
                     review_retry = self._retry_update_after_review_failure(
                         route,
                         session,
@@ -4742,17 +5096,6 @@ class Planner:
                     ),
                     review=review,
                 )
-                if recorded_noop_review:
-                    return ContentGenerationResult(
-                        source="failed",
-                        failure=self._build_update_review_failure(
-                            session,
-                            path,
-                            review,
-                            current_content=current_content,
-                        ),
-                        repair_strategy_used=repair_strategy,
-                    )
                 review_retry = self._retry_update_after_review_failure(
                     route,
                     session,
@@ -5206,10 +5549,11 @@ class Planner:
         *,
         history: list[ExecutionAttemptRecord] | None = None,
     ) -> list[GenerationRecoveryAttempt]:
+        recovery_model = self._lightweight_generation_model_name() or self._generation_recovery_model_name()
         policy = ExecutionRecoveryPolicy(
             task_class="content_generation",
             allow_same_backend_retry=True,
-            allow_smaller_faster_model=bool(self._lightweight_generation_model_name()),
+            allow_smaller_faster_model=bool(recovery_model),
             allow_resume_after_progress=True,
             allow_reduce_request_complexity=True,
             allow_deterministic_fallback=False,
@@ -5219,7 +5563,7 @@ class Planner:
         decisions = policy.plan_recovery(
             issue,
             primary_model=self._primary_generation_model_name(),
-            faster_model=self._lightweight_generation_model_name(),
+            faster_model=recovery_model,
             history=list(history or []),
         )
         attempts: list[GenerationRecoveryAttempt] = []
@@ -5271,7 +5615,7 @@ class Planner:
                 )
             )
         primary_model = self._primary_generation_model_name()
-        lightweight_model = self._lightweight_generation_model_name()
+        lightweight_model = recovery_model
         current_model = str(issue.model_identifier or "").strip()
         if (
             issue.no_start_failure
@@ -5383,6 +5727,7 @@ class Planner:
         *,
         retained_progress_issue: ExecutionFailure | None = None,
     ) -> tuple[int, int, int]:
+        cold_start_recovery = issue.no_start_failure
         progress_timeout_recovery = (
             issue.timeout_like and issue.had_progress
         ) or (
@@ -5393,15 +5738,27 @@ class Planner:
         )
         if attempt.prompt_kind == "resume":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 3072 if attempt.model_name is None else 2048
         elif attempt.prompt_kind == "compact":
             base_timeout = 60 if issue.timeout_like else 45
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 2048
         else:
             base_timeout = 75 if issue.timeout_like else 60
-            total_timeout = 270 if progress_timeout_recovery else (210 if issue.timeout_like else 150)
+            total_timeout = (
+                270
+                if progress_timeout_recovery
+                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+            )
             num_ctx = 4096 if attempt.model_name is None else 3072
         return (
             max(self._llm_timeout(base_timeout), base_timeout),
@@ -5578,6 +5935,14 @@ class Planner:
             current_content=current_content,
             repair_context=session.active_repair_context,
         )
+        if direct_main_recovery is None:
+            direct_main_recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=session.active_repair_context,
+            )
         if direct_main_recovery is not None:
             self._log(
                 "content_generation_recovery_started",
@@ -5875,6 +6240,507 @@ class Planner:
         if pending_content is not None:
             return pending_content
         return self._current_file_content(session, path)
+
+    def _path_is_web_contract_artifact(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_SUFFIXES
+
+    def _path_is_web_contract_html(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_HTML_SUFFIXES
+
+    def _path_is_web_contract_css(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_CSS_SUFFIXES
+
+    def _path_is_web_contract_script(self, path: str) -> bool:
+        return Path(path).suffix.lower() in WEB_CONTRACT_SCRIPT_SUFFIXES
+
+    def _normalize_web_hook_token(self, token: str) -> str | None:
+        candidate = str(token or "").strip()
+        if not candidate or not re.fullmatch(r"[A-Za-z_][\w-]*", candidate):
+            return None
+        return candidate
+
+    def _html_tag_declares_behavioral_hook(self, tag_name: str, tag_text: str) -> bool:
+        normalized_tag = str(tag_name or "").strip().lower()
+        if normalized_tag in WEB_CONTRACT_BEHAVIORAL_HTML_TAGS:
+            return True
+        behavioral_attributes = (
+            "aria-controls",
+            "aria-expanded",
+            "aria-pressed",
+            "aria-selected",
+            "for",
+            "onclick",
+            "onchange",
+            "oninput",
+            "role",
+            "tabindex",
+        )
+        lowered_tag = str(tag_text or "").lower()
+        return any(attribute in lowered_tag for attribute in behavioral_attributes)
+
+    def _web_contract_inventory(self, path: str, content: str) -> WebContractInventory:
+        inventory = WebContractInventory()
+        suffix = Path(path).suffix.lower()
+
+        if suffix in WEB_CONTRACT_HTML_SUFFIXES:
+            for tag_match in re.finditer(r"<[A-Za-z][^>]*>", content):
+                tag_text = str(tag_match.group(0) or "")
+                tag_name_match = re.match(r"<([A-Za-z][\w:-]*)", tag_text)
+                normalized_tag_name = str(tag_name_match.group(1) or "").strip().lower() if tag_name_match is not None else ""
+                id_match = re.search(r"\bid\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
+                class_match = re.search(r"\bclass\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
+                normalized_id = None
+                if id_match is not None:
+                    normalized_id = self._normalize_web_hook_token(str(id_match.group(2) or ""))
+                    if normalized_id is not None:
+                        inventory.html_ids.add(normalized_id)
+                        if self._html_tag_declares_behavioral_hook(normalized_tag_name, tag_text):
+                            inventory.html_behavioral_ids.add(normalized_id)
+                if normalized_id is None or class_match is None:
+                    continue
+                class_tokens: set[str] = set()
+                for token in str(class_match.group(2) or "").split():
+                    normalized = self._normalize_web_hook_token(token)
+                    if normalized is not None:
+                        class_tokens.add(normalized)
+                if class_tokens:
+                    inventory.html_id_classes.setdefault(normalized_id, set()).update(class_tokens)
+            for _, raw_value in re.findall(r"\bid\s*=\s*(['\"])([^'\"]+)\1", content, flags=re.IGNORECASE):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.html_ids.add(normalized)
+            for _, raw_value in re.findall(
+                r"<(?:html|body)\b[^>]*\bclass\s*=\s*(['\"])([^'\"]+)\1",
+                content,
+                flags=re.IGNORECASE,
+            ):
+                for token in raw_value.split():
+                    normalized = self._normalize_web_hook_token(token)
+                    if normalized is not None:
+                        inventory.html_root_classes.add(normalized)
+
+        if suffix in WEB_CONTRACT_CSS_SUFFIXES:
+            selector_source = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+            for selector_text in re.findall(r"(?s)([^{}]+)\{", selector_source):
+                for raw_value in re.findall(r"#([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.css_id_selectors.add(normalized)
+                for raw_value in re.findall(r"\.([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.css_class_selectors.add(normalized)
+                for raw_value in re.findall(
+                    r"(?:^|[\s>+~,])(?:html|body|:root)\.([A-Za-z_][\w-]*)",
+                    selector_text,
+                ):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.css_root_state_classes.add(normalized)
+
+        if suffix in WEB_CONTRACT_SCRIPT_SUFFIXES:
+            for raw_value in re.findall(r"getElementById\(\s*['\"]([^'\"]+)['\"]\s*\)", content):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_id_refs.add(normalized)
+            for _, selector_text in re.findall(
+                r"(?:querySelector|querySelectorAll|closest|matches)\(\s*(['\"])(.*?)\1\s*\)",
+                content,
+                flags=re.DOTALL,
+            ):
+                for raw_value in re.findall(r"#([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.js_id_refs.add(normalized)
+                for raw_value in re.findall(r"\.([A-Za-z_][\w-]*)", selector_text):
+                    normalized = self._normalize_web_hook_token(raw_value)
+                    if normalized is not None:
+                        inventory.js_class_tokens.add(normalized)
+            for raw_value in re.findall(r"\.id\s*=\s*['\"]([^'\"]+)['\"]", content):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_declared_ids.add(normalized)
+            for raw_value in re.findall(
+                r"setAttribute\(\s*['\"]id['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)",
+                content,
+            ):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_declared_ids.add(normalized)
+            for raw_value in re.findall(
+                r"document\.(?:body|documentElement)\.classList\.(?:add|remove|toggle|replace|contains)\(\s*['\"]([^'\"]+)['\"]",
+                content,
+            ):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_root_state_classes.add(normalized)
+            for raw_value in re.findall(
+                r"\.classList\.(?:add|remove|toggle|replace|contains)\(\s*['\"]([^'\"]+)['\"]",
+                content,
+            ):
+                normalized = self._normalize_web_hook_token(raw_value)
+                if normalized is not None:
+                    inventory.js_class_tokens.add(normalized)
+
+        return inventory
+
+    def _web_contract_paths(
+        self,
+        session: SessionState,
+        *,
+        route: RouterOutput | None = None,
+        current_path: str | None = None,
+    ) -> tuple[list[str], set[str]]:
+        resolved_route = route or session.router_result
+        candidates: list[str] = []
+        if resolved_route is not None:
+            candidates.extend(self._explicit_target_paths(resolved_route, session))
+        candidates.extend(str(item.path or "").strip() for item in session.changed_files)
+        if current_path:
+            candidates.append(current_path)
+        relevant_paths = [
+            candidate
+            for candidate in self._unique_paths(candidates)
+            if candidate and self._path_is_web_contract_artifact(candidate)
+        ]
+        if resolved_route is None:
+            return relevant_paths, set()
+
+        if resolved_route.intent == RouteIntent.CREATE:
+            deferred_targets = self._active_deferred_create_targets(resolved_route, session)
+        else:
+            deferred_targets = self._active_deferred_update_targets(session)
+        changed_paths = {str(item.path or "").strip() for item in session.changed_files if str(item.path or "").strip()}
+        pending_paths = {
+            candidate
+            for candidate in self._explicit_target_paths(resolved_route, session)
+            if (
+                candidate
+                and candidate != current_path
+                and candidate not in changed_paths
+                and candidate not in deferred_targets
+                and self._path_is_web_contract_artifact(candidate)
+            )
+        }
+        return relevant_paths, pending_paths
+
+    def _web_contract_analysis(
+        self,
+        session: SessionState,
+        *,
+        route: RouterOutput | None = None,
+        current_path: str | None = None,
+        proposed_content: str | None = None,
+    ) -> tuple[list[WebContractFinding], list[str], dict[str, WebContractInventory]]:
+        relevant_paths, pending_paths = self._web_contract_paths(
+            session,
+            route=route,
+            current_path=current_path,
+        )
+        if len(relevant_paths) < 2:
+            return [], [], {}
+
+        contents_by_path: dict[str, str] = {}
+        for candidate in relevant_paths:
+            if current_path is not None and candidate == current_path:
+                content = proposed_content
+            else:
+                content = self._session_or_current_file_content(session, candidate)
+            if isinstance(content, str) and content.strip():
+                contents_by_path[candidate] = content
+        if len(contents_by_path) < 2:
+            return [], [], {}
+
+        has_html = any(self._path_is_web_contract_html(path) for path in contents_by_path)
+        has_css = any(self._path_is_web_contract_css(path) for path in contents_by_path)
+        has_script = any(self._path_is_web_contract_script(path) for path in contents_by_path)
+        if not has_html or not (has_css or has_script):
+            return [], [], {}
+
+        scope_paths = {
+            str(item.path or "").strip()
+            for item in session.changed_files
+            if str(item.path or "").strip() in contents_by_path
+        }
+        if current_path is not None:
+            scope_paths.add(current_path)
+        if not scope_paths:
+            return [], [], {}
+
+        inventories: dict[str, WebContractInventory] = {
+            path: self._web_contract_inventory(path, content)
+            for path, content in contents_by_path.items()
+        }
+
+        def collect_by_token(
+            paths: set[str],
+            extractor,
+        ) -> dict[str, set[str]]:
+            index: dict[str, set[str]] = {}
+            for path in paths:
+                inventory = inventories.get(path)
+                if inventory is None:
+                    continue
+                for token in extractor(inventory):
+                    index.setdefault(token, set()).add(path)
+            return index
+
+        all_html_ids = set().union(*(item.html_ids for item in inventories.values()))
+        all_html_root_classes = set().union(*(item.html_root_classes for item in inventories.values()))
+        all_css_id_selectors = set().union(*(item.css_id_selectors for item in inventories.values()))
+        all_js_id_refs = set().union(*(item.js_id_refs for item in inventories.values()))
+        all_js_declared_ids = set().union(*(item.js_declared_ids for item in inventories.values()))
+        all_js_root_state_classes = set().union(*(item.js_root_state_classes for item in inventories.values()))
+        all_declared_ids = all_html_ids | all_js_declared_ids
+        sibling_class_tokens = set().union(*(item.css_class_selectors | item.js_class_tokens for item in inventories.values()))
+
+        source_html_paths = {path for path in scope_paths if self._path_is_web_contract_html(path)}
+        source_css_paths = {path for path in scope_paths if self._path_is_web_contract_css(path)}
+        source_script_paths = {path for path in scope_paths if self._path_is_web_contract_script(path)}
+        source_html_ids = collect_by_token(source_html_paths, lambda inventory: inventory.html_ids)
+        source_css_id_selectors = collect_by_token(source_css_paths, lambda inventory: inventory.css_id_selectors)
+        source_css_root_state_classes = collect_by_token(
+            source_css_paths,
+            lambda inventory: inventory.css_root_state_classes,
+        )
+        source_js_id_refs = collect_by_token(source_script_paths, lambda inventory: inventory.js_id_refs)
+
+        pending_html = any(self._path_is_web_contract_html(path) for path in pending_paths)
+        pending_css = any(self._path_is_web_contract_css(path) for path in pending_paths)
+        pending_script = any(self._path_is_web_contract_script(path) for path in pending_paths)
+
+        findings: list[WebContractFinding] = []
+        file_hints: set[str] = set()
+
+        for token, paths in sorted(source_css_root_state_classes.items()):
+            if token in all_html_root_classes or token in all_js_root_state_classes:
+                continue
+            if pending_html or pending_script:
+                continue
+            source_preview = ", ".join(sorted(paths)[:2])
+            findings.append(
+                WebContractFinding(
+                    kind="css_root_state",
+                    token=token,
+                    source_paths=tuple(sorted(paths)),
+                    summary=(
+                        f"{source_preview} introduces the root state selector '{token}', but no current sibling HTML or JS provides or toggles that state."
+                    ),
+                )
+            )
+            file_hints.update(paths)
+
+        if has_script:
+            for token, paths in sorted(source_html_ids.items()):
+                if token in all_js_id_refs or token in all_css_id_selectors:
+                    continue
+                if pending_css or pending_script:
+                    continue
+                has_behavioral_signal = False
+                for path in paths:
+                    inventory = inventories.get(path)
+                    if inventory is None:
+                        continue
+                    related_classes = inventory.html_id_classes.get(token, set())
+                    if token in inventory.html_behavioral_ids or any(
+                        class_token in sibling_class_tokens for class_token in related_classes
+                    ):
+                        has_behavioral_signal = True
+                        break
+                if not has_behavioral_signal:
+                    continue
+                source_preview = ", ".join(sorted(paths)[:2])
+                findings.append(
+                    WebContractFinding(
+                        kind="html_id_hook",
+                        token=token,
+                        source_paths=tuple(sorted(paths)),
+                        summary=(
+                            f"{source_preview} introduces the id hook '{token}', but no current sibling CSS or JS consumes it."
+                        ),
+                    )
+                )
+                file_hints.update(paths)
+
+        for token, paths in sorted(source_css_id_selectors.items()):
+            if token in all_declared_ids:
+                continue
+            if pending_html or pending_script:
+                continue
+            source_preview = ", ".join(sorted(paths)[:2])
+            findings.append(
+                WebContractFinding(
+                    kind="css_id_selector",
+                    token=token,
+                    source_paths=tuple(sorted(paths)),
+                    summary=(
+                        f"{source_preview} references the id selector '#{token}', but no current sibling HTML or JS declares that hook."
+                    ),
+                )
+            )
+            file_hints.update(paths)
+
+        for token, paths in sorted(source_js_id_refs.items()):
+            if token in all_declared_ids:
+                continue
+            if pending_html or pending_script:
+                continue
+            source_preview = ", ".join(sorted(paths)[:2])
+            findings.append(
+                WebContractFinding(
+                    kind="js_id_lookup",
+                    token=token,
+                    source_paths=tuple(sorted(paths)),
+                    summary=(
+                        f"{source_preview} looks up the id hook '{token}', but no current sibling HTML or JS declares it."
+                    ),
+                )
+            )
+            file_hints.update(paths)
+
+        if not findings:
+            return [], [], inventories
+        return findings[:4], sorted(file_hints)[:6], inventories
+
+    def _web_contract_findings(
+        self,
+        session: SessionState,
+        *,
+        route: RouterOutput | None = None,
+        current_path: str | None = None,
+        proposed_content: str | None = None,
+    ) -> tuple[list[str], list[str]]:
+        findings, file_hints, _ = self._web_contract_analysis(
+            session,
+            route=route,
+            current_path=current_path,
+            proposed_content=proposed_content,
+        )
+        return [item.summary for item in findings], file_hints
+
+    def _web_contract_repair_hints(
+        self,
+        *,
+        path: str,
+        findings: list[WebContractFinding],
+        inventories: dict[str, WebContractInventory],
+    ) -> list[str]:
+        current_inventory = inventories.get(path)
+        sibling_class_tokens: set[str] = set()
+        for sibling_path, inventory in inventories.items():
+            if sibling_path == path:
+                continue
+            sibling_class_tokens.update(inventory.css_class_selectors)
+            sibling_class_tokens.update(inventory.js_class_tokens)
+
+        hints: list[str] = []
+        for finding in findings:
+            if finding.kind == "html_id_hook":
+                related_classes = (
+                    current_inventory.html_id_classes.get(finding.token, set())
+                    if current_inventory is not None
+                    else set()
+                )
+                consumed_classes = sorted(token for token in related_classes if token in sibling_class_tokens)
+                if consumed_classes:
+                    class_preview = ", ".join(consumed_classes[:2])
+                    hints.append(
+                        f"Reuse the existing class-based hook {class_preview} in {path} and remove the unconsumed id hook '{finding.token}' unless sibling CSS or JS also consumes that id."
+                    )
+                hints.append(
+                    f"If you are repairing only {path}, remove or rename the unconsumed id hook '{finding.token}' instead of returning it unchanged."
+                )
+                continue
+            if finding.kind == "css_root_state":
+                hints.append(
+                    f"Do not introduce the root-state token '{finding.token}' in {path} until sibling HTML or JS actually provides or toggles it."
+                )
+                continue
+            if finding.kind == "css_id_selector":
+                hints.append(
+                    f"Drop or rename the selector '#{finding.token}' in {path} unless sibling HTML or JS declares that hook."
+                )
+                continue
+            if finding.kind == "js_id_lookup":
+                hints.append(
+                    f"Remove the lookup for '{finding.token}' in {path} or declare that id in the shared HTML or JS contract before using it."
+                )
+
+        hints.append(
+            "Keep one shared contract across HTML, CSS, and JS instead of introducing parallel hooks that describe the same UI behavior in different ways."
+        )
+        return list(dict.fromkeys(hints))[:4]
+
+    def _pre_write_web_contract_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        findings, _, inventories = self._web_contract_analysis(
+            session,
+            route=route,
+            current_path=path,
+            proposed_content=proposed_content,
+        )
+        if not findings:
+            return None
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed update introduces a cross-file web contract that is not yet wired through the sibling HTML, CSS, and JS artifacts."
+            ),
+            confidence=0.92,
+            blocking_issues=[item.summary for item in findings],
+            preservation_risks=[],
+            repair_hints=self._web_contract_repair_hints(
+                path=path,
+                findings=findings,
+                inventories=inventories,
+            ),
+        )
+
+    def _semantic_web_contract_review(self, session: SessionState) -> SemanticChangeReview | None:
+        findings, file_hints, inventories = self._web_contract_analysis(session)
+        if not findings:
+            return None
+        repair_hints: list[str] = []
+        implicated_paths = file_hints or [item.path for item in session.changed_files[:4]]
+        for candidate in implicated_paths:
+            normalized_path = str(candidate or "").strip()
+            if not normalized_path:
+                continue
+            path_findings = [
+                item
+                for item in findings
+                if normalized_path in item.source_paths
+            ]
+            if not path_findings:
+                continue
+            repair_hints.extend(
+                self._web_contract_repair_hints(
+                    path=normalized_path,
+                    findings=path_findings,
+                    inventories=inventories,
+                )
+            )
+        return SemanticChangeReview(
+            requirements_satisfied=False,
+            summary="The changed web artifacts still contain a cross-file web contract mismatch.",
+            confidence=0.93,
+            missing_requirements=[
+                "Resolve the introduced cross-file web contract mismatch across the changed HTML, CSS, and JS artifacts."
+            ],
+            suspicious_issues=[item.summary for item in findings],
+            file_hints=file_hints or [item.path for item in session.changed_files[:4]],
+            repair_hints=list(dict.fromkeys(repair_hints))[:4]
+            or [
+                "Wire the same ids, selectors, and root-state tokens through the relevant HTML, CSS, and JS files before declaring the task complete.",
+                "Remove duplicate or unused hooks instead of adding parallel DOM elements or selectors for the same behavior.",
+            ],
+        )
 
     def _clarification_response(self, route: RouterOutput, *, session: SessionState | None = None) -> str:
         language = self._session_language(session) if session is not None else self._language_for_text(route.user_goal)
@@ -6594,24 +7460,75 @@ class Planner:
         return max(int(configured), minimum)
 
     def _primary_generation_model_name(self) -> str | None:
+        primary, _ = self._resolved_generation_model_names()
+        return primary
+
+    def _resolved_generation_model_names(self) -> tuple[str | None, str | None]:
         config = getattr(self.llm, "config", None)
         if config is None:
-            return None
-        candidate = str(getattr(config, "model_name", "") or "").strip()
-        return candidate or None
+            return None, None
+        preferred_primary = str(getattr(config, "model_name", "") or "").strip()
+        preferred_router = str(getattr(config, "router_model_name", "") or "").strip()
+        live_candidates = self._live_generation_model_candidates()
+        if not live_candidates:
+            primary = preferred_primary or None
+            router = preferred_router or None
+        else:
+            primary = select_primary_model(
+                preferred_model=preferred_primary or preferred_router,
+                installed_names=live_candidates,
+            )
+            router = select_router_model(
+                preferred_router=preferred_router or None,
+                installed_names=live_candidates,
+                primary_model=primary,
+            )
+        if router == primary:
+            router = None
+        return (primary or None, router or None)
 
     def _backend_identifier(self) -> str:
         return "ollama"
 
     def _lightweight_generation_model_name(self) -> str | None:
+        _, router = self._resolved_generation_model_names()
+        return router
+
+    def _live_generation_model_candidates(self) -> list[str]:
+        list_models = getattr(self.llm, "list_models_safe", None)
+        if not callable(list_models):
+            return []
+        try:
+            raw_models = list_models()
+        except Exception:
+            return []
+        candidates: list[str] = []
+        for item in raw_models or []:
+            if isinstance(item, dict):
+                text = str(item.get("name") or item.get("model") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        return candidates
+
+    def _generation_recovery_model_name(self) -> str | None:
+        primary = self._primary_generation_model_name()
         config = getattr(self.llm, "config", None)
-        if config is None:
-            return None
-        candidate = str(getattr(config, "router_model_name", "") or "").strip()
-        primary = str(getattr(config, "model_name", "") or "").strip()
-        if not candidate or candidate == primary:
-            return None
-        return candidate
+        candidate_pool: list[str] = []
+        if config is not None:
+            raw_candidates = getattr(config, "model_candidates", ()) or ()
+            if isinstance(raw_candidates, str):
+                raw_candidates = [raw_candidates]
+            for raw in raw_candidates:
+                text = str(raw or "").strip()
+                if text and text not in candidate_pool:
+                    candidate_pool.append(text)
+        for candidate in self._live_generation_model_candidates():
+            if candidate not in candidate_pool:
+                candidate_pool.append(candidate)
+        recovery_model = availability_recovery_model(primary, candidate_pool)
+        return str(recovery_model or "").strip() or None
 
     def _task_state_semantics_limited(self, session: SessionState) -> bool:
         task_state = session.task_state
@@ -7209,9 +8126,6 @@ class Planner:
         *,
         artifacts: list[dict[str, object]],
     ) -> bool:
-        lightweight = self._lightweight_generation_model_name()
-        if lightweight is None:
-            return False
         if route.needs_clarification or not route.safe_to_execute:
             return False
         if route.intent not in {RouteIntent.UPDATE, RouteIntent.DEBUG, RouteIntent.CREATE}:
@@ -7220,7 +8134,14 @@ class Planner:
             return False
         if len(artifacts) > MAX_LIGHTWEIGHT_UPDATE_CHANGED_FILES:
             return False
-        if session.validation_status != "passed" and not self.validation_planner.has_runtime_success(session):
+        runtime_review_required = self.validation_planner.runtime_verification_required(
+            session
+        ) or self.validation_planner.web_functional_verification_required(session)
+        if (
+            runtime_review_required
+            and session.validation_status != "passed"
+            and not self.validation_planner.has_runtime_success(session)
+        ):
             return False
 
         target_paths = self._actionable_explicit_target_paths(route, session)
@@ -7299,9 +8220,106 @@ class Planner:
             )
         )
 
+    def _review_reported_missing_literal(
+        self,
+        *,
+        path: str,
+        issue: str,
+    ) -> str | None:
+        normalized_path = str(path or "").strip()
+        text = str(issue or "").strip()
+        if not normalized_path or not text:
+            return None
+        prefix = f"The exact requested literal is missing from {normalized_path}:"
+        if not text.startswith(prefix):
+            return None
+        literal = text[len(prefix) :].strip()
+        return literal or None
+
+    def _sanitize_model_backed_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        review: ProposedUpdateReview,
+    ) -> ProposedUpdateReview:
+        if review.safe_to_write or not review.blocking_issues:
+            return review
+        scope = _artifact_scoped_focus(
+            route,
+            session,
+            path,
+            current_content=current_content,
+        )
+        supported_literals = {
+            str(item or "").strip()
+            for item in scope.get("literal_constraints", [])
+            if str(item or "").strip()
+        }
+        retained_issues: list[str] = []
+        discarded_literals: list[str] = []
+        for issue in review.blocking_issues:
+            literal = self._review_reported_missing_literal(path=path, issue=issue)
+            if literal is None or literal in supported_literals:
+                retained_issues.append(issue)
+                continue
+            discarded_literals.append(literal)
+        if not discarded_literals:
+            return review
+
+        self._log(
+            "proposed_update_review_unsupported_literal_discarded",
+            path=path,
+            literals=discarded_literals[:4],
+            supported_literals=sorted(supported_literals)[:4],
+        )
+
+        lowered_discarded = [literal.lower() for literal in discarded_literals]
+        retained_hints = [
+            hint
+            for hint in review.repair_hints
+            if not (
+                "exact requested literal" in str(hint or "").lower()
+                or "placeholder values" in str(hint or "").lower()
+                or any(literal in str(hint or "").lower() for literal in lowered_discarded)
+            )
+        ]
+
+        if not retained_issues and not review.preservation_risks:
+            return ProposedUpdateReview(
+                safe_to_write=True,
+                summary=(
+                    "The proposed update passes the deterministic integrity checks; the model-backed review only "
+                    "reported unsupported literal obligations that are not hard source constraints for this file."
+                ),
+                confidence=max(0.51, min(float(review.confidence or 0.0), 0.74)),
+                blocking_issues=[],
+                preservation_risks=[],
+                repair_hints=retained_hints[:4]
+                or [
+                    "Keep the repair anchored to the evidenced behavior delta and preserve unrelated existing behavior.",
+                ],
+            )
+
+        summary = review.summary
+        lowered_summary = str(summary or "").lower()
+        if "literal constraint" in lowered_summary or "exact requested literal" in lowered_summary:
+            summary = "The model-backed review still found another concrete issue after unsupported literal findings were discarded."
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=summary,
+            confidence=review.confidence,
+            blocking_issues=retained_issues[:4],
+            preservation_risks=review.preservation_risks[:4],
+            repair_hints=retained_hints[:4],
+        )
+
     def _evidence_backed_behavior_adjustment_is_in_scope(
         self,
         *,
+        route: RouterOutput,
         session: SessionState,
         path: str,
         current_content: str,
@@ -7311,8 +8329,6 @@ class Planner:
     ) -> bool:
         if review.safe_to_write:
             return False
-        if not self._review_rejection_looks_like_scope_broadening(review):
-            return False
         if self._supporting_runtime_contract_requires_stdout_emission(
             session,
             repair_context=repair_context,
@@ -7321,12 +8337,22 @@ class Planner:
             proposed_content=proposed_content,
         ):
             return False
-        return self._repair_update_is_evidence_backed_behavior_adjustment(
+        if not self._repair_update_is_evidence_backed_behavior_adjustment(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        ):
+            return False
+        local_review = self._local_pre_write_update_review(
+            route,
+            session,
             path=path,
             current_content=current_content,
             proposed_content=proposed_content,
             repair_context=repair_context,
         )
+        return local_review.safe_to_write
 
     def _supporting_runtime_contract_requires_stdout_emission(
         self,
@@ -7336,17 +8362,11 @@ class Planner:
     ) -> bool:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return False
-
-        candidate_paths = list(
-            dict.fromkeys(
-                [
-                    str(candidate or "").strip()
-                    for candidate in getattr(repair_context, "file_hints", []) or []
-                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
-                ]
-            )
+        support_texts = self._runtime_support_contract_texts(
+            session,
+            repair_context=repair_context,
         )
-        if not candidate_paths:
+        if not support_texts:
             return False
 
         stdout_capture_markers = (
@@ -7357,11 +8377,113 @@ class Planner:
             "patch('sys.stdout'",
             'patch("sys.stdout"',
         )
-        for candidate in candidate_paths[:4]:
-            excerpt = self._current_or_last_read_excerpt(session, path=candidate)
-            if any(marker in excerpt for marker in stdout_capture_markers):
+        for excerpt in support_texts:
+            lowered_excerpt = excerpt.lower()
+            if any(marker in lowered_excerpt for marker in stdout_capture_markers):
                 return True
         return False
+
+    def _runtime_support_contract_texts(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+        limit: int = 4,
+    ) -> list[str]:
+        if repair_context is None:
+            return []
+        candidate_paths = list(
+            dict.fromkeys(
+                [
+                    str(candidate or "").strip()
+                    for candidate in [
+                        *(getattr(repair_context, "file_hints", []) or []),
+                        *(getattr(repair_context, "artifact_paths", []) or []),
+                    ]
+                    if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+                ]
+            )
+        )
+        texts: list[str] = []
+        for candidate in candidate_paths[:limit]:
+            content = self._session_or_current_file_content(session, candidate)
+            if content:
+                texts.append(content)
+        return texts
+
+    def _supporting_runtime_contract_requires_zero_exit_status(
+        self,
+        session: SessionState,
+        *,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        support_texts = self._runtime_support_contract_texts(
+            session,
+            repair_context=repair_context,
+        )
+        if not support_texts:
+            return False
+        stdout_capture_markers = (
+            "redirect_stdout(",
+            ".getvalue().strip(",
+            ".getvalue().strip()",
+            "capsys.readouterr(",
+            "patch('sys.stdout'",
+            'patch("sys.stdout"',
+        )
+        for excerpt in support_texts:
+            lowered_excerpt = excerpt.lower()
+            if not any(marker in lowered_excerpt for marker in stdout_capture_markers):
+                continue
+            for match in re.finditer(
+                r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:__main__\.)?main\(",
+                excerpt,
+            ):
+                capture_name = str(match.group("name") or "").strip()
+                if not capture_name:
+                    continue
+                if re.search(rf"assert\s+{re.escape(capture_name)}\s*==\s*0\b", excerpt):
+                    return True
+                if re.search(
+                    rf"self\.assertEqual\(\s*{re.escape(capture_name)}\s*,\s*0\s*\)",
+                    excerpt,
+                ):
+                    return True
+                if re.search(
+                    rf"self\.assertEqual\(\s*0\s*,\s*{re.escape(capture_name)}\s*\)",
+                    excerpt,
+                ):
+                    return True
+        return False
+
+    def _repair_context_returns_output_instead_of_success_status(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return False
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return False
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        observed_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "observed_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if "0" not in expected_values:
+            return False
+        return any(
+            value
+            and value not in {"0", "''", '""', "None", "null", "undefined"}
+            for value in observed_values
+        )
 
     def _repair_update_addresses_stdout_contract(
         self,
@@ -7465,6 +8587,29 @@ class Planner:
         proposed_content: str,
         reserve_model: str | None,
     ) -> bool:
+        return self._compact_single_model_repair_review_candidate(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+            respect_attempt_history=True,
+            allow_evidence_backed_behavior_adjustment=False,
+        )
+
+    def _compact_single_model_repair_review_candidate(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+        respect_attempt_history: bool,
+        allow_evidence_backed_behavior_adjustment: bool,
+    ) -> bool:
         repair_context = session.active_repair_context
         if repair_context is None or current_content is None:
             return False
@@ -7501,11 +8646,14 @@ class Planner:
             return False
         if primary_target and primary_target != normalized_path and not target_is_explicitly_allowed:
             return False
-        if self._repair_update_is_evidence_backed_behavior_adjustment(
-            path=normalized_path,
-            current_content=current_content,
-            proposed_content=proposed_content,
-            repair_context=repair_context,
+        if (
+            not allow_evidence_backed_behavior_adjustment
+            and self._repair_update_is_evidence_backed_behavior_adjustment(
+                path=normalized_path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
         ):
             return False
         if allowed_files and normalized_path not in allowed_files:
@@ -7527,10 +8675,11 @@ class Planner:
         }
         if len(unresolved_competing_scope) > 1:
             return False
-        if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
-            return False
-        if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
-            return False
+        if respect_attempt_history:
+            if self._repair_attempt_failure_count(session, repair_context, normalized_path) >= 1:
+                return False
+            if self._repair_attempt_mutation_count(session, repair_context, normalized_path) >= 1:
+                return False
 
         changed_line_count = self._compact_repair_change_line_count(
             current_content=current_content,
@@ -7542,6 +8691,72 @@ class Planner:
             return False
 
         return True
+
+    def _should_skip_retry_model_backed_repair_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        proposed_content: str,
+        reserve_model: str | None,
+        review_feedback: ProposedUpdateReview,
+    ) -> bool:
+        if review_feedback.safe_to_write:
+            return False
+        if review_feedback.preservation_risks:
+            return False
+        if self._review_rejection_looks_like_scope_broadening(review_feedback):
+            return False
+        return self._compact_single_model_repair_review_candidate(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            reserve_model=reserve_model,
+            respect_attempt_history=False,
+            allow_evidence_backed_behavior_adjustment=True,
+        )
+
+    def _repair_review_prefers_primary_model(
+        self,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> bool:
+        return getattr(repair_context, "repair_brief", None) is not None
+
+    def _record_local_update_review_skip(
+        self,
+        session: SessionState,
+        *,
+        path: str,
+        reason: str,
+        model: str | None,
+        summary: str,
+    ) -> None:
+        self._log(
+            "proposed_update_review_skipped",
+            path=path,
+            reason=reason,
+            model=model,
+        )
+        self._append_runtime_execution(
+            session,
+            build_execution_run_record(
+                operation_name="proposed_update_review",
+                task_class="proposed_update_review",
+                final_state="degraded_success",
+                capability_tier="tier_d",
+                recovery_strategy="deterministic_fallback",
+                degraded=True,
+                honest_blocked=False,
+                artifact_bytes_generated=0,
+                validation_possible=True,
+                summary=summary,
+                attempts=[],
+            ),
+        )
 
     def _repair_no_effective_change_review(
         self,
@@ -7593,6 +8808,74 @@ class Planner:
                 "Do not change only whitespace, comments, metadata, or unrelated lines; produce a real code-level fix.",
                 "Use the expected-versus-observed repair brief to make a minimal but real semantic change.",
             ],
+        )
+
+    def _task_backed_no_effective_change_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is not None:
+            return None
+        if not self._supports_update_style_existing_artifact(route, current_content=current_content):
+            return None
+
+        if self._exact_text_contract_resolved_by_mutation(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+        ):
+            return None
+
+        mutation = self._assess_effective_mutation(path, current_content, proposed_content)
+        if mutation.effective:
+            return None
+
+        target_paths = self._actionable_explicit_target_paths(route, session)
+        normalized_path = str(path or "").strip()
+        if target_paths and normalized_path not in target_paths:
+            return None
+
+        focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        raw_requirements = focus.get("current_write_requirements") or []
+        write_requirements = [
+            str(item or "").strip()
+            for item in raw_requirements
+            if str(item or "").strip()
+        ]
+        verification_target = str(getattr(session.task_state, "verification_target", "") or "").strip()
+        if not write_requirements and not verification_target:
+            return None
+
+        repair_hints: list[str] = []
+        for requirement in write_requirements[:2]:
+            repair_hints.append(f"Make a real change in {normalized_path} that addresses: {requirement}.")
+        if verification_target:
+            repair_hints.append(
+                f"Anchor the next draft to the exercised path checked by {verification_target} instead of resubmitting equivalent code."
+            )
+        repair_hints.append(
+            "Do not resubmit equivalent content; change the code lines that control the requested behavior or output."
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed update is a no-op or only an equivalent restatement, so writing it would preserve "
+                "the same current behavior."
+            ),
+            confidence=0.9,
+            blocking_issues=[
+                f"The proposal for {normalized_path} does not make a productive change ({mutation.reason})."
+            ],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
         )
 
     def _semantic_delta_noop_repair_hints(
@@ -7679,6 +8962,29 @@ class Planner:
             return max(self._llm_timeout(90), 90), max(self._llm_timeout(420), 420)
         return max(self._llm_timeout(60), 60), max(self._llm_timeout(240), 240)
 
+    def _compact_reserve_review_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(25), 25)
+        # Compact reserve-model reviews still carry summarized artifact excerpts and
+        # often begin streaming close to the initial warm-start deadline on local CPU
+        # stacks. Keep the prompt compact, but give the completion enough room to
+        # finish so we do not escalate purely because the reviewer started late.
+        return timeout, max(timeout + 60, 90)
+
+    def _compact_primary_semantic_review_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(60), 60)
+        # Single-model deployments still benefit from the compact review path, but
+        # the same local model must warm up again for a structured JSON review right
+        # after generation. Reuse the longer review-style budget so small CPU-backed
+        # models do not fail during startup before the semantic gate can even run.
+        return timeout, max(self._llm_timeout(210), 210)
+
+    def _primary_semantic_review_followup_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(60), 60)
+        # If the compact same-model semantic review still fails to start, the full
+        # follow-up should remain meaningfully different instead of collapsing to the
+        # short generic JSON-review budget that already proved too small in live runs.
+        return timeout, max(self._llm_timeout(180), 180)
+
     def _review_generated_update(
         self,
         route: RouterOutput,
@@ -7748,8 +9054,8 @@ class Planner:
                 ),
                 mode="compact",
             )
-        reserve_model = self._lightweight_generation_model_name()
         primary_model = self._primary_generation_model_name()
+        reserve_model = self._lightweight_generation_model_name()
         local_review_reason: str | None = None
         if focused_compact_review and not repair_review and reserve_model is None:
             local_review_reason = "single_model_compact_update"
@@ -7770,32 +9076,24 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
             )
-            self._log(
-                "proposed_update_review_skipped",
+            self._record_local_update_review_skip(
+                session,
                 path=path,
                 reason=local_review_reason,
                 model=primary_model,
-            )
-            self._append_runtime_execution(
-                session,
-                build_execution_run_record(
-                    operation_name="proposed_update_review",
-                    task_class="proposed_update_review",
-                    final_state="degraded_success",
-                    capability_tier="tier_d",
-                    recovery_strategy="deterministic_fallback",
-                    degraded=True,
-                    honest_blocked=False,
-                    artifact_bytes_generated=0,
-                    validation_possible=True,
-                    summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
-                    attempts=[],
-                ),
+                summary="A focused update skipped a second same-model review hop and used conservative local preservation checks instead.",
             )
             return review
         review_attempts: list[tuple[str | None, str, str]] = []
         if repair_review:
+            primary_first_repair_review = self._repair_review_prefers_primary_model(
+                session.active_repair_context,
+            )
+            if reserve_model is not None and not primary_first_repair_review:
+                review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
             review_attempts.append((primary_model, "tier_a", "primary_model_review"))
+            if reserve_model is not None and primary_first_repair_review:
+                review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
         elif focused_compact_review:
             if reserve_model is not None:
                 review_attempts.append((reserve_model, "tier_b", "reserve_model_review"))
@@ -7841,7 +9139,7 @@ class Planner:
             same_model_compact_review = (
                 use_compact_prompt
                 and capability_tier == "tier_a"
-                and reserve_model is None
+                and normalized_model == str(primary_model or "").strip()
             )
             if use_compact_prompt:
                 # Primary-model compact reviews still pay the full local startup cost on
@@ -7857,9 +9155,17 @@ class Planner:
                     else:
                         timeout = max(self._llm_timeout(60), 60)
                         total_timeout = max(self._llm_timeout(180), 180)
+                elif repair_review and capability_tier == "tier_b":
+                    # Recovery-model repair reviews on local CPU stacks can warm up almost
+                    # as slowly as the generation hop they are validating. Reuse the
+                    # compact repair generation budget so the stronger reviewer can
+                    # actually start before we fall back to the weaker primary model.
+                    timeout, total_timeout = self._content_generation_time_budget(
+                        prompt_variant="compact",
+                        repair_context=session.active_repair_context,
+                    )
                 else:
-                    timeout = max(self._llm_timeout(25), 25)
-                    total_timeout = max(timeout + 20, 45)
+                    timeout, total_timeout = self._compact_reserve_review_budget()
             else:
                 timeout = max(self._llm_timeout(18), 18)
                 total_timeout = max(timeout + 12, timeout * 2)
@@ -7913,6 +9219,13 @@ class Planner:
                     model=model_name,
                 )
                 continue
+            review = self._sanitize_model_backed_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                review=review,
+            )
 
             self._append_runtime_execution(
                 session,
@@ -8024,11 +9337,25 @@ class Planner:
                 repair_context=repair_context,
             )
         if review is None:
+            review = self._direct_python_script_option_contract_review(
+                path=path,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._pre_write_web_contract_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
+        if review is None:
             review = self._validation_repair_relevance_review(
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
+                session=session,
             )
         if review is None:
             review = self._repair_no_effective_change_review(
@@ -8046,11 +9373,19 @@ class Planner:
                 proposed_content=proposed_content,
             )
             review_from_generated = True
+        review = self._sanitize_model_backed_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            review=review,
+        )
         if (
             review_from_generated
             and
             not review.safe_to_write
             and self._evidence_backed_behavior_adjustment_is_in_scope(
+                route=route,
                 session=session,
                 path=path,
                 current_content=current_content,
@@ -8105,20 +9440,30 @@ class Planner:
             return None
 
         review_text = self._proposed_update_review_text(review_feedback) if review_feedback is not None else ""
-        if review_text and not any(
-            marker in review_text
-            for marker in ("direct main", "argv", "launcher", "option token")
-        ):
-            return None
 
         option_tokens, _ = self._direct_main_option_contract_details(session, repair_context)
+        _, positional_tokens = self._direct_main_option_contract_details(session, repair_context)
         if not option_tokens:
             return None
 
-        patched_content = self._apply_direct_main_contract_patch(
+        payload_echo_patch = self._apply_direct_main_payload_echo_patch(
             current_content=current_content,
             option_tokens=option_tokens,
+            positional_tokens=positional_tokens,
+            repair_context=repair_context,
         )
+        patched_content = payload_echo_patch
+        if patched_content is None:
+            if review_text and not any(
+                marker in review_text
+                for marker in ("direct main", "argv", "launcher", "option token")
+            ):
+                return None
+
+            patched_content = self._apply_direct_main_contract_patch(
+                current_content=current_content,
+                option_tokens=option_tokens,
+            )
         if patched_content is None or patched_content == current_content:
             return None
         try:
@@ -8141,6 +9486,1049 @@ class Planner:
             review=review,
             recovery_strategy="deterministic_direct_main_contract",
         )
+
+    def _deterministic_cli_stdout_exit_contract_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        del review_feedback
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+        if not self._supporting_runtime_contract_requires_stdout_emission(
+            session,
+            repair_context=repair_context,
+        ):
+            return None
+        if not self._supporting_runtime_contract_requires_zero_exit_status(
+            session,
+            repair_context=repair_context,
+        ):
+            return None
+        if not self._repair_context_returns_output_instead_of_success_status(repair_context):
+            return None
+
+        patched_content = self._apply_cli_stdout_exit_contract_patch(current_content)
+        if patched_content is None or patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_cli_stdout_exit_contract",
+        )
+
+    def _direct_python_script_expected_output(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if repair_context.verification_scope != "runtime":
+            return None
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if not expected_values:
+            return None
+        expected_output = str(expected_values[0] or "").strip()
+        return expected_output or None
+
+    def _direct_python_script_verbatim_option_payload_layout(
+        self,
+        *,
+        tail_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if len(tail_tokens) < 2:
+            return None
+        expected_output = self._direct_python_script_expected_output(repair_context)
+        if not expected_output:
+            return None
+
+        option_payload = str(tail_tokens[0] or "").strip()
+        remainder_tokens = [str(token or "").strip() for token in tail_tokens[1:] if str(token or "").strip()]
+        if not option_payload or not remainder_tokens:
+            return None
+
+        remainder_output = " ".join(remainder_tokens).strip()
+        candidates = (
+            ("prefix_tight", f"{option_payload}{remainder_output}"),
+            ("prefix_spaced", f"{option_payload} {remainder_output}".strip()),
+            ("suffix_tight", f"{remainder_output}{option_payload}"),
+            ("suffix_spaced", f"{remainder_output} {option_payload}".strip()),
+        )
+        for layout, candidate in candidates:
+            if candidate == expected_output:
+                return layout
+        return None
+
+    def _apply_direct_python_script_verbatim_option_payload_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+        tail_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if not option_tokens or len(tail_tokens) < 2:
+            return None
+
+        layout = self._direct_python_script_verbatim_option_payload_layout(
+            tail_tokens=tail_tokens,
+            repair_context=repair_context,
+        )
+        if layout is None:
+            return None
+
+        option_payload = str(tail_tokens[0] or "").strip()
+        if not option_payload:
+            return None
+
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = lines[start:end]
+        condition_pattern = re.compile(
+            r"^(?P<indent>\s*)if\s+(?:(?:len\((?P<len_arg>\w+)\)\s*>=\s*(?P<required>\d+)\s+and\s+))?"
+            r"(?P<arg>\w+)\s*\[\s*:\s*(?P<slice>\d+)\s*\]\s*==\s*(?P<literal>\[[^\n]+\])\s*:\s*$"
+        )
+        option_count = len(option_tokens)
+        required_len = option_count + 1
+
+        for index, raw_line in enumerate(block_lines):
+            match = condition_pattern.match(raw_line)
+            if match is None:
+                continue
+            try:
+                literal_value = ast.literal_eval(str(match.group("literal") or "").strip())
+            except (SyntaxError, ValueError):
+                continue
+            if not isinstance(literal_value, (list, tuple)):
+                continue
+
+            literal_tokens = [str(item) for item in literal_value]
+            slice_length = int(match.group("slice") or 0)
+            if slice_length != len(literal_tokens):
+                continue
+
+            explicit_required = int(match.group("required") or 0)
+            arg_name = str(match.group("arg") or "").strip()
+            len_arg_name = str(match.group("len_arg") or "").strip()
+            if not arg_name or (len_arg_name and len_arg_name != arg_name):
+                continue
+
+            dynamic_branch = literal_tokens == option_tokens
+            hardcoded_payload_branch = literal_tokens == [*option_tokens, option_payload]
+            if not dynamic_branch and not hardcoded_payload_branch:
+                continue
+
+            branch_indent = str(match.group("indent") or "")
+            branch_body_indent = branch_indent + "    "
+            branch_end = len(block_lines)
+            for candidate in range(index + 1, len(block_lines)):
+                line = block_lines[candidate]
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= len(branch_indent):
+                    branch_end = candidate
+                    break
+            branch_lines = block_lines[index + 1 : branch_end]
+            if not branch_lines:
+                continue
+
+            has_print = any("print(" in line for line in branch_lines)
+            has_return = any(line.lstrip().startswith("return") for line in branch_lines)
+            has_value_return = any(
+                line.lstrip().startswith("return") and line.strip() != "return"
+                for line in branch_lines
+            )
+            if not has_print and not has_value_return:
+                continue
+
+            effective_required_len = max(explicit_required, required_len)
+            payload_expr = f"{arg_name}[{option_count}]"
+            remainder_expr = f"' '.join({arg_name}[{option_count + 1}:])"
+            if layout == "prefix_tight":
+                output_expr = f"{payload_expr} + {remainder_expr}"
+            elif layout == "prefix_spaced":
+                output_expr = f"{payload_expr} + ' ' + {remainder_expr}"
+            elif layout == "suffix_spaced":
+                output_expr = f"{remainder_expr} + ' ' + {payload_expr}"
+            else:
+                output_expr = f"{remainder_expr} + {payload_expr}"
+
+            new_condition = (
+                f"{branch_indent}if len({arg_name}) >= {effective_required_len} and "
+                f"{arg_name}[:{option_count}] == {option_tokens!r}:\n"
+            )
+            replacement_lines = [new_condition]
+            if has_print:
+                replacement_lines.append(f"{branch_body_indent}print({output_expr})\n")
+                if has_return:
+                    replacement_lines.append(f"{branch_body_indent}return\n")
+            else:
+                replacement_lines.append(f"{branch_body_indent}return {output_expr}\n")
+
+            updated_lines = [
+                *lines[:start],
+                *block_lines[:index],
+                *replacement_lines,
+                *block_lines[branch_end:],
+                *lines[end:],
+            ]
+            updated_content = "".join(updated_lines)
+            if updated_content != current_content:
+                return updated_content
+        return None
+
+    def _rewrite_direct_python_script_payload_branch(
+        self,
+        branch_lines: list[str],
+        *,
+        indent: str,
+        arg_name: str,
+        payload_index: int,
+        payload_literal: str,
+    ) -> list[str] | None:
+        if not branch_lines:
+            return None
+        wrapper_source = "def _codex_branch():\n" + "".join(branch_lines)
+        try:
+            tree = ast.parse(wrapper_source)
+        except SyntaxError:
+            return None
+        function = tree.body[0] if tree.body else None
+        if not isinstance(function, ast.FunctionDef):
+            return None
+
+        def _payload_access() -> ast.Subscript:
+            return ast.Subscript(
+                value=ast.Name(id=arg_name, ctx=ast.Load()),
+                slice=ast.Constant(value=payload_index),
+                ctx=ast.Load(),
+            )
+
+        class PayloadLiteralTransformer(ast.NodeTransformer):
+            def __init__(self) -> None:
+                self.changed = False
+
+            def visit_Constant(self, node: ast.Constant) -> ast.AST:
+                value = node.value
+                if not isinstance(value, str):
+                    return node
+                if value == payload_literal:
+                    self.changed = True
+                    return ast.copy_location(_payload_access(), node)
+                if value == f"{payload_literal} ":
+                    self.changed = True
+                    return ast.copy_location(
+                        ast.BinOp(
+                            left=_payload_access(),
+                            op=ast.Add(),
+                            right=ast.Constant(value=" "),
+                        ),
+                        node,
+                    )
+                if value == f" {payload_literal}":
+                    self.changed = True
+                    return ast.copy_location(
+                        ast.BinOp(
+                            left=ast.Constant(value=" "),
+                            op=ast.Add(),
+                            right=_payload_access(),
+                        ),
+                        node,
+                    )
+                return node
+
+        transformer = PayloadLiteralTransformer()
+        transformed = transformer.visit(tree)
+        if not transformer.changed:
+            return None
+        ast.fix_missing_locations(transformed)
+        function = transformed.body[0] if transformed.body else None
+        if not isinstance(function, ast.FunctionDef):
+            return None
+        rewritten_lines: list[str] = []
+        for statement in function.body:
+            statement_code = ast.unparse(statement)
+            rewritten_lines.extend(
+                f"{indent}{line}\n" if line else "\n"
+                for line in statement_code.splitlines()
+            )
+        return rewritten_lines or None
+
+    def _apply_direct_python_script_payload_literal_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+        tail_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        if not option_tokens or not tail_tokens:
+            return None
+        expected_output = self._direct_python_script_expected_output(repair_context)
+        first_tail_token = str(tail_tokens[0] or "").strip()
+        if not expected_output or not first_tail_token or first_tail_token not in expected_output:
+            return None
+
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = lines[start:end]
+        condition_pattern = re.compile(
+            r"^(?P<indent>\s*)if\s+(?P<arg>\w+)\s*\[\s*:\s*(?P<slice>\d+)\s*\]\s*==\s*(?P<literal>\[[^\n]+\])\s*:\s*$"
+        )
+        option_count = len(option_tokens)
+        required_len = option_count + 1
+
+        for index, raw_line in enumerate(block_lines):
+            match = condition_pattern.match(raw_line)
+            if match is None:
+                continue
+            try:
+                literal_value = ast.literal_eval(str(match.group("literal") or "").strip())
+            except (SyntaxError, ValueError):
+                continue
+            if not isinstance(literal_value, (list, tuple)):
+                continue
+            literal_tokens = [str(item) for item in literal_value]
+            slice_length = int(match.group("slice") or 0)
+            if (
+                slice_length != len(literal_tokens)
+                or len(literal_tokens) != required_len
+                or literal_tokens[:option_count] != option_tokens
+            ):
+                continue
+
+            payload_literal = str(literal_tokens[option_count] or "").strip()
+            if not payload_literal:
+                continue
+
+            branch_indent = str(match.group("indent") or "")
+            branch_body_indent = branch_indent + "    "
+            arg_name = str(match.group("arg") or "").strip()
+            if not arg_name:
+                continue
+
+            branch_end = len(block_lines)
+            for candidate in range(index + 1, len(block_lines)):
+                line = block_lines[candidate]
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= len(branch_indent):
+                    branch_end = candidate
+                    break
+            branch_lines = block_lines[index + 1 : branch_end]
+            rewritten_body = self._rewrite_direct_python_script_payload_branch(
+                branch_lines,
+                indent=branch_body_indent,
+                arg_name=arg_name,
+                payload_index=option_count,
+                payload_literal=payload_literal,
+            )
+            if rewritten_body is None:
+                continue
+
+            new_condition = (
+                f"{branch_indent}if len({arg_name}) >= {required_len} and "
+                f"{arg_name}[:{option_count}] == {option_tokens!r}:\n"
+            )
+            updated_lines = [
+                *lines[:start],
+                *block_lines[:index],
+                new_condition,
+                *rewritten_body,
+                *block_lines[branch_end:],
+                *lines[end:],
+            ]
+            updated_content = "".join(updated_lines)
+            if updated_content != current_content:
+                return updated_content
+        return None
+
+    def _deterministic_direct_python_script_runtime_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        option_tokens, tail_tokens = self._direct_python_script_option_contract_details(
+            repair_context,
+            path=path,
+        )
+        if not option_tokens or not tail_tokens:
+            return None
+
+        patched_content = self._apply_direct_python_script_verbatim_option_payload_patch(
+            current_content=current_content,
+            option_tokens=option_tokens,
+            tail_tokens=tail_tokens,
+            repair_context=repair_context,
+        )
+        if patched_content is None:
+            patched_content = self._apply_direct_python_script_payload_literal_patch(
+            current_content=current_content,
+            option_tokens=option_tokens,
+            tail_tokens=tail_tokens,
+            repair_context=repair_context,
+            )
+        if patched_content is None or patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_direct_python_script_contract",
+        )
+
+    def _deterministic_runtime_literal_delta_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+
+        def looks_truncated(value: str) -> bool:
+            candidate = str(value or "").strip()
+            return "..." in candidate or "…" in candidate
+
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        lines = str(current_content or "").splitlines(keepends=True)
+        focused_indexes = [
+            hint - 1
+            for hint in line_hints
+            if isinstance(hint, int) and 0 < hint <= len(lines)
+        ]
+
+        replacement_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        expected_values, observed_values = _repair_semantic_values(repair_context)
+        for observed, expected in zip(observed_values, expected_values, strict=False):
+            observed_text = str(observed or "").strip()
+            expected_text = str(expected or "").strip()
+            if not observed_text or not expected_text or observed_text == expected_text:
+                continue
+            if looks_truncated(observed_text) or looks_truncated(expected_text):
+                continue
+            pair = (observed_text, expected_text)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            replacement_pairs.append(pair)
+        mismatch_patterns = (
+            re.compile(r"assert ['\"](?P<observed>.+?)['\"] == ['\"](?P<expected>.+?)['\"]"),
+            re.compile(r"AssertionError:\s*['\"](?P<observed>.+?)['\"] != ['\"](?P<expected>.+?)['\"]"),
+        )
+        evidence_texts = [
+            str(repair_context.excerpt or "").strip(),
+            str(repair_context.failure_summary or "").strip(),
+            str(repair_context.summary or "").strip(),
+        ]
+        for evidence_text in evidence_texts:
+            if not evidence_text:
+                continue
+            for pattern in mismatch_patterns:
+                for match in pattern.finditer(evidence_text):
+                    observed = str(match.group("observed") or "")
+                    expected = str(match.group("expected") or "")
+                    if not observed or not expected or observed == expected:
+                        continue
+                    if looks_truncated(observed) or looks_truncated(expected):
+                        continue
+                    pair = (observed, expected)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    replacement_pairs.append(pair)
+        for delta in _repair_semantic_delta_lines(
+            repair_context,
+            limit=2,
+            path=path,
+            current_content=current_content,
+        ):
+            text = str(delta or "").strip()
+            if not text:
+                continue
+            replace_match = re.search(
+                r"Replace observed-only text ['\"](?P<observed>.+?)['\"] with expected text ['\"](?P<expected>.+?)['\"]",
+                text,
+            )
+            if replace_match is None:
+                continue
+            observed = str(replace_match.group("observed") or "").strip()
+            expected = str(replace_match.group("expected") or "").strip()
+            if not observed or not expected or observed == expected:
+                continue
+            if looks_truncated(observed) or looks_truncated(expected):
+                continue
+            pair = (observed, expected)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            replacement_pairs.append(pair)
+
+        for observed, expected in replacement_pairs:
+
+            patched_content: str | None = None
+            if focused_indexes:
+                updated_lines = list(lines)
+                changed = False
+                for index in focused_indexes:
+                    line = updated_lines[index]
+                    if observed not in line:
+                        continue
+                    updated_lines[index] = line.replace(observed, expected)
+                    changed = True
+                if changed:
+                    patched_content = "".join(updated_lines)
+            if patched_content is None and current_content.count(observed) == 1:
+                patched_content = current_content.replace(observed, expected, 1)
+
+            if patched_content is None or patched_content == current_content:
+                continue
+            if Path(path).suffix.lower() in {".py", ".pyi"}:
+                try:
+                    ast.parse(patched_content)
+                except SyntaxError:
+                    continue
+
+            review = self._local_pre_write_update_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=patched_content,
+                repair_context=repair_context,
+            )
+            if not review.safe_to_write:
+                continue
+            return DeterministicUpdateRecovery(
+                content=patched_content,
+                review=review,
+                recovery_strategy="deterministic_runtime_literal_delta",
+            )
+        return None
+
+    def _deterministic_runtime_similar_function_name_recovery(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+        review_feedback: ProposedUpdateReview | None = None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is None or repair_context is None or review_feedback is None:
+            return None
+        if repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        undefined_symbol = self._undefined_runtime_symbol(repair_context)
+        if not undefined_symbol:
+            return None
+        review_text = self._proposed_update_review_text(review_feedback)
+        if undefined_symbol not in review_text or "undefined" not in review_text:
+            return None
+
+        similar_candidates = _python_similar_defined_name_candidates(current_content, undefined_symbol)
+        if not similar_candidates:
+            return None
+        if not self._similar_python_name_candidate_is_unambiguous(undefined_symbol, similar_candidates):
+            return None
+
+        candidate_name, candidate_kind, _lineno = similar_candidates[0]
+        if candidate_kind != "function":
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        line_hints = _repair_target_line_hints(
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        target_indexes: list[int] = []
+        for hint in line_hints:
+            if not isinstance(hint, int) or hint <= 0:
+                continue
+            candidate_index = hint - 1
+            if 0 <= candidate_index < len(lines) and undefined_symbol in lines[candidate_index]:
+                target_indexes.append(candidate_index)
+                continue
+            search_start = max(candidate_index - 2, 0)
+            search_end = min(candidate_index + 3, len(lines))
+            nearby_match = next(
+                (
+                    index
+                    for index in range(search_start, search_end)
+                    if undefined_symbol in lines[index]
+                    and not _python_line_binds_name(lines[index], undefined_symbol)
+                ),
+                None,
+            )
+            if nearby_match is not None:
+                target_indexes.append(nearby_match)
+        target_indexes = sorted(set(target_indexes))
+        if not target_indexes:
+            target_indexes = [
+                index
+                for index, raw_line in enumerate(lines)
+                if undefined_symbol in raw_line and not _python_line_binds_name(raw_line, undefined_symbol)
+            ]
+            if len(target_indexes) != 1:
+                return None
+
+        bare_symbol_replacement = None
+        if self._python_function_accepts_zero_args(current_content, candidate_name):
+            bare_symbol_replacement = f"{candidate_name}()"
+
+        call_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b(?=\s*\()")
+        bare_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b(?!\s*\()")
+        updated_lines = list(lines)
+        changed = False
+        for index in target_indexes:
+            raw_line = updated_lines[index]
+            if not raw_line.strip() or _python_line_binds_name(raw_line, undefined_symbol):
+                continue
+            replaced_line = call_pattern.sub(candidate_name, raw_line)
+            if bare_pattern.search(replaced_line):
+                if bare_symbol_replacement is None:
+                    return None
+                replaced_line = bare_pattern.sub(bare_symbol_replacement, replaced_line)
+            if replaced_line != raw_line:
+                updated_lines[index] = replaced_line
+                changed = True
+        if not changed:
+            return None
+
+        patched_content = "".join(updated_lines)
+        if patched_content == current_content:
+            return None
+        try:
+            ast.parse(patched_content)
+        except SyntaxError:
+            return None
+
+        review = self._local_pre_write_update_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            proposed_content=patched_content,
+            repair_context=repair_context,
+        )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=patched_content,
+            review=review,
+            recovery_strategy="deterministic_runtime_similar_function_name",
+        )
+
+    def _similar_python_name_candidate_is_unambiguous(
+        self,
+        target_name: str,
+        candidates: list[tuple[str, str, int | None]],
+    ) -> bool:
+        if not candidates:
+            return False
+        top_name, top_kind, _ = candidates[0]
+        top_score = self._similar_python_name_score(target_name, top_name, top_kind)
+        if top_score < 0.95:
+            return False
+        if len(candidates) == 1:
+            return True
+        second_name, second_kind, _ = candidates[1]
+        second_score = self._similar_python_name_score(target_name, second_name, second_kind)
+        return top_score - second_score >= 0.12
+
+    def _similar_python_name_score(
+        self,
+        target_name: str,
+        candidate_name: str,
+        candidate_kind: str,
+    ) -> float:
+        normalized_target = str(target_name or "").strip().lower()
+        normalized_candidate = str(candidate_name or "").strip().lower()
+        if not normalized_target or not normalized_candidate or normalized_candidate == normalized_target:
+            return 0.0
+        score = difflib.SequenceMatcher(None, normalized_target, normalized_candidate).ratio()
+        if normalized_candidate.startswith(normalized_target):
+            score += 0.35
+        elif normalized_target.startswith(normalized_candidate):
+            score += 0.1
+        if normalized_target in normalized_candidate:
+            score += 0.1
+        if normalized_candidate.replace("_", "") == normalized_target.replace("_", ""):
+            score += 0.15
+        if candidate_kind == "function":
+            score += 0.08
+        elif candidate_kind == "import":
+            score += 0.04
+        return score
+
+    def _python_function_accepts_zero_args(
+        self,
+        content: str,
+        function_name: str,
+    ) -> bool:
+        target = str(function_name or "").strip()
+        if not target:
+            return False
+        try:
+            module = ast.parse(str(content or ""))
+        except SyntaxError:
+            return False
+        for node in ast.walk(module):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != target:
+                continue
+            positional_args = [
+                *getattr(node.args, "posonlyargs", []),
+                *getattr(node.args, "args", []),
+            ]
+            required_positional = max(len(positional_args) - len(node.args.defaults), 0)
+            required_kwonly = sum(1 for item in node.args.kwonlyargs if item is not None) - sum(
+                1 for default in node.args.kw_defaults if default is not None
+            )
+            return required_positional == 0 and required_kwonly <= 0
+        return False
+
+    def _deterministic_runtime_repair_decision(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> AgentDecision | None:
+        if current_content is None or repair_context is None:
+            return None
+        recovery = self._deterministic_direct_main_runtime_recovery(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        if recovery is None:
+            recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
+            recovery = self._deterministic_direct_python_script_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
+            recovery = self._deterministic_runtime_literal_delta_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
+        if recovery is None:
+            return None
+        mutation = self._assess_effective_mutation(path, current_content, recovery.content)
+        if not mutation.effective:
+            return None
+        self._log(
+            "content_generation_recovery_started",
+            path=path,
+            strategy=recovery.recovery_strategy,
+            failure_class="validation_repair_runtime_direct",
+            models=[],
+        )
+        self._log(
+            "content_generation_recovery_finished",
+            path=path,
+            strategy=recovery.recovery_strategy,
+            source=recovery.recovery_strategy,
+        )
+        self._record_repair_attempt(
+            session,
+            repair_context,
+            target=path,
+            strategy=recovery.recovery_strategy,
+            result="mutation_planned",
+            reason=mutation.reason,
+            mutation=mutation,
+        )
+        return AgentDecision(
+            thought_summary=f"Apply the deterministic runtime repair for {path}.",
+            action_type=AgentActionType.CALL_TOOL,
+            tool_name="write_file",
+            tool_args={"path": path, "content": recovery.content},
+            expected_outcome="Apply the targeted repair derived directly from the failed runtime evidence.",
+            final_response=None,
+        )
+
+    def _apply_direct_main_payload_echo_patch(
+        self,
+        *,
+        current_content: str,
+        option_tokens: list[str],
+        positional_tokens: list[str],
+        repair_context: ValidationFailureEvidence,
+    ) -> str | None:
+        expected_output = self._direct_main_expected_payload_output(
+            repair_context,
+            positional_tokens=positional_tokens,
+        )
+        if expected_output is None:
+            return None
+
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = lines[start:end]
+        option_set = {str(token or "").strip() for token in option_tokens if str(token or "").strip()}
+        if not option_set:
+            return None
+
+        condition_index: int | None = None
+        branch_end_index: int | None = None
+        branch_arg_name = ""
+        branch_indent = ""
+        condition_pattern = re.compile(
+            r"^(?P<indent>\s*)if\s+(?P<arg>\w+)\s+and\s+(?P=arg)\s*\[\s*0\s*\]\s*==\s*(?P<quote>['\"])(?P<option>.+?)(?P=quote)\s*:\s*$"
+        )
+        for index, raw_line in enumerate(block_lines):
+            match = condition_pattern.match(raw_line)
+            if match is None:
+                continue
+            option_literal = str(match.group("option") or "").strip()
+            if option_literal not in option_set:
+                continue
+            condition_index = index
+            branch_arg_name = str(match.group("arg") or "").strip()
+            branch_indent = str(match.group("indent") or "")
+            branch_body_indent = branch_indent + "    "
+            branch_end_index = len(block_lines)
+            for candidate in range(index + 1, len(block_lines)):
+                line = block_lines[candidate]
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                current_indent = len(line) - len(line.lstrip())
+                if current_indent <= len(branch_indent):
+                    branch_end_index = candidate
+                    break
+            branch_lines = block_lines[index + 1 : branch_end_index]
+            if not branch_lines:
+                return None
+            has_print = any("print(" in line for line in branch_lines)
+            has_return = any(line.lstrip().startswith("return") for line in branch_lines)
+            if not has_print and not has_return:
+                return None
+            normalized_block_lines = list(block_lines)
+            for binding_index in range(index):
+                normalized_line = self._normalize_direct_main_option_binding_line(
+                    normalized_block_lines[binding_index],
+                    binding_name=branch_arg_name,
+                )
+                if normalized_line != normalized_block_lines[binding_index]:
+                    normalized_block_lines[binding_index] = normalized_line
+                    break
+            replacement_lines = [block_lines[index]]
+            if has_print:
+                replacement_lines.append(f"{branch_body_indent}print(' '.join({branch_arg_name}[1:]))\n")
+                if has_return:
+                    replacement_lines.append(f"{branch_body_indent}return\n")
+            else:
+                replacement_lines.append(f"{branch_body_indent}return ' '.join({branch_arg_name}[1:])\n")
+            updated_lines = [
+                *lines[:start],
+                *normalized_block_lines[:index],
+                *replacement_lines,
+                *normalized_block_lines[branch_end_index:],
+                *lines[end:],
+            ]
+            updated_content = "".join(updated_lines)
+            if updated_content == current_content:
+                return None
+            return updated_content
+        return None
+
+    def _normalize_direct_main_option_binding_line(
+        self,
+        raw_line: str,
+        *,
+        binding_name: str,
+    ) -> str:
+        pattern = re.compile(
+            rf"^(?P<indent>\s*){re.escape(binding_name)}\s*=\s*(?P<expr>.+?)\s*\[\s*1\s*:\s*\]\s*$"
+        )
+        stripped_line = raw_line.rstrip("\n")
+        match = pattern.match(stripped_line)
+        if match is None:
+            return raw_line
+        expression = str(match.group("expr") or "").strip()
+        if "argv" not in expression:
+            return raw_line
+        indent = str(match.group("indent") or "")
+        suffix = "\n" if raw_line.endswith("\n") else ""
+        return f"{indent}{binding_name} = {expression}{suffix}"
+
+    def _direct_main_expected_payload_output(
+        self,
+        repair_context: ValidationFailureEvidence,
+        *,
+        positional_tokens: list[str],
+    ) -> str | None:
+        if repair_context.verification_scope != "runtime" or not positional_tokens:
+            return None
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return None
+        expected_values = [
+            _repair_semantic_value_text(item)
+            for item in getattr(brief, "expected_semantics", [])
+            if _repair_semantic_value_text(item)
+        ]
+        if not expected_values:
+            return None
+        expected_output = str(expected_values[0] or "").strip()
+        payload_output = " ".join(str(token or "").strip() for token in positional_tokens if str(token or "").strip()).strip()
+        if not expected_output or not payload_output or expected_output != payload_output:
+            return None
+        return expected_output
+
+    def _apply_cli_stdout_exit_contract_patch(
+        self,
+        current_content: str,
+    ) -> str | None:
+        bounds = self._python_function_block_bounds(current_content, function_name="main")
+        if bounds is None:
+            return None
+
+        lines = str(current_content or "").splitlines(keepends=True)
+        start, end = bounds
+        block_lines = list(lines[start:end])
+        if not block_lines:
+            return None
+        if any(
+            "print(" in line or "sys.stdout.write(" in line.lower() or "stdout.write(" in line.lower()
+            for line in block_lines
+        ):
+            return None
+
+        signature_line = block_lines[0]
+        if "->" in signature_line and "-> int:" not in signature_line:
+            block_lines[0] = re.sub(r"->\s*[^:]+:", "-> int:", signature_line)
+
+        changed = False
+        for index in range(1, len(block_lines)):
+            raw_line = block_lines[index]
+            stripped = raw_line.lstrip()
+            indent = raw_line[: len(raw_line) - len(stripped)]
+            if not stripped.startswith("return "):
+                continue
+            expr = stripped[len("return ") :].rstrip("\n").strip()
+            if not expr:
+                continue
+            if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", expr) or expr in {"None", "True", "False"}:
+                continue
+            if "\\" in expr:
+                return None
+            block_lines[index : index + 1] = [
+                f"{indent}print({expr})\n",
+                f"{indent}return 0\n",
+            ]
+            changed = True
+
+        if not changed:
+            return None
+        updated_content = "".join([*lines[:start], *block_lines, *lines[end:]])
+        if updated_content == current_content:
+            return None
+        return updated_content
 
     def _apply_direct_main_contract_patch(
         self,
@@ -8383,7 +10771,16 @@ class Planner:
         if repair_context.verification_scope != "runtime":
             return [], []
 
-        candidate_paths = self._unique_paths(
+        command_paths = self._unique_paths(
+            [
+                str(candidate or "").strip()
+                for candidate in self.validation_planner._paths_from_explicit_test_command(
+                    str(getattr(repair_context, "command", "") or "").strip()
+                )
+                if str(candidate or "").strip() and self._path_is_test_like(str(candidate or "").strip())
+            ]
+        )
+        fallback_paths = self._unique_paths(
             [
                 *[
                     str(candidate or "").strip()
@@ -8397,6 +10794,7 @@ class Planner:
                 ),
             ]
         )
+        candidate_paths = command_paths or fallback_paths
         if not candidate_paths:
             return [], []
 
@@ -8406,32 +10804,19 @@ class Planner:
             excerpt = self._current_or_last_read_excerpt(session, path=candidate)
             if "main([" not in excerpt:
                 continue
-            for match in re.finditer(r"\bmain\(\s*(\[[^\]]*\])\s*\)", excerpt):
-                raw_argv = str(match.group(1) or "").strip()
-                if not raw_argv:
-                    continue
-                try:
-                    values = ast.literal_eval(raw_argv)
-                except (SyntaxError, ValueError):
-                    continue
-                if not isinstance(values, (list, tuple)):
-                    continue
-                saw_option = False
-                for value in values:
-                    token = str(value or "").strip()
-                    if token.startswith("-"):
-                        saw_option = True
-                        if token in tokens:
-                            continue
-                        tokens.append(token)
-                        if len(tokens) >= limit:
-                            return tokens[:limit], positional_tokens[:limit]
-                        continue
-                    if not saw_option or token in positional_tokens:
-                        continue
-                    positional_tokens.append(token)
-                    if len(positional_tokens) >= limit:
+            option_candidates, positional_candidates = _direct_main_runtime_contract(
+                excerpt,
+                limit=limit,
+            )
+            for token in option_candidates:
+                if token and token not in tokens:
+                    tokens.append(token)
+                    if len(tokens) >= limit and positional_tokens:
                         return tokens[:limit], positional_tokens[:limit]
+            if positional_candidates:
+                positional_tokens = positional_candidates[:limit]
+                if len(positional_tokens) >= limit:
+                    return tokens[:limit], positional_tokens[:limit]
         return tokens[:limit], positional_tokens[:limit]
 
     def _session_direct_main_option_contract_details(
@@ -8509,6 +10894,308 @@ class Planner:
             return True
         combined = "\n".join([str(current_content or ""), str(proposed_content or "")])
         return bool(re.search(r"^\s*def\s+main\s*\(", combined, re.MULTILINE))
+
+    def _direct_python_script_option_contract_details(
+        self,
+        repair_context: ValidationFailureEvidence,
+        *,
+        path: str,
+        limit: int = 4,
+    ) -> tuple[list[str], list[str]]:
+        if repair_context.verification_scope != "runtime":
+            return [], []
+        return _direct_python_script_runtime_contract(
+            repair_context.command,
+            target_path=path,
+            limit=limit,
+        )
+
+    def _python_constant_string_sequence(
+        self,
+        node: ast.AST,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            return None
+        values: list[str] = []
+        for element in node.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+                return None
+            values.append(str(element.value))
+        return tuple(values)
+
+    def _python_prefix_slice_contract(
+        self,
+        sequence_node: ast.AST,
+        literal_node: ast.AST,
+    ) -> PythonSequencePrefixContract | None:
+        if not isinstance(sequence_node, ast.Subscript):
+            return None
+        slice_node = sequence_node.slice
+        if not isinstance(slice_node, ast.Slice):
+            return None
+        if slice_node.lower is not None or slice_node.step is not None:
+            return None
+        upper = slice_node.upper
+        if not isinstance(upper, ast.Constant) or not isinstance(upper.value, int):
+            return None
+        literal_tokens = self._python_constant_string_sequence(literal_node)
+        if literal_tokens is None:
+            return None
+        try:
+            variable_expression = ast.unparse(sequence_node.value).strip()
+        except Exception:
+            return None
+        if not variable_expression:
+            return None
+        return PythonSequencePrefixContract(
+            variable_expression=variable_expression,
+            slice_length=int(upper.value),
+            literal_tokens=literal_tokens,
+            lineno=int(getattr(sequence_node, "lineno", 0) or 0),
+        )
+
+    def _python_prefix_sequence_contracts(
+        self,
+        content: str,
+    ) -> list[PythonSequencePrefixContract]:
+        try:
+            tree = ast.parse(str(content or ""))
+        except SyntaxError:
+            return []
+        contracts: list[PythonSequencePrefixContract] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            if len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq) or len(node.comparators) != 1:
+                continue
+            comparator = node.comparators[0]
+            for sequence_node, literal_node in ((node.left, comparator), (comparator, node.left)):
+                contract = self._python_prefix_slice_contract(sequence_node, literal_node)
+                if contract is not None:
+                    contracts.append(contract)
+                    break
+        return contracts
+
+    def _python_sequence_accesses(
+        self,
+        content: str,
+        *,
+        variable_expression: str,
+    ) -> tuple[set[int], set[int]]:
+        try:
+            tree = ast.parse(str(content or ""))
+        except SyntaxError:
+            return set(), set()
+        index_accesses: set[int] = set()
+        slice_starts: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Subscript):
+                continue
+            try:
+                base_expression = ast.unparse(node.value).strip()
+            except Exception:
+                continue
+            if base_expression != variable_expression:
+                continue
+            slice_node = node.slice
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
+                index_accesses.add(int(slice_node.value))
+                continue
+            if (
+                isinstance(slice_node, ast.Slice)
+                and isinstance(slice_node.lower, ast.Constant)
+                and isinstance(slice_node.lower.value, int)
+                and slice_node.upper is None
+                and slice_node.step is None
+            ):
+                slice_starts.add(int(slice_node.lower.value))
+        return index_accesses, slice_starts
+
+    def _direct_python_script_option_contract_review(
+        self,
+        *,
+        path: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> ProposedUpdateReview | None:
+        if repair_context is None or repair_context.verification_scope != "runtime":
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi"}:
+            return None
+
+        option_tokens, tail_tokens = self._direct_python_script_option_contract_details(
+            repair_context,
+            path=path,
+        )
+        if not option_tokens:
+            return None
+
+        lowered_proposed = str(proposed_content or "").lower()
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        option_preview = ", ".join(option_tokens[:3])
+        tail_preview = ", ".join(repr(token) for token in tail_tokens[:3])
+        missing_exact_tokens = [
+            token for token in option_tokens if token.lower() not in lowered_proposed
+        ]
+        if missing_exact_tokens:
+            repair_hints = [
+                f"Handle the exact direct script option token sequence {option_preview} in {path}; do not rewrite those tokens into stripped-hyphen or underscore-only lookalikes.",
+            ]
+            if tail_tokens:
+                repair_hints.append(
+                    f"After recognizing {option_preview}, derive behavior from the remaining argv payload {tail_preview} instead of hardcoding those sample values."
+                )
+            repair_hints.extend(
+                self._runtime_target_repair_hints(
+                    path,
+                    repair_context,
+                    evidence_lines=target_evidence,
+                )
+            )
+            return ProposedUpdateReview(
+                safe_to_write=False,
+                summary=(
+                    "The proposed repair still misses the exact direct python script option tokens exercised by the failed runtime path."
+                ),
+                confidence=0.92,
+                blocking_issues=[
+                    (
+                        f"The failing runtime command invokes {Path(path).name} with option tokens like {option_preview}, "
+                        f"but the proposal never recognizes those exact tokens in {path}."
+                    )
+                ],
+                preservation_risks=[],
+                repair_hints=repair_hints[:4],
+            )
+
+        prefix_contracts = [
+            contract
+            for contract in self._python_prefix_sequence_contracts(proposed_content)
+            if any(token in option_tokens for token in contract.literal_tokens)
+        ]
+        for contract in prefix_contracts:
+            literal_preview = ", ".join(repr(token) for token in contract.literal_tokens)
+            if (
+                len(contract.literal_tokens) > len(option_tokens)
+                and list(contract.literal_tokens[: len(option_tokens)]) == option_tokens
+                and any(
+                    token in tail_tokens
+                    for token in contract.literal_tokens[len(option_tokens) :]
+                )
+            ):
+                extra_tokens = contract.literal_tokens[len(option_tokens) :]
+                extra_preview = ", ".join(repr(token) for token in extra_tokens[:3])
+                repair_hints = [
+                    f"Treat the direct script option prefix {option_preview} as the contract anchor in {path}; do not hardcode illustrative runtime payload tokens like {extra_preview} into the branch guard.",
+                ]
+                if tail_tokens:
+                    repair_hints.append(
+                        f"After recognizing {option_preview}, derive behavior from the remaining argv payload {tail_preview} instead of matching one sample payload token literally."
+                    )
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
+                )
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary=(
+                        "The proposed repair still hardcodes illustrative direct python script payload tokens into the exercised option-prefix branch."
+                    ),
+                    confidence=0.9,
+                    blocking_issues=[
+                        (
+                            f"The proposal guards {contract.variable_expression} with {literal_preview} in {path}, "
+                            f"which bakes the sample runtime payload token(s) {extra_preview} into the prefix match "
+                            "instead of treating them as data that should flow through the repaired path."
+                        )
+                    ],
+                    preservation_risks=[],
+                    repair_hints=repair_hints[:4],
+                )
+            if contract.slice_length != len(contract.literal_tokens):
+                repair_hints = [
+                    f"If you compare {contract.variable_expression}[:N] against a literal option sequence in {path}, keep the slice length aligned with the compared literal tokens.",
+                    f"Match the exercised option prefix {option_preview} on the real argv payload after {Path(path).name}; do not write a branch that can never satisfy the runtime contract.",
+                ]
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
+                )
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary=(
+                        "The proposed repair still misstates the direct python script argv prefix contract exercised by the failed runtime path."
+                    ),
+                    confidence=0.9,
+                    blocking_issues=[
+                        (
+                            f"The proposal compares {contract.variable_expression}[:{contract.slice_length}] against "
+                            f"{literal_preview} in {path}, but that branch can never match because the slice length "
+                            "and literal token count differ."
+                        )
+                    ],
+                    preservation_risks=[],
+                    repair_hints=repair_hints[:4],
+                )
+
+        payload_start = len(option_tokens)
+        for contract in prefix_contracts:
+            if payload_start <= 0:
+                break
+            if list(contract.literal_tokens) != option_tokens[: len(contract.literal_tokens)]:
+                continue
+            if contract.slice_length != payload_start:
+                continue
+            index_accesses, slice_starts = self._python_sequence_accesses(
+                proposed_content,
+                variable_expression=contract.variable_expression,
+            )
+            suspicious_slice_starts = sorted(
+                start for start in slice_starts if start > payload_start
+            )
+            if (
+                suspicious_slice_starts
+                and payload_start not in index_accesses
+                and payload_start not in slice_starts
+            ):
+                suspicious_start = suspicious_slice_starts[0]
+                repair_hints = [
+                    f"Once {contract.variable_expression}[:{payload_start}] matches {option_preview}, consume the remaining payload from {contract.variable_expression}[{payload_start}:] or {contract.variable_expression}[{payload_start}] onward instead of skipping past the first non-option token.",
+                ]
+                if tail_tokens:
+                    repair_hints.append(
+                        f"The exercised runtime payload after {option_preview} begins with {tail_preview}; do not drop that first payload token when formatting stdout."
+                    )
+                repair_hints.extend(
+                    self._runtime_target_repair_hints(
+                        path,
+                        repair_context,
+                        evidence_lines=target_evidence,
+                    )
+                )
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary=(
+                        "The proposed repair still drops the first direct python script payload token after matching the exercised option prefix."
+                    ),
+                    confidence=0.88,
+                    blocking_issues=[
+                        (
+                            f"The proposal recognizes {option_preview} in {contract.variable_expression}[:{payload_start}] "
+                            f"but then consumes {contract.variable_expression}[{suspicious_start}:], which skips the first "
+                            "runtime payload token required by the failing path."
+                        )
+                    ],
+                    preservation_risks=[],
+                    repair_hints=repair_hints[:4],
+                )
+        return None
 
     def _direct_main_option_contract_argv_index_review(
         self,
@@ -8749,11 +11436,25 @@ class Planner:
                 repair_context=repair_context,
             )
         if review is None:
+            review = self._direct_python_script_option_contract_review(
+                path=path,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        if review is None:
+            review = self._pre_write_web_contract_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
+        if review is None:
             review = self._validation_repair_relevance_review(
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
+                session=session,
             )
         if review is None:
             review = self._repair_no_effective_change_review(
@@ -8770,6 +11471,13 @@ class Planner:
                 current_content=current_content,
                 proposed_content=proposed_content,
             )
+        review = self._sanitize_model_backed_review(
+            route,
+            session,
+            path=path,
+            current_content=current_content,
+            review=review,
+        )
         return review
 
     def _retry_update_after_review_failure(
@@ -8787,7 +11495,7 @@ class Planner:
         retry_attempts: list[ExecutionAttemptRecord] = []
         last_review = review_feedback
         primary_model = self._primary_generation_model_name()
-        reserve_model = self._lightweight_generation_model_name()
+        reserve_model = self._generation_recovery_model_name() or self._lightweight_generation_model_name()
         prefer_compact_create_retry = current_content is None
         prefer_lightweight_retry = current_content is not None and self._should_prefer_lightweight_update_generation(
             route,
@@ -8796,6 +11504,13 @@ class Planner:
             current_content=current_content,
         )
         prefer_primary_repair_retry = repair_context is not None
+        prefer_reserve_after_initial_noop = self._prefer_reserve_after_initial_primary_noop(
+            review_feedback=review_feedback,
+            repair_context=repair_context,
+            primary_model=primary_model,
+            reserve_model=reserve_model,
+            prior_attempts=prior_attempts,
+        )
         keep_compact_update_retry = (
             repair_context is None
             and current_content is not None
@@ -8807,14 +11522,57 @@ class Planner:
             )
         )
 
-        deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+        deterministic_recovery = self._deterministic_exact_text_contract_generation(
             route,
             session,
             path=path,
             current_content=current_content,
             repair_context=repair_context,
-            review_feedback=review_feedback,
         )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_runtime_similar_function_name_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_direct_main_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_cli_stdout_exit_contract_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_direct_python_script_runtime_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+                review_feedback=review_feedback,
+            )
+        if deterministic_recovery is None:
+            deterministic_recovery = self._deterministic_runtime_literal_delta_recovery(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                repair_context=repair_context,
+            )
         if deterministic_recovery is not None:
             effective_repair_strategy = self._review_retry_repair_strategy(
                 repair_strategy,
@@ -8832,7 +11590,7 @@ class Planner:
                 "content_generation_recovery_finished",
                 path=path,
                 strategy=deterministic_recovery.recovery_strategy,
-                source="deterministic_direct_main_contract",
+                source=deterministic_recovery.recovery_strategy,
             )
             return UpdateReviewRetryResult(
                 content=deterministic_recovery.content,
@@ -8892,17 +11650,43 @@ class Planner:
                     "compact",
                 )
             )
-            retry_models.append(
-                (
-                    primary_model,
-                    "tier_a",
-                    "review_guided_retry_followup",
-                    followup_timeout_seconds,
-                    followup_total_timeout_seconds,
-                    min(self._llm_num_ctx(4096), 4096),
-                    "full",
+            if prefer_reserve_after_initial_noop:
+                if reserve_model is not None and reserve_model != primary_model:
+                    retry_models.append(
+                        (
+                            reserve_model,
+                            "tier_b",
+                            "review_guided_fallback_model",
+                            followup_timeout_seconds,
+                            followup_total_timeout_seconds,
+                            min(self._llm_num_ctx(3072), 3072),
+                            "full",
+                        )
+                    )
+            else:
+                retry_models.append(
+                    (
+                        primary_model,
+                        "tier_a",
+                        "review_guided_retry_followup",
+                        followup_timeout_seconds,
+                        followup_total_timeout_seconds,
+                        min(self._llm_num_ctx(4096), 4096),
+                        "full",
+                    )
                 )
-            )
+                if reserve_model is not None and reserve_model != primary_model:
+                    retry_models.append(
+                        (
+                            reserve_model,
+                            "tier_b",
+                            "review_guided_fallback_model",
+                            followup_timeout_seconds,
+                            followup_total_timeout_seconds,
+                            min(self._llm_num_ctx(3072), 3072),
+                            "full",
+                        )
+                    )
         elif prefer_lightweight_retry and reserve_model is not None:
             retry_models.append(
                 (
@@ -8916,6 +11700,7 @@ class Planner:
                 )
             )
         elif keep_compact_update_retry:
+            followup_timeout_seconds, followup_total_timeout_seconds = self._repair_followup_retry_budget()
             retry_models.append(
                 (
                     primary_model,
@@ -8938,6 +11723,18 @@ class Planner:
                     "compact",
                 )
             )
+            if reserve_model is not None and reserve_model != primary_model:
+                retry_models.append(
+                    (
+                        reserve_model,
+                        "tier_b",
+                        "review_guided_fallback_model",
+                        followup_timeout_seconds,
+                        followup_total_timeout_seconds,
+                        min(self._llm_num_ctx(2048), 2048),
+                        "compact",
+                    )
+                )
         if prefer_lightweight_retry and reserve_model is not None and keep_compact_update_retry:
             retry_models.append(
                 (
@@ -9127,14 +11924,42 @@ class Planner:
                 strategy=strategy,
                 characters=len(cleaned),
             )
-            review = self._pre_write_update_review(
+            if self._should_skip_retry_model_backed_repair_review(
                 route,
                 session,
                 path=path,
                 current_content=current_content,
                 proposed_content=cleaned,
-                repair_context=repair_context,
-            )
+                reserve_model=reserve_model,
+                review_feedback=last_review,
+            ):
+                self._record_local_update_review_skip(
+                    session,
+                    path=path,
+                    reason="single_model_compact_repair_followup",
+                    model=primary_model,
+                    summary=(
+                        "A guided single-model repair follow-up reused deterministic local preservation checks "
+                        "instead of repeating the same model-backed review hop."
+                    ),
+                )
+                review = self._local_pre_write_update_review(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content or "",
+                    proposed_content=cleaned,
+                    repair_context=repair_context,
+                )
+            else:
+                review = self._pre_write_update_review(
+                    route,
+                    session,
+                    path=path,
+                    current_content=current_content,
+                    proposed_content=cleaned,
+                    repair_context=repair_context,
+                )
             if review.safe_to_write:
                 return UpdateReviewRetryResult(
                     content=cleaned,
@@ -9258,10 +12083,21 @@ class Planner:
             current_content=current_content,
             proposed_content=proposed_content,
             repair_context=repair_context,
+            session=session,
         )
         if review is not None:
             return review
         review = self._repair_no_effective_change_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+        )
+        if review is not None:
+            return review
+        review = self._task_backed_no_effective_change_review(
+            route,
+            session,
             path=path,
             current_content=current_content,
             proposed_content=proposed_content,
@@ -9761,6 +12597,15 @@ class Planner:
                     ],
                 )
 
+        text_contract_review = self._explicit_text_line_contract_review(
+            route,
+            session,
+            path=path,
+            proposed_content=proposed_content,
+        )
+        if text_contract_review is not None:
+            return text_contract_review
+
         if Path(path).suffix.lower() == ".md":
             added_headings = self._unexpected_markdown_headings(
                 route,
@@ -9843,6 +12688,15 @@ class Planner:
                     ],
                 )
 
+        text_contract_review = self._explicit_text_line_contract_review(
+            route,
+            session,
+            path=path,
+            proposed_content=proposed_content,
+        )
+        if text_contract_review is not None:
+            return text_contract_review
+
         if Path(path).suffix.lower() == ".md":
             echoed_instruction = self._markdown_instruction_echo(
                 route,
@@ -9866,6 +12720,327 @@ class Planner:
                 )
 
         return None
+
+    def _explicit_text_line_contract_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return None
+        mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=proposed_content,
+        )
+        if mismatch is None:
+            return None
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed text content does not match the exact requested line sequence.",
+            confidence=0.99,
+            blocking_issues=[mismatch],
+            preservation_risks=[],
+            repair_hints=[
+                f"Write {path} with exactly the requested lines and no trailing spaces or extra text.",
+            ],
+        )
+
+    def _requested_exact_text_lines(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> list[str]:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        if suffix not in EXACT_TEXT_CONTRACT_SUFFIXES:
+            return []
+        candidate_sources: list[str] = []
+        task_state = session.task_state
+        for raw in (
+            str(getattr(task_state, "latest_user_turn", "") or "").strip(),
+            str(session.task or "").strip(),
+            str(route.user_goal or "").strip(),
+            str(route.requested_outcome or "").strip(),
+        ):
+            if raw and raw not in candidate_sources:
+                candidate_sources.append(raw)
+        for source in candidate_sources:
+            extracted = self._extract_requested_exact_text_lines(source)
+            if extracted:
+                return extracted
+        return []
+
+    def _extract_requested_exact_text_lines(self, text: str) -> list[str]:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return []
+        pattern = re.compile(
+            r"(?P<prefix>[^:\n]{0,180}?(?:line|lines|zeile|zeilen)[^:\n]{0,120})\s*:\s*(?P<body>[^\n]+(?:\n[^\n]+){0,7})",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(normalized):
+            prefix = str(match.group("prefix") or "").strip()
+            if not self._looks_like_exact_line_request(prefix):
+                continue
+            expected_count = self._exact_line_count_hint(prefix)
+            extracted = self._parse_exact_line_contract_body(
+                str(match.group("body") or ""),
+                expected_count=expected_count,
+            )
+            if extracted:
+                return extracted
+        return []
+
+    def _looks_like_exact_line_request(self, prefix: str) -> bool:
+        lowered = f" {str(prefix or '').lower()} "
+        if not any(token in lowered for token in (" line ", " lines ", " zeile ", " zeilen ")):
+            return False
+        return any(
+            token in lowered
+            for token in (
+                " exact ",
+                " exactly ",
+                " exakt ",
+                " genau ",
+                " these ",
+                " these",
+                " diesen ",
+                " diese ",
+                " folgenden ",
+                " following ",
+                " nothing else ",
+                " sonst nichts ",
+            )
+        )
+
+    def _exact_line_count_hint(self, prefix: str) -> int | None:
+        tokens = re.findall(r"[0-9A-Za-zÄÖÜäöüß]+", str(prefix or "").lower())
+        for index, token in enumerate(tokens):
+            if token not in {"line", "lines", "zeile", "zeilen"}:
+                continue
+            start = max(index - 4, 0)
+            for candidate in reversed(tokens[start:index]):
+                hinted = EXACT_LINE_COUNT_HINTS.get(candidate)
+                if hinted is not None:
+                    return hinted
+        return None
+
+    def _parse_exact_line_contract_body(
+        self,
+        text: str,
+        *,
+        expected_count: int | None,
+    ) -> list[str]:
+        segment = str(text or "").strip()
+        if not segment:
+            return []
+
+        lines: list[str] = []
+        current: list[str] = []
+        trailing_remainder = ""
+        index = 0
+        while index < len(segment):
+            char = segment[index]
+            if char in {",", ";", "\n"}:
+                candidate = self._clean_exact_line_item("".join(current), terminal=False)
+                if not candidate:
+                    return []
+                lines.append(candidate)
+                current = []
+                index += 1
+                while index < len(segment) and segment[index].isspace() and segment[index] != "\n":
+                    index += 1
+                if expected_count is not None and len(lines) >= expected_count:
+                    trailing_remainder = segment[index:]
+                    break
+                continue
+            if char in ".!?" and self._line_contract_sentence_break(segment, index):
+                trailing_remainder = segment[index + 1 :]
+                break
+            current.append(char)
+            index += 1
+
+        tail = self._clean_exact_line_item("".join(current), terminal=True)
+        if tail:
+            lines.append(tail)
+
+        if expected_count is not None and len(lines) != expected_count:
+            fallback = self._parse_conjoined_exact_line_contract_body(
+                segment,
+                expected_count=expected_count,
+            )
+            if fallback:
+                return fallback
+            return []
+        if not 2 <= len(lines) <= 8:
+            return []
+        if trailing_remainder and not self._line_contract_remainder_looks_like_followup(trailing_remainder):
+            return []
+        return lines
+
+    def _parse_conjoined_exact_line_contract_body(
+        self,
+        text: str,
+        *,
+        expected_count: int,
+    ) -> list[str]:
+        if expected_count < 2 or expected_count > 4:
+            return []
+        segment = str(text or "").strip()
+        if not segment or any(marker in segment for marker in {",", ";", "\n"}):
+            return []
+
+        head = segment
+        remainder = ""
+        for index, char in enumerate(segment):
+            if char in ".!?" and self._line_contract_sentence_break(segment, index):
+                head = segment[:index]
+                remainder = segment[index + 1 :]
+                break
+        if remainder and not self._line_contract_remainder_looks_like_followup(remainder):
+            return []
+
+        parts = [
+            self._clean_exact_line_item(raw_part, terminal=True)
+            for raw_part in re.split(r"\s+(?:and|und)\s+", head, flags=re.IGNORECASE)
+        ]
+        if len(parts) != expected_count or any(not part for part in parts):
+            return []
+        return parts
+
+    def _clean_exact_line_item(self, raw: str, *, terminal: bool) -> str:
+        candidate = str(raw or "").strip()
+        if not candidate:
+            return ""
+        if terminal:
+            candidate = re.sub(r"[.!?]+$", "", candidate).strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"', "`"}:
+            candidate = candidate[1:-1].strip()
+        if not candidate or len(candidate) > 120:
+            return ""
+        return candidate
+
+    def _line_contract_sentence_break(self, text: str, index: int) -> bool:
+        if index >= len(text) - 1:
+            return True
+        remainder = str(text[index + 1 :] or "")
+        stripped = remainder.lstrip()
+        if not stripped:
+            return True
+        first = stripped[0]
+        if first in {'"', "'", "`"} and len(stripped) > 1:
+            first = stripped[1]
+        return first.isupper()
+
+    def _line_contract_remainder_looks_like_followup(self, remainder: str) -> bool:
+        normalized = str(remainder or "").strip()
+        if not normalized:
+            return True
+        first = normalized[0]
+        if first in {'"', "'", "`"} and len(normalized) > 1:
+            first = normalized[1]
+        if first.isupper():
+            return True
+        return len(re.findall(r"[0-9A-Za-zÄÖÜäöüß]+", normalized)) >= 2
+
+    def _exact_text_line_mismatch(
+        self,
+        *,
+        path: str,
+        expected_lines: list[str],
+        content: str,
+    ) -> str | None:
+        normalized_content = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+        if normalized_content.endswith("\n"):
+            normalized_content = normalized_content[:-1]
+        actual_lines = normalized_content.split("\n") if normalized_content else []
+        if actual_lines == expected_lines:
+            return None
+        if len(actual_lines) != len(expected_lines):
+            return (
+                f"{path} should contain exactly {len(expected_lines)} lines, but the current content has "
+                f"{len(actual_lines)}."
+            )
+        for index, (actual_line, expected_line) in enumerate(zip(actual_lines, expected_lines), start=1):
+            if actual_line == expected_line:
+                continue
+            if actual_line.rstrip() == expected_line:
+                return (
+                    f"Line {index} in {path} has trailing whitespace. Expected {expected_line!r}, got {actual_line!r}."
+                )
+            return f"Line {index} in {path} should be {expected_line!r}, but is {actual_line!r}."
+        return f"{path} does not match the exact requested line sequence."
+
+    def _deterministic_exact_text_contract_generation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str | None,
+        repair_context: ValidationFailureEvidence | None,
+    ) -> DeterministicUpdateRecovery | None:
+        if current_content is not None and repair_context is None and route.intent != RouteIntent.CREATE:
+            return None
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return None
+        deterministic_content = "\n".join(expected_lines)
+        if current_content is None:
+            review = self._pre_write_create_review(
+                route,
+                session,
+                path=path,
+                proposed_content=deterministic_content,
+            )
+        else:
+            review = self._pre_write_update_review(
+                route,
+                session,
+                path=path,
+                current_content=current_content,
+                proposed_content=deterministic_content,
+                repair_context=repair_context,
+            )
+        if not review.safe_to_write:
+            return None
+        return DeterministicUpdateRecovery(
+            content=deterministic_content,
+            review=review,
+            recovery_strategy="deterministic_exact_text_contract",
+        )
+
+    def _exact_text_contract_resolved_by_mutation(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+    ) -> bool:
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return False
+        current_mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=current_content,
+        )
+        if current_mismatch is None:
+            return False
+        proposed_mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=proposed_content,
+        )
+        return proposed_mismatch is None
 
     def _markdown_instruction_echo(
         self,
@@ -9918,27 +13093,47 @@ class Planner:
         current_content: str,
         proposed_content: str,
         repair_context: ValidationFailureEvidence | None,
+        session: SessionState | None = None,
     ) -> ProposedUpdateReview | None:
         if repair_context is None or repair_context.verification_scope != "runtime":
             return None
+        exact_output_contract_review = self._runtime_output_contract_source_literal_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+            session=session,
+        )
+        if exact_output_contract_review is not None:
+            return exact_output_contract_review
+        payload_hardcoding_review = self._runtime_sample_payload_hardcoding_review(
+            path=path,
+            current_content=current_content,
+            proposed_content=proposed_content,
+            repair_context=repair_context,
+            session=session,
+        )
+        if payload_hardcoding_review is not None:
+            return payload_hardcoding_review
         if (
             self._is_runtime_support_repair_target(path, repair_context)
             and Path(path).suffix.lower() not in {".py", ".pyi"}
         ):
-            return self._runtime_support_file_relevance_review(
+            support_review = self._runtime_support_file_relevance_review(
                 path=path,
                 current_content=current_content,
                 proposed_content=proposed_content,
                 repair_context=repair_context,
             )
-        if Path(path).suffix.lower() not in {".py", ".pyi"}:
-            return None
+            if support_review is not None:
+                return support_review
 
         identifiers = self._repair_identifiers_for_target(
             path,
             repair_context,
             current_content=current_content,
             proposed_content=proposed_content,
+            session=session,
         )
         if not identifiers:
             return None
@@ -9948,14 +13143,15 @@ class Planner:
             for identifier in identifiers
             if identifier in current_content or identifier in proposed_content
         ]
-        undefined_symbol_review = self._undefined_runtime_symbol_repair_review(
-            path=path,
-            current_content=current_content,
-            proposed_content=proposed_content,
-            repair_context=repair_context,
-        )
-        if undefined_symbol_review is not None:
-            return undefined_symbol_review
+        if Path(path).suffix.lower() in {".py", ".pyi"}:
+            undefined_symbol_review = self._undefined_runtime_symbol_repair_review(
+                path=path,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+            if undefined_symbol_review is not None:
+                return undefined_symbol_review
         target_evidence = self._runtime_target_evidence_lines(path, repair_context)
         if not relevant_identifiers:
             evidence_hint = f" near {' | '.join(target_evidence[:2])}" if target_evidence else ""
@@ -9996,6 +13192,205 @@ class Planner:
             ],
         )
 
+    def _runtime_output_contract_source_literal_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+        session: SessionState | None,
+    ) -> ProposedUpdateReview | None:
+        if session is None:
+            return None
+        supporting_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if not supporting_output_contracts:
+            return None
+        _option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+            limit=4,
+        )
+
+        unresolved_contracts: list[tuple[str, str]] = []
+        for required_literal in _runtime_output_contract_required_literals(
+            supporting_output_contracts,
+            limit=6,
+        ):
+            required_text = str(required_literal or "").strip()
+            if not required_text or required_text in proposed_content:
+                continue
+            candidate = _literal_near_match_in_content(required_text, current_content)
+            if candidate and candidate == required_text:
+                candidate = None
+            if candidate is None:
+                fragment_match = _best_contract_fragment_near_match(required_text, current_content)
+                if fragment_match is None:
+                    continue
+                candidate, _fragment = fragment_match
+            if not candidate or not self._runtime_source_literal_remains_on_targeted_line(
+                candidate=candidate,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            ):
+                continue
+            unresolved_contracts.append((candidate, required_text))
+            if len(unresolved_contracts) >= 2:
+                break
+
+        if not unresolved_contracts:
+            return None
+
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        blocking_issues = [
+            (
+                f"The proposed update for {path} still leaves the near-match source literal {candidate!r} "
+                f"on the runtime-targeted path, so the exercised output cannot satisfy the exact supporting "
+                f"contract {required_text!r}."
+            )
+            for candidate, required_text in unresolved_contracts
+        ]
+        repair_hints = [
+            threading_hint
+            for threading_hint in [
+                _python_cli_runtime_value_threading_hint(
+                    current_content=current_content,
+                    runtime_value_tokens=positional_tokens,
+                )
+            ]
+            if threading_hint
+        ]
+        repair_hints.extend(
+            [
+            (
+                f"Replace or restructure the remaining source literal {candidate!r} so the exercised path can "
+                f"emit {required_text!r} without leaving the old placeholder behavior intact."
+            )
+            for candidate, required_text in unresolved_contracts
+            ]
+        )
+        repair_hints.extend(
+            self._runtime_target_repair_hints(
+                path,
+                repair_context,
+                evidence_lines=target_evidence,
+            )
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair still leaves a source literal that conflicts with the exact supporting runtime output contract."
+            ),
+            confidence=0.9,
+            blocking_issues=blocking_issues[:3],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
+
+    def _runtime_source_literal_remains_on_targeted_line(
+        self,
+        *,
+        candidate: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+    ) -> bool:
+        candidate_text = str(candidate or "").strip()
+        if not candidate_text or candidate_text not in current_content or candidate_text not in proposed_content:
+            return False
+        current_lines = str(current_content or "").splitlines()
+        proposed_lines = str(proposed_content or "").splitlines()
+        line_hints = _repair_target_line_hints(
+            path="",
+            current_content=current_content,
+            repair_context=repair_context,
+        )
+        for hint in line_hints:
+            if not isinstance(hint, int) or hint <= 0:
+                continue
+            index = hint - 1
+            if index >= len(current_lines) or index >= len(proposed_lines):
+                continue
+            if candidate_text in current_lines[index] and candidate_text in proposed_lines[index]:
+                return True
+        return current_content.count(candidate_text) == 1 and proposed_content.count(candidate_text) >= 1
+
+    def _runtime_sample_payload_hardcoding_review(
+        self,
+        *,
+        path: str,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence,
+        session: SessionState | None,
+    ) -> ProposedUpdateReview | None:
+        if session is None:
+            return None
+        if Path(path).suffix.lower() not in {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+            return None
+        supporting_output_contracts = _source_backed_runtime_output_contracts(
+            session,
+            target_path=path,
+            repair_context=repair_context,
+            limit=3,
+        )
+        if not supporting_output_contracts:
+            return None
+        _option_tokens, positional_tokens = _source_backed_runtime_argv_contract(
+            session,
+            target_path=path,
+            limit=4,
+        )
+        if not positional_tokens:
+            return None
+        contract_text = "\n".join(supporting_output_contracts)
+        introduced_payload_literals = [
+            token
+            for token in positional_tokens
+            if token
+            and token not in current_content
+            and token in contract_text
+            and re.search(rf"['\"][^'\"]*{re.escape(token)}[^'\"]*['\"]", proposed_content)
+        ]
+        if not introduced_payload_literals:
+            return None
+        payload_preview = ", ".join(repr(token) for token in introduced_payload_literals[:3])
+        target_evidence = self._runtime_target_evidence_lines(path, repair_context)
+        repair_hints = [
+            (
+                f"Propagate the remaining argv payload {payload_preview} through the exercised branch instead of "
+                f"embedding those sample values directly into {path}."
+            )
+        ]
+        repair_hints.extend(
+            self._runtime_target_repair_hints(
+                path,
+                repair_context,
+                evidence_lines=target_evidence,
+            )
+        )
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                "The proposed repair hardcodes sample runtime payload values instead of propagating the exercised input through the repaired path."
+            ),
+            confidence=0.92,
+            blocking_issues=[
+                (
+                    f"The proposal for {path} introduces sample runtime payload value(s) {payload_preview} directly "
+                    "into source literals, which would bake the observed test input into the implementation."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=repair_hints[:4],
+        )
+
     def _undefined_runtime_symbol_repair_review(
         self,
         *,
@@ -10009,8 +13404,17 @@ class Planner:
         undefined_symbol = self._undefined_runtime_symbol(repair_context)
         if not undefined_symbol:
             return None
-        current_uses = [line.strip() for line in str(current_content or "").splitlines() if undefined_symbol in line]
-        proposed_uses = [line.strip() for line in str(proposed_content or "").splitlines() if undefined_symbol in line]
+        symbol_pattern = re.compile(rf"\b{re.escape(undefined_symbol)}\b")
+        current_uses = [
+            line.strip()
+            for line in str(current_content or "").splitlines()
+            if symbol_pattern.search(line)
+        ]
+        proposed_uses = [
+            line.strip()
+            for line in str(proposed_content or "").splitlines()
+            if symbol_pattern.search(line)
+        ]
         if not current_uses and not proposed_uses:
             return None
         if current_uses and not proposed_uses:
@@ -10019,6 +13423,16 @@ class Planner:
             return None
         evidence_lines = self._runtime_target_evidence_lines(path, repair_context)
         evidence_hint = f" near {' | '.join(evidence_lines[:2])}" if evidence_lines else ""
+        similar_candidates = _python_similar_defined_name_candidates(current_content, undefined_symbol)
+        similar_hint = ""
+        reuse_hint = ""
+        if similar_candidates:
+            formatted_candidates = _format_similar_python_name_candidates(similar_candidates)
+            similar_hint = f" Existing same-file definitions with similar names: {formatted_candidates}."
+            reuse_hint = (
+                f"Prefer reusing the closest matching same-file definition when it already fits the missing behavior: "
+                f"{formatted_candidates}."
+            )
         return ProposedUpdateReview(
             safe_to_write=False,
             summary="The proposed repair still leaves the undefined runtime symbol unresolved.",
@@ -10027,10 +13441,12 @@ class Planner:
                 (
                     f"The runtime failure still reports '{undefined_symbol}' as undefined in {path}, "
                     f"but the proposal neither binds/imports '{undefined_symbol}' nor removes its failing usage{evidence_hint}."
+                    f"{similar_hint}"
                 )
             ],
             preservation_risks=[],
             repair_hints=[
+                *([reuse_hint] if reuse_hint else []),
                 f"Either import or otherwise bind '{undefined_symbol}' in {path}, or remove the failing usage from the implicated line.",
                 *self._runtime_target_repair_hints(path, repair_context, evidence_lines=evidence_lines),
             ],
@@ -10968,18 +14384,154 @@ class Planner:
         *,
         current_content: str,
         proposed_content: str,
+        session: SessionState | None = None,
     ) -> list[str]:
-        target_specific = self._target_specific_repair_identifiers(path, repair_context)
-        if target_specific:
-            relevant = [
+        candidates: list[str] = []
+        candidates.extend(self._target_specific_repair_identifiers(path, repair_context))
+        candidates.extend(self._repair_brief_implicated_identifiers(repair_context))
+        candidates.extend(
+            self._request_repair_identifiers(
+                session,
+                current_content=current_content,
+                proposed_content=proposed_content,
+                repair_context=repair_context,
+            )
+        )
+        candidates.extend(self._repair_identifiers_from_failure_evidence(repair_context))
+
+        identifiers = self._unique_paths(
+            [
                 identifier
-                for identifier in target_specific
-                if identifier in current_content or identifier in proposed_content
+                for identifier in candidates
+                if identifier and not self._is_generic_runtime_repair_identifier(identifier)
             ]
-            if relevant:
-                return relevant[:6]
-            return target_specific[:6]
-        return self._repair_identifiers_from_failure_evidence(repair_context)
+        )
+        if not identifiers:
+            return []
+
+        relevant = [
+            identifier
+            for identifier in identifiers
+            if identifier in current_content or identifier in proposed_content
+        ]
+        if relevant:
+            return relevant[:8]
+        return identifiers[:8]
+
+    def _repair_brief_implicated_identifiers(
+        self,
+        repair_context: ValidationFailureEvidence,
+    ) -> list[str]:
+        brief = getattr(repair_context, "repair_brief", None)
+        if brief is None:
+            return []
+        return self._unique_paths(
+            [
+                str(identifier or "").strip()
+                for identifier in getattr(brief, "implicated_symbols", []) or []
+                if str(identifier or "").strip()
+            ]
+        )[:6]
+
+    def _request_repair_identifiers(
+        self,
+        session: SessionState | None,
+        *,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None = None,
+    ) -> list[str]:
+        if session is None:
+            return []
+
+        texts: list[str] = [str(session.task or "").strip()]
+        task_state = getattr(session, "task_state", None)
+        if task_state is not None:
+            texts.append(str(getattr(task_state, "latest_user_turn", "") or "").strip())
+            texts.extend(str(item or "").strip() for item in getattr(task_state, "constraints", []) or [])
+
+        content_markers = f"{current_content}\n{proposed_content}"
+        identifiers: list[str] = []
+        patterns = (
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b",
+            r"(?<![A-Za-z0-9_])--?[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_](?![A-Za-z0-9_])",
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?=\()",
+        )
+        for text in texts:
+            if not text:
+                continue
+            for pattern in patterns:
+                for match in re.finditer(pattern, text):
+                    candidate = str(match.group(0) or "").strip()
+                    if not candidate or candidate not in content_markers:
+                        continue
+                    if candidate.startswith("-") and not self._request_option_identifier_is_relevant(
+                        candidate,
+                        current_content=current_content,
+                        proposed_content=proposed_content,
+                        repair_context=repair_context,
+                    ):
+                        continue
+                    identifiers.append(candidate)
+        return self._unique_paths(identifiers)[:8]
+
+    def _request_option_identifier_is_relevant(
+        self,
+        identifier: str,
+        *,
+        current_content: str,
+        proposed_content: str,
+        repair_context: ValidationFailureEvidence | None = None,
+    ) -> bool:
+        token = str(identifier or "").strip()
+        if not token:
+            return False
+
+        matching_lines = [
+            line.strip()
+            for line in f"{current_content}\n{proposed_content}".splitlines()
+            if token in line
+        ]
+        if not matching_lines:
+            return False
+
+        if any(not self._looks_like_option_declaration_line(line) for line in matching_lines):
+            return True
+
+        evidence_text = " ".join(
+            str(item or "").strip().lower()
+            for item in (
+                getattr(repair_context, "excerpt", ""),
+                getattr(repair_context, "failure_summary", ""),
+                getattr(repair_context, "summary", ""),
+            )
+            if str(item or "").strip()
+        )
+        return any(
+            marker in evidence_text
+            for marker in (
+                "unrecognized arguments",
+                "unrecognized argument",
+                "unknown option",
+                "no such option",
+                "unexpected option",
+            )
+        )
+
+    def _looks_like_option_declaration_line(self, line: str) -> bool:
+        lowered = str(line or "").strip().lower()
+        if not lowered:
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "add_argument(",
+                "add_option(",
+                "addoption(",
+                ".option(",
+                "@click.option",
+            )
+        )
 
     def _target_specific_repair_identifiers(
         self,
@@ -11233,7 +14785,101 @@ class Planner:
             identifier,
             current_content=current_content,
             proposed_content=proposed_content,
+        ) or self._python_implicated_statement_changed(
+            identifier,
+            current_content=current_content,
+            proposed_content=proposed_content,
         )
+
+    def _python_implicated_statement_changed(
+        self,
+        identifier: str,
+        *,
+        current_content: str,
+        proposed_content: str,
+    ) -> bool:
+        target = str(identifier or "").strip()
+        if not target:
+            return False
+        try:
+            current_module = ast.parse(str(current_content or ""))
+            proposed_module = ast.parse(str(proposed_content or ""))
+        except SyntaxError:
+            return False
+
+        current_lines = [
+            index
+            for index, raw in enumerate(str(current_content or "").splitlines(), start=1)
+            if target in raw
+        ]
+        proposed_lines = [
+            index
+            for index, raw in enumerate(str(proposed_content or "").splitlines(), start=1)
+            if target in raw
+        ]
+        if not current_lines or not proposed_lines:
+            return False
+
+        current_statements = self._python_smallest_statements_for_lines(
+            current_module,
+            line_numbers=current_lines,
+        )
+        proposed_statements = self._python_smallest_statements_for_lines(
+            proposed_module,
+            line_numbers=proposed_lines,
+        )
+        if not current_statements or not proposed_statements:
+            return False
+
+        current_dump = [ast.dump(node, include_attributes=False) for node in current_statements]
+        proposed_dump = [ast.dump(node, include_attributes=False) for node in proposed_statements]
+        return current_dump != proposed_dump
+
+    def _python_smallest_statements_for_lines(
+        self,
+        module: ast.AST,
+        *,
+        line_numbers: list[int],
+    ) -> list[ast.stmt]:
+        selected: list[ast.stmt] = []
+        seen: set[tuple[int, int, str]] = set()
+        for line_number in line_numbers:
+            candidate = self._python_smallest_statement_covering_line(module, line_number=line_number)
+            if candidate is None:
+                continue
+            key = (
+                int(getattr(candidate, "lineno", 0) or 0),
+                int(getattr(candidate, "end_lineno", 0) or 0),
+                candidate.__class__.__name__,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(candidate)
+        return selected
+
+    def _python_smallest_statement_covering_line(
+        self,
+        module: ast.AST,
+        *,
+        line_number: int,
+    ) -> ast.stmt | None:
+        best: ast.stmt | None = None
+        best_span: tuple[int, int] | None = None
+        for node in ast.walk(module):
+            if not isinstance(node, ast.stmt) or isinstance(node, ast.Module):
+                continue
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", None)
+            if start is None or end is None:
+                continue
+            if not (start <= line_number <= end):
+                continue
+            span = (int(end) - int(start), int(start))
+            if best is None or best_span is None or span < best_span:
+                best = node
+                best_span = span
+        return best
 
     def _python_named_block_changed(
         self,
@@ -11489,8 +15135,105 @@ class Planner:
             return "(no diff)"
         return self._review_excerpt(diff, limit=limit)
 
+    def _deterministic_exact_text_create_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> SemanticChangeReview | None:
+        if route.intent != RouteIntent.CREATE or len(session.changed_files) != 1:
+            return None
+        if self._has_pending_explicit_create_targets(route, session):
+            return None
+        if self.validation_planner.runtime_verification_required(session):
+            return None
+        if self.validation_planner.web_functional_verification_required(session):
+            return None
+
+        change = session.changed_files[0]
+        if str(change.operation or "").strip().lower() != "create":
+            return None
+        path = str(change.path or "").strip()
+        if not path:
+            return None
+
+        expected_lines = self._requested_exact_text_lines(route, session, path=path)
+        if not expected_lines:
+            return None
+        content = self._session_or_current_file_content(session, path)
+        if content is None:
+            return SemanticChangeReview(
+                requirements_satisfied=False,
+                summary="The explicit text artifact has not been created yet.",
+                confidence=0.97,
+                missing_requirements=[f"Create {path} with the exact requested line sequence."],
+                repair_hints=[f"Write {path} with exactly the requested lines before finishing."],
+                file_hints=[path],
+            )
+        mismatch = self._exact_text_line_mismatch(
+            path=path,
+            expected_lines=expected_lines,
+            content=content,
+        )
+        if mismatch is not None:
+            return SemanticChangeReview(
+                requirements_satisfied=False,
+                summary="The created text artifact does not yet match the exact requested line sequence.",
+                confidence=0.98,
+                missing_requirements=[mismatch],
+                repair_hints=[f"Rewrite {path} so it contains exactly the requested lines and nothing extra."],
+                file_hints=[path],
+            )
+        return SemanticChangeReview(
+            requirements_satisfied=True,
+            summary="The created text artifact matches the exact requested line sequence without requiring a second model review hop.",
+            confidence=0.93,
+            file_hints=[path],
+        )
+
     def _run_semantic_change_review(self, route: RouterOutput, session: SessionState) -> None:
         if not session.changed_files or self.validation_planner.has_semantic_review(session):
+            return
+
+        deterministic_web_review = self._semantic_web_contract_review(session)
+        if deterministic_web_review is not None:
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="semantic_change_review",
+                    task_class="semantic_change_review",
+                    final_state="completed",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_web_contract_review",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="A deterministic cross-file web contract review found unresolved DOM or selector mismatches before model-backed semantic review.",
+                    attempts=[],
+                ),
+            )
+            self._record_semantic_change_review(session, deterministic_web_review)
+            return
+
+        deterministic_text_create_review = self._deterministic_exact_text_create_review(route, session)
+        if deterministic_text_create_review is not None:
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="semantic_change_review",
+                    task_class="semantic_change_review",
+                    final_state="completed",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_exact_text_create_review",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=0,
+                    validation_possible=True,
+                    summary="A deterministic exact-text review confirmed the created artifact already satisfies the explicit line-level request.",
+                    attempts=[],
+                ),
+            )
+            self._record_semantic_change_review(session, deterministic_text_create_review)
             return
 
         artifacts = self._semantic_review_artifacts(session)
@@ -11547,17 +15290,30 @@ class Planner:
             )
 
         review_attempts: list[tuple[str | None, str, str, int, int, str]] = []
-        if prefer_lightweight and reserve_model is not None:
-            review_attempts.append(
-                (
-                    reserve_model,
-                    "tier_b",
-                    "reserve_model_generation",
-                    max(self._llm_timeout(18), 18),
-                    min(self._llm_num_ctx(2048), 2048),
-                    "compact",
+        if prefer_lightweight:
+            if reserve_model is not None:
+                review_attempts.append(
+                    (
+                        reserve_model,
+                        "tier_b",
+                        "reserve_model_generation",
+                        max(self._llm_timeout(18), 18),
+                        min(self._llm_num_ctx(2048), 2048),
+                        "compact",
+                    )
                 )
-            )
+            else:
+                compact_timeout, _ = self._compact_primary_semantic_review_budget()
+                review_attempts.append(
+                    (
+                        primary_model,
+                        "tier_a",
+                        "primary_model_compact_generation",
+                        compact_timeout,
+                        min(self._llm_num_ctx(2048), 2048),
+                        "compact",
+                    )
+                )
         review_attempts.append(
             (
                 primary_model,
@@ -11590,7 +15346,18 @@ class Planner:
 
         for model_name, capability_tier, strategy, timeout, num_ctx, prompt_variant in review_attempts:
             prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
-            total_timeout = 40 if prompt_variant == "compact" else max(timeout + 20, timeout * 2)
+            strict_timeouts = prompt_variant == "compact"
+            if prompt_variant == "compact":
+                if strategy == "primary_model_compact_generation":
+                    timeout, total_timeout = self._compact_primary_semantic_review_budget()
+                    strict_timeouts = False
+                else:
+                    timeout, total_timeout = self._compact_reserve_review_budget()
+            else:
+                if model_name == primary_model and reserve_model is None:
+                    timeout, total_timeout = self._primary_semantic_review_followup_budget()
+                else:
+                    total_timeout = max(timeout + 20, timeout * 2)
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,
@@ -11599,7 +15366,7 @@ class Planner:
                     retries=0,
                     timeout=timeout,
                     total_timeout=total_timeout,
-                    strict_timeouts=prompt_variant == "compact",
+                    strict_timeouts=strict_timeouts,
                     num_ctx=num_ctx,
                     progress_callback=progress,
                 ),
@@ -11860,6 +15627,16 @@ class Planner:
                 repair_hints=["Complete the explicitly requested file updates before declaring the task done."],
                 file_hints=pending_snapshot_targets[:6],
             )
+        if session.router_result is not None:
+            deterministic_text_create_review = self._deterministic_exact_text_create_review(
+                session.router_result,
+                session,
+            )
+            if deterministic_text_create_review is not None:
+                return deterministic_text_create_review
+        deterministic_web_review = self._semantic_web_contract_review(session)
+        if deterministic_web_review is not None:
+            return deterministic_web_review
         if self.validation_planner.web_structural_proxy_sufficient(session):
             return SemanticChangeReview(
                 requirements_satisfied=True,

@@ -303,6 +303,43 @@ def test_ollama_client_scales_small_model_startup_budget_with_long_recovery_time
     assert progress_events[0]["total_timeout"] == 210
 
 
+def test_ollama_client_extends_short_small_model_startup_budget_for_cold_semantic_bootstrap(monkeypatch, tmp_path):
+    captured: list[int] = []
+    progress_events: list[dict] = []
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        llm_timeout=25,
+        llm_request_retries=0,
+    )
+    client = OllamaClient(config)
+
+    def fake_urlopen(req: request.Request, timeout):
+        del req
+        captured.append(timeout)
+        return FakeReadlineStreamingResponse(
+            [
+                (json.dumps({"response": "ready", "done": False}) + "\n").encode("utf-8"),
+                (json.dumps({"done": True}) + "\n").encode("utf-8"),
+            ]
+        )
+
+    monkeypatch.setattr("llm.ollama_client.request.urlopen", fake_urlopen)
+
+    result = client.generate(
+        "bootstrap semantics",
+        timeout=25,
+        total_timeout=70,
+        retries=0,
+        progress_callback=progress_events.append,
+    )
+
+    assert result == "ready"
+    assert captured == [100]
+    assert progress_events[0]["startup_timeout"] == 100
+    assert progress_events[0]["total_timeout"] == 120
+
+
 def test_ollama_client_extends_small_model_startup_budget_for_long_same_model_followups(monkeypatch, tmp_path):
     captured: list[int] = []
     progress_events: list[dict] = []
