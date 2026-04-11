@@ -34,6 +34,7 @@ from agent.prompts import (
     _direct_main_runtime_contract,
     _direct_python_script_runtime_contract,
     _artifact_scoped_focus,
+    final_response_prompt,
     _repair_target_line_hints,
     _repair_required_literal_anchors,
     _split_requirement_clauses,
@@ -496,6 +497,31 @@ def test_planner_generates_freeform_answer_for_conversation_route_without_hardco
     assert decision.action_type == AgentActionType.FINAL
     assert "Hamburger" in (decision.final_response or "")
     assert llm.generate_calls
+
+
+def test_final_response_prompt_keeps_conversation_answer_grounded_on_latest_message(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="explain",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "respond_directly",
+                    "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                }
+            ],
+            direct_response=None,
+            repo_context_needed=False,
+            requested_outcome="Answer the user's normal conversation directly without repository work.",
+        )
+    )
+    session = SessionState(task="und was kannst du hier machen?", workspace_root=str(tmp_path))
+
+    prompt = final_response_prompt(route, session)
+
+    assert "answer that question, not a different greeting or a prior turn" in prompt
+    assert "If you are unsure about a fact" in prompt
+    assert '"und was kannst du hier machen?"' in prompt
 
 
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):

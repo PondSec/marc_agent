@@ -1079,6 +1079,10 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
             [
                 "Answer the user's latest message directly and naturally.",
                 "This is normal conversation, not a repository task.",
+                "Stay on the exact topic of the latest message and answer that question, not a different greeting or a prior turn.",
+                "Prefer a short, plain, factual answer over creative detail or embellishment.",
+                "If you are unsure about a fact, say so briefly instead of inventing specifics.",
+                "If the user asks about your capabilities here, describe what you can do in this workspace.",
                 f"User message: {json.dumps(session.task, ensure_ascii=False)}",
                 "Use general knowledge when needed.",
                 "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
