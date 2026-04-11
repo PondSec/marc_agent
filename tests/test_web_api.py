@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import time
 import zipfile
 from dataclasses import dataclass
@@ -137,6 +138,37 @@ def create_test_workspace(client: TestClient, root, name: str = "Workspace A") -
     return response.json()
 
 
+def run_git(repo_path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(repo_path),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout or f"git {' '.join(args)} failed")
+    return completed.stdout.strip()
+
+
+def build_git_source_repo(root, *, name: str = "source-repo"):
+    repo_path = root / name
+    repo_path.mkdir()
+    run_git(repo_path, "init")
+    run_git(repo_path, "config", "user.email", "tester@example.com")
+    run_git(repo_path, "config", "user.name", "Test User")
+    run_git(repo_path, "checkout", "-b", "main")
+    (repo_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    run_git(repo_path, "add", "README.md")
+    run_git(repo_path, "commit", "-m", "Initial commit")
+    run_git(repo_path, "checkout", "-b", "develop")
+    (repo_path / "develop.txt").write_text("develop\n", encoding="utf-8")
+    run_git(repo_path, "add", "develop.txt")
+    run_git(repo_path, "commit", "-m", "Add develop branch marker")
+    run_git(repo_path, "checkout", "main")
+    return repo_path
+
+
 def test_web_root_serves_gui(tmp_path):
     config = build_test_config(tmp_path)
     config.ensure_state_dirs()
@@ -159,6 +191,118 @@ def test_workspaces_api_does_not_auto_add_base_workspace(tmp_path):
 
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_git_discovery_and_source_inspection_expose_existing_repo_branches(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    source_repo = build_git_source_repo(tmp_path)
+    app = create_app(config)
+    client = build_test_client(app)
+
+    discovery_response = client.get("/api/git/discovery")
+    inspect_response = client.post(
+        "/api/git/inspect",
+        json={"git_sync_source": str(source_repo)},
+    )
+
+    assert discovery_response.status_code == 200
+    discovered_paths = {item["path"] for item in discovery_response.json()}
+    assert str(source_repo.resolve()) in discovered_paths
+
+    assert inspect_response.status_code == 200
+    payload = inspect_response.json()
+    assert payload["source_kind"] == "local_path"
+    assert payload["resolved_path"] == str(source_repo.resolve())
+    assert payload["current_branch"] == "main"
+    assert "develop" in payload["local_branches"]
+
+
+def test_create_workspace_can_clone_and_track_selected_git_branch(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    source_repo = build_git_source_repo(tmp_path)
+    target_path = tmp_path / "cloned-project"
+    app = create_app(config)
+    client = build_test_client(app)
+
+    response = client.post(
+        "/api/workspaces",
+        json={
+            "name": "Cloned Project",
+            "path": str(target_path),
+            "git_sync_source": str(source_repo),
+            "git_branch": "develop",
+            "git_remote_name": "origin",
+            "sync_on_create": True,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["git_branch"] == "develop"
+    assert payload["git_sync_source"] == str(source_repo.resolve())
+    assert payload["last_git_sync_at"]
+    assert (target_path / ".git").exists()
+    assert run_git(target_path, "branch", "--show-current") == "develop"
+
+    git_status = client.get(f"/api/workspaces/{payload['id']}/git")
+    assert git_status.status_code == 200
+    status_payload = git_status.json()
+    assert status_payload["is_repo"] is True
+    assert status_payload["current_branch"] == "develop"
+    assert "develop" in status_payload["local_branches"]
+
+
+def test_sync_workspace_git_switches_existing_repo_branch_and_updates_metadata(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    source_repo = build_git_source_repo(tmp_path)
+    app = create_app(config)
+    client = build_test_client(app)
+
+    create_response = client.post(
+        "/api/workspaces",
+        json={"name": "Existing Repo", "path": str(source_repo)},
+    )
+    assert create_response.status_code == 201
+    workspace_id = create_response.json()["id"]
+
+    sync_response = client.post(
+        f"/api/workspaces/{workspace_id}/git/sync",
+        json={"git_branch": "develop"},
+    )
+
+    assert sync_response.status_code == 200
+    payload = sync_response.json()
+    assert payload["workspace"]["git_branch"] == "develop"
+    assert payload["workspace"]["last_git_sync_at"]
+    assert payload["git"]["current_branch"] == "develop"
+    assert run_git(source_repo, "branch", "--show-current") == "develop"
+
+
+def test_sync_workspace_git_blocks_dirty_existing_repo(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    source_repo = build_git_source_repo(tmp_path)
+    app = create_app(config)
+    client = build_test_client(app)
+
+    create_response = client.post(
+        "/api/workspaces",
+        json={"name": "Dirty Repo", "path": str(source_repo)},
+    )
+    assert create_response.status_code == 201
+    workspace_id = create_response.json()["id"]
+    (source_repo / "README.md").write_text("# changed\n", encoding="utf-8")
+
+    sync_response = client.post(
+        f"/api/workspaces/{workspace_id}/git/sync",
+        json={"git_branch": "develop"},
+    )
+
+    assert sync_response.status_code == 400
+    assert "uncommitted changes" in sync_response.json()["detail"].lower()
 
 
 def test_first_run_setup_status_is_available_when_config_is_incomplete(tmp_path):

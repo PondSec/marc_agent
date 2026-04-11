@@ -32,6 +32,8 @@ from server.setup_schemas import SetupCompleteRequest, SetupCompleteResponse, Se
 from server.setup_service import SetupService
 from server.security import configure_security
 from server.schemas import (
+    GitRepositoryCandidate,
+    GitSourceInspectionResponse,
     HealthResponse,
     ModelCatalogResponse,
     SessionSummary,
@@ -41,6 +43,9 @@ from server.schemas import (
     TerminalSessionResponse,
     TaskCreateRequest,
     WorkspaceCreateRequest,
+    WorkspaceGitStatus,
+    WorkspaceGitSyncRequest,
+    WorkspaceGitSyncResponse,
     WorkspaceRecord,
     WorkspaceUpdateRequest,
 )
@@ -470,7 +475,17 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         dependencies=[Depends(require_auth), Depends(require_csrf)],
     )
     async def create_workspace(request: WorkspaceCreateRequest) -> WorkspaceRecord:
-        return current_runtime().task_manager.create_workspace(request.name, request.path)
+        try:
+            return current_runtime().task_manager.create_workspace(
+                request.name,
+                request.path,
+                git_sync_source=request.git_sync_source,
+                git_branch=request.git_branch,
+                git_remote_name=request.git_remote_name,
+                sync_on_create=request.sync_on_create,
+            )
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.patch(
         "/api/workspaces/{workspace_id}",
@@ -481,14 +496,79 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         workspace_id: str,
         request: WorkspaceUpdateRequest,
     ) -> WorkspaceRecord:
-        workspace = current_runtime().task_manager.update_workspace(
-            workspace_id,
-            name=request.name,
-            path=request.path,
-        )
+        try:
+            workspace = current_runtime().task_manager.update_workspace(
+                workspace_id,
+                name=request.name,
+                path=request.path,
+                git_sync_source=request.git_sync_source,
+                git_branch=request.git_branch,
+                git_remote_name=request.git_remote_name,
+                sync_on_save=bool(request.sync_on_save),
+            )
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if workspace is None:
             raise HTTPException(status_code=404, detail="Workspace not found.")
         return workspace
+
+    @app.get(
+        "/api/git/discovery",
+        response_model=list[GitRepositoryCandidate],
+        dependencies=[Depends(require_auth)],
+    )
+    async def discover_git_repositories() -> list[GitRepositoryCandidate]:
+        return current_runtime().task_manager.discover_git_repositories()
+
+    @app.post(
+        "/api/git/inspect",
+        response_model=GitSourceInspectionResponse,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
+    async def inspect_git_source(request: WorkspaceGitSyncRequest) -> GitSourceInspectionResponse:
+        if not request.git_sync_source:
+            raise HTTPException(status_code=400, detail="Git source is required.")
+        try:
+            return current_runtime().task_manager.inspect_git_source(request.git_sync_source)
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/git",
+        response_model=WorkspaceGitStatus,
+        dependencies=[Depends(require_auth)],
+    )
+    async def get_workspace_git_status(workspace_id: str) -> WorkspaceGitStatus:
+        try:
+            return current_runtime().task_manager.workspace_git_status(workspace_id)
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/workspaces/{workspace_id}/git/sync",
+        response_model=WorkspaceGitSyncResponse,
+        dependencies=[Depends(require_auth), Depends(require_csrf)],
+    )
+    async def sync_workspace_git(
+        workspace_id: str,
+        request: WorkspaceGitSyncRequest,
+    ) -> WorkspaceGitSyncResponse:
+        try:
+            workspace, git_status = current_runtime().task_manager.sync_workspace_git(
+                workspace_id,
+                git_sync_source=request.git_sync_source,
+                git_branch=request.git_branch,
+                git_remote_name=request.git_remote_name,
+            )
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspaceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return WorkspaceGitSyncResponse(workspace=workspace, git=git_status)
 
     @app.get(
         "/api/workspaces/{workspace_id}/download",

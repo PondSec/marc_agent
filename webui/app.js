@@ -123,6 +123,16 @@ const state = {
     editingWorkspaceId: null,
     workspaceName: "",
     workspacePath: "",
+    workspaceSource: "directory",
+    workspaceGitSyncSource: "",
+    workspaceGitBranch: "",
+    workspaceGitRemoteName: "origin",
+    workspaceGitSyncOnSave: true,
+    workspaceGitDiscovery: [],
+    workspaceGitStatus: null,
+    workspaceGitInspection: null,
+    workspaceGitLoading: false,
+    workspaceGitInspecting: false,
     terminal: {
       open: false,
       starting: false,
@@ -403,6 +413,7 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
   state.ui.page = preserveRoute ? state.ui.page : "workspace";
   state.ui.sessionLoading = false;
   state.ui.workspaceModalOpen = false;
+  resetWorkspaceGitState();
   state.ui.runQueue = {
     open: false,
     submitting: false,
@@ -447,6 +458,19 @@ function resetTerminalState() {
     exitCode: null,
     error: "",
   };
+}
+
+function resetWorkspaceGitState() {
+  state.ui.workspaceSource = "directory";
+  state.ui.workspaceGitSyncSource = "";
+  state.ui.workspaceGitBranch = "";
+  state.ui.workspaceGitRemoteName = "origin";
+  state.ui.workspaceGitSyncOnSave = true;
+  state.ui.workspaceGitDiscovery = [];
+  state.ui.workspaceGitStatus = null;
+  state.ui.workspaceGitInspection = null;
+  state.ui.workspaceGitLoading = false;
+  state.ui.workspaceGitInspecting = false;
 }
 
 async function refreshHealth() {
@@ -1620,6 +1644,16 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "inspect-workspace-git-source") {
+    inspectWorkspaceGitSource();
+    return;
+  }
+
+  if (action === "sync-workspace-git") {
+    syncWorkspaceGit(target.dataset.workspaceId);
+    return;
+  }
+
   if (action === "clear-active-session") {
     startNewChat(state.selectedWorkspaceId);
     return;
@@ -1740,6 +1774,18 @@ function handleInput(event) {
     state.ui.workspaceName = event.target.value;
     return;
   }
+  if (event.target.id === "workspaceGitSourceInput") {
+    state.ui.workspaceGitSyncSource = event.target.value;
+    return;
+  }
+  if (event.target.id === "workspaceGitBranchInput") {
+    state.ui.workspaceGitBranch = event.target.value;
+    return;
+  }
+  if (event.target.id === "workspaceGitRemoteNameInput") {
+    state.ui.workspaceGitRemoteName = event.target.value;
+    return;
+  }
   if (event.target.id === "terminalCaptureInput") {
     if (event.target.value) {
       state.ui.terminal.input += event.target.value;
@@ -1775,6 +1821,19 @@ function handleChange(event) {
     state.composer.executionProfile = event.target.value;
   } else if (event.target.id === "dryRunToggle") {
     state.composer.dryRun = event.target.checked;
+  } else if (event.target.id === "workspaceSourceSelect") {
+    state.ui.workspaceSource = event.target.value;
+  } else if (event.target.id === "workspaceGitSyncToggle") {
+    state.ui.workspaceGitSyncOnSave = event.target.checked;
+  } else if (event.target.id === "workspaceGitRepositorySelect") {
+    const selectedPath = event.target.value;
+    const candidate =
+      state.ui.workspaceGitDiscovery.find((item) => String(item.path || "") === String(selectedPath || "")) || null;
+    if (candidate) {
+      applyGitDiscoveryCandidate(candidate);
+    } else {
+      state.ui.workspaceGitSyncSource = selectedPath;
+    }
   } else {
     return;
   }
@@ -1896,20 +1955,267 @@ function derivedWorkspacePath(name, { keepExisting = false } = {}) {
   return `${workspaceRoot}/${folderName}`;
 }
 
+function pathBasename(path) {
+  const text = String(path || "").trim().replace(/\/+$/g, "");
+  if (!text) {
+    return "";
+  }
+  const parts = text.split("/");
+  return parts[parts.length - 1] || text;
+}
+
+function workspaceModalTargetPathFrom(source = {}) {
+  const mode = source.workspaceMode || "create";
+  const sourceType = source.workspaceSource || "directory";
+  const gitInspection = source.workspaceGitInspection || null;
+  if (sourceType === "git" && gitInspection?.source_kind === "local_path" && gitInspection?.resolved_path) {
+    return gitInspection.resolved_path;
+  }
+  return derivedWorkspacePath(source.workspaceName || "", {
+    keepExisting: mode === "edit" && Boolean(source.workspacePath),
+  });
+}
+
+function workspaceGitBranchSuggestions(source = {}) {
+  const suggestions = [];
+  const append = (value) => {
+    const text = String(value || "").trim();
+    if (!text || suggestions.includes(text)) {
+      return;
+    }
+    suggestions.push(text);
+  };
+  const inspection = source.workspaceGitInspection || null;
+  const gitStatus = source.workspaceGitStatus || null;
+  append(source.workspaceGitBranch);
+  append(inspection?.current_branch);
+  append(inspection?.default_branch);
+  for (const branch of inspection?.local_branches || []) {
+    append(branch);
+  }
+  for (const branch of inspection?.remote_branches || []) {
+    append(branch);
+  }
+  append(gitStatus?.current_branch);
+  append(gitStatus?.configured_branch);
+  append(gitStatus?.default_branch);
+  for (const branch of gitStatus?.local_branches || []) {
+    append(branch);
+  }
+  for (const branch of gitStatus?.remote_branches || []) {
+    append(branch);
+  }
+  return suggestions;
+}
+
+function workspaceHasGitBinding(workspace) {
+  if (!workspace) {
+    return false;
+  }
+  return Boolean(
+    workspace.git_sync_source ||
+      workspace.git_branch ||
+      workspace.git_remote_name ||
+      workspace.last_git_sync_at,
+  );
+}
+
+function workspaceGitBadgeLabel(workspace) {
+  if (!workspaceHasGitBinding(workspace)) {
+    return "";
+  }
+  return workspace.git_branch || workspace.git_remote_name || "Git verbunden";
+}
+
+function workspaceGitSummaryLine(workspace) {
+  if (!workspaceHasGitBinding(workspace)) {
+    return "";
+  }
+  const parts = [];
+  if (workspace.git_branch) {
+    parts.push(workspace.git_branch);
+  }
+  if (workspace.git_remote_name) {
+    parts.push(`Remote ${workspace.git_remote_name}`);
+  }
+  if (workspace.last_git_sync_at) {
+    parts.push(`Sync ${formatSessionTimestamp(workspace.last_git_sync_at)}`);
+  }
+  return parts.join(" · ") || "Git verbunden";
+}
+
+function currentWorkspaceModalTargetPath() {
+  return workspaceModalTargetPathFrom(state.ui);
+}
+
+function applyGitDiscoveryCandidate(candidate) {
+  if (!candidate) {
+    return;
+  }
+  state.ui.workspaceSource = "git";
+  state.ui.workspaceGitSyncSource = candidate.path || "";
+  state.ui.workspaceGitInspection = {
+    source: candidate.path || "",
+    source_kind: "local_path",
+    resolved_path: candidate.path || "",
+    remote_url: candidate.remote_url || null,
+    current_branch: candidate.current_branch || null,
+    default_branch: candidate.current_branch || null,
+    local_branches: Array.isArray(candidate.local_branches) ? candidate.local_branches : [],
+    remote_branches: Array.isArray(candidate.remote_branches) ? candidate.remote_branches : [],
+    has_uncommitted_changes: Boolean(candidate.has_uncommitted_changes),
+  };
+  if (!state.ui.workspaceName) {
+    state.ui.workspaceName = candidate.name || pathBasename(candidate.path || "");
+  }
+  if (!state.ui.workspaceGitBranch) {
+    state.ui.workspaceGitBranch =
+      candidate.current_branch ||
+      (Array.isArray(candidate.remote_branches) ? candidate.remote_branches[0] : "") ||
+      "";
+  }
+}
+
+async function loadWorkspaceGitContext(workspaceId = null) {
+  state.ui.workspaceGitLoading = true;
+  renderApp();
+  try {
+    const [discovery, gitStatus] = await Promise.all([
+      fetchJSON("/api/git/discovery"),
+      workspaceId ? fetchJSON(`/api/workspaces/${workspaceId}/git`) : Promise.resolve(null),
+    ]);
+    if (!state.ui.workspaceModalOpen) {
+      return;
+    }
+    state.ui.workspaceGitDiscovery = Array.isArray(discovery) ? discovery : [];
+    state.ui.workspaceGitStatus = gitStatus || null;
+    if (gitStatus) {
+      if (gitStatus.is_repo || gitStatus.configured_source || gitStatus.configured_branch) {
+        state.ui.workspaceSource = "git";
+      }
+      if (!state.ui.workspaceGitSyncSource) {
+        state.ui.workspaceGitSyncSource = gitStatus.configured_source || gitStatus.remote_url || gitStatus.workspace_path || "";
+      }
+      if (!state.ui.workspaceGitBranch) {
+        state.ui.workspaceGitBranch =
+          gitStatus.configured_branch || gitStatus.current_branch || gitStatus.default_branch || "";
+      }
+      if (!state.ui.workspaceGitRemoteName) {
+        state.ui.workspaceGitRemoteName = gitStatus.remote_name || "origin";
+      }
+      if (gitStatus.is_repo) {
+        state.ui.workspaceGitInspection = {
+          source: gitStatus.workspace_path,
+          source_kind: "local_path",
+          resolved_path: gitStatus.workspace_path,
+          remote_url: gitStatus.remote_url || null,
+          current_branch: gitStatus.current_branch || null,
+          default_branch: gitStatus.default_branch || null,
+          local_branches: Array.isArray(gitStatus.local_branches) ? gitStatus.local_branches : [],
+          remote_branches: Array.isArray(gitStatus.remote_branches) ? gitStatus.remote_branches : [],
+          has_uncommitted_changes: Boolean(gitStatus.has_uncommitted_changes),
+        };
+      }
+    }
+  } catch (error) {
+    showToast(`Git-Informationen konnten nicht geladen werden: ${error.message}`, "error");
+  } finally {
+    state.ui.workspaceGitLoading = false;
+    renderApp();
+  }
+}
+
+async function inspectWorkspaceGitSource({ silent = false } = {}) {
+  const source = state.ui.workspaceGitSyncSource.trim();
+  if (!source) {
+    if (!silent) {
+      showToast("Bitte gib zuerst eine Git-Quelle oder einen lokalen Repo-Pfad an.", "error");
+    }
+    return null;
+  }
+  state.ui.workspaceGitInspecting = true;
+  renderApp();
+  try {
+    const inspection = await fetchJSON("/api/git/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ git_sync_source: source }),
+    });
+    state.ui.workspaceGitInspection = inspection;
+    if (inspection.source_kind === "local_path" && inspection.resolved_path && !state.ui.workspaceName) {
+      state.ui.workspaceName = pathBasename(inspection.resolved_path);
+    }
+    if (!state.ui.workspaceGitBranch) {
+      state.ui.workspaceGitBranch =
+        inspection.current_branch || inspection.default_branch || inspection.remote_branches?.[0] || "";
+    }
+    renderApp();
+    return inspection;
+  } catch (error) {
+    state.ui.workspaceGitInspection = null;
+    renderApp();
+    if (!silent) {
+      showToast(`Git-Quelle konnte nicht geprueft werden: ${error.message}`, "error");
+    }
+    return null;
+  } finally {
+    state.ui.workspaceGitInspecting = false;
+    renderApp();
+  }
+}
+
+async function syncWorkspaceGit(workspaceId, overrides = {}) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId);
+  if (!workspace) {
+    showToast("Projekt wurde nicht gefunden.", "error");
+    return;
+  }
+  try {
+    const payload = {};
+    if (overrides.git_sync_source) {
+      payload.git_sync_source = overrides.git_sync_source;
+    }
+    if (overrides.git_branch) {
+      payload.git_branch = overrides.git_branch;
+    }
+    if (overrides.git_remote_name) {
+      payload.git_remote_name = overrides.git_remote_name;
+    }
+    const response = await fetchJSON(`/api/workspaces/${workspaceId}/git/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    await refreshWorkspaces();
+    state.ui.workspaceGitStatus = response.git || state.ui.workspaceGitStatus;
+    if (response.workspace?.git_branch) {
+      state.ui.workspaceGitBranch = response.workspace.git_branch;
+    }
+    showToast(`Git-Sync fuer "${workspace.name}" abgeschlossen.`, "success");
+  } catch (error) {
+    showToast(`Git-Sync fehlgeschlagen: ${error.message}`, "error");
+  }
+}
+
 function openWorkspaceModal(mode, workspaceId = null) {
   state.ui.workspaceModalOpen = true;
   state.ui.workspaceMode = mode;
   state.ui.editingWorkspaceId = workspaceId;
+  resetWorkspaceGitState();
 
   if (mode === "edit" && workspaceId) {
     const workspace = state.workspaces.find((item) => item.id === workspaceId);
     state.ui.workspaceName = workspace?.name || "";
     state.ui.workspacePath = workspace?.path || "";
+    state.ui.workspaceGitSyncSource = workspace?.git_sync_source || "";
+    state.ui.workspaceGitBranch = workspace?.git_branch || "";
+    state.ui.workspaceGitRemoteName = workspace?.git_remote_name || "origin";
   } else {
     state.ui.workspaceName = "";
     state.ui.workspacePath = "";
   }
   renderApp();
+  loadWorkspaceGitContext(workspaceId).catch(() => {});
 }
 
 function openSettingsPage() {
@@ -1923,6 +2229,7 @@ function closeWorkspaceModal() {
   state.ui.workspaceModalOpen = false;
   state.ui.workspaceMode = "create";
   state.ui.editingWorkspaceId = null;
+  resetWorkspaceGitState();
   renderApp();
 }
 
@@ -1934,32 +2241,58 @@ function closeSettingsPage() {
 
 async function saveWorkspace() {
   const name = state.ui.workspaceName.trim();
-  const path = derivedWorkspacePath(name, { keepExisting: state.ui.workspaceMode === "edit" });
+  const path = currentWorkspaceModalTargetPath();
+  const useGit = state.ui.workspaceSource === "git";
+  const syncWithGit = useGit && state.ui.workspaceGitSyncOnSave;
   if (!name || !path) {
     showToast("Bitte gib mindestens einen Ordnernamen an.", "error");
     return;
   }
+  if (useGit && !state.ui.workspaceGitSyncSource.trim()) {
+    showToast("Bitte waehle zuerst ein Git-Repository oder gib eine Git-Quelle an.", "error");
+    return;
+  }
 
   try {
+    const payload = { name, path };
+    if (useGit) {
+      if (
+        state.ui.workspaceGitSyncSource.trim() &&
+        (!state.ui.workspaceGitInspection || state.ui.workspaceGitInspection.source !== state.ui.workspaceGitSyncSource.trim())
+      ) {
+        await inspectWorkspaceGitSource({ silent: true });
+      }
+      payload.git_sync_source = state.ui.workspaceGitSyncSource.trim() || undefined;
+      payload.git_branch = state.ui.workspaceGitBranch.trim() || undefined;
+      payload.git_remote_name = state.ui.workspaceGitRemoteName.trim() || undefined;
+      if (state.ui.workspaceMode === "edit") {
+        payload.sync_on_save = Boolean(state.ui.workspaceGitSyncOnSave);
+      } else {
+        payload.sync_on_create = Boolean(state.ui.workspaceGitSyncOnSave);
+      }
+    }
     let workspace;
     if (state.ui.workspaceMode === "edit" && state.ui.editingWorkspaceId) {
       workspace = await fetchJSON(`/api/workspaces/${state.ui.editingWorkspaceId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, path }),
+        body: JSON.stringify(payload),
       });
     } else {
       workspace = await fetchJSON("/api/workspaces", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, path }),
+        body: JSON.stringify(payload),
       });
     }
     await refreshWorkspaces();
     state.selectedWorkspaceId = workspace.id;
     persistPreferences();
     closeWorkspaceModal();
-    showToast("Projekt gespeichert.", "success");
+    showToast(
+      syncWithGit ? "Projekt gespeichert und mit Git synchronisiert." : "Projekt gespeichert.",
+      "success",
+    );
   } catch (error) {
     showToast(`Projekt konnte nicht gespeichert werden: ${error.message}`, "error");
   }
@@ -2562,6 +2895,8 @@ function renderSidebarProject(workspace) {
   const active = workspace.id === activeWorkspaceId();
   const sessions = sessionsForWorkspace(workspace.id);
   const disabled = isWorkspaceBusy(workspace.id);
+  const gitLabel = workspaceGitBadgeLabel(workspace);
+  const gitSummary = workspaceGitSummaryLine(workspace);
 
   return `
     <div class="project-row ${active ? "active" : ""}">
@@ -2575,8 +2910,32 @@ function renderSidebarProject(workspace) {
         >
           <span class="project-button-icon project-row-icon" aria-hidden="true">${icon("folder")}</span>
           <span class="project-button-name project-row-title">${escapeHtml(workspace.name)}</span>
+          ${
+            gitLabel
+              ? `<span class="project-row-git-label" title="${escapeAttribute(gitSummary || gitLabel)}">${icon("git-branch")} ${escapeHtml(
+                  gitLabel,
+                )}</span>`
+              : ""
+          }
         </button>
         <div class="sidebar-row-actions project-row-actions">
+          ${
+            gitLabel
+              ? `
+                <button
+                  class="icon-button sidebar-row-icon-button"
+                  type="button"
+                  data-action="sync-workspace-git"
+                  data-workspace-id="${escapeHtml(workspace.id)}"
+                  aria-label="Git synchronisieren"
+                  title="${escapeAttribute(gitSummary || "Git synchronisieren")}"
+                  ${disabled ? "disabled" : ""}
+                >
+                  ${icon("sync")}
+                </button>
+              `
+              : ""
+          }
           <button
             class="icon-button sidebar-row-icon-button"
             type="button"
@@ -2672,12 +3031,29 @@ function renderSidebarThreadSection(workspace, sessions) {
 
 function renderProjectOverflowMenu(workspace, options = {}) {
   const { disabled = false, compact = false } = options;
+  const gitLabel = workspaceGitBadgeLabel(workspace);
   return `
     <details class="overflow-menu project-row-menu" data-preserve-open id="project-menu-${escapeHtml(workspace.id)}">
       <summary class="${compact ? "overflow-action sidebar-row-icon-button" : "overflow-action"}" aria-label="Projektaktionen">
         ${icon("more")}
       </summary>
       <div class="overflow-menu-panel">
+        ${
+          gitLabel
+            ? `
+              <button
+                class="overflow-menu-item"
+                type="button"
+                data-action="sync-workspace-git"
+                data-workspace-id="${escapeHtml(workspace.id)}"
+                ${disabled ? "disabled" : ""}
+              >
+                ${icon("sync")}
+                <span>Git synchronisieren</span>
+              </button>
+            `
+            : ""
+        }
         <button
           class="overflow-menu-item"
           type="button"
@@ -2832,6 +3208,12 @@ function renderWorkspaceItem(workspace) {
   const count = workspaceSessions.length;
   const activeRuns = workspaceSessions.filter((session) => isSessionRunning(session)).length;
   const disabled = isWorkspaceBusy(workspace.id);
+  const activitySummary = activeRuns
+    ? `${activeRuns} ${countLabel(activeRuns, "aktiver Agent", "aktive Agenten")}`
+    : count
+      ? `${count} ${countLabel(count, "Thread", "Threads")} im Verlauf`
+      : "Noch kein Verlauf";
+  const gitSummary = workspaceGitSummaryLine(workspace);
 
   return `
     <div class="workspace-item ${active ? "active" : ""}">
@@ -2846,15 +3228,8 @@ function renderWorkspaceItem(workspace) {
           <span class="workspace-badge">${count}</span>
         </span>
         <span class="workspace-path">${escapeHtml(shortenPath(workspace.path, 58))}</span>
-        <span class="workspace-meta">
-          ${escapeHtml(
-            activeRuns
-              ? `${activeRuns} ${countLabel(activeRuns, "aktiver Agent", "aktive Agenten")}`
-              : count
-                ? `${count} ${countLabel(count, "Thread", "Threads")} im Verlauf`
-                : "Noch kein Verlauf",
-          )}
-        </span>
+        ${gitSummary ? `<span class="workspace-meta">${icon("git-branch")} ${escapeHtml(gitSummary)}</span>` : ""}
+        <span class="workspace-meta">${escapeHtml(activitySummary)}</span>
       </button>
       ${renderWorkspaceItemMenu(workspace, { disabled })}
     </div>
@@ -2863,12 +3238,29 @@ function renderWorkspaceItem(workspace) {
 
 function renderWorkspaceItemMenu(workspace, options = {}) {
   const { disabled = false } = options;
+  const gitLabel = workspaceGitBadgeLabel(workspace);
   return `
     <details class="overflow-menu workspace-item-menu" data-preserve-open id="workspace-item-menu-${escapeHtml(workspace.id)}">
       <summary class="overflow-action" aria-label="Projektaktionen">
         ${icon("more")}
       </summary>
       <div class="overflow-menu-panel">
+        ${
+          gitLabel
+            ? `
+              <button
+                class="overflow-menu-item"
+                type="button"
+                data-action="sync-workspace-git"
+                data-workspace-id="${escapeHtml(workspace.id)}"
+                ${disabled ? "disabled" : ""}
+              >
+                ${icon("sync")}
+                <span>Git synchronisieren</span>
+              </button>
+            `
+            : ""
+        }
         <button
           class="overflow-menu-item"
           type="button"
@@ -3105,6 +3497,7 @@ function buildWorkspaceShellView(sourceState = state) {
   const statusTone = session ? sessionStatusTone(session) : "muted";
   const statusText = session ? sessionBadgeText(session) : "Bereit";
   const running = isSessionRunning(session);
+  const workspaceBusy = workspace ? isWorkspaceBusyFrom(sourceState, workspace.id) : false;
   const accessModeLabel = labelForAccessMode(session?.access_mode || sourceState.composer.accessMode);
   const profileLabel = executionProfileLabelFromState(sourceState);
   const title = session
@@ -3122,6 +3515,41 @@ function buildWorkspaceShellView(sourceState = state) {
     subtitleParts.push(`Aktualisiert ${formatSessionTimestamp(session.updated_at)}`);
   }
 
+  if (workspaceHasGitBinding(workspace)) {
+    subtitleParts.push(`Git ${workspaceGitSummaryLine(workspace)}`);
+  }
+
+  const metaItems = [
+    {
+      label: "Projekt",
+      value: workspace?.name || "Kein Projekt",
+      tone: workspace ? "muted" : "warning",
+    },
+    {
+      label: "Workspace",
+      value: workspace?.path ? shortenPath(workspace.path, 72) : "Nicht verbunden",
+      tone: workspace?.path ? "muted" : "warning",
+    },
+    {
+      label: "Zuletzt",
+      value: session?.updated_at ? formatSessionTimestamp(session.updated_at) : workspace ? "Bereit" : "Noch offen",
+      tone: "muted",
+    },
+    {
+      label: "Modus",
+      value: [accessModeLabel, profileLabel].filter(Boolean).join(" · ") || "Standard",
+      tone: "muted",
+    },
+  ];
+
+  if (workspaceHasGitBinding(workspace)) {
+    metaItems.splice(2, 0, {
+      label: "Git",
+      value: workspaceGitBadgeLabel(workspace),
+      tone: "muted",
+    });
+  }
+
   return {
     workspace,
     session,
@@ -3129,33 +3557,13 @@ function buildWorkspaceShellView(sourceState = state) {
     title,
     statusTone,
     statusText,
-    metaItems: [
-      {
-        label: "Projekt",
-        value: workspace?.name || "Kein Projekt",
-        tone: workspace ? "muted" : "warning",
-      },
-      {
-        label: "Workspace",
-        value: workspace?.path ? shortenPath(workspace.path, 72) : "Nicht verbunden",
-        tone: workspace?.path ? "muted" : "warning",
-      },
-      {
-        label: "Zuletzt",
-        value: session?.updated_at ? formatSessionTimestamp(session.updated_at) : workspace ? "Bereit" : "Noch offen",
-        tone: "muted",
-      },
-      {
-        label: "Modus",
-        value: [accessModeLabel, profileLabel].filter(Boolean).join(" · ") || "Standard",
-        tone: "muted",
-      },
-    ],
+    metaItems,
     runtimeStatusItems: buildRuntimeStatusItems(sourceState),
     subtitle:
       subtitleParts.join(" | ") || "Links ein Projekt waehlen oder einen neuen Thread starten.",
     canPreview: Boolean(workspace) && !running,
     canCommit: Boolean(workspace) && !running,
+    canSyncGit: Boolean(workspace) && workspaceHasGitBinding(workspace) && !workspaceBusy,
     canDeleteSession: Boolean(session) && !running,
     canDownloadHandoff:
       Boolean(session) && !running && Array.isArray(session?.changed_files) && session.changed_files.length > 0,
@@ -3465,6 +3873,22 @@ function renderThreadToolbarMenu(shell) {
           ${icon("download")}
           <span>Workspace herunterladen</span>
         </button>
+        ${
+          workspace && workspaceHasGitBinding(workspace)
+            ? `
+              <button
+                class="overflow-menu-item"
+                type="button"
+                data-action="sync-workspace-git"
+                data-workspace-id="${escapeHtml(workspace.id)}"
+                ${shell.canSyncGit ? "" : "disabled"}
+              >
+                ${icon("sync")}
+                <span>Git synchronisieren</span>
+              </button>
+            `
+            : ""
+        }
         <button
           class="overflow-menu-item"
           type="button"
@@ -5079,7 +5503,39 @@ function renderWorkspaceModal() {
   }
 
   const edit = state.ui.workspaceMode === "edit";
-  const derivedPath = derivedWorkspacePath(state.ui.workspaceName, { keepExisting: edit });
+  const derivedPath = currentWorkspaceModalTargetPath();
+  const useGit = state.ui.workspaceSource === "git";
+  const gitStatus = state.ui.workspaceGitStatus;
+  const gitInspection = state.ui.workspaceGitInspection;
+  const branchSuggestions = workspaceGitBranchSuggestions(state.ui);
+  const gitSourceOptions = state.ui.workspaceGitDiscovery || [];
+  const gitSummary = gitStatus
+    ? [
+        gitStatus.current_branch ? `Aktiv: ${gitStatus.current_branch}` : "",
+        gitStatus.remote_url ? shortenPath(gitStatus.remote_url, 46) : "",
+        gitStatus.has_uncommitted_changes ? "ungespeicherte Aenderungen" : "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+  const gitInspectionSummary = gitInspection
+    ? [
+        gitInspection.source_kind === "local_path" ? "Lokales Repo" : "Remote-Repository",
+        gitInspection.current_branch ? `Aktiv ${gitInspection.current_branch}` : "",
+        !gitInspection.current_branch && gitInspection.default_branch ? `Default ${gitInspection.default_branch}` : "",
+        gitInspection.has_uncommitted_changes ? "ungespeicherte Aenderungen" : "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+  const gitInspectionDetail = gitInspection
+    ? [
+        gitInspection.remote_url || gitInspection.resolved_path || gitInspection.source,
+        branchSuggestions.length ? `Branches: ${branchSuggestions.slice(0, 4).join(", ")}` : "",
+      ]
+        .filter(Boolean)
+        .join(" | ")
+    : "";
   return `
     <div class="modal-backdrop" data-action="close-workspace-modal"></div>
     <div class="modal-layer">
@@ -5095,20 +5551,140 @@ function renderWorkspaceModal() {
         </header>
         <div class="modal-body">
           <label class="modal-field">
-            <span>${edit ? "Projektname" : "Ordnername"}</span>
-            <input id="workspaceNameInput" type="text" placeholder="z. B. agent_ai" value="${escapeAttribute(state.ui.workspaceName)}" />
-            <small>${edit ? "Der bestehende Projektordner bleibt erhalten, nur der Anzeigename aendert sich." : "Der Ordner wird automatisch unter dem konfigurierten Workspace-Root angelegt."}</small>
+            <span>Quelle</span>
+            <select id="workspaceSourceSelect">
+              <option value="directory" ${useGit ? "" : "selected"}>Lokaler Projektordner</option>
+              <option value="git" ${useGit ? "selected" : ""}>Git-Repository</option>
+            </select>
+            <small>${useGit ? "Projekt wird direkt mit einem Git-Repo verbunden oder daraus synchronisiert." : "Es wird nur ein lokaler Projektordner in der WebUI verwaltet."}</small>
           </label>
+          <label class="modal-field">
+            <span>${edit ? "Projektname" : useGit ? "Projektname" : "Ordnername"}</span>
+            <input id="workspaceNameInput" type="text" placeholder="z. B. agent_ai" value="${escapeAttribute(state.ui.workspaceName)}" />
+            <small>${edit ? "Der bestehende Projektordner bleibt erhalten, nur der Anzeigename aendert sich." : useGit ? "Der Anzeigename bleibt frei, auch wenn das Repo einen anderen Ordnernamen hat." : "Der Ordner wird automatisch unter dem konfigurierten Workspace-Root angelegt."}</small>
+          </label>
+          ${
+            useGit
+              ? `
+                <label class="modal-field">
+                  <span>Bestehendes Repo auswaehlen</span>
+                  <select id="workspaceGitRepositorySelect">
+                    <option value="">Lokales Repo waehlen oder unten manuell eingeben</option>
+                    ${gitSourceOptions
+                      .map(
+                        (candidate) => `
+                          <option value="${escapeAttribute(candidate.path)}" ${
+                            String(candidate.path || "") === String(state.ui.workspaceGitSyncSource || "") ? "selected" : ""
+                          }>
+                            ${escapeHtml(candidate.name)} · ${escapeHtml(shortenPath(candidate.path, 56))}
+                          </option>
+                        `,
+                      )
+                      .join("")}
+                  </select>
+                  <small>Gefundene Git-Repositories unter dem Workspace-Root und in bestehenden Projekten.</small>
+                </label>
+                <label class="modal-field">
+                  <span>Git-Quelle</span>
+                  <input
+                    id="workspaceGitSourceInput"
+                    type="text"
+                    placeholder="https://host/repo.git oder /srv/repos/app"
+                    value="${escapeAttribute(state.ui.workspaceGitSyncSource)}"
+                  />
+                  <small>Du kannst eine Remote-URL oder einen bestehenden lokalen Repo-Pfad verwenden.</small>
+                </label>
+                <div class="modal-actions modal-actions-inline">
+                  <button
+                    class="button-secondary"
+                    type="button"
+                    data-action="inspect-workspace-git-source"
+                    ${state.ui.workspaceGitInspecting ? "disabled" : ""}
+                  >
+                    ${state.ui.workspaceGitInspecting ? "Prueft..." : "Repo pruefen"}
+                  </button>
+                </div>
+                <label class="modal-field">
+                  <span>Branch</span>
+                  <input
+                    id="workspaceGitBranchInput"
+                    type="text"
+                    list="workspaceGitBranchList"
+                    placeholder="z. B. main"
+                    value="${escapeAttribute(state.ui.workspaceGitBranch)}"
+                  />
+                  <datalist id="workspaceGitBranchList">
+                    ${branchSuggestions.map((branch) => `<option value="${escapeAttribute(branch)}"></option>`).join("")}
+                  </datalist>
+                  <small>Vorbelegte Branches kommen aus dem Repo selbst oder aus den Remote-Refs.</small>
+                </label>
+                <label class="modal-field">
+                  <span>Remote</span>
+                  <input
+                    id="workspaceGitRemoteNameInput"
+                    type="text"
+                    placeholder="origin"
+                    value="${escapeAttribute(state.ui.workspaceGitRemoteName)}"
+                  />
+                  <small>Standard ist <code>origin</code>. Damit wird der Pull-/Fetch-Remote festgelegt.</small>
+                </label>
+                <label class="modal-field checkbox-field">
+                  <span>
+                    <input id="workspaceGitSyncToggle" type="checkbox" ${state.ui.workspaceGitSyncOnSave ? "checked" : ""} />
+                    Beim Speichern direkt aus Git synchronisieren
+                  </span>
+                  <small>Bei neuen Projekten wird geklont, bei bestehenden Repos Branch gewechselt, gefetcht und per Fast-Forward gepullt.</small>
+                </label>
+                ${
+                  gitSummary
+                    ? `<div class="modal-preview-card"><span>Git-Status</span><strong>${escapeHtml(gitSummary)}</strong><small>${escapeHtml(
+                        gitStatus?.configured_source || state.ui.workspaceGitSyncSource || "Konfigurierte Git-Quelle",
+                      )}</small></div>`
+                    : ""
+                }
+                ${
+                  gitInspection
+                    ? `<div class="modal-preview-card"><span>Repo-Erkennung</span><strong>${escapeHtml(
+                        gitInspectionSummary || "Git-Quelle erkannt",
+                      )}</strong><small>${escapeHtml(gitInspectionDetail || gitInspection.source || "")}</small></div>`
+                    : ""
+                }
+              `
+              : ""
+          }
           <div class="modal-preview-card">
             <span>Projektpfad</span>
             <strong>${escapeHtml(derivedPath || "-")}</strong>
-            <small>${edit ? "Dieser Pfad bleibt fuer das bestehende Projekt fixiert." : `Automatisch aus Workspace Root und dem sicheren Ordnernamen "${normalizeWorkspaceFolderName(state.ui.workspaceName)}" erzeugt.`}</small>
+            <small>${
+              useGit
+                ? state.ui.workspaceGitInspection?.source_kind === "local_path"
+                  ? "Lokale Repo-Projekte verwenden direkt den ausgewaehlten Repo-Pfad."
+                  : edit
+                    ? "Beim bestehenden Projekt bleibt der Zielpfad erhalten; Git synchronisiert nur den Inhalt."
+                    : `Neue Git-Projekte werden standardmaessig unter "${normalizeWorkspaceFolderName(state.ui.workspaceName)}" im Workspace-Root angelegt.`
+                : edit
+                  ? "Dieser Pfad bleibt fuer das bestehende Projekt fixiert."
+                  : `Automatisch aus Workspace Root und dem sicheren Ordnernamen "${normalizeWorkspaceFolderName(state.ui.workspaceName)}" erzeugt.`
+            }</small>
           </div>
-          <p class="modal-note">Die WebUI nimmt nur noch den Ordnernamen entgegen. Den vollen Serverpfad setzt das System selbst.</p>
+          <p class="modal-note">${
+            useGit
+              ? "Git-Sync arbeitet absichtlich nur auf sauberen Repos ohne uncommitted Changes. So vermeiden wir verdeckte Merge- oder Checkout-Konflikte aus der WebUI."
+              : "Die WebUI nimmt nur noch den Ordnernamen entgegen. Den vollen Serverpfad setzt das System selbst."
+          }</p>
+          ${state.ui.workspaceGitLoading ? `<p class="modal-note">Git-Repositories und Branch-Infos werden geladen ...</p>` : ""}
         </div>
         <footer class="modal-actions">
           <button class="button-secondary" type="button" data-action="close-workspace-modal">Abbrechen</button>
-          <button class="button-primary" type="button" data-action="save-workspace">${edit ? "Speichern" : "Anlegen"}</button>
+          <button class="button-primary" type="button" data-action="save-workspace">${
+            useGit && state.ui.workspaceGitSyncOnSave
+              ? edit
+                ? "Speichern und synchronisieren"
+                : "Anlegen und klonen"
+              : edit
+                ? "Speichern"
+                : "Anlegen"
+          }</button>
         </footer>
       </section>
     </div>
@@ -6663,7 +7239,11 @@ function sessionsForWorkspace(workspaceId) {
 }
 
 function isWorkspaceBusy(workspaceId) {
-  return state.sessions.some(
+  return isWorkspaceBusyFrom(state, workspaceId);
+}
+
+function isWorkspaceBusyFrom(sourceState = state, workspaceId) {
+  return sourceState.sessions.some(
     (session) => session.workspace_id === workspaceId && isSessionRunning(session),
   );
 }
@@ -7840,8 +8420,12 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M5.5 6.5h9M8 6.5V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M7 8.5v6M10 8.5v6M13 8.5v6M6.5 6.5l.6 9a1.8 1.8 0 0 0 1.8 1.5h2.2a1.8 1.8 0 0 0 1.8-1.5l.6-9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     broom:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M11.8 3.7 16.3 8.2M10.2 5.3 14.7 9.8M8.7 6.8l4.5 4.5M5.7 9.8l4.5 4.5M4.4 11.1c2.4-.1 4.5.8 6.2 2.6l1.6 1.6c.4.4.4 1 0 1.4l-.6.6c-.4.4-1 .4-1.4 0l-1.6-1.6c-1.8-1.8-2.7-3.9-2.6-6.2z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.4"/></svg>',
+    "git-branch":
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 4.5v9M14 6.5v5.5M6 9.5h5a3 3 0 0 0 3-3V6.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="4.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="6" cy="14.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="6.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
     "git-push":
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 14.5h8a2 2 0 0 0 2-2V9.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><path d="M10 12.5V4.5M6.8 7.7 10 4.5l3.2 3.2" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/><circle cx="6" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14.5" r="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
+    sync:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M15.5 8a5.5 5.5 0 0 0-9.4-2.7M4.5 12a5.5 5.5 0 0 0 9.4 2.7M5.5 5.3H3.7v1.8M14.5 14.7h1.8v-1.8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     download:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M10 4.5v7.5M6.8 9.8 10 13l3.2-3.2M4.5 14.5h11" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     sliders:
@@ -7876,6 +8460,11 @@ if (typeof module !== "undefined" && module.exports) {
     buildThreadPresentationView,
     buildUiRoute,
     buildWorkspaceShellView,
+    workspaceModalTargetPathFrom,
+    workspaceGitBranchSuggestions,
+    workspaceHasGitBinding,
+    workspaceGitBadgeLabel,
+    workspaceGitSummaryLine,
     buildPhaseSteps,
     buildSessionOverview,
     buildValidationSnapshot,
