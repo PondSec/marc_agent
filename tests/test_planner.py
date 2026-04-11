@@ -4895,6 +4895,108 @@ def test_generate_content_prompt_surfaces_cross_file_import_consistency_requirem
     assert "texttools/normalize.py" in prompt
 
 
+def test_generate_content_prompt_adds_copy_grounding_rule_for_html_surfaces(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = empty_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["Index.html"],
+            "important_files": ["Index.html", "script.js", "styles.css"],
+            "focus_files": ["Index.html", "script.js", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+        }
+    )
+    session = SessionState(
+        task=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["Index.html", "script.js", "styles.css"],
+        target_name="Index.html",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="Index.html",
+        mode="compact",
+    )
+
+    assert "Ground any user-facing copy in the request and inspected context." in prompt
+    assert "Do not invent concrete facts, historical claims" in prompt
+
+
+def test_generate_content_prompt_adds_copy_grounding_rule_for_web_repair_scripts(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    script_path = tmp_path / "script.js"
+    script_path.write_text(
+        "document.addEventListener('DOMContentLoaded', () => {});\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Index.html").write_text("<!doctype html><title>Demo</title>\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: sans-serif; }\n", encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["Index.html"],
+            "important_files": ["Index.html", "script.js", "styles.css"],
+            "focus_files": ["script.js", "Index.html", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+        }
+    )
+    session = SessionState(
+        task="Aktualisiere die Website und korrigiere den Inhalt in allen drei Webdateien.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the website copy."}],
+        target_paths=["Index.html", "script.js", "styles.css"],
+        target_name="script.js",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    repair_context = ValidationFailureEvidence(
+        command='internal:semantic_review:[{"path":"Index.html"},{"path":"script.js"},{"path":"styles.css"}]',
+        verification_scope="semantic",
+        summary="The generated web copy is not yet reliable.",
+        failure_summary="The generated web copy is not yet reliable.",
+        file_hints=["Index.html", "script.js", "styles.css"],
+        repair_requirements=[
+            "Refresh the generated copy so it stays grounded in the requested website topic.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="semantic_gap",
+            failure_signature="semantic:web-copy-grounding",
+            primary_target="script.js",
+            locked_target="script.js",
+            repair_constraints=["Keep the update local to script.js."],
+            allowed_files=["script.js", "Index.html", "styles.css"],
+            forbidden_files=[],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=script_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Ground any user-facing copy in the request and inspected context." in prompt
+    assert "If the facts are not given, keep the wording generic" in prompt
+
+
 def test_artifact_scoped_focus_adds_test_contract_requirement_for_python_module(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
