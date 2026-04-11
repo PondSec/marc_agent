@@ -192,6 +192,17 @@ WEB_CONTRACT_SUFFIXES = (
     | WEB_CONTRACT_CSS_SUFFIXES
     | WEB_CONTRACT_SCRIPT_SUFFIXES
 )
+WEB_CONTRACT_BEHAVIORAL_HTML_TAGS = {
+    "button",
+    "details",
+    "dialog",
+    "form",
+    "input",
+    "option",
+    "select",
+    "summary",
+    "textarea",
+}
 
 
 @dataclass(slots=True)
@@ -259,6 +270,7 @@ class MutationAssessment:
 class WebContractInventory:
     html_ids: set[str] = field(default_factory=set)
     html_id_classes: dict[str, set[str]] = field(default_factory=dict)
+    html_behavioral_ids: set[str] = field(default_factory=set)
     html_root_classes: set[str] = field(default_factory=set)
     css_id_selectors: set[str] = field(default_factory=set)
     css_class_selectors: set[str] = field(default_factory=set)
@@ -6226,6 +6238,25 @@ class Planner:
             return None
         return candidate
 
+    def _html_tag_declares_behavioral_hook(self, tag_name: str, tag_text: str) -> bool:
+        normalized_tag = str(tag_name or "").strip().lower()
+        if normalized_tag in WEB_CONTRACT_BEHAVIORAL_HTML_TAGS:
+            return True
+        behavioral_attributes = (
+            "aria-controls",
+            "aria-expanded",
+            "aria-pressed",
+            "aria-selected",
+            "for",
+            "onclick",
+            "onchange",
+            "oninput",
+            "role",
+            "tabindex",
+        )
+        lowered_tag = str(tag_text or "").lower()
+        return any(attribute in lowered_tag for attribute in behavioral_attributes)
+
     def _web_contract_inventory(self, path: str, content: str) -> WebContractInventory:
         inventory = WebContractInventory()
         suffix = Path(path).suffix.lower()
@@ -6233,6 +6264,8 @@ class Planner:
         if suffix in WEB_CONTRACT_HTML_SUFFIXES:
             for tag_match in re.finditer(r"<[A-Za-z][^>]*>", content):
                 tag_text = str(tag_match.group(0) or "")
+                tag_name_match = re.match(r"<([A-Za-z][\w:-]*)", tag_text)
+                normalized_tag_name = str(tag_name_match.group(1) or "").strip().lower() if tag_name_match is not None else ""
                 id_match = re.search(r"\bid\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
                 class_match = re.search(r"\bclass\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
                 normalized_id = None
@@ -6240,6 +6273,8 @@ class Planner:
                     normalized_id = self._normalize_web_hook_token(str(id_match.group(2) or ""))
                     if normalized_id is not None:
                         inventory.html_ids.add(normalized_id)
+                        if self._html_tag_declares_behavioral_hook(normalized_tag_name, tag_text):
+                            inventory.html_behavioral_ids.add(normalized_id)
                 if normalized_id is None or class_match is None:
                     continue
                 class_tokens: set[str] = set()
@@ -6436,6 +6471,7 @@ class Planner:
         all_js_declared_ids = set().union(*(item.js_declared_ids for item in inventories.values()))
         all_js_root_state_classes = set().union(*(item.js_root_state_classes for item in inventories.values()))
         all_declared_ids = all_html_ids | all_js_declared_ids
+        sibling_class_tokens = set().union(*(item.css_class_selectors | item.js_class_tokens for item in inventories.values()))
 
         source_html_paths = {path for path in scope_paths if self._path_is_web_contract_html(path)}
         source_css_paths = {path for path in scope_paths if self._path_is_web_contract_css(path)}
@@ -6478,6 +6514,19 @@ class Planner:
                 if token in all_js_id_refs or token in all_css_id_selectors:
                     continue
                 if pending_css or pending_script:
+                    continue
+                has_behavioral_signal = False
+                for path in paths:
+                    inventory = inventories.get(path)
+                    if inventory is None:
+                        continue
+                    related_classes = inventory.html_id_classes.get(token, set())
+                    if token in inventory.html_behavioral_ids or any(
+                        class_token in sibling_class_tokens for class_token in related_classes
+                    ):
+                        has_behavioral_signal = True
+                        break
+                if not has_behavioral_signal:
                     continue
                 source_preview = ", ".join(sorted(paths)[:2])
                 findings.append(

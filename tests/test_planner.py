@@ -20394,6 +20394,109 @@ def test_pre_write_update_review_tells_html_repairs_to_remove_unconsumed_id_hook
     assert any("remove" in hint.lower() and "theme-switcher" in hint for hint in review.repair_hints)
 
 
+def test_pre_write_update_review_allows_semantic_section_ids_without_sibling_consumers(
+    tmp_path,
+    monkeypatch,
+):
+    current_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main>\n"
+        "      <section>\n"
+        "        <h1>Hamburger</h1>\n"
+        "      </section>\n"
+        "    </main>\n"
+        "    <script src=\"script.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    proposed_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main>\n"
+        "      <section id=\"history\">\n"
+        "        <h1>Hamburger</h1>\n"
+        "        <p>Geschichte und Zubereitung.</p>\n"
+        "      </section>\n"
+        "    </main>\n"
+        "    <script src=\"script.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    (tmp_path / "Index.html").write_text(current_content, encoding="utf-8")
+    (tmp_path / "script.js").write_text("console.log('ready');\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("section { padding: 1rem; }\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Hamburger-Website.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["Index.html", "script.js", "styles.css"],
+            focus_files=["Index.html", "script.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="Index.html", operation="modify"),
+            FileChangeRecord(path="script.js", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the existing web copy."}],
+            target_paths=["Index.html", "script.js", "styles.css"],
+            target_name="Index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="Index.html",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is True
+    assert "cross-file web contract" not in review.summary.lower()
+
+
 def test_compact_retry_prompt_includes_orphan_hook_removal_direction_for_html_repairs(tmp_path):
     current_content = (
         "<!doctype html>\n"
@@ -20681,6 +20784,74 @@ def test_semantic_review_failure_evidence_keeps_file_local_web_contract_repair_d
         "remove or rename the unconsumed id hook 'theme-switcher'" in item
         for item in session.active_repair_context.repair_requirements
     )
+
+
+def test_semantic_web_contract_review_allows_semantic_section_ids_without_sibling_consumers(tmp_path):
+    (tmp_path / "Index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main>\n"
+            "      <section id=\"history\">\n"
+            "        <h1>Hamburger</h1>\n"
+            "      </section>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "script.js").write_text("console.log('ready');\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("section { padding: 1rem; }\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Hamburger-Website.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["Index.html", "script.js", "styles.css"],
+            focus_files=["Index.html", "script.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="Index.html", operation="modify"),
+            FileChangeRecord(path="script.js", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the existing web copy."}],
+            target_paths=["Index.html", "script.js", "styles.css"],
+            target_name="Index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+
+    review = planner._semantic_web_contract_review(session)
+
+    assert review is None
 
 
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
