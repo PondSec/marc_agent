@@ -503,9 +503,16 @@ class ExecutionDecisionPolicy:
             explicit_request_paths = self._explicit_request_paths(understanding.original_request)
             if explicit_request_paths:
                 merged_candidates = list(explicit_request_paths)
+                merged_candidate_keys = {
+                    self._path_merge_key(candidate)
+                    for candidate in merged_candidates
+                    if candidate
+                }
                 for candidate in candidates:
-                    if candidate and candidate not in merged_candidates:
+                    candidate_key = self._path_merge_key(candidate)
+                    if candidate and candidate_key not in merged_candidate_keys:
                         merged_candidates.append(candidate)
+                        merged_candidate_keys.add(candidate_key)
                 candidates = merged_candidates
         if candidates:
             return self._unique_paths(candidates)[:8]
@@ -526,6 +533,9 @@ class ExecutionDecisionPolicy:
             if candidate and candidate not in paths:
                 paths.append(candidate)
         return paths[:8]
+
+    def _path_merge_key(self, value: str | None) -> str:
+        return str(value or "").strip().replace("\\", "/").lower()
 
     def _target_name(
         self,

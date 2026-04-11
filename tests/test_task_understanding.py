@@ -578,7 +578,7 @@ def test_execution_policy_restores_explicit_create_paths_when_task_state_narrows
         open_problem=None,
         verification_target="Create the initial implementation and run the most relevant validation or entry command.",
         target_artifacts=[
-            TaskArtifact(path="Index.html", name="Index.html", kind=".html", role="primary_target", confidence=0.9),
+            TaskArtifact(path="index.html", name="index.html", kind=".html", role="primary_target", confidence=0.9),
         ],
         evidence=[],
         relevant_context=[],
