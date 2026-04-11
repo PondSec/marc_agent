@@ -563,6 +563,49 @@ def test_execution_policy_routes_implement_request_to_update_even_if_mode_is_ins
     assert any(step.action == RouteActionName.UPDATE_ARTIFACT for step in route.action_plan)
 
 
+def test_execution_policy_restores_explicit_create_paths_when_task_state_narrows_scope(tmp_path):
+    task_state = TaskState(
+        latest_user_turn=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        root_goal="Create the requested website files.",
+        active_goal="Create the requested website files.",
+        goal_relation="new_task",
+        output_expectation="A small runnable website with the named files.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        open_problem=None,
+        verification_target="Create the initial implementation and run the most relevant validation or entry command.",
+        target_artifacts=[
+            TaskArtifact(path="Index.html", name="Index.html", kind=".html", role="primary_target", confidence=0.9),
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.9,
+        next_action="create",
+        next_best_action="create",
+        execution_outline=["Create the requested website files.", "Validate the result."],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=SessionState(task=task_state.latest_user_turn, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_paths == ["Index.html", "script.js", "styles.css"]
+    assert route.entities.target_name == "Index.html"
+
+
 def test_execution_policy_requests_clarification_on_low_confidence_high_risk():
     understanding = TaskUnderstanding(
         original_request="actually revert that part",

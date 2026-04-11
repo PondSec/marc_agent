@@ -26899,6 +26899,68 @@ def test_planner_preserves_explicit_primary_markdown_create_target_over_validati
     assert planner._choose_create_path(session.router_result, session) == "docs/repo-map.md"
 
 
+def test_planner_continues_named_create_paths_before_validating_first_web_file(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command='internal:web_artifact:[{"path":"Index.html","expected_features":[]}]',
+                kind="check",
+                verification_scope="structural",
+            )
+        ],
+        verification_commands=['internal:web_artifact:[{"path":"Index.html","expected_features":[]}]'],
+    )
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Create the requested website files.",
+        active_goal="Create the requested website files.",
+        goal_relation="new_task",
+        output_expectation="A small runnable website with the named files.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        open_problem=None,
+        verification_target='internal:web_artifact:[{"path":"Index.html","expected_features":[]}]',
+        target_artifacts=[
+            TaskArtifact(path="Index.html", name="Index.html", kind=".html", role="primary_target", confidence=0.9),
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.9,
+        next_action="create",
+        next_best_action="create",
+        execution_outline=["Create the requested website files.", "Validate the result."],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    session.router_result = ExecutionDecisionPolicy().build_route(
+        session.task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    session.changed_files = [FileChangeRecord(path="Index.html", operation="create")]
+
+    assert session.router_result.entities.target_paths == ["Index.html", "script.js", "styles.css"]
+    assert planner._has_pending_explicit_create_targets(session.router_result, session) is True
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "script.js"
+
+
 def test_planner_does_not_treat_validation_target_as_pending_create_artifact(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
