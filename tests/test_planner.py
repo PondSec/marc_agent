@@ -26900,7 +26900,12 @@ def test_planner_preserves_explicit_primary_markdown_create_target_over_validati
 
 
 def test_planner_continues_named_create_paths_before_validating_first_web_file(tmp_path):
-    planner = Planner(ScriptedLLM(), "")
+    planner = Planner(
+        ScriptedLLM(
+            text_payloads=["document.addEventListener('DOMContentLoaded', () => {});\n"],
+        ),
+        "",
+    )
     session = SessionState(
         task=(
             "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
