@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from agent.prompts import task_state_system_prompt, task_state_update_prompt
+from agent.semantic_defaults import classify_conversation_request
 from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
@@ -66,6 +67,37 @@ class TaskStateUpdater:
         initial_mode = self._initial_prompt_mode(session)
         local_state = self._fallback_state(user_input, snapshot=snapshot, session=session)
         strict_semantic_execution = self._requires_semantic_model_execution(session, local_state)
+        if self._should_short_circuit_direct_chat(
+            user_input=user_input,
+            session=session,
+            state=local_state,
+        ):
+            self._log(
+                "task_state_local_short_circuit",
+                strategy="deterministic_fallback",
+                reason="direct_chat_request",
+            )
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary="Task understanding used deterministic direct-chat inference instead of invoking semantic model execution.",
+                        attempts=[],
+                    ),
+                    semantic_resolution="minimal_inference",
+                ),
+            )
+            self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
+            return local_state
         if self._should_short_circuit_with_local_state(
             initial_mode=initial_mode,
             session=session,
@@ -766,6 +798,22 @@ class TaskStateUpdater:
         if state.needs_clarification or state.ambiguity_level == "high":
             return False
         return float(state.confidence or 0.0) >= 0.65
+
+    def _should_short_circuit_direct_chat(
+        self,
+        *,
+        user_input: str,
+        session,
+        state: TaskState,
+    ) -> bool:
+        del session
+        if classify_conversation_request(user_input) is None:
+            return False
+        if state.needs_clarification:
+            return False
+        if str(state.current_user_intent or "").strip() != "explain":
+            return False
+        return str(state.next_best_action or state.next_action or "").strip() == "explain"
 
     def _agent_profile(self, session) -> str:
         if session is None:

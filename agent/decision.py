@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from agent.models import SessionState, WorkspaceSnapshot
-from agent.semantic_defaults import infer_artifact_name_hint, infer_requested_extension, infer_scope_tokens
+from agent.semantic_defaults import (
+    classify_conversation_request,
+    infer_artifact_name_hint,
+    infer_requested_extension,
+    infer_scope_tokens,
+)
 from agent.task_state import TaskState
 from agent.task_schema import TaskArtifact, TaskUnderstanding
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
+
+_EXPLICIT_PATH_RE = re.compile(
+    r"([\w./-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|html|css|sh|toml|ya?ml|go|rs|java|kt|rb|ini|cfg|conf|env|log|sql|xml|svg|csv))",
+    flags=re.IGNORECASE,
+)
 
 
 class ExecutionDecisionPolicy:
@@ -484,8 +495,10 @@ class ExecutionDecisionPolicy:
         session: SessionState | None,
         intent: RouteIntent,
     ) -> list[str]:
-        candidates: list[str] = [
-            item.path
+        if classify_conversation_request(understanding.original_request) is not None:
+            return []
+        candidate_artifacts = [
+            item
             for item in understanding.target_artifacts
             if item.path
             and (
@@ -493,6 +506,14 @@ class ExecutionDecisionPolicy:
                 or item.role in {"primary_target", "validation_target", "supporting_context"}
             )
         ]
+        candidates: list[str] = [str(item.path) for item in candidate_artifacts if item.path]
+        if intent == RouteIntent.CREATE:
+            explicit_request_paths = self._explicit_request_paths(understanding.original_request)
+            if explicit_request_paths:
+                candidates = self._merge_create_candidates_with_request_paths(
+                    candidate_artifacts,
+                    explicit_request_paths,
+                )
         if candidates:
             return self._unique_paths(candidates)[:8]
         if intent == RouteIntent.CREATE:
@@ -504,6 +525,50 @@ class ExecutionDecisionPolicy:
                 candidates.extend(session.follow_up_context.changed_files[:8])
                 candidates.extend(session.follow_up_context.read_files[:8])
         return self._unique_paths(candidates)[:8]
+
+    def _explicit_request_paths(self, request: str) -> list[str]:
+        paths: list[str] = []
+        for match in _EXPLICIT_PATH_RE.finditer(str(request or "")):
+            candidate = str(match.group(1) or "").lstrip("./")
+            if candidate and candidate not in paths:
+                paths.append(candidate)
+        return paths[:8]
+
+    def _merge_create_candidates_with_request_paths(
+        self,
+        candidate_artifacts: list[TaskArtifact],
+        explicit_request_paths: list[str],
+    ) -> list[str]:
+        explicit_by_key = {
+            self._path_merge_key(candidate): candidate
+            for candidate in explicit_request_paths
+            if candidate
+        }
+        merged: list[str] = []
+        seen: set[str] = set()
+        insert_after_primary = 0
+        for artifact in candidate_artifacts:
+            candidate = str(artifact.path or "").strip()
+            if not candidate:
+                continue
+            candidate_key = self._path_merge_key(candidate)
+            if candidate_key in seen:
+                continue
+            merged.append(explicit_by_key.pop(candidate_key, candidate))
+            seen.add(candidate_key)
+            if artifact.role == "primary_target":
+                insert_after_primary = len(merged)
+        for candidate in explicit_request_paths:
+            candidate_key = self._path_merge_key(candidate)
+            if not candidate or candidate_key in seen:
+                continue
+            merged.insert(insert_after_primary, candidate)
+            seen.add(candidate_key)
+            insert_after_primary += 1
+        return merged
+
+    def _path_merge_key(self, value: str | None) -> str:
+        return str(value or "").strip().replace("\\", "/").lower()
 
     def _target_name(
         self,

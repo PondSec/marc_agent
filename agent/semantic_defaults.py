@@ -18,6 +18,7 @@ _CREATE_SIGNALS = (
     "build",
     "create",
     "erstell",
+    "anleg",
     "generate",
     "implement",
     "add",
@@ -238,9 +239,14 @@ _PROBLEM_REPORT_TOKENS = (
     "crash",
     "error",
     "exception",
+    "fail",
+    "failed",
+    "failing",
+    "fails",
     "fehler",
     "geht nicht",
     "kaputt",
+    "not working",
     "problem",
     "stacktrace",
     "terminal",
@@ -345,6 +351,147 @@ _FRONTEND_SCOPE_TOKENS = (
     "ui only",
 )
 
+_QUESTION_WORD_TOKENS = (
+    "how",
+    "wann",
+    "warum",
+    "was",
+    "what",
+    "when",
+    "wer",
+    "where",
+    "wie",
+    "wieso",
+    "wo",
+    "who",
+    "why",
+)
+
+_SECOND_PERSON_TOKENS = (
+    "dich",
+    "dir",
+    "du",
+    "dein",
+    "deine",
+    "you",
+    "your",
+)
+
+_REPO_CONTEXT_TOKENS = (
+    "auth",
+    "branch",
+    "code",
+    "komponente",
+    "commit",
+    "component",
+    "config",
+    "datei",
+    "diff",
+    "endpoint",
+    "file",
+    "function",
+    "handler",
+    "klasse",
+    "class",
+    "logik",
+    "logic",
+    "method",
+    "modul",
+    "module",
+    "project",
+    "projekt",
+    "repo",
+    "repository",
+    "route",
+    "selector",
+    "source",
+    "test",
+    "workspace",
+)
+
+_REPO_ACTION_TOKENS = (
+    "analysier",
+    "analysiere",
+    "check",
+    "erklaer",
+    "erklär",
+    "explain",
+    "find",
+    "inspect",
+    "lese",
+    "locate",
+    "look through",
+    "read",
+    "review",
+    "search",
+    "show",
+    "such",
+    "summarize",
+    "where is",
+    "wo ist",
+    "wo steckt",
+    "zusammen",
+)
+
+_DEICTIC_TASK_OBJECT_TOKENS = (
+    "das",
+    "dies",
+    "dieses",
+    "es",
+    "it",
+    "that",
+    "this",
+)
+
+_DIRECT_TASK_REQUEST_TOKENS = (
+    "analys",
+    "analyz",
+    "build",
+    "check",
+    "create",
+    "debug",
+    "delete",
+    "find",
+    "fix",
+    "inspect",
+    "inspiz",
+    "les",
+    "locate",
+    "modify",
+    "read",
+    "remove",
+    "repair",
+    "review",
+    "run",
+    "search",
+    "show",
+    "start",
+    "such",
+    "update",
+)
+
+_GENERIC_EXECUTION_TOKENS = (
+    "do",
+    "mach",
+    "make",
+    "tu",
+)
+
+_AMBIGUOUS_CONTEXT_REFERENCE_TOKENS = (
+    "da",
+    "darin",
+    "drin",
+    "here",
+    "hier",
+    "inside",
+    "there",
+)
+
+_CODE_PATH_RE = re.compile(
+    r"([\w./-]+\.(?:py|js|ts|tsx|jsx|json|md|txt|html|css|sh|toml|ya?ml|go|rs|java|kt|rb|ini|cfg|conf|env|log|sql|xml|svg|csv))",
+    flags=re.IGNORECASE,
+)
+
 
 PrimarySemanticIntent = Literal["create", "debug", "explain", "update"]
 
@@ -355,6 +502,11 @@ class ObviousRequestClassification:
     confidence: float
     requested_extension: str | None = None
     artifact_name_hint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationClassification:
+    confidence: float
 
 
 def normalize_text(text: str) -> str:
@@ -387,6 +539,14 @@ def _contains_term(
         if term in tokens:
             return True
     return False
+
+
+def _looks_like_actionable_request(normalized: str, tokens: list[str]) -> bool:
+    if _contains_term(normalized, tokens, _DIRECT_TASK_REQUEST_TOKENS, prefix=True):
+        return True
+    has_deictic_object = _contains_term(normalized, tokens, _DEICTIC_TASK_OBJECT_TOKENS)
+    has_generic_execution = _contains_term(normalized, tokens, _GENERIC_EXECUTION_TOKENS, prefix=True)
+    return has_deictic_object and has_generic_execution
 
 
 def _contains_implementation_noun(normalized: str) -> bool:
@@ -461,12 +621,15 @@ def is_clear_low_risk_build_request(text: str) -> bool:
         _NEED_CREATE_SIGNALS,
         prefix=True,
     )
-    has_change_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True) or _contains_term(
+    update_signal = _contains_term(
         normalized,
         tokens,
         _UPDATE_REQUEST_TOKENS,
         prefix=True,
     )
+    if update_signal and _is_scope_limiter_change_guardrail(normalized):
+        update_signal = False
+    has_change_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True) or update_signal
     has_delivery_signal = _contains_implementation_noun(normalized)
     has_medium_signal = infer_requested_extension(normalized) is not None
     has_named_scope = bool(infer_scope_tokens(normalized))
@@ -475,6 +638,24 @@ def is_clear_low_risk_build_request(text: str) -> bool:
         and not has_change_signal
         and (has_delivery_signal or has_medium_signal)
         and has_named_scope
+    )
+
+
+def _is_scope_limiter_change_guardrail(normalized: str) -> bool:
+    text = str(normalized or "").strip()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "sonst nichts",
+            "nichts sonst",
+            "nothing else",
+            "anything else",
+            "any other",
+            "do not change anything else",
+            "don't change anything else",
+        )
     )
 
 
@@ -520,6 +701,58 @@ def looks_like_debug_request(text: str) -> bool:
     has_fix_signal = _contains_term(normalized, tokens, _DEBUG_REQUEST_TOKENS, prefix=True)
     has_problem_signal = looks_like_problem_report(text)
     return has_fix_signal or has_problem_signal
+
+
+def classify_conversation_request(text: str) -> ConversationClassification | None:
+    normalized = normalize_text(text)
+    if not normalized:
+        return None
+    tokens = _text_tokens(normalized)
+    if not tokens:
+        return None
+    if _CODE_PATH_RE.search(str(text or "")):
+        return None
+    if (
+        is_clear_low_risk_build_request(text)
+        or looks_like_debug_request(text)
+        or looks_like_update_request(text)
+        or looks_like_validation_request(text)
+        or looks_like_correction_request(text)
+        or looks_like_hardening_request(text)
+        or looks_like_scope_narrowing_request(text)
+    ):
+        return None
+    nlp_prediction = classify_fallback_intent(text)
+    if nlp_prediction.intent in {"create", "debug", "inspect", "plan", "search", "update"} and nlp_prediction.confidence >= 0.38:
+        return None
+    has_repo_context = _contains_term(normalized, tokens, _REPO_CONTEXT_TOKENS)
+    has_repo_action = _contains_term(normalized, tokens, _REPO_ACTION_TOKENS, prefix=True)
+    question_like = normalized.endswith("?") or (tokens and tokens[0] in _QUESTION_WORD_TOKENS)
+    addresses_agent = _contains_term(normalized, tokens, _SECOND_PERSON_TOKENS)
+    actionable_request = _looks_like_actionable_request(normalized, tokens)
+    ambiguous_context_question = (
+        question_like
+        and nlp_prediction.intent != "conversation"
+        and _contains_term(normalized, tokens, _AMBIGUOUS_CONTEXT_REFERENCE_TOKENS)
+    )
+    repo_grounded_explanation = (
+        any(token in normalized for token in _EXPLANATION_REQUEST_TOKENS)
+        and (has_repo_context or _contains_implementation_noun(normalized))
+    )
+    if (
+        repo_grounded_explanation
+        or (has_repo_context and has_repo_action)
+        or actionable_request
+        or ambiguous_context_question
+    ):
+        return None
+    if nlp_prediction.intent == "conversation" and nlp_prediction.confidence >= 0.34:
+        return ConversationClassification(confidence=max(nlp_prediction.confidence, 0.46))
+    if question_like and addresses_agent:
+        return ConversationClassification(confidence=max(nlp_prediction.confidence, 0.48))
+    if question_like and not has_repo_context and nlp_prediction.intent in {"conversation", "unknown", "explain"}:
+        return ConversationClassification(confidence=max(nlp_prediction.confidence, 0.44))
+    return None
 
 
 def looks_like_explanation_request(text: str) -> bool:

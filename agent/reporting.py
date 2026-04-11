@@ -472,18 +472,15 @@ class SessionReporter:
 
     def _is_intro_conversation(self, session: SessionState) -> bool:
         route = session.router_result
-        if route is not None:
-            first_action = route.action_plan[0].action.value if route.action_plan else ""
-            if (
-                route.intent.value == "explain"
-                and not route.repo_context_needed
-                and first_action == "respond_directly"
-            ):
-                return True
-        task_state = session.task_state
-        if task_state is not None and task_state.next_action == "explain" and not task_state.target_artifacts:
-            return True
-        return False
+        if route is None:
+            return False
+        first_action = route.action_plan[0].action.value if route.action_plan else ""
+        return (
+            route.intent.value == "explain"
+            and not route.repo_context_needed
+            and first_action == "respond_directly"
+            and bool(route.direct_response)
+        )
 
     def _require_task_state(self, session: SessionState) -> None:
         if session.task_state is None:

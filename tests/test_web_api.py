@@ -1248,6 +1248,20 @@ def test_stale_active_lease_does_not_block_stale_session_detection(tmp_path):
     assert not lease_path.exists()
 
 
+def test_app_start_clears_orphaned_active_session_leases(tmp_path):
+    config = build_test_config(tmp_path, llm_timeout=1)
+    config.ensure_state_dirs()
+
+    orphaned_lease = config.state_root / "active_sessions" / "orphaned-session.lease"
+    orphaned_lease.parent.mkdir(parents=True, exist_ok=True)
+    orphaned_lease.touch()
+
+    app = create_app(config)
+
+    assert not orphaned_lease.exists()
+    assert app.state.task_manager.active_sessions() == []
+
+
 def test_delete_session_removes_chat_metadata_and_logs(tmp_path):
     config = build_test_config(tmp_path, max_iterations=1, shell_timeout=1)
     config.ensure_state_dirs()

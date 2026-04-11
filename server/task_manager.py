@@ -86,6 +86,7 @@ class TaskManager:
         self.workspace_store = WorkspaceStore(self.base_config.state_root / "workspaces.json")
         self._active_session_dir = self.base_config.state_root / "active_sessions"
         self._active_session_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_orphaned_active_session_leases()
         self._heal_workspace_store_from_workspace_root()
         self._sync_workspace_state_to_base()
         self._lock = Lock()
@@ -828,6 +829,10 @@ class TaskManager:
 
     def _active_session_lease_path(self, session_id: str) -> Path:
         return self._active_session_dir / f"{session_id}.lease"
+
+    def _clear_orphaned_active_session_leases(self) -> None:
+        for lease in self._active_session_dir.glob("*.lease"):
+            lease.unlink(missing_ok=True)
 
     def _touch_active_session_lease(self, session_id: str) -> None:
         path = self._active_session_lease_path(session_id)

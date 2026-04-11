@@ -56,11 +56,13 @@ from agent.prompts import (
     semantic_change_review_system_prompt,
 )
 from agent.router import IntentRouter
+from agent.semantic_defaults import classify_conversation_request
 from agent.semantic_runtime import availability_recovery_model
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 from llm.ollama_client import OllamaGenerationError
+from llm.model_selection import select_primary_model, select_router_model
 from llm.provider import LLMProvider
 from llm.runtime_resilience import (
     ExecutionAttemptRecord,
@@ -191,6 +193,17 @@ WEB_CONTRACT_SUFFIXES = (
     | WEB_CONTRACT_CSS_SUFFIXES
     | WEB_CONTRACT_SCRIPT_SUFFIXES
 )
+WEB_CONTRACT_BEHAVIORAL_HTML_TAGS = {
+    "button",
+    "details",
+    "dialog",
+    "form",
+    "input",
+    "option",
+    "select",
+    "summary",
+    "textarea",
+}
 
 
 @dataclass(slots=True)
@@ -258,6 +271,7 @@ class MutationAssessment:
 class WebContractInventory:
     html_ids: set[str] = field(default_factory=set)
     html_id_classes: dict[str, set[str]] = field(default_factory=dict)
+    html_behavioral_ids: set[str] = field(default_factory=set)
     html_root_classes: set[str] = field(default_factory=set)
     css_id_selectors: set[str] = field(default_factory=set)
     css_class_selectors: set[str] = field(default_factory=set)
@@ -747,6 +761,12 @@ class Planner:
         route = session.router_result
         if route is not None and route.direct_response and not session.tool_calls:
             return route.direct_response
+        if self._is_conversation_request(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die normale Frage erkannt, aber die freie Antwort konnte in diesem Lauf nicht stabil erzeugt werden.",
+                en="I recognized this as normal conversation, but I could not generate a stable free-form answer in this run.",
+            )
         if session.changed_files and self._functional_validation_missing(session):
             return self._localized_text(
                 language,
@@ -810,6 +830,13 @@ class Planner:
         inspected = self._read_paths(session)[:4]
         language = self._session_language(session)
         lines: list[str] = []
+
+        if self._is_conversation_request(session):
+            return self._localized_text(
+                language,
+                de="Ich habe die Frage als normale Unterhaltung erkannt, aber die freie Antwort konnte gerade nicht stabil erzeugt werden.",
+                en="I recognized the question as normal conversation, but I could not generate a stable free-form answer just now.",
+            )
 
         if session.changed_files:
             lines.append(
@@ -910,6 +937,13 @@ class Planner:
             )
 
         return "\n\n".join(part for part in lines if part)
+
+    def _is_conversation_request(self, session: SessionState) -> bool:
+        return (
+            not session.changed_files
+            and not session.tool_calls
+            and classify_conversation_request(session.task) is not None
+        )
 
     def _draft_create_decision(
         self,
@@ -6225,6 +6259,25 @@ class Planner:
             return None
         return candidate
 
+    def _html_tag_declares_behavioral_hook(self, tag_name: str, tag_text: str) -> bool:
+        normalized_tag = str(tag_name or "").strip().lower()
+        if normalized_tag in WEB_CONTRACT_BEHAVIORAL_HTML_TAGS:
+            return True
+        behavioral_attributes = (
+            "aria-controls",
+            "aria-expanded",
+            "aria-pressed",
+            "aria-selected",
+            "for",
+            "onclick",
+            "onchange",
+            "oninput",
+            "role",
+            "tabindex",
+        )
+        lowered_tag = str(tag_text or "").lower()
+        return any(attribute in lowered_tag for attribute in behavioral_attributes)
+
     def _web_contract_inventory(self, path: str, content: str) -> WebContractInventory:
         inventory = WebContractInventory()
         suffix = Path(path).suffix.lower()
@@ -6232,6 +6285,8 @@ class Planner:
         if suffix in WEB_CONTRACT_HTML_SUFFIXES:
             for tag_match in re.finditer(r"<[A-Za-z][^>]*>", content):
                 tag_text = str(tag_match.group(0) or "")
+                tag_name_match = re.match(r"<([A-Za-z][\w:-]*)", tag_text)
+                normalized_tag_name = str(tag_name_match.group(1) or "").strip().lower() if tag_name_match is not None else ""
                 id_match = re.search(r"\bid\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
                 class_match = re.search(r"\bclass\s*=\s*(['\"])([^'\"]+)\1", tag_text, flags=re.IGNORECASE)
                 normalized_id = None
@@ -6239,6 +6294,8 @@ class Planner:
                     normalized_id = self._normalize_web_hook_token(str(id_match.group(2) or ""))
                     if normalized_id is not None:
                         inventory.html_ids.add(normalized_id)
+                        if self._html_tag_declares_behavioral_hook(normalized_tag_name, tag_text):
+                            inventory.html_behavioral_ids.add(normalized_id)
                 if normalized_id is None or class_match is None:
                     continue
                 class_tokens: set[str] = set()
@@ -6435,6 +6492,7 @@ class Planner:
         all_js_declared_ids = set().union(*(item.js_declared_ids for item in inventories.values()))
         all_js_root_state_classes = set().union(*(item.js_root_state_classes for item in inventories.values()))
         all_declared_ids = all_html_ids | all_js_declared_ids
+        sibling_class_tokens = set().union(*(item.css_class_selectors | item.js_class_tokens for item in inventories.values()))
 
         source_html_paths = {path for path in scope_paths if self._path_is_web_contract_html(path)}
         source_css_paths = {path for path in scope_paths if self._path_is_web_contract_css(path)}
@@ -6477,6 +6535,19 @@ class Planner:
                 if token in all_js_id_refs or token in all_css_id_selectors:
                     continue
                 if pending_css or pending_script:
+                    continue
+                has_behavioral_signal = False
+                for path in paths:
+                    inventory = inventories.get(path)
+                    if inventory is None:
+                        continue
+                    related_classes = inventory.html_id_classes.get(token, set())
+                    if token in inventory.html_behavioral_ids or any(
+                        class_token in sibling_class_tokens for class_token in related_classes
+                    ):
+                        has_behavioral_signal = True
+                        break
+                if not has_behavioral_signal:
                     continue
                 source_preview = ", ".join(sorted(paths)[:2])
                 findings.append(
@@ -7389,24 +7460,39 @@ class Planner:
         return max(int(configured), minimum)
 
     def _primary_generation_model_name(self) -> str | None:
+        primary, _ = self._resolved_generation_model_names()
+        return primary
+
+    def _resolved_generation_model_names(self) -> tuple[str | None, str | None]:
         config = getattr(self.llm, "config", None)
         if config is None:
-            return None
-        candidate = str(getattr(config, "model_name", "") or "").strip()
-        return candidate or None
+            return None, None
+        preferred_primary = str(getattr(config, "model_name", "") or "").strip()
+        preferred_router = str(getattr(config, "router_model_name", "") or "").strip()
+        live_candidates = self._live_generation_model_candidates()
+        if not live_candidates:
+            primary = preferred_primary or None
+            router = preferred_router or None
+        else:
+            primary = select_primary_model(
+                preferred_model=preferred_primary or preferred_router,
+                installed_names=live_candidates,
+            )
+            router = select_router_model(
+                preferred_router=preferred_router or None,
+                installed_names=live_candidates,
+                primary_model=primary,
+            )
+        if router == primary:
+            router = None
+        return (primary or None, router or None)
 
     def _backend_identifier(self) -> str:
         return "ollama"
 
     def _lightweight_generation_model_name(self) -> str | None:
-        config = getattr(self.llm, "config", None)
-        if config is None:
-            return None
-        candidate = str(getattr(config, "router_model_name", "") or "").strip()
-        primary = str(getattr(config, "model_name", "") or "").strip()
-        if not candidate or candidate == primary:
-            return None
-        return candidate
+        _, router = self._resolved_generation_model_names()
+        return router
 
     def _live_generation_model_candidates(self) -> list[str]:
         list_models = getattr(self.llm, "list_models_safe", None)
@@ -8885,11 +8971,19 @@ class Planner:
         return timeout, max(timeout + 60, 90)
 
     def _compact_primary_semantic_review_budget(self) -> tuple[int, int]:
-        timeout = max(self._llm_timeout(35), 35)
+        timeout = max(self._llm_timeout(60), 60)
         # Single-model deployments still benefit from the compact review path, but
-        # they need a slightly larger warm-start window because there is no faster
-        # reserve model to absorb the first semantic-review hop.
-        return timeout, max(timeout + 75, 120)
+        # the same local model must warm up again for a structured JSON review right
+        # after generation. Reuse the longer review-style budget so small CPU-backed
+        # models do not fail during startup before the semantic gate can even run.
+        return timeout, max(self._llm_timeout(210), 210)
+
+    def _primary_semantic_review_followup_budget(self) -> tuple[int, int]:
+        timeout = max(self._llm_timeout(60), 60)
+        # If the compact same-model semantic review still fails to start, the full
+        # follow-up should remain meaningfully different instead of collapsing to the
+        # short generic JSON-review budget that already proved too small in live runs.
+        return timeout, max(self._llm_timeout(180), 180)
 
     def _review_generated_update(
         self,
@@ -12777,12 +12871,48 @@ class Planner:
             lines.append(tail)
 
         if expected_count is not None and len(lines) != expected_count:
+            fallback = self._parse_conjoined_exact_line_contract_body(
+                segment,
+                expected_count=expected_count,
+            )
+            if fallback:
+                return fallback
             return []
         if not 2 <= len(lines) <= 8:
             return []
         if trailing_remainder and not self._line_contract_remainder_looks_like_followup(trailing_remainder):
             return []
         return lines
+
+    def _parse_conjoined_exact_line_contract_body(
+        self,
+        text: str,
+        *,
+        expected_count: int,
+    ) -> list[str]:
+        if expected_count < 2 or expected_count > 4:
+            return []
+        segment = str(text or "").strip()
+        if not segment or any(marker in segment for marker in {",", ";", "\n"}):
+            return []
+
+        head = segment
+        remainder = ""
+        for index, char in enumerate(segment):
+            if char in ".!?" and self._line_contract_sentence_break(segment, index):
+                head = segment[:index]
+                remainder = segment[index + 1 :]
+                break
+        if remainder and not self._line_contract_remainder_looks_like_followup(remainder):
+            return []
+
+        parts = [
+            self._clean_exact_line_item(raw_part, terminal=True)
+            for raw_part in re.split(r"\s+(?:and|und)\s+", head, flags=re.IGNORECASE)
+        ]
+        if len(parts) != expected_count or any(not part for part in parts):
+            return []
+        return parts
 
     def _clean_exact_line_item(self, raw: str, *, terminal: bool) -> str:
         candidate = str(raw or "").strip()
@@ -15216,13 +15346,18 @@ class Planner:
 
         for model_name, capability_tier, strategy, timeout, num_ctx, prompt_variant in review_attempts:
             prompt = compact_prompt if prompt_variant == "compact" and compact_prompt is not None else full_prompt
+            strict_timeouts = prompt_variant == "compact"
             if prompt_variant == "compact":
                 if strategy == "primary_model_compact_generation":
                     timeout, total_timeout = self._compact_primary_semantic_review_budget()
+                    strict_timeouts = False
                 else:
                     timeout, total_timeout = self._compact_reserve_review_budget()
             else:
-                total_timeout = max(timeout + 20, timeout * 2)
+                if model_name == primary_model and reserve_model is None:
+                    timeout, total_timeout = self._primary_semantic_review_followup_budget()
+                else:
+                    total_timeout = max(timeout + 20, timeout * 2)
             outcome = invoke_model(
                 lambda progress, review_model=model_name: self.llm.generate_json(
                     prompt,
@@ -15231,7 +15366,7 @@ class Planner:
                     retries=0,
                     timeout=timeout,
                     total_timeout=total_timeout,
-                    strict_timeouts=prompt_variant == "compact",
+                    strict_timeouts=strict_timeouts,
                     num_ctx=num_ctx,
                     progress_callback=progress,
                 ),

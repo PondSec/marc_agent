@@ -8,6 +8,7 @@ import re
 import shlex
 
 from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
+from agent.semantic_defaults import classify_conversation_request
 from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
@@ -525,6 +526,9 @@ def generate_content_prompt(
             if explicit_constraints != "none":
                 sections.append(f"Explicit constraints: {explicit_constraints}")
             sections.append(f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
+            grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+            if grounding_instruction:
+                sections.append(grounding_instruction)
             if related_targets:
                 sections.append(
                     f"Out-of-scope companion files for this step: {_format_list(related_targets)}. They will be handled separately."
@@ -584,6 +588,9 @@ def generate_content_prompt(
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
+        grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+        if grounding_instruction:
+            sections.append(grounding_instruction)
         if runtime_hints:
             sections.append(
                 "Targeted runtime hints: "
@@ -674,6 +681,9 @@ def generate_content_prompt(
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
     if runtime_hints:
@@ -813,6 +823,9 @@ def generate_content_retry_prompt(
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
+        grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+        if grounding_instruction:
+            sections.append(grounding_instruction)
         if session is not None:
             sections.append(f"Related file hints: {related_context}")
             if exact_output_contracts:
@@ -914,6 +927,9 @@ def generate_content_retry_prompt(
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
     if exact_output_contracts:
@@ -990,6 +1006,9 @@ def generate_content_continuation_prompt(
         f"Search hints: {_format_list(route.search_terms[:6])}",
         _single_file_boundary_instruction(path, route.entities.target_paths),
     ]
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
     if session is not None:
         sections.extend(
             [
@@ -1051,6 +1070,24 @@ def _single_file_boundary_instruction(path: str, target_paths: list[str] | None)
 
 
 def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
+    if (
+        classify_conversation_request(session.task) is not None
+        and not session.changed_files
+        and not session.tool_calls
+    ):
+        return "\n".join(
+            [
+                "Answer the user's latest message directly and naturally.",
+                "This is normal conversation, not a repository task.",
+                "Stay on the exact topic of the latest message and answer that question, not a different greeting or a prior turn.",
+                "Prefer a short, plain, factual answer over creative detail or embellishment.",
+                "If you are unsure about a fact, say so briefly instead of inventing specifics.",
+                "If the user asks about your capabilities here, describe what you can do in this workspace.",
+                f"User message: {json.dumps(session.task, ensure_ascii=False)}",
+                "Use general knowledge when needed.",
+                "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
+            ]
+        )
     recent_notes = session.notes[-12:]
     recent_calls = _compact_recent_calls(session)
     report_context = {
@@ -2037,6 +2074,31 @@ def _file_local_requirement_summary(file_focus: dict[str, object], *, limit: int
     return "File-local requirements: " + "; ".join(items)
 
 
+def _user_facing_copy_grounding_instruction(
+    path: str,
+    route: RouterOutput | None = None,
+) -> str:
+    suffix = Path(str(path or "").strip()).suffix.lower()
+    target_paths = [
+        str(item or "").strip()
+        for item in (getattr(getattr(route, "entities", None), "target_paths", None) or [])
+        if str(item or "").strip()
+    ]
+    target_suffixes = {Path(item).suffix.lower() for item in target_paths}
+    is_text_surface = suffix in {".html", ".htm", ".md", ".markdown", ".rst", ".txt"}
+    is_web_copy_carrier = suffix in {".js", ".jsx", ".ts", ".tsx"} and bool(
+        target_suffixes & {".html", ".htm"}
+    )
+    if not (is_text_surface or is_web_copy_carrier):
+        return ""
+    return (
+        "Ground any user-facing copy in the request and inspected context. "
+        "Do not invent concrete facts, historical claims, named origins, statistics, or step-by-step instructions "
+        "unless they were supplied by the request or visible source evidence. "
+        "If the facts are not given, keep the wording generic, high-level, and clearly non-specific."
+    )
+
+
 def _compact_repair_file_focus(
     file_focus: dict[str, object],
     *,
@@ -2170,6 +2232,9 @@ def _compact_repair_update_prompt(
                 if str(item or "").strip()
             )
         )
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -2404,6 +2469,9 @@ def _compact_repair_retry_prompt(
                 if str(item or "").strip()
             )
         )
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -2666,6 +2734,9 @@ def _focused_full_repair_update_prompt(
     file_requirement_summary = _file_local_requirement_summary(compact_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)

@@ -563,6 +563,49 @@ def test_execution_policy_routes_implement_request_to_update_even_if_mode_is_ins
     assert any(step.action == RouteActionName.UPDATE_ARTIFACT for step in route.action_plan)
 
 
+def test_execution_policy_restores_explicit_create_paths_when_task_state_narrows_scope(tmp_path):
+    task_state = TaskState(
+        latest_user_turn=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        root_goal="Create the requested website files.",
+        active_goal="Create the requested website files.",
+        goal_relation="new_task",
+        output_expectation="A small runnable website with the named files.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        open_problem=None,
+        verification_target="Create the initial implementation and run the most relevant validation or entry command.",
+        target_artifacts=[
+            TaskArtifact(path="index.html", name="index.html", kind=".html", role="primary_target", confidence=0.9),
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.9,
+        next_action="create",
+        next_best_action="create",
+        execution_outline=["Create the requested website files.", "Validate the result."],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=SessionState(task=task_state.latest_user_turn, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_paths == ["Index.html", "script.js", "styles.css"]
+    assert route.entities.target_name == "Index.html"
+
+
 def test_execution_policy_requests_clarification_on_low_confidence_high_risk():
     understanding = TaskUnderstanding(
         original_request="actually revert that part",
@@ -1645,6 +1688,117 @@ def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     assert route.intent == RouteIntent.EXPLAIN
     assert route.needs_clarification is False
     assert task_state.semantic_resolution == "minimal_inference"
+
+
+def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    session = SessionState(
+        task="super danke. und was kannst du mir über dich erzählen wer bist du wie heißt du und was kannst du?",
+        workspace_root=str(tmp_path),
+        follow_up_context=FollowUpContext(
+            previous_task="Programmiere mir eine Website über Hamburger.",
+            previous_root_goal="Create the requested website files.",
+            previous_active_goal="Create Index.html, script.js, and styles.css for the website.",
+            previous_next_action="create",
+            previous_requested_outcome="A small runnable website with the named files.",
+            target_paths=["Index.html", "script.js", "styles.css"],
+            changed_files=["Index.html", "script.js", "styles.css"],
+            read_files=["Index.html", "script.js", "styles.css"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.execution_strategy == "validation_inspection"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts == []
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.needs_clarification is False
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
+
+
+def test_task_state_a2_short_circuits_clear_direct_chat_follow_up_without_model_calls(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm, model_name=config.model_name)
+    session = SessionState(
+        task="und was kannst du hier machen?",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+        follow_up_context=FollowUpContext(
+            previous_task="Programmiere mir eine Website über Hamburger.",
+            previous_root_goal="Create the requested website files.",
+            previous_active_goal="Create Index.html, script.js, and styles.css for the website.",
+            previous_next_action="create",
+            previous_requested_outcome="A small runnable website with the named files.",
+            target_paths=["Index.html", "script.js", "styles.css"],
+            changed_files=["Index.html", "script.js", "styles.css"],
+            read_files=["Index.html", "script.js", "styles.css"],
+        ),
+    )
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_timeout_fallback_treats_general_knowledge_question_as_conversation_not_repo_task(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+
+    task_state = updater.update_task_state(
+        "weißt du was ein Hamburger ist?",
+        snapshot=build_snapshot(tmp_path),
+    )
+    route = ExecutionDecisionPolicy().build_route(
+        task_state,
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task="weißt du was ein Hamburger ist?", workspace_root=str(tmp_path)),
+    )
+
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.target_artifacts == []
+    assert route.intent == RouteIntent.EXPLAIN
+    assert route.repo_context_needed is False
+    assert route.action_plan[0].action == RouteActionName.RESPOND_DIRECTLY
+    assert route.direct_response is None
 
 
 def test_task_interpreter_timeout_fallback_preserves_clear_create_request(tmp_path):
@@ -2738,6 +2892,60 @@ def test_task_state_timeout_fallback_preserves_explicit_file_create_request_in_e
         "tests/test_wordfreq.py",
     ]
     assert route.action_plan[0].action.value == "create_artifact"
+
+
+def test_task_state_local_short_circuit_keeps_explicit_create_intent_despite_scope_limiter_phrase(
+    tmp_path,
+):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=1,
+        language_counts={"text": 1},
+        top_directories=[],
+        important_files=["smoke_a2_live.txt"],
+        focus_files=["smoke_a2_live.txt"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=[],
+        repo_map=[],
+        project_labels=["general repository"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="One existing smoke file.",
+    )
+    prompt = (
+        "Erstelle im aktuellen Workspace die Datei smoke_status_note.txt mit einer kurzen "
+        "Smoke-Statusnotiz in einer Zeile. Aendere sonst nichts."
+    )
+    llm = ScriptedLLM()
+    llm.config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    session = SessionState(task=prompt, workspace_root=str(tmp_path))
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        prompt,
+        snapshot=snapshot,
+        session=session,
+    )
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+    artifact_roles = {artifact.path: artifact.role for artifact in task_state.target_artifacts if artifact.path}
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "create"
+    assert task_state.target_artifacts[0].path == "smoke_status_note.txt"
+    assert artifact_roles["smoke_status_note.txt"] == "primary_target"
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_name == "smoke_status_note.txt"
+    assert route.entities.target_paths[0] == "smoke_status_note.txt"
 
 
 def test_task_state_updater_falls_back_when_model_payload_is_invalid(tmp_path):

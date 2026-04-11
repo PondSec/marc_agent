@@ -34,6 +34,7 @@ from agent.prompts import (
     _direct_main_runtime_contract,
     _direct_python_script_runtime_contract,
     _artifact_scoped_focus,
+    final_response_prompt,
     _repair_target_line_hints,
     _repair_required_literal_anchors,
     _split_requirement_clauses,
@@ -333,6 +334,7 @@ def route_payload(
     repo_context_needed=True,
     target_name=None,
     search_terms=None,
+    requested_outcome=None,
 ):
     return {
         "user_goal": "Handle the user request safely.",
@@ -344,7 +346,7 @@ def route_payload(
             "attributes": [],
             "constraints": [],
         },
-        "requested_outcome": "Produce the requested result.",
+        "requested_outcome": requested_outcome or "Produce the requested result.",
         "action_plan": action_plan,
         "needs_clarification": needs_clarification,
         "clarification_questions": clarification_questions or [],
@@ -464,6 +466,62 @@ def test_planner_returns_direct_response_from_router(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert "lokaler Agent" in (decision.final_response or "")
+
+
+def test_planner_generates_freeform_answer_for_conversation_route_without_hardcoded_direct_response(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="explain",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "respond_directly",
+                        "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                    }
+                ],
+                direct_response=None,
+                repo_context_needed=False,
+                requested_outcome="Answer the user's normal conversation directly without repository work.",
+            )
+        ],
+        text_payloads=["Ein Hamburger ist ein warmes Sandwich mit einem Bratling in einem aufgeschnittenen Broetchen."],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(task="weißt du was ein Hamburger ist?", workspace_root=str(tmp_path))
+    commit_task_state_and_route(planner, session, payload)
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Hamburger" in (decision.final_response or "")
+    assert llm.generate_calls
+
+
+def test_final_response_prompt_keeps_conversation_answer_grounded_on_latest_message(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="explain",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "respond_directly",
+                    "reason": "This is normal conversation and does not require repository inspection or tool execution.",
+                }
+            ],
+            direct_response=None,
+            repo_context_needed=False,
+            requested_outcome="Answer the user's normal conversation directly without repository work.",
+        )
+    )
+    session = SessionState(task="und was kannst du hier machen?", workspace_root=str(tmp_path))
+
+    prompt = final_response_prompt(route, session)
+
+    assert "answer that question, not a different greeting or a prior turn" in prompt
+    assert "If you are unsure about a fact" in prompt
+    assert '"und was kannst du hier machen?"' in prompt
 
 
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
@@ -800,12 +858,87 @@ def test_small_single_model_semantic_review_uses_compact_primary_attempt_for_sim
 
     assert len(llm.generate_json_calls) == 1
     assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
-    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is True
-    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 35
-    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 120
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 210
     assert llm.generate_json_calls[0]["kwargs"]["num_ctx"] == 2048
     assert session.validation_runs[-1].verification_scope == "semantic"
     assert session.validation_runs[-1].status == "passed"
+
+
+def test_small_single_model_semantic_review_uses_extended_full_followup_after_compact_start_failure(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "run_validation", "reason": "Validate the result."},
+            {"step": 3, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_03.txt"],
+        target_name="smoke_live_run_03.txt",
+    )
+    session = SessionState(
+        task="Create smoke_live_run_03.txt with a short smoke-test status note.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_03.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_03.txt").write_text("smoke test ready\n", encoding="utf-8")
+
+    safe_review = {
+        "requirements_satisfied": True,
+        "summary": "The changed artifact satisfies the explicit request.",
+        "confidence": 0.82,
+        "missing_requirements": [],
+        "suspicious_issues": [],
+        "file_hints": [],
+        "repair_hints": [],
+    }
+
+    def fake_generate_json(*args, **kwargs):
+        llm.generate_json_calls.append({"args": args, "kwargs": kwargs})
+        if len(llm.generate_json_calls) == 1:
+            raise OllamaGenerationError(
+                "timed out waiting for the model to start streaming after 80.0 seconds",
+                reason="startup_timeout",
+                elapsed=80.0,
+                idle_for=80.0,
+                retryable=True,
+                model_name=kwargs.get("model"),
+                startup_timeout_seconds=80,
+                inactivity_timeout_seconds=60,
+                total_timeout_seconds=210,
+                first_output_received=False,
+            )
+        return safe_review
+
+    llm.generate_json = fake_generate_json
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert len(llm.generate_json_calls) == 2
+    assert llm.generate_json_calls[0]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[0]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[0]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[0]["kwargs"]["total_timeout"] >= 210
+    assert llm.generate_json_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_json_calls[1]["kwargs"]["strict_timeouts"] is False
+    assert llm.generate_json_calls[1]["kwargs"]["timeout"] >= 60
+    assert llm.generate_json_calls[1]["kwargs"]["total_timeout"] >= 180
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "passed"
+    assert session.runtime_executions[-1]["recovery_strategy"] == "primary_model_generation"
 
 
 def test_explicit_create_constraint_review_blocks_exact_text_line_mismatch(tmp_path):
@@ -930,6 +1063,47 @@ def test_generate_file_content_uses_deterministic_exact_text_contract_for_create
     assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_contract"
 
 
+def test_generate_file_content_uses_deterministic_exact_text_contract_for_two_line_conjunction_request(
+    tmp_path,
+):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+        ],
+        target_paths=["smoke_alpha.txt"],
+        target_name="smoke_alpha.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_alpha.txt mit genau zwei Zeilen: "
+            "alpha und beta. Aendere sonst nichts."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    generation = planner._generate_file_content(
+        session.router_result,
+        session,
+        path="smoke_alpha.txt",
+        current_content=None,
+    )
+
+    assert generation.content == "alpha\nbeta"
+    assert generation.source == "deterministic_exact_text_contract"
+    assert llm.generate_calls == []
+
+
 def test_retry_update_after_review_failure_uses_deterministic_exact_text_contract(tmp_path):
     llm = ScriptedLLM(
         config=AppConfig(
@@ -1019,6 +1193,46 @@ def test_planner_deterministic_exact_text_create_review_flags_mismatched_lines(t
     assert session.validation_runs[-1].status == "failed"
     assert session.active_repair_context is not None
     assert "trailing whitespace" in (session.active_repair_context.failure_summary or "").lower()
+
+
+def test_planner_deterministic_exact_text_create_review_handles_two_line_conjunction_request(tmp_path):
+    llm = ScriptedLLM(
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        )
+    )
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested artifact."},
+            {"step": 2, "action": "summarize_result", "reason": "Summarize honestly."},
+        ],
+        target_paths=["smoke_live_run_02.txt"],
+        target_name="smoke_live_run_02.txt",
+    )
+    session = SessionState(
+        task=(
+            "Erstelle smoke_live_run_02.txt mit genau zwei Zeilen: "
+            "alpha und beta. Aendere sonst nichts."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        changed_files=[FileChangeRecord(path="smoke_live_run_02.txt", operation="create")],
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "smoke_live_run_02.txt").write_text("alpha  \nbeta", encoding="utf-8")
+
+    planner._run_semantic_change_review(session.router_result, session)
+
+    assert llm.generate_json_calls == []
+    assert session.validation_runs[-1].verification_scope == "semantic"
+    assert session.validation_runs[-1].status == "failed"
+    assert session.active_repair_context is not None
+    assert "trailing whitespace" in (session.active_repair_context.failure_summary or "").lower()
+    assert session.runtime_executions[-1]["recovery_strategy"] == "deterministic_exact_text_create_review"
 
 
 def test_semantic_change_review_rejects_unbound_web_contracts_before_model_review(tmp_path):
@@ -4737,6 +4951,108 @@ def test_generate_content_prompt_surfaces_cross_file_import_consistency_requirem
     assert "File-local requirements:" in prompt
     assert "normalize_words_keep_case" in prompt
     assert "texttools/normalize.py" in prompt
+
+
+def test_generate_content_prompt_adds_copy_grounding_rule_for_html_surfaces(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = empty_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["Index.html"],
+            "important_files": ["Index.html", "script.js", "styles.css"],
+            "focus_files": ["Index.html", "script.js", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+        }
+    )
+    session = SessionState(
+        task=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["Index.html", "script.js", "styles.css"],
+        target_name="Index.html",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="Index.html",
+        mode="compact",
+    )
+
+    assert "Ground any user-facing copy in the request and inspected context." in prompt
+    assert "Do not invent concrete facts, historical claims" in prompt
+
+
+def test_generate_content_prompt_adds_copy_grounding_rule_for_web_repair_scripts(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    script_path = tmp_path / "script.js"
+    script_path.write_text(
+        "document.addEventListener('DOMContentLoaded', () => {});\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Index.html").write_text("<!doctype html><title>Demo</title>\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: sans-serif; }\n", encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["Index.html"],
+            "important_files": ["Index.html", "script.js", "styles.css"],
+            "focus_files": ["script.js", "Index.html", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+        }
+    )
+    session = SessionState(
+        task="Aktualisiere die Website und korrigiere den Inhalt in allen drei Webdateien.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the website copy."}],
+        target_paths=["Index.html", "script.js", "styles.css"],
+        target_name="script.js",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    repair_context = ValidationFailureEvidence(
+        command='internal:semantic_review:[{"path":"Index.html"},{"path":"script.js"},{"path":"styles.css"}]',
+        verification_scope="semantic",
+        summary="The generated web copy is not yet reliable.",
+        failure_summary="The generated web copy is not yet reliable.",
+        file_hints=["Index.html", "script.js", "styles.css"],
+        repair_requirements=[
+            "Refresh the generated copy so it stays grounded in the requested website topic.",
+        ],
+        repair_brief=RepairBrief(
+            failure_type="semantic_gap",
+            failure_signature="semantic:web-copy-grounding",
+            primary_target="script.js",
+            locked_target="script.js",
+            repair_constraints=["Keep the update local to script.js."],
+            allowed_files=["script.js", "Index.html", "styles.css"],
+            forbidden_files=[],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=script_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Ground any user-facing copy in the request and inspected context." in prompt
+    assert "If the facts are not given, keep the wording generic" in prompt
 
 
 def test_artifact_scoped_focus_adds_test_contract_requirement_for_python_module(tmp_path):
@@ -20238,6 +20554,109 @@ def test_pre_write_update_review_tells_html_repairs_to_remove_unconsumed_id_hook
     assert any("remove" in hint.lower() and "theme-switcher" in hint for hint in review.repair_hints)
 
 
+def test_pre_write_update_review_allows_semantic_section_ids_without_sibling_consumers(
+    tmp_path,
+    monkeypatch,
+):
+    current_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main>\n"
+        "      <section>\n"
+        "        <h1>Hamburger</h1>\n"
+        "      </section>\n"
+        "    </main>\n"
+        "    <script src=\"script.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    proposed_content = (
+        "<!doctype html>\n"
+        "<html lang=\"de\">\n"
+        "  <body>\n"
+        "    <main>\n"
+        "      <section id=\"history\">\n"
+        "        <h1>Hamburger</h1>\n"
+        "        <p>Geschichte und Zubereitung.</p>\n"
+        "      </section>\n"
+        "    </main>\n"
+        "    <script src=\"script.js\"></script>\n"
+        "  </body>\n"
+        "</html>\n"
+    )
+    (tmp_path / "Index.html").write_text(current_content, encoding="utf-8")
+    (tmp_path / "script.js").write_text("console.log('ready');\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("section { padding: 1rem; }\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Hamburger-Website.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["Index.html", "script.js", "styles.css"],
+            focus_files=["Index.html", "script.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="Index.html", operation="modify"),
+            FileChangeRecord(path="script.js", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the existing web copy."}],
+            target_paths=["Index.html", "script.js", "styles.css"],
+            target_name="Index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+    monkeypatch.setattr(
+        planner,
+        "_review_generated_update",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="The proposal stays focused and preserves the current behavior.",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    review = planner._pre_write_update_review(
+        session.router_result,
+        session,
+        path="Index.html",
+        current_content=current_content,
+        proposed_content=proposed_content,
+        repair_context=None,
+    )
+
+    assert review.safe_to_write is True
+    assert "cross-file web contract" not in review.summary.lower()
+
+
 def test_compact_retry_prompt_includes_orphan_hook_removal_direction_for_html_repairs(tmp_path):
     current_content = (
         "<!doctype html>\n"
@@ -20525,6 +20944,74 @@ def test_semantic_review_failure_evidence_keeps_file_local_web_contract_repair_d
         "remove or rename the unconsumed id hook 'theme-switcher'" in item
         for item in session.active_repair_context.repair_requirements
     )
+
+
+def test_semantic_web_contract_review_allows_semantic_section_ids_without_sibling_consumers(tmp_path):
+    (tmp_path / "Index.html").write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main>\n"
+            "      <section id=\"history\">\n"
+            "        <h1>Hamburger</h1>\n"
+            "      </section>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "script.js").write_text("console.log('ready');\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("section { padding: 1rem; }\n", encoding="utf-8")
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Aktualisiere die bestehende kleine Hamburger-Website.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=3,
+            language_counts={"html": 1, "javascript": 1, "css": 1},
+            top_directories=[],
+            important_files=["Index.html", "script.js", "styles.css"],
+            focus_files=["Index.html", "script.js", "styles.css"],
+            file_briefs={},
+            manifests=[],
+            configs=[],
+            test_files=[],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=[],
+            repo_map=[],
+            project_labels=["web"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Small multi-file web workspace.",
+        ),
+        changed_files=[
+            FileChangeRecord(path="Index.html", operation="modify"),
+            FileChangeRecord(path="script.js", operation="modify"),
+            FileChangeRecord(path="styles.css", operation="modify"),
+        ],
+    )
+    commit_task_state_and_route(
+        planner,
+        session,
+        route_payload(
+            intent="update",
+            action_plan=[{"step": 1, "action": "update_artifact", "reason": "Refresh the existing web copy."}],
+            target_paths=["Index.html", "script.js", "styles.css"],
+            target_name="Index.html",
+        ),
+        verification_target="Verify the generated web artifact.",
+    )
+
+    review = planner._semantic_web_contract_review(session)
+
+    assert review is None
 
 
 def test_pre_write_update_review_rejects_launcher_style_direct_main_argv_indexing(
@@ -23280,6 +23767,32 @@ def test_generation_recovery_model_name_uses_live_inventory_for_single_model_run
         "",
     )
 
+    assert planner._generation_recovery_model_name() == "qwen3:8b"
+
+
+def test_generation_model_names_resolve_missing_large_configured_models_against_live_inventory(tmp_path):
+    class InventoryLLM(ScriptedLLM):
+        def list_models_safe(self):
+            return [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen3:8b"},
+                {"name": "qwen3:14b"},
+            ]
+
+    planner = Planner(
+        InventoryLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:14b",
+                router_model_name="qwen2.5-coder:14b",
+                model_candidates=("qwen2.5-coder:14b", "qwen2.5-coder:7b", "qwen3:8b"),
+            )
+        ),
+        "",
+    )
+
+    assert planner._primary_generation_model_name() == "qwen2.5-coder:7b"
+    assert planner._lightweight_generation_model_name() is None
     assert planner._generation_recovery_model_name() == "qwen3:8b"
 
 
@@ -26442,6 +26955,73 @@ def test_planner_preserves_explicit_primary_markdown_create_target_over_validati
     }
     assert planner._ordered_create_targets(session.router_result, session) == ["docs/repo-map.md"]
     assert planner._choose_create_path(session.router_result, session) == "docs/repo-map.md"
+
+
+def test_planner_continues_named_create_paths_before_validating_first_web_file(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            text_payloads=["document.addEventListener('DOMContentLoaded', () => {});\n"],
+        ),
+        "",
+    )
+    session = SessionState(
+        task=(
+            "Programmiere mir eine Website über Hamburger. Dazu erstellst du eine Index.html, "
+            "eine script.js und eine styles.css."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+        validation_plan=[
+            ValidationCommand(
+                command='internal:web_artifact:[{"path":"Index.html","expected_features":[]}]',
+                kind="check",
+                verification_scope="structural",
+            )
+        ],
+        verification_commands=['internal:web_artifact:[{"path":"Index.html","expected_features":[]}]'],
+    )
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Create the requested website files.",
+        active_goal="Create the requested website files.",
+        goal_relation="new_task",
+        output_expectation="A small runnable website with the named files.",
+        current_user_intent="implement",
+        execution_strategy="feature_implementation",
+        open_problem=None,
+        verification_target='internal:web_artifact:[{"path":"Index.html","expected_features":[]}]',
+        target_artifacts=[
+            TaskArtifact(path="Index.html", name="Index.html", kind=".html", role="primary_target", confidence=0.9),
+        ],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.9,
+        next_action="create",
+        next_best_action="create",
+        execution_outline=["Create the requested website files.", "Validate the result."],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    session.router_result = ExecutionDecisionPolicy().build_route(
+        session.task_state,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+    session.changed_files = [FileChangeRecord(path="Index.html", operation="create")]
+
+    assert session.router_result.entities.target_paths == ["Index.html", "script.js", "styles.css"]
+    assert planner._has_pending_explicit_create_targets(session.router_result, session) is True
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "create_file"
+    assert decision.tool_args["path"] == "script.js"
 
 
 def test_planner_does_not_treat_validation_target_as_pending_create_artifact(tmp_path):
