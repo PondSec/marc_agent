@@ -2610,10 +2610,16 @@ class Planner:
 
         locked_target = self._repair_brief_locked_target(repair_context)
         if locked_target and locked_target in candidates:
-            if self._runtime_locked_target_should_yield(session, repair_context, locked_target):
-                remaining = [candidate for candidate in candidates if candidate != locked_target]
-                return [*_order_by_attempt_status(remaining), locked_target]
             remaining = [candidate for candidate in candidates if candidate != locked_target]
+            if self._nonruntime_locked_target_should_yield_after_failed_attempt(
+                repair_context,
+                attempted_results,
+                locked_target=locked_target,
+                remaining_candidates=remaining,
+            ):
+                return [*_order_by_attempt_status(remaining), locked_target]
+            if self._runtime_locked_target_should_yield(session, repair_context, locked_target):
+                return [*_order_by_attempt_status(remaining), locked_target]
             return [locked_target, *_order_by_attempt_status(remaining)]
 
         if repair_context.verification_scope == "runtime":
@@ -2653,6 +2659,27 @@ class Planner:
             return candidates
 
         return _order_by_attempt_status(candidates)
+
+    def _nonruntime_locked_target_should_yield_after_failed_attempt(
+        self,
+        repair_context: ValidationFailureEvidence,
+        attempted_results: dict[str, str],
+        *,
+        locked_target: str | None,
+        remaining_candidates: list[str],
+    ) -> bool:
+        if repair_context.verification_scope == "runtime":
+            return False
+        target = str(locked_target or "").strip()
+        if not target:
+            return False
+        latest_result = str(attempted_results.get(target) or "").strip()
+        if latest_result not in {"generation_failed", "no_effective_change"}:
+            return False
+        return any(
+            candidate and candidate not in attempted_results
+            for candidate in remaining_candidates
+        )
 
     def _recent_runtime_support_repair_target(
         self,
@@ -6918,13 +6945,30 @@ class Planner:
         stop_reason: str,
         repair_context: ValidationFailureEvidence | None,
     ) -> AgentDecision | None:
-        if repair_context is not None or stop_reason not in {
+        if stop_reason not in {
             "update_review_rejected",
             "no_effective_change",
         }:
             return None
         if route.intent != RouteIntent.UPDATE:
             return None
+        if repair_context is not None:
+            alternative_decision = self._alternative_repair_target_decision(
+                route,
+                session,
+                repair_context,
+                current_target=target,
+            )
+            if alternative_decision is None:
+                return None
+            next_target = self._next_update_target(route, session)
+            self._log(
+                "update_target_deferred",
+                path=target,
+                reason=stop_reason,
+                next_target=next_target,
+            )
+            return alternative_decision
 
         deferred_targets = self._deferred_update_targets(session)
         if target in deferred_targets:

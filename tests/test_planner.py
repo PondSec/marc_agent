@@ -525,6 +525,77 @@ def test_final_response_prompt_keeps_conversation_answer_grounded_on_latest_mess
     assert '"und was kannst du hier machen?"' in prompt
 
 
+def test_final_response_prompt_includes_read_evidence_for_explain_runs(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="explain",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "read_relevant_files",
+                    "reason": "Read the referenced artifacts before explaining them.",
+                }
+            ],
+            requested_outcome="Summarize the observed files and technologies in the project.",
+        )
+    )
+    session = SessionState(
+        task="Lies das Projekt und nenne kurz Dateien und Technologien.",
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="Lies das Projekt und nenne kurz Dateien und Technologien.",
+            root_goal="Summarize the observed files and technologies in the project.",
+            active_goal="Summarize the observed files and technologies in the project.",
+            goal_relation="new_task",
+            output_expectation="A concise summary of the observed files and technologies.",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.95,
+            next_action="explain",
+            execution_outline=[],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "README.md"},
+                success=True,
+                summary="Read README.md.",
+                phase="exploring",
+                output_excerpt="# Demo Project\n\nA tiny Python CLI utility.\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "app.py"},
+                success=True,
+                summary="Read app.py.",
+                phase="exploring",
+                output_excerpt="import argparse\n\nprint('hello')\n",
+            ),
+        ]
+    )
+
+    prompt = final_response_prompt(route, session)
+
+    assert '"inspected_files": ["README.md", "app.py"]' in prompt
+    assert '"path": "README.md"' in prompt
+    assert "A tiny Python CLI utility." in prompt
+    assert "Do not merely say that you inspected or summarized files" in prompt
+
+
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -6485,6 +6556,175 @@ def test_planner_defers_review_blocked_target_and_continues_then_validates(tmp_p
     assert second_decision.action_type == AgentActionType.CALL_TOOL
     assert second_decision.tool_name == "run_tests"
     assert second_decision.tool_args["command"] == "python -m unittest tests.test_cli"
+
+
+def test_planner_pivots_to_unattempted_repair_file_after_review_rejected_locked_web_target(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><html><body><button>Open</button><script src='script.js'></script></body></html>\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "script.js").write_text("console.log('ready');\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: sans-serif; }\n", encoding="utf-8")
+
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=3,
+        language_counts={"html": 1, "javascript": 1, "css": 1},
+        top_directories=[],
+        important_files=["index.html", "script.js", "styles.css"],
+        focus_files=["index.html", "script.js", "styles.css"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["index.html"],
+        repo_map=[],
+        project_labels=["web"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small multi-file web workspace.",
+    )
+
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Repair the missing dialog behavior in the small web app.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+        validation_status="failed",
+        edit_generation=1,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "read_relevant_files",
+                "reason": "Inspect the implicated files before repairing them.",
+            },
+            {
+                "step": 2,
+                "action": "update_artifact",
+                "reason": "Repair the failed structural validation.",
+            },
+            {
+                "step": 3,
+                "action": "run_validation",
+                "reason": "Verify the repaired web artifact.",
+            },
+        ],
+        target_paths=["index.html", "script.js", "styles.css"],
+        target_name="index.html",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.changed_files.extend(
+        [
+            FileChangeRecord(path="index.html", operation="write"),
+            FileChangeRecord(path="script.js", operation="write"),
+            FileChangeRecord(path="styles.css", operation="write"),
+        ]
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Read index.html.",
+                output_excerpt=(tmp_path / "index.html").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "script.js"},
+                success=True,
+                summary="Read script.js.",
+                output_excerpt=(tmp_path / "script.js").read_text(encoding="utf-8"),
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Read styles.css.",
+                output_excerpt=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+            ),
+        ]
+    )
+    failed_run = ValidationRunRecord(
+        command='internal:web_artifact:[{"path":"index.html","expected_features":["dialog"]}]',
+        kind="check",
+        verification_scope="structural",
+        status="failed",
+        edit_generation=1,
+        summary="Structural web validation failed.",
+        excerpt="index.html: missing expected web features (dialog)",
+    )
+    session.validation_runs.append(failed_run)
+    session.active_repair_context = ValidationFailureEvidence(
+        command=failed_run.command,
+        verification_scope="structural",
+        status="failed",
+        artifact_paths=["index.html", "script.js", "styles.css"],
+        summary=failed_run.summary,
+        excerpt=failed_run.excerpt,
+        failure_summary="index.html is missing validation-required behavior or structure: dialog.",
+        expected_features=["dialog"],
+        missing_features=["dialog"],
+        file_hints=["index.html", "script.js", "styles.css"],
+        repair_requirements=[
+            "Repair the missing dialog behavior across the implicated web files.",
+        ],
+        evidence_signature="structural:web-dialog",
+        repair_brief=RepairBrief(
+            failure_type="structural_missing_feature",
+            failure_signature="structural:web-dialog",
+            primary_target="index.html",
+            locked_target="index.html",
+            repair_constraints=["Keep the repair aligned to the failed dialog validation."],
+            allowed_files=["index.html", "script.js", "styles.css"],
+            forbidden_files=[],
+        ),
+    )
+
+    def fake_generate(route, active_session, *, path, current_content=None, repair_context=None, repair_strategy=None):
+        assert route.intent == RouteIntent.UPDATE
+        assert active_session is session
+        assert repair_context is session.active_repair_context
+        del current_content, repair_strategy
+        if path == "index.html":
+            return ContentGenerationResult(
+                source="failed",
+                failure=ContentGenerationFailure(
+                    stop_reason="update_review_rejected",
+                    failure_class="update_review_rejected",
+                    blocker_message="Pre-write review rejected the proposed update for index.html.",
+                    user_message="Blocked until a narrower mutation is available.",
+                ),
+            )
+        if path == "script.js":
+            return ContentGenerationResult(content="document.getElementById('info-dialog')?.showModal();\n")
+        if path == "styles.css":
+            return ContentGenerationResult(content="dialog { border: none; }\n")
+        raise AssertionError(path)
+
+    monkeypatch.setattr(planner, "_generate_file_content", fake_generate)
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.CALL_TOOL
+    assert decision.tool_name == "write_file"
+    assert decision.tool_args["path"] in {"script.js", "styles.css"}
+    assert decision.tool_args["path"] != "index.html"
+    assert session.stop_reason is None
+    assert session.blockers == []
+    assert any(
+        attempt.artifact_path == "index.html" and attempt.result == "generation_failed"
+        for attempt in session.repair_history
+    )
 
 
 def test_planner_marks_generation_failure_honestly_before_any_validation(tmp_path):
