@@ -20,7 +20,14 @@ from config.settings import AccessMode, AppConfig
 from runtime.logger import AgentLogger
 from runtime.workspace import WorkspaceError, WorkspaceManager
 from server.git_integration import GitIntegrationError, GitWorkspaceService
-from server.schemas import LogRecord, SessionSummary, WorkspaceInspectResponse
+from server.schemas import (
+    LogRecord,
+    SessionSummary,
+    WorkspaceFileContentResponse,
+    WorkspaceInspectResponse,
+    WorkspaceTreeNode,
+    WorkspaceTreeResponse,
+)
 from server.workspace_store import WorkspaceStore
 
 
@@ -80,6 +87,9 @@ class WorkspacePreviewTarget:
 
 
 class TaskManager:
+    WORKSPACE_BROWSER_MAX_FILES = 5_000
+    WORKSPACE_BROWSER_MAX_CHARS = 200_000
+
     def __init__(self, base_config: AppConfig):
         self.base_config = base_config
         self.base_config.ensure_state_dirs()
@@ -465,6 +475,94 @@ class TaskManager:
         return WorkspaceInspectResponse(
             text=agent.memory.render_snapshot(snapshot),
             snapshot=snapshot.model_dump(),
+        )
+
+    def workspace_file_tree(self, workspace_id: str) -> WorkspaceTreeResponse:
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError("Workspace not found.")
+
+        manager = WorkspaceManager(workspace.path)
+        files = manager.iter_files(max_results=self.WORKSPACE_BROWSER_MAX_FILES + 1)
+        truncated = len(files) > self.WORKSPACE_BROWSER_MAX_FILES
+        if truncated:
+            files = files[: self.WORKSPACE_BROWSER_MAX_FILES]
+
+        root: dict[str, dict[str, Any]] = {}
+        for candidate in files:
+            display_path = manager.display_path(candidate)
+            if manager.should_ignore(display_path):
+                continue
+            parts = [part for part in Path(display_path).parts if part]
+            if not parts:
+                continue
+            cursor = root
+            current_parts: list[str] = []
+            for index, part in enumerate(parts):
+                current_parts.append(part)
+                node_path = "/".join(current_parts)
+                is_file = index == len(parts) - 1
+                existing = cursor.get(part)
+                if existing is None:
+                    existing = {
+                        "name": part,
+                        "path": node_path,
+                        "kind": "file" if is_file else "directory",
+                        "children": {},
+                    }
+                    cursor[part] = existing
+                if not is_file:
+                    existing["kind"] = "directory"
+                    cursor = existing["children"]
+
+        return WorkspaceTreeResponse(
+            workspace_id=workspace.id,
+            workspace_name=workspace.name,
+            workspace_path=workspace.path,
+            entries=self._serialize_workspace_tree(root),
+            file_count=len(files),
+            truncated=truncated,
+        )
+
+    def read_workspace_file(self, workspace_id: str, path: str) -> WorkspaceFileContentResponse:
+        workspace = self.workspace_store.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError("Workspace not found.")
+
+        manager = WorkspaceManager(workspace.path)
+        try:
+            target = manager.resolve_path(path)
+        except WorkspaceError as exc:
+            raise WorkspaceOperationError(str(exc)) from exc
+        if not target.exists() or not target.is_file():
+            raise WorkspaceOperationError("Workspace file not found.")
+
+        display_path = manager.display_path(target)
+        if manager.should_ignore(display_path):
+            raise WorkspaceOperationError("This path is not available in the workspace browser.")
+
+        data = target.read_bytes()
+        if b"\x00" in data[:8192]:
+            raise WorkspaceOperationError("Binary files are not shown in the workspace browser.")
+
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("utf-8", errors="replace")
+
+        truncated = False
+        if len(text) > self.WORKSPACE_BROWSER_MAX_CHARS:
+            text = text[: self.WORKSPACE_BROWSER_MAX_CHARS]
+            truncated = True
+
+        return WorkspaceFileContentResponse(
+            workspace_id=workspace.id,
+            workspace_name=workspace.name,
+            workspace_path=workspace.path,
+            path=display_path,
+            content=text,
+            truncated=truncated,
+            size_bytes=len(data),
         )
 
     def list_workspaces(self):
@@ -1016,6 +1114,24 @@ class TaskManager:
                 )
             raise WorkspaceNotFoundError("Workspace not found.")
         return None
+
+    def _serialize_workspace_tree(self, nodes: dict[str, dict[str, Any]]) -> list[WorkspaceTreeNode]:
+        serialized: list[WorkspaceTreeNode] = []
+        ordered = sorted(
+            nodes.values(),
+            key=lambda item: (0 if item["kind"] == "directory" else 1, str(item["name"]).lower()),
+        )
+        for item in ordered:
+            children = self._serialize_workspace_tree(item["children"]) if item["kind"] == "directory" else []
+            serialized.append(
+                WorkspaceTreeNode(
+                    name=str(item["name"]),
+                    path=str(item["path"]),
+                    kind=str(item["kind"]),
+                    children=children,
+                )
+            )
+        return serialized
 
     def _derive_title(self, prompt: str) -> str:
         cleaned = " ".join(str(prompt or "").split()).strip()
