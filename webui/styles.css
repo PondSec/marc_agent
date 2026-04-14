@@ -10662,3 +10662,149 @@ body {
   box-shadow: inset 2px 0 0 #80ef80;
   background: rgba(128, 239, 128, 0.08);
 }
+
+.thread-running-indicator {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 14px;
+}
+
+.thread-running-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(217, 221, 227, 0.22);
+  border-top-color: rgba(234, 238, 244, 0.72);
+  border-right-color: rgba(234, 238, 244, 0.34);
+  border-radius: 999px;
+  animation: thread-running-spin 880ms linear infinite;
+}
+
+.thread-history-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0 14px;
+  border: 0;
+  background: transparent;
+  color: rgba(207, 214, 225, 0.62);
+  text-align: left;
+  cursor: pointer;
+}
+
+.thread-history-toggle:hover {
+  color: rgba(233, 238, 245, 0.88);
+}
+
+.thread-history-toggle-label {
+  font-size: 14px;
+  font-weight: 560;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.thread-history-toggle-line {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.thread-history-toggle-icon {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  transition: transform 160ms ease;
+}
+
+.thread-history-toggle.expanded .thread-history-toggle-icon {
+  transform: rotate(90deg);
+}
+
+.thread-live-thought-card {
+  display: grid;
+  gap: 12px;
+  margin: 10px 0 18px;
+  padding: 18px 20px;
+  border: 1px solid rgba(231, 239, 248, 0.06);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.thread-live-thought-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.thread-live-thought-kicker,
+.thread-live-thought-meta {
+  color: rgba(190, 200, 214, 0.56);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.thread-live-thought-copy {
+  margin: 0;
+  color: rgba(241, 245, 250, 0.94);
+  font-size: clamp(18px, 1.75vw, 22px);
+  font-weight: 560;
+  line-height: 1.5;
+}
+
+.shiny-text {
+  display: inline;
+  color: transparent;
+  background-image: linear-gradient(
+    115deg,
+    var(--shiny-color, rgba(223, 229, 237, 0.78)) 0%,
+    var(--shiny-color, rgba(223, 229, 237, 0.78)) 35%,
+    var(--shiny-highlight, #ffffff) 50%,
+    var(--shiny-color, rgba(223, 229, 237, 0.78)) 65%,
+    var(--shiny-color, rgba(223, 229, 237, 0.78)) 100%
+  );
+  background-size: 220% auto;
+  background-position: 140% 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shiny-text-sweep var(--shiny-speed, 1.8s) linear infinite;
+}
+
+.activity-stream-shiny,
+.composer-shiny-text,
+.thread-live-step-shiny,
+.thread-live-phase-shiny {
+  line-height: inherit;
+}
+
+@keyframes thread-running-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes shiny-text-sweep {
+  0% {
+    background-position: 140% 50%;
+  }
+  100% {
+    background-position: -60% 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-running-spinner,
+  .shiny-text {
+    animation: none;
+  }
+}
