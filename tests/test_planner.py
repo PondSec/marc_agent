@@ -593,7 +593,8 @@ def test_final_response_prompt_includes_read_evidence_for_explain_runs(tmp_path)
     assert '"inspected_files": ["README.md", "app.py"]' in prompt
     assert '"path": "README.md"' in prompt
     assert "A tiny Python CLI utility." in prompt
-    assert "Do not merely say that you inspected or summarized files" in prompt
+    assert "Antworte auf Deutsch." in prompt
+    assert "Erzaehle nicht den Arbeitsablauf nach" in prompt
 
 
 def test_final_response_prompt_uses_focused_grounding_rules_for_read_only_file_explanations(tmp_path):
@@ -629,18 +630,25 @@ def test_final_response_prompt_uses_focused_grounding_rules_for_read_only_file_e
             success=True,
             summary="Read app.py.",
             phase="exploring",
-            output_excerpt="from flask import Flask\nfrom flask_cors import CORS\n",
+            output_excerpt=(
+                "from flask import Flask\n"
+                "from flask_cors import CORS\n"
+                "import sqlite3\n"
+                "DATABASE = 'inventory.db'\n"
+            ),
         )
     )
 
     prompt = final_response_prompt(route, session)
 
-    assert "Match the language of the user's latest message." in prompt
-    assert "Do not speculate about frameworks, routes, database layers" in prompt
+    assert "Antworte auf Deutsch." in prompt
+    assert "Spekuliere nicht ueber Framework-Details, Routen, Datenbanklogik" in prompt
     assert '"target_paths": ["app.py"]' in prompt
     assert '"inspection_evidence": [{"path": "app.py"' in prompt
+    assert "import sqlite3" in prompt
+    assert "DATABASE = 'inventory.db'" in prompt
     assert '"memory_context"' not in prompt
-    assert "generic repository overview" in prompt
+    assert "generischen Repository-Ueberblick" in prompt
 
 
 def test_final_response_num_ctx_scales_with_prompt_size(tmp_path):
