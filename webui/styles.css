@@ -10727,6 +10727,92 @@ body {
   transform: rotate(90deg);
 }
 
+.thread-run-history {
+  display: grid;
+  gap: 10px;
+  margin: 4px 0 20px;
+}
+
+.thread-run-history-live {
+  gap: 14px;
+  margin-top: 6px;
+}
+
+.thread-run-history-toggle {
+  padding-top: 2px;
+  padding-bottom: 10px;
+}
+
+.thread-run-history-toggle .thread-history-toggle-label {
+  font-size: 17px;
+  font-weight: 520;
+  color: rgba(233, 238, 245, 0.78);
+}
+
+.thread-run-history-list {
+  display: grid;
+  gap: 14px;
+}
+
+.thread-run-feed-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 16px;
+}
+
+.thread-run-feed-entry.active {
+  align-items: center;
+}
+
+.thread-run-feed-copy {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.thread-run-feed-text,
+.thread-run-feed-detail {
+  margin: 0;
+}
+
+.thread-run-feed-text {
+  color: rgba(241, 245, 250, 0.94);
+  font-size: clamp(20px, 1.9vw, 24px);
+  font-weight: 520;
+  line-height: 1.45;
+}
+
+.thread-run-feed-entry:not(.active) .thread-run-feed-text {
+  font-size: 15px;
+  font-weight: 480;
+  color: rgba(232, 237, 244, 0.88);
+}
+
+.thread-run-feed-detail {
+  color: rgba(184, 194, 208, 0.6);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.thread-run-feed-entry.active .thread-run-feed-detail {
+  color: rgba(202, 211, 223, 0.64);
+}
+
+.thread-run-feed-time {
+  color: rgba(180, 190, 204, 0.48);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding-top: 7px;
+}
+
+.thread-run-feed-entry.active .thread-run-feed-time {
+  padding-top: 4px;
+}
+
 .thread-live-thought-card {
   display: grid;
   gap: 12px;

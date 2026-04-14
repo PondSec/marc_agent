@@ -6,6 +6,7 @@ const {
   buildConversationWindow,
   buildReferenceHeroView,
   buildRuntimeStatusItems,
+  buildThreadRunFeed,
   buildThreadPresentationView,
   buildUiRoute,
   buildWorkspaceShellView,
@@ -149,6 +150,66 @@ test("buildConversationWindow laesst bei fertigen Threads nur die letzte Frage u
   assert.equal(window.visible.length, 2);
   assert.equal(window.visible[0].message.content, "letzte Frage");
   assert.equal(window.visible[1].message.content, "letzte Antwort");
+});
+
+test("buildConversationWindow trennt letzte Nutzerfrage und letzte Antwort fuer den Arbeitsverlauf", () => {
+  const entries = [
+    { type: "message", message: { role: "user", content: "alt 1" } },
+    { type: "message", message: { role: "assistant", content: "alt 2" } },
+    { type: "message", message: { role: "user", content: "letzte Frage" } },
+    { type: "message", message: { role: "assistant", content: "letzte Antwort" } },
+  ];
+
+  const window = buildConversationWindow(entries, { running: false });
+
+  assert.equal(window.leading.length, 1);
+  assert.equal(window.leading[0].message.content, "letzte Frage");
+  assert.equal(window.trailing.length, 1);
+  assert.equal(window.trailing[0].message.content, "letzte Antwort");
+});
+
+test("buildThreadRunFeed zeigt abgeschlossene Schritte schlicht und nur den letzten aktiven Schritt shiny-faehig", () => {
+  const session = makeSession({
+    status: "running",
+    current_phase: "editing",
+    updated_at: "2026-04-14T20:44:10.000Z",
+  });
+  const logs = [
+    {
+      timestamp: "2026-04-14T20:44:00.000Z",
+      event: "task_started",
+      payload: { task: "UI fixen" },
+    },
+    {
+      timestamp: "2026-04-14T20:44:02.000Z",
+      event: "decision",
+      payload: { thought_summary: "Ich analysiere jetzt die Thread-Ansicht." },
+    },
+    {
+      timestamp: "2026-04-14T20:44:03.000Z",
+      event: "tool_result",
+      payload: { tool_name: "search_in_files", success: true, message: "3 matches found" },
+    },
+    {
+      timestamp: "2026-04-14T20:44:05.000Z",
+      event: "decision",
+      payload: { thought_summary: "Ich fasse jetzt die eigentlichen Dateien an." },
+    },
+    {
+      timestamp: "2026-04-14T20:44:07.000Z",
+      event: "content_generation_progress",
+      payload: { type: "status", stage: "request_started", path: "webui/app.js" },
+    },
+  ];
+
+  const feed = buildThreadRunFeed(session, logs);
+
+  assert.equal(feed.history.length, 2);
+  assert.match(feed.history[0].text, /analysiere jetzt die thread-ansicht/i);
+  assert.match(feed.history[1].text, /3 Treffer gefunden/i);
+  assert.ok(feed.active);
+  assert.match(feed.active.text, /fasse jetzt die eigentlichen dateien an/i);
+  assert.equal(feed.active.active, true);
 });
 
 test("buildValidationSnapshot hebt fehlgeschlagene Checks klar hervor", () => {

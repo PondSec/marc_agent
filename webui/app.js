@@ -154,6 +154,7 @@ const state = {
       path: null,
     },
     expandedHistory: {},
+    expandedRunHistory: {},
     chatScroll: {
       positions: {},
     },
@@ -430,6 +431,7 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
     blockingSessionId: null,
   };
   state.ui.expandedHistory = {};
+  state.ui.expandedRunHistory = {};
   state.ui.chatScroll.positions = {};
   resetDiffViewer();
   resetChatScrollState();
@@ -631,6 +633,14 @@ async function openSession(sessionId, { updateHistory = true } = {}) {
     state.logs = Array.isArray(logs) ? logs : [];
     state.activeSessionId = session.id;
     state.selectedWorkspaceId = session.workspace_id || state.selectedWorkspaceId;
+    state.ui.expandedHistory = {
+      ...state.ui.expandedHistory,
+      [session.id]: Boolean(state.ui.expandedHistory?.[session.id]),
+    };
+    state.ui.expandedRunHistory = {
+      ...state.ui.expandedRunHistory,
+      [session.id]: Boolean(state.ui.expandedRunHistory?.[session.id]),
+    };
     persistPreferences();
     if (updateHistory) {
       syncHistory(session.id);
@@ -670,6 +680,7 @@ function clearActiveSession() {
   state.activeSessionId = null;
   state.activeSession = null;
   state.logs = [];
+  state.ui.expandedRunHistory = {};
   resetDiffViewer();
   disconnectStream();
   syncHistory(null);
@@ -686,6 +697,10 @@ function primeSubmittedSession(session) {
   state.logs = [];
   state.ui.expandedHistory = {
     ...state.ui.expandedHistory,
+    [session.id]: false,
+  };
+  state.ui.expandedRunHistory = {
+    ...state.ui.expandedRunHistory,
     [session.id]: false,
   };
   syncDiffViewerState(session);
@@ -1704,6 +1719,11 @@ function handleClick(event) {
 
   if (action === "toggle-history") {
     toggleConversationHistory(target.dataset.sessionId);
+    return;
+  }
+
+  if (action === "toggle-run-history") {
+    toggleRunHistory(target.dataset.sessionId);
     return;
   }
 
@@ -4232,22 +4252,18 @@ function renderThreadView(session) {
 }
 
 function renderThreadTranscriptWorkbench(session, presentation, diffFile) {
-  const transcript = renderConversationTimelineWindow(session, presentation);
-  const liveThought = presentation.running ? renderThreadLiveThoughtCard(session, presentation) : "";
-  const transcriptNotes = presentation.running
-    ? ""
-    : buildThreadTranscriptNotes(session, { includeChanges: false }).map(renderTranscriptNote).join("");
-  const dividerLabel =
-    presentation.durationLabel && !presentation.running ? `${presentation.durationLabel} lang gearbeitet` : "";
+  const conversation = renderConversationTimelineWindow(session, presentation);
+  const runFeed = renderThreadRunHistory(session, presentation);
 
   return `
     <div class="thread-transcript-layout ${state.ui.diffViewer.open && diffFile ? "with-review" : ""}">
       <section class="thread-transcript-view">
         <div class="thread-feed thread-feed-transcript">
-          ${transcript}
-          ${liveThought}
-          ${dividerLabel ? renderThreadSessionDivider(dividerLabel) : ""}
-          ${transcriptNotes}
+          ${conversation.leading}
+          ${conversation.toggle}
+          ${conversation.hidden}
+          ${runFeed}
+          ${conversation.trailing}
           ${renderThreadChangeSummaryCard(session, presentation)}
         </div>
       </section>
@@ -4259,34 +4275,39 @@ function renderThreadTranscriptWorkbench(session, presentation, diffFile) {
 function renderConversationTimelineWindow(session, presentation) {
   const timeline = conversationTimeline(session);
   if (!timeline.length) {
-    return renderTranscriptNote({
-      author: "Agent",
-      tone: presentation.overview.tone,
-      timestamp: session.updated_at,
-      title: presentation.overview.title,
-      content: presentation.overview.summary,
-    });
+    return {
+      toggle: "",
+      hidden: "",
+      leading: renderTranscriptNote({
+        author: "Agent",
+        tone: presentation.overview.tone,
+        timestamp: session.updated_at,
+        title: presentation.overview.title,
+        content: presentation.overview.summary,
+      }),
+      trailing: "",
+    };
   }
 
   const expanded = isConversationHistoryExpanded(session.id);
   const messageWindow = buildConversationWindow(timeline, { running: presentation.running });
   const hidden = expanded ? messageWindow.hidden.map((entry) => renderTimelineEntry(entry, session)).join("") : "";
-  const visible = messageWindow.visible.map((entry) => renderTimelineEntry(entry, session)).join("");
   const toggle = messageWindow.hidden.length
     ? renderConversationHistoryToggle(session.id, messageWindow.hidden.length, expanded)
     : "";
 
-  return `
-    ${toggle}
-    ${hidden}
-    ${visible}
-  `;
+  return {
+    toggle,
+    hidden,
+    leading: messageWindow.leading.map((entry) => renderTimelineEntry(entry, session)).join(""),
+    trailing: messageWindow.trailing.map((entry) => renderTimelineEntry(entry, session)).join(""),
+  };
 }
 
 function buildConversationWindow(entries, options = {}) {
   const source = Array.isArray(entries) ? entries.filter(Boolean) : [];
   if (!source.length) {
-    return { hidden: [], visible: [] };
+    return { hidden: [], visible: [], leading: [], trailing: [] };
   }
 
   let visibleCount = 1;
@@ -4296,9 +4317,23 @@ function buildConversationWindow(entries, options = {}) {
   }
 
   visibleCount = Math.max(1, Math.min(source.length, visibleCount));
+  const visible = source.slice(-visibleCount);
+  let leading = visible;
+  let trailing = [];
+
+  if (!options.running) {
+    const latestVisible = visible[visible.length - 1];
+    if (latestVisible?.type === "message" && latestVisible?.message?.role === "assistant") {
+      leading = visible.slice(0, -1);
+      trailing = [latestVisible];
+    }
+  }
+
   return {
     hidden: source.slice(0, -visibleCount),
-    visible: source.slice(-visibleCount),
+    visible,
+    leading,
+    trailing,
   };
 }
 
@@ -4334,12 +4369,101 @@ function toggleConversationHistory(sessionId) {
   renderApp();
 }
 
+function isRunHistoryExpanded(sessionId) {
+  return Boolean(state.ui.expandedRunHistory?.[sessionId]);
+}
+
+function toggleRunHistory(sessionId) {
+  if (!sessionId) {
+    return;
+  }
+  state.ui.expandedRunHistory = {
+    ...state.ui.expandedRunHistory,
+    [sessionId]: !isRunHistoryExpanded(sessionId),
+  };
+  renderApp();
+}
+
 function renderThreadSessionDivider(label) {
   return `
     <div class="thread-session-divider" aria-label="${escapeAttribute(label)}">
       <span></span>
       <strong>${escapeHtml(label)}</strong>
       <span></span>
+    </div>
+  `;
+}
+
+function renderThreadRunHistory(session, presentation) {
+  const runFeed = presentation.runFeed || { history: [], active: null };
+  const history = Array.isArray(runFeed.history) ? runFeed.history : [];
+  const active = runFeed.active || null;
+
+  if (!history.length && !active) {
+    return "";
+  }
+
+  if (presentation.running) {
+    return `
+      <section class="thread-run-history thread-run-history-live">
+        ${history.map((entry) => renderThreadRunFeedEntry(entry)).join("")}
+        ${active ? renderThreadRunFeedEntry(active, { active: true }) : ""}
+      </section>
+    `;
+  }
+
+  if (!history.length) {
+    return "";
+  }
+
+  const expanded = isRunHistoryExpanded(session.id);
+  const label =
+    presentation.durationLabel && String(presentation.durationLabel).trim()
+      ? `${presentation.durationLabel} lang gearbeitet`
+      : countLabel(history.length, "1 Arbeitsschritt", `${history.length} Arbeitsschritte`);
+
+  return `
+    <section class="thread-run-history">
+      ${renderRunHistoryToggle(session.id, label, expanded)}
+      ${expanded ? `<div class="thread-run-history-list">${history.map((entry) => renderThreadRunFeedEntry(entry)).join("")}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderRunHistoryToggle(sessionId, label, expanded) {
+  return `
+    <button
+      class="thread-history-toggle thread-run-history-toggle ${expanded ? "expanded" : ""}"
+      type="button"
+      data-action="toggle-run-history"
+      data-session-id="${escapeAttribute(sessionId)}"
+      aria-expanded="${expanded ? "true" : "false"}"
+    >
+      <span class="thread-history-toggle-label">${escapeHtml(label)}</span>
+      <span class="thread-history-toggle-icon" aria-hidden="true">${icon("chevron-right")}</span>
+      <span class="thread-history-toggle-line" aria-hidden="true"></span>
+    </button>
+  `;
+}
+
+function renderThreadRunFeedEntry(entry, options = {}) {
+  if (!entry || !String(entry.text || "").trim()) {
+    return "";
+  }
+  const tone = String(entry.tone || "muted");
+  const isActive = Boolean(options.active || entry.active);
+  const text = String(entry.text || "").trim();
+  const detail = String(entry.detail || entry.meta || "").trim();
+  const timestamp = entry.timestamp ? formatTime(entry.timestamp) : "";
+  const textMarkup = isActive ? renderShinyText(text, "thread-live-step-shiny", { speed: 2.15 }) : escapeHtml(text);
+
+  return `
+    <div class="thread-run-feed-entry tone-${escapeHtml(tone)} ${isActive ? "active" : ""}">
+      <div class="thread-run-feed-copy">
+        <p class="thread-run-feed-text">${textMarkup}</p>
+        ${detail ? `<p class="thread-run-feed-detail">${escapeHtml(detail)}</p>` : ""}
+      </div>
+      ${timestamp ? `<span class="thread-run-feed-time">${escapeHtml(timestamp)}</span>` : ""}
     </div>
   `;
 }
@@ -6700,6 +6824,7 @@ function buildThreadPresentationView(session, logs) {
     validation: buildValidationSnapshot(session),
     changes: Array.isArray(session?.changed_files) ? session.changed_files : [],
     activity: buildActivityClusters(session, logs).slice(0, 6),
+    runFeed: buildThreadRunFeed(session, logs),
     highlights: buildRunHighlights(session),
   };
 }
@@ -6887,6 +7012,162 @@ function buildActivityClusters(session, logs) {
   }
 
   return clusters.slice(-12).reverse();
+}
+
+function buildThreadRunFeed(session, logs) {
+  const source = currentRunLogs(logs);
+  const history = [];
+  let pendingStep = null;
+
+  for (const record of source) {
+    const narrated = describeNarratedStep(record);
+    if (narrated) {
+      const text = normalizeProgressText(narrated);
+      if (!text) {
+        continue;
+      }
+      if (pendingStep && pendingStep.text !== text) {
+        appendRunFeedEntry(history, pendingStep);
+        pendingStep = null;
+      }
+      if (!pendingStep) {
+        pendingStep = {
+          kind: "step",
+          text,
+          timestamp: record.timestamp,
+          tone: record.event === "decision" ? "muted" : "running",
+        };
+      } else {
+        pendingStep.timestamp = record.timestamp;
+      }
+      continue;
+    }
+
+    const detail = describeRunFeedDetail(record, { pendingStep });
+    if (!detail) {
+      continue;
+    }
+
+    if (pendingStep) {
+      appendRunFeedEntry(history, pendingStep);
+      pendingStep = null;
+    }
+
+    appendRunFeedEntry(history, detail.kind === "detail-inline" ? { ...detail, kind: "detail" } : detail);
+  }
+
+  const activeText = isSessionRunning(session)
+    ? normalizeProgressText(currentThoughtFrom({ activeSession: session, logs }))
+    : "";
+
+  if (activeText) {
+    if (pendingStep && pendingStep.text === activeText) {
+      return {
+        history,
+        active: {
+          ...pendingStep,
+          active: true,
+          tone: sessionStatusTone(session),
+        },
+      };
+    }
+    if (pendingStep) {
+      appendRunFeedEntry(history, pendingStep);
+    }
+    return {
+      history,
+      active: {
+        kind: "step",
+        text: activeText,
+        timestamp: session.updated_at,
+        tone: sessionStatusTone(session),
+        active: true,
+      },
+    };
+  }
+
+  if (pendingStep) {
+    appendRunFeedEntry(history, pendingStep);
+  }
+
+  return { history, active: null };
+}
+
+function appendRunFeedEntry(history, entry) {
+  if (!entry || !String(entry.text || "").trim()) {
+    return;
+  }
+  const previous = history[history.length - 1];
+  if (
+    previous &&
+    previous.kind === entry.kind &&
+    previous.text === entry.text &&
+    String(previous.detail || "") === String(entry.detail || "")
+  ) {
+    previous.timestamp = entry.timestamp || previous.timestamp;
+    previous.tone = entry.tone || previous.tone;
+    return;
+  }
+  history.push(entry);
+}
+
+function describeRunFeedDetail(record, options = {}) {
+  if (!record?.event) {
+    return null;
+  }
+
+  const event = String(record.event || "").trim();
+
+  if (record.event === "decision") {
+    return null;
+  }
+
+  if (record.event === "tool_requested") {
+    const payload = record.payload || {};
+    const hasNarratedStep = Boolean(normalizeProgressText(payload.thought_summary || payload.expected_outcome || ""));
+    if (hasNarratedStep) {
+      const request = describeToolRequestLog(payload.tool || payload.tool_name || null, payload);
+      if (!request?.meta) {
+        return null;
+      }
+      return {
+        kind: "detail-inline",
+        text: request.text,
+        detail: request.meta,
+        tone: request.tone,
+        timestamp: record.timestamp,
+      };
+    }
+  }
+
+  if (
+    ![
+      "tool_result",
+      "tool_blocked",
+      "tool_error",
+      "tool_execution_error",
+      "tool_validation_error",
+      "task_stop_requested",
+      "task_stopped",
+      "task_crashed",
+      "task_finished",
+    ].includes(event)
+  ) {
+    return null;
+  }
+
+  const detail = describeLogRecord(record);
+  if (!detail) {
+    return null;
+  }
+
+  return {
+    kind: "detail",
+    text: detail.text,
+    detail: detail.meta || "",
+    tone: detail.tone,
+    timestamp: record.timestamp,
+  };
 }
 
 function currentRunLogs(logs) {
@@ -7079,6 +7360,19 @@ function describeLogRecord(record) {
 
   if (record.event === "tool_requested") {
     return describeToolRequestLog(toolName, payload);
+  }
+
+  if (record.event === "decision") {
+    const summary = normalizeProgressText(payload.thought_summary || payload.expected_outcome || "");
+    if (!summary) {
+      return null;
+    }
+    return {
+      text: summary,
+      meta: null,
+      tone: "muted",
+      groupKey: `decision:${summary}`,
+    };
   }
 
   if (record.event === "tool_result") {
@@ -8694,6 +8988,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildConversationWindow,
     buildReferenceHeroView,
     buildRuntimeStatusItems,
+    buildThreadRunFeed,
     buildThreadPresentationView,
     buildUiRoute,
     buildWorkspaceShellView,
