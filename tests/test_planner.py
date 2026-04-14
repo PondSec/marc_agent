@@ -596,6 +596,62 @@ def test_final_response_prompt_includes_read_evidence_for_explain_runs(tmp_path)
     assert "Do not merely say that you inspected or summarized files" in prompt
 
 
+def test_final_response_prompt_uses_focused_grounding_rules_for_read_only_file_explanations(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="explain",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "read_relevant_files",
+                    "reason": "Read the referenced artifact before explaining it.",
+                },
+                {
+                    "step": 2,
+                    "action": "summarize_result",
+                    "reason": "Explain the result clearly.",
+                },
+            ],
+            target_paths=["app.py"],
+            target_name="app.py",
+            requested_outcome="Analysiere app.py und gib eine Zusammenfassung.",
+        )
+    )
+    session = SessionState(
+        task="analysiere bitte app.py und gib eine zusammenfassung",
+        workspace_root=str(tmp_path),
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            phase="exploring",
+            output_excerpt="from flask import Flask\nfrom flask_cors import CORS\n",
+        )
+    )
+
+    prompt = final_response_prompt(route, session)
+
+    assert "Match the language of the user's latest message." in prompt
+    assert "Do not speculate about frameworks, routes, database layers" in prompt
+    assert '"target_paths": ["app.py"]' in prompt
+    assert '"inspection_evidence": [{"path": "app.py"' in prompt
+    assert '"memory_context"' not in prompt
+    assert "generic repository overview" in prompt
+
+
+def test_final_response_num_ctx_scales_with_prompt_size(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+
+    assert planner._final_response_num_ctx("x" * 1200) == 1024
+    assert planner._final_response_num_ctx("x" * 2200) == 1536
+    assert planner._final_response_num_ctx("x" * 4200) == 2048
+    assert planner._final_response_num_ctx("x" * 6500) == 3072
+
+
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[

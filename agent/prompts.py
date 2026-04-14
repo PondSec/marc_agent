@@ -12,7 +12,7 @@ from agent.semantic_defaults import classify_conversation_request
 from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
-from llm.schemas import RouteActionName, RouterOutput
+from llm.schemas import RouteActionName, RouteIntent, RouterOutput
 
 
 REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
@@ -1090,6 +1090,32 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
                 "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
             ]
         )
+    inspection_evidence = _compact_read_evidence(session)
+    if route.intent in {RouteIntent.EXPLAIN, RouteIntent.INSPECT} and not session.changed_files and inspection_evidence:
+        focused_context = {
+            "user_task": session.task,
+            "requested_outcome": route.requested_outcome,
+            "target_paths": route.entities.target_paths[:4],
+            "inspected_files": _read_paths(session)[-6:],
+            "inspection_evidence": inspection_evidence,
+            "recent_tool_calls": _compact_recent_calls(session),
+            "notes": session.notes[-8:],
+            "validation_status": session.validation_status,
+        }
+        return "\n".join(
+            [
+                "Write a concise user-facing explanation for the user's latest repository question.",
+                "Match the language of the user's latest message.",
+                f"Context: {json.dumps(focused_context, ensure_ascii=False)}",
+                "Focus first on the explicitly requested target paths when target_paths are present.",
+                "Base every concrete claim on the inspection evidence above.",
+                "Do not merely say that you inspected or summarized files; use the evidence to answer the user's actual request.",
+                "Do not speculate about frameworks, routes, database layers, integrations, validations, or runtime behavior that are not visible in the evidence.",
+                "If the inspected excerpt does not confirm an important detail, say that it is not visible there instead of inferring it.",
+                "Answer the user's actual question directly, not as a generic repository overview.",
+                "Do not emit JSON.",
+            ]
+        )
     recent_notes = session.notes[-12:]
     recent_calls = _compact_recent_calls(session)
     report_context = {
@@ -1099,7 +1125,7 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
         "memory_context": _compact_memory_context(session),
         "changed_files": [item.path for item in session.changed_files[-8:]],
         "inspected_files": _read_paths(session)[-8:],
-        "inspection_evidence": _compact_read_evidence(session),
+        "inspection_evidence": inspection_evidence,
         "validation_status": session.validation_status,
         "recent_tool_calls": recent_calls,
         "recent_diagnostics": _compact_recent_diagnostics(session),
@@ -1110,10 +1136,12 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
     return "\n".join(
         [
             "Write a concise user-facing response for the completed or blocked task.",
+            "Match the language of the user's latest message.",
             f"Context: {json.dumps(report_context, ensure_ascii=False)}",
             "Mention the main outcome, changed files or inspected files when relevant, and any blocker or validation status.",
             "When no files were changed and inspection evidence is present, summarize the concrete observed contents, behaviors, or technologies from that evidence.",
             "Do not merely say that you inspected or summarized files; use the evidence to answer the user's actual request.",
+            "Do not speculate about details the visible evidence does not confirm; state uncertainty briefly instead.",
             "Do not emit JSON.",
         ]
     )
