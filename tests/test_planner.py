@@ -29320,6 +29320,103 @@ def test_planner_deletes_only_after_target_has_been_read(tmp_path):
     assert decision.tool_args["path"] == "obsolete.py"
 
 
+def test_inspect_with_explicit_file_target_summarizes_after_reading_that_file(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="inspect",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "inspect_workspace",
+                        "reason": "Collect repository context first.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "read_relevant_files",
+                        "reason": "Inspect the requested file before summarizing.",
+                    },
+                    {
+                        "step": 3,
+                        "action": "summarize_result",
+                        "reason": "Summarize honestly.",
+                    },
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+                requested_outcome="Summarize app.py.",
+            )
+        ],
+        text_payloads=["app.py wires the Flask app, runtime configuration, upload limits, and auth/session helpers together."],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="analysiere bitte app.py und gib eine zusammenfassung",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=82,
+            language_counts={"python": 33, "html": 22, "javascript": 10},
+            top_directories=["templates", "tests", "pondsec_ai"],
+            important_files=[
+                "README.md",
+                "tests/test_server_settings.py",
+                "requirements.txt",
+                "pondsec_ai/tools/assets.py",
+                "app.py",
+            ],
+            focus_files=[],
+            file_briefs={"app.py": "Main Flask application."},
+            manifests=["README.md", "requirements.txt"],
+            configs=["instance/runtime_config.json"],
+            test_files=["tests/test_server_settings.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["app.py"],
+            repo_map=["pondsec_ai/", "templates/", "tests/"],
+            project_labels=["python", "flask"],
+            likely_commands=["python -m pytest"],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Large Flask inventory workspace.",
+        ),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="inspect_workspace",
+            tool_args={"focus": "Summarize app.py."},
+            success=True,
+            summary="Workspace inspected successfully.",
+            phase="exploring",
+            output_excerpt=(
+                "The repository contains 82 scanned files. Inspect README.md, tests/test_server_settings.py, "
+                "requirements.txt, pondsec_ai/tools/assets.py, app.py before broad edits."
+            ),
+        )
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=2,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            phase="exploring",
+            output_excerpt="from flask import Flask\napp = Flask(__name__)\n",
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "app.py" in (decision.final_response or "")
+    assert "README.md" not in (decision.final_response or "")
+    assert len(llm.generate_calls) == 1
+
+
 def test_analyze_task_returns_router_output_model(tmp_path):
     llm = ScriptedLLM()
     planner = Planner(llm, "")

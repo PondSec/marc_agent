@@ -4015,6 +4015,7 @@ class Planner:
     ) -> list[str]:
         repair_context = self._current_repair_context_hint(session)
         if repair_context is not None and route.intent in {
+            RouteIntent.INSPECT,
             RouteIntent.UPDATE,
             RouteIntent.DEBUG,
             RouteIntent.DELETE,
@@ -4027,6 +4028,7 @@ class Planner:
                 return self._unique_paths(repair_targets)
         explicit_targets = self._explicit_target_paths(route, session)
         if explicit_targets and route.intent in {
+            RouteIntent.INSPECT,
             RouteIntent.UPDATE,
             RouteIntent.DEBUG,
             RouteIntent.DELETE,
