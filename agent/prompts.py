@@ -1098,6 +1098,8 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
         "task_understanding": _compact_task_understanding(session.task_understanding),
         "memory_context": _compact_memory_context(session),
         "changed_files": [item.path for item in session.changed_files[-8:]],
+        "inspected_files": _read_paths(session)[-8:],
+        "inspection_evidence": _compact_read_evidence(session),
         "validation_status": session.validation_status,
         "recent_tool_calls": recent_calls,
         "recent_diagnostics": _compact_recent_diagnostics(session),
@@ -1110,6 +1112,8 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
             "Write a concise user-facing response for the completed or blocked task.",
             f"Context: {json.dumps(report_context, ensure_ascii=False)}",
             "Mention the main outcome, changed files or inspected files when relevant, and any blocker or validation status.",
+            "When no files were changed and inspection evidence is present, summarize the concrete observed contents, behaviors, or technologies from that evidence.",
+            "Do not merely say that you inspected or summarized files; use the evidence to answer the user's actual request.",
             "Do not emit JSON.",
         ]
     )
@@ -1357,6 +1361,29 @@ def _compact_recent_calls(session: SessionState | None) -> list[dict[str, object
         }
         for item in session.tool_calls[-6:]
     ]
+
+
+def _compact_read_evidence(session: SessionState | None, *, limit: int = 4) -> list[dict[str, object]]:
+    if session is None:
+        return []
+    evidence: list[dict[str, object]] = []
+    for item in session.tool_calls:
+        if item.tool_name != "read_file" or not item.success:
+            continue
+        path = str(item.tool_args.get("path") or "").strip()
+        excerpt = _trim_text(item.output_excerpt or "", 220)
+        summary = _trim_text(item.summary, 120)
+        if not path and not excerpt and not summary:
+            continue
+        payload: dict[str, object] = {}
+        if path:
+            payload["path"] = path
+        if excerpt:
+            payload["excerpt"] = excerpt
+        elif summary:
+            payload["summary"] = summary
+        evidence.append(payload)
+    return evidence[-limit:]
 
 
 def _compact_follow_up_context(session: SessionState | None) -> dict[str, object]:

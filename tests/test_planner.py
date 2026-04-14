@@ -525,6 +525,77 @@ def test_final_response_prompt_keeps_conversation_answer_grounded_on_latest_mess
     assert '"und was kannst du hier machen?"' in prompt
 
 
+def test_final_response_prompt_includes_read_evidence_for_explain_runs(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="explain",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "read_relevant_files",
+                    "reason": "Read the referenced artifacts before explaining them.",
+                }
+            ],
+            requested_outcome="Summarize the observed files and technologies in the project.",
+        )
+    )
+    session = SessionState(
+        task="Lies das Projekt und nenne kurz Dateien und Technologien.",
+        workspace_root=str(tmp_path),
+        task_state=TaskState(
+            latest_user_turn="Lies das Projekt und nenne kurz Dateien und Technologien.",
+            root_goal="Summarize the observed files and technologies in the project.",
+            active_goal="Summarize the observed files and technologies in the project.",
+            goal_relation="new_task",
+            output_expectation="A concise summary of the observed files and technologies.",
+            open_problem=None,
+            verification_target=None,
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.95,
+            next_action="explain",
+            execution_outline=[],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "README.md"},
+                success=True,
+                summary="Read README.md.",
+                phase="exploring",
+                output_excerpt="# Demo Project\n\nA tiny Python CLI utility.\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "app.py"},
+                success=True,
+                summary="Read app.py.",
+                phase="exploring",
+                output_excerpt="import argparse\n\nprint('hello')\n",
+            ),
+        ]
+    )
+
+    prompt = final_response_prompt(route, session)
+
+    assert '"inspected_files": ["README.md", "app.py"]' in prompt
+    assert '"path": "README.md"' in prompt
+    assert "A tiny Python CLI utility." in prompt
+    assert "Do not merely say that you inspected or summarized files" in prompt
+
+
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
