@@ -153,6 +153,7 @@ const state = {
       expanded: false,
       path: null,
     },
+    expandedHistory: {},
     chatScroll: {
       positions: {},
     },
@@ -428,6 +429,7 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
     clearComposer: false,
     blockingSessionId: null,
   };
+  state.ui.expandedHistory = {};
   state.ui.chatScroll.positions = {};
   resetDiffViewer();
   resetChatScrollState();
@@ -674,6 +676,24 @@ function clearActiveSession() {
   ensureChatScrollState(currentChatScrollKey());
 }
 
+function primeSubmittedSession(session) {
+  if (!session || !session.id) {
+    return;
+  }
+  state.activeSessionId = session.id;
+  state.activeSession = session;
+  state.selectedWorkspaceId = session.workspace_id || state.selectedWorkspaceId;
+  state.logs = [];
+  state.ui.expandedHistory = {
+    ...state.ui.expandedHistory,
+    [session.id]: false,
+  };
+  syncDiffViewerState(session);
+  resetChatScrollState(chatScrollKeyForSession(session.id));
+  persistPreferences();
+  renderApp();
+}
+
 function resetDiffViewer() {
   state.ui.diffViewer = {
     open: false,
@@ -862,6 +882,7 @@ async function queuePromptRun() {
     if (pending.clearComposer) {
       state.composer.prompt = "";
     }
+    primeSubmittedSession(session);
     await refreshSessions({ force: true, source: "manual" });
     closeRunQueueModal();
     await openSession(session.id);
@@ -930,6 +951,7 @@ async function submitPrompt({ promptOverride = null, accessModeOverride = null }
     if (promptOverride === null) {
       state.composer.prompt = "";
     }
+    primeSubmittedSession(session);
     await refreshSessions();
     await openSession(session.id);
   } catch (error) {
@@ -1492,7 +1514,8 @@ function handleScroll(event) {
 }
 
 function handleClick(event) {
-  const target = event.target.closest("[data-action]");
+  syncPreservedDetailsForClick(event.target);
+  const target = event.target instanceof Element ? event.target.closest("[data-action]") : null;
   if (!target) {
     return;
   }
@@ -1676,6 +1699,11 @@ function handleClick(event) {
 
   if (action === "close-diff-panel") {
     closeDiffPanel();
+    return;
+  }
+
+  if (action === "toggle-history") {
+    toggleConversationHistory(target.dataset.sessionId);
     return;
   }
 
@@ -1865,6 +1893,7 @@ function handleKeydown(event) {
     }
   }
   if (event.key === "Escape") {
+    closePreservedDetails();
     if (state.ui.terminal.open) {
       closeTerminalModal();
       return;
@@ -2354,8 +2383,60 @@ function renderApp() {
     restoreChatScrollState();
     window.requestAnimationFrame(() => {
       restoreChatScrollState();
+      ensureSidebarSelectionVisible();
     });
   }
+}
+
+function closePreservedDetails(except = null) {
+  for (const panel of document.querySelectorAll("details[data-preserve-open][open]")) {
+    if (panel !== except) {
+      panel.open = false;
+    }
+  }
+}
+
+function syncPreservedDetailsForClick(target) {
+  if (!(target instanceof Element)) {
+    closePreservedDetails();
+    return;
+  }
+
+  const menu = target.closest("details[data-preserve-open]");
+  const summary = target.closest("summary");
+  const actionTarget = target.closest("[data-action]");
+  const insidePanel = target.closest(".overflow-menu-panel");
+  const keepOpen =
+    menu &&
+    ((summary && menu.contains(summary)) || (insidePanel && (!actionTarget || !insidePanel.contains(actionTarget))))
+      ? menu
+      : null;
+
+  closePreservedDetails(keepOpen);
+}
+
+function ensureElementVisibleWithin(container, target) {
+  if (!(container instanceof HTMLElement) || !(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const fullyVisible = targetRect.top >= containerRect.top && targetRect.bottom <= containerRect.bottom;
+  if (!fullyVisible) {
+    target.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+function ensureSidebarSelectionVisible() {
+  if (state.ui.page !== "workspace") {
+    return;
+  }
+  const container = document.querySelector(".sidebar-scroll");
+  const target =
+    document.querySelector(".thread-row.active .thread-nav-row") ||
+    document.querySelector(".project-row.active .project-row-button");
+  ensureElementVisibleWithin(container, target);
 }
 
 function renderSetupShell() {
@@ -2975,6 +3056,10 @@ function renderSidebarProject(workspace) {
 function renderSidebarThreadItem(session) {
   const active = session.id === state.activeSessionId;
   const title = session.title || session.last_message_preview || session.task || "Neuer Thread";
+  const liveIndicator =
+    active && isSessionRunning(session)
+      ? `<span class="thread-running-indicator" aria-hidden="true"><span class="thread-running-spinner"></span></span>`
+      : "";
 
   return `
     <div class="thread-row ${active ? "active" : ""}">
@@ -2985,6 +3070,7 @@ function renderSidebarThreadItem(session) {
         data-session-id="${escapeHtml(session.id)}"
         title="${escapeAttribute(title)}"
       >
+        ${liveIndicator}
         <span class="thread-nav-title">${escapeHtml(title)}</span>
       </button>
       <div class="sidebar-row-actions thread-row-actions">
@@ -4146,18 +4232,11 @@ function renderThreadView(session) {
 }
 
 function renderThreadTranscriptWorkbench(session, presentation, diffFile) {
-  const timeline = conversationTimeline(session);
-  const transcript = timeline.length
-    ? timeline.map((entry) => renderTimelineEntry(entry, session)).join("")
-    : renderTranscriptNote({
-        author: "Agent",
-        tone: presentation.overview.tone,
-        timestamp: session.updated_at,
-        title: presentation.overview.title,
-        content: presentation.overview.summary,
-      });
-
-  const worklog = renderThreadSystemFeed(session, state.logs);
+  const transcript = renderConversationTimelineWindow(session, presentation);
+  const liveThought = presentation.running ? renderThreadLiveThoughtCard(session, presentation) : "";
+  const transcriptNotes = presentation.running
+    ? ""
+    : buildThreadTranscriptNotes(session, { includeChanges: false }).map(renderTranscriptNote).join("");
   const dividerLabel =
     presentation.durationLabel && !presentation.running ? `${presentation.durationLabel} lang gearbeitet` : "";
 
@@ -4166,14 +4245,93 @@ function renderThreadTranscriptWorkbench(session, presentation, diffFile) {
       <section class="thread-transcript-view">
         <div class="thread-feed thread-feed-transcript">
           ${transcript}
+          ${liveThought}
           ${dividerLabel ? renderThreadSessionDivider(dividerLabel) : ""}
-          ${worklog}
+          ${transcriptNotes}
           ${renderThreadChangeSummaryCard(session, presentation)}
         </div>
       </section>
       ${state.ui.diffViewer.open && diffFile ? renderThreadReviewPane(session, diffFile) : ""}
     </div>
   `;
+}
+
+function renderConversationTimelineWindow(session, presentation) {
+  const timeline = conversationTimeline(session);
+  if (!timeline.length) {
+    return renderTranscriptNote({
+      author: "Agent",
+      tone: presentation.overview.tone,
+      timestamp: session.updated_at,
+      title: presentation.overview.title,
+      content: presentation.overview.summary,
+    });
+  }
+
+  const expanded = isConversationHistoryExpanded(session.id);
+  const messageWindow = buildConversationWindow(timeline, { running: presentation.running });
+  const hidden = expanded ? messageWindow.hidden.map((entry) => renderTimelineEntry(entry, session)).join("") : "";
+  const visible = messageWindow.visible.map((entry) => renderTimelineEntry(entry, session)).join("");
+  const toggle = messageWindow.hidden.length
+    ? renderConversationHistoryToggle(session.id, messageWindow.hidden.length, expanded)
+    : "";
+
+  return `
+    ${toggle}
+    ${hidden}
+    ${visible}
+  `;
+}
+
+function buildConversationWindow(entries, options = {}) {
+  const source = Array.isArray(entries) ? entries.filter(Boolean) : [];
+  if (!source.length) {
+    return { hidden: [], visible: [] };
+  }
+
+  let visibleCount = 1;
+  if (!options.running) {
+    const latestEntry = source[source.length - 1];
+    visibleCount = latestEntry?.type === "message" && latestEntry?.message?.role === "assistant" ? 2 : 1;
+  }
+
+  visibleCount = Math.max(1, Math.min(source.length, visibleCount));
+  return {
+    hidden: source.slice(0, -visibleCount),
+    visible: source.slice(-visibleCount),
+  };
+}
+
+function renderConversationHistoryToggle(sessionId, hiddenCount, expanded) {
+  const label = countLabel(hiddenCount, "1 vorherige Nachricht", `${hiddenCount} vorherige Nachrichten`);
+  return `
+    <button
+      class="thread-history-toggle ${expanded ? "expanded" : ""}"
+      type="button"
+      data-action="toggle-history"
+      data-session-id="${escapeAttribute(sessionId)}"
+      aria-expanded="${expanded ? "true" : "false"}"
+    >
+      <span class="thread-history-toggle-label">${escapeHtml(label)}</span>
+      <span class="thread-history-toggle-icon" aria-hidden="true">${icon("chevron-right")}</span>
+      <span class="thread-history-toggle-line" aria-hidden="true"></span>
+    </button>
+  `;
+}
+
+function isConversationHistoryExpanded(sessionId) {
+  return Boolean(state.ui.expandedHistory?.[sessionId]);
+}
+
+function toggleConversationHistory(sessionId) {
+  if (!sessionId) {
+    return;
+  }
+  state.ui.expandedHistory = {
+    ...state.ui.expandedHistory,
+    [sessionId]: !isConversationHistoryExpanded(sessionId),
+  };
+  renderApp();
 }
 
 function renderThreadSessionDivider(label) {
@@ -4473,7 +4631,11 @@ function renderThreadLivePanel(session, presentation) {
         })}
       </div>
       <div class="live-inline-summary">
-        <strong>${escapeHtml(currentStep || "Der Agent arbeitet fokussiert am aktuellen Auftrag.")}</strong>
+        <strong>${
+          isSessionRunning(session)
+            ? renderShinyText(currentStep || "Der Agent arbeitet fokussiert am aktuellen Auftrag.", "thread-live-step-shiny")
+            : escapeHtml(currentStep || "Der Agent arbeitet fokussiert am aktuellen Auftrag.")
+        }</strong>
         <p>${escapeHtml(buildSessionOverview(session).summary)}</p>
       </div>
       <div class="thread-inline-stats">
@@ -4484,7 +4646,11 @@ function renderThreadLivePanel(session, presentation) {
       <div class="live-phase-strip">
         <span class="live-phase-strip-label">Aktuelle Phase</span>
         <strong>${escapeHtml(labelForPhase(session?.current_phase || "planning"))}</strong>
-        <span>${escapeHtml(currentStep || headline)}</span>
+        <span>${
+          isSessionRunning(session)
+            ? renderShinyText(currentStep || headline, "thread-live-phase-shiny", { speed: 2.2 })
+            : escapeHtml(currentStep || headline)
+        }</span>
       </div>
       <div class="live-phase-track">
         ${renderPhaseTrack(session)}
@@ -4511,6 +4677,25 @@ function renderThreadLiveMetric(label, value) {
       <span>${escapeHtml(label)}</span>
       <strong>${escapeHtml(value)}</strong>
     </div>
+  `;
+}
+
+function renderThreadLiveThoughtCard(session, presentation) {
+  const thought = presentation.currentStep || currentThoughtFrom({ activeSession: session, logs: state.logs });
+  if (!thought) {
+    return "";
+  }
+  const meta = [labelForPhase(session?.current_phase || "planning"), presentation.durationLabel || "Gerade gestartet"]
+    .filter(Boolean)
+    .join(" · ");
+  return `
+    <section class="thread-live-thought-card">
+      <div class="thread-live-thought-head">
+        <span class="thread-live-thought-kicker">Aktiv</span>
+        <span class="thread-live-thought-meta">${escapeHtml(meta)}</span>
+      </div>
+      <p class="thread-live-thought-copy">${renderShinyText(thought, "thread-live-step-shiny", { speed: 2.2 })}</p>
+    </section>
   `;
 }
 
@@ -4957,6 +5142,7 @@ function renderRunningMessage(session = state.activeSession) {
   return renderActivityStreamItem({
     text: headline,
     meta: copy,
+    metaHtml: renderShinyText(copy, "activity-stream-shiny"),
     tone,
     timestamp: session?.updated_at || new Date().toISOString(),
     count: 1,
@@ -5092,7 +5278,7 @@ function renderChatInput() {
   const running = shell.running;
   const modelInstallNotice = currentModelInstallNotice();
   const notice = thought
-    ? { label: "Laufstatus", text: thought, tone: running ? "running" : "muted" }
+    ? { label: "Laufstatus", text: thought, tone: running ? "running" : "muted", shiny: running }
     : modelInstallNotice
       ? { label: "Modelle", text: modelInstallNotice, tone: "muted" }
       : null;
@@ -5198,10 +5384,11 @@ function renderComposerControlsMenu() {
 }
 
 function renderComposerNotice(notice) {
+  const text = notice?.shiny ? renderShinyText(notice.text, "composer-shiny-text") : escapeHtml(notice.text);
   return `
     <div class="composer-notice tone-${escapeHtml(notice.tone || "muted")}">
       <span class="composer-notice-label">${escapeHtml(notice.label)}</span>
-      <span class="composer-notice-text">${escapeHtml(notice.text)}</span>
+      <span class="composer-notice-text">${text}</span>
     </div>
   `;
 }
@@ -5212,7 +5399,23 @@ function renderModelInstallStrip(notice) {
 
 function renderThoughtStrip(thought) {
   return `
-    ${renderComposerNotice({ label: "Laufstatus", text: thought, tone: "running" })}
+    ${renderComposerNotice({ label: "Laufstatus", text: thought, tone: "running", shiny: true })}
+  `;
+}
+
+function renderShinyText(text, className = "", options = {}) {
+  const content = String(text || "").trim();
+  if (!content) {
+    return "";
+  }
+  const speed = Math.max(1.2, Number(options.speed) || 1.8);
+  const color = String(options.color || "rgba(223, 229, 237, 0.78)");
+  const shineColor = String(options.shineColor || "#ffffff");
+  return `
+    <span
+      class="shiny-text ${escapeHtml(className)}"
+      style="--shiny-speed:${escapeAttribute(String(speed))}s; --shiny-color:${escapeAttribute(color)}; --shiny-highlight:${escapeAttribute(shineColor)};"
+    >${escapeHtml(content)}</span>
   `;
 }
 
@@ -5885,6 +6088,14 @@ function renderActivityStreamItem(item) {
   }
   const meta = String(item.meta || "").trim();
   const tone = String(item.tone || "muted");
+  const titleHtml = typeof item?.titleHtml === "string" ? item.titleHtml : escapeHtml(item.text || "");
+  const metaMarkup = item?.metaHtml
+    ? item.metaHtml
+    : meta
+      ? isLikelyCodeMeta(meta)
+        ? `<code class="activity-stream-pill">${escapeHtml(meta)}</code>`
+        : `<p class="activity-stream-copy">${escapeHtml(meta)}</p>`
+      : "";
   return `
     <div class="activity-stream-item tone-${escapeHtml(tone)} ${item.live ? "live" : ""}">
       <div class="activity-stream-marker" aria-hidden="true">
@@ -5895,14 +6106,8 @@ function renderActivityStreamItem(item) {
           <span class="activity-stream-kicker">Agent</span>
           <span class="activity-stream-time">${escapeHtml(formatTime(item.timestamp))}</span>
         </div>
-        <p class="activity-stream-title">${escapeHtml(item.text || "")}</p>
-        ${
-          meta
-            ? isLikelyCodeMeta(meta)
-              ? `<code class="activity-stream-pill">${escapeHtml(meta)}</code>`
-              : `<p class="activity-stream-copy">${escapeHtml(meta)}</p>`
-            : ""
-        }
+        <p class="activity-stream-title">${titleHtml}</p>
+        ${metaMarkup}
       </div>
     </div>
   `;
@@ -6084,12 +6289,13 @@ function buildIssueTranscriptContent(issues) {
 
 function hasWorklogContent(session, logs) {
   return Boolean(
-    (Array.isArray(logs) && logs.length) ||
+    currentRunLogs(logs).length ||
       session?.validation_runs?.length ||
       session?.changed_files?.length ||
       session?.blockers?.length ||
       session?.diagnostics?.length ||
-      session?.tool_calls?.length,
+      session?.tool_calls?.length ||
+      isSessionRunning(session),
   );
 }
 
@@ -6641,7 +6847,7 @@ function latestIssueText(session) {
 }
 
 function buildActivityClusters(session, logs) {
-  const source = (Array.isArray(logs) ? logs : [])
+  const source = currentRunLogs(logs)
     .map((record) => {
       const detail = describeLogRecord(record);
       if (!detail) {
@@ -6681,6 +6887,16 @@ function buildActivityClusters(session, logs) {
   }
 
   return clusters.slice(-12).reverse();
+}
+
+function currentRunLogs(logs) {
+  const source = Array.isArray(logs) ? logs.filter(Boolean) : [];
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    if (source[index]?.event === "task_started") {
+      return source.slice(index);
+    }
+  }
+  return source;
 }
 
 function buildActivityFallback(session) {
@@ -7918,11 +8134,20 @@ function currentThoughtFrom(sourceState = state) {
     return "Der laufende Schritt wird sauber beendet.";
   }
 
-  if (sourceState.activeSession?.status === "queued" && (sourceState.logs || []).length === 0) {
+  const activeLogs = currentRunLogs(sourceState.logs);
+
+  if (sourceState.activeSession?.status === "queued" && activeLogs.length === 0) {
     return "Der Lauf wird vorbereitet.";
   }
 
-  for (const record of [...(sourceState.logs || [])].reverse()) {
+  for (const record of [...activeLogs].reverse()) {
+    const thought = describeNarratedStep(record);
+    if (thought) {
+      return thought;
+    }
+  }
+
+  for (const record of [...activeLogs].reverse()) {
     const thought = describeCurrentStep(record);
     if (thought) {
       return thought;
@@ -7950,6 +8175,17 @@ function currentThoughtFrom(sourceState = state) {
 
 function currentThought() {
   return currentThoughtFrom(state);
+}
+
+function describeNarratedStep(record) {
+  if (!record || !record.event) {
+    return "";
+  }
+  const payload = record.payload || {};
+  if (record.event === "decision" || record.event === "tool_requested") {
+    return normalizeProgressText(payload.thought_summary || payload.expected_outcome || "");
+  }
+  return "";
 }
 
 function describeCurrentStep(record) {
@@ -8102,11 +8338,11 @@ function describeToolActivity(payload, options = {}) {
   const query = typeof args.query === "string" ? args.query.trim() : "";
   const focus = typeof args.focus === "string" ? args.focus.trim() : "";
   const branchName = typeof args.name === "string" ? args.name.trim() : "";
-  const genericSummary = normalizeProgressText(
-    options.fromDecision
-      ? payload.expected_outcome || payload.thought_summary || payload.message || ""
-      : payload.thought_summary || payload.expected_outcome || payload.message || "",
-  );
+  const genericSummary = normalizeProgressText(payload.thought_summary || payload.expected_outcome || payload.message || "");
+
+  if ((options.fromDecision || String(payload.thought_summary || "").trim()) && genericSummary) {
+    return genericSummary;
+  }
 
   if (toolName === "create_file") {
     return path
@@ -8455,6 +8691,7 @@ function icon(name) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildActivityClusters,
+    buildConversationWindow,
     buildReferenceHeroView,
     buildRuntimeStatusItems,
     buildThreadPresentationView,
@@ -8468,6 +8705,8 @@ if (typeof module !== "undefined" && module.exports) {
     buildPhaseSteps,
     buildSessionOverview,
     buildValidationSnapshot,
+    currentRunLogs,
+    currentThoughtFrom,
     findBlockingRunForSubmission,
     createRefreshController,
     describeLogRecord,

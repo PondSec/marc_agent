@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   buildActivityClusters,
+  buildConversationWindow,
   buildReferenceHeroView,
   buildRuntimeStatusItems,
   buildThreadPresentationView,
@@ -14,6 +15,8 @@ const {
   buildSessionOverview,
   buildValidationSnapshot,
   createRefreshController,
+  currentRunLogs,
+  currentThoughtFrom,
   findBlockingRunForSubmission,
   formatSessionElapsed,
   parseUiRoute,
@@ -70,6 +73,82 @@ test("buildActivityClusters fasst wiederholten Modell-Progress zu einem Eintrag 
   assert.equal(items.length, 1);
   assert.equal(items[0].count, 3);
   assert.match(items[0].text, /thread\.js|streamt|generiert/i);
+});
+
+test("currentRunLogs ignoriert Logeintraege aus frueheren Runs derselben Session", () => {
+  const logs = [
+    {
+      timestamp: "2026-04-02T10:00:00.000Z",
+      event: "task_started",
+      payload: { task: "alter Lauf" },
+    },
+    {
+      timestamp: "2026-04-02T10:00:04.000Z",
+      event: "tool_requested",
+      payload: { tool_name: "read_file", thought_summary: "Alten Kontext lesen." },
+    },
+    {
+      timestamp: "2026-04-02T10:05:00.000Z",
+      event: "task_started",
+      payload: { task: "neuer Lauf" },
+    },
+    {
+      timestamp: "2026-04-02T10:05:03.000Z",
+      event: "decision",
+      payload: { thought_summary: "Ich analysiere jetzt die aktuelle UI-Stelle." },
+    },
+  ];
+
+  const current = currentRunLogs(logs);
+
+  assert.equal(current.length, 2);
+  assert.equal(current[0].event, "task_started");
+  assert.match(JSON.stringify(current), /neuer Lauf|aktuelle UI-Stelle/i);
+  assert.doesNotMatch(JSON.stringify(current), /alter Lauf|Alten Kontext/i);
+});
+
+test("currentThoughtFrom priorisiert den letzten formulierten Agenten-Schritt vor Modell-Heartbeat-Rauschen", () => {
+  const logs = [
+    {
+      timestamp: "2026-04-02T10:05:00.000Z",
+      event: "task_started",
+      payload: { task: "UI fixen" },
+    },
+    {
+      timestamp: "2026-04-02T10:05:02.000Z",
+      event: "decision",
+      payload: { thought_summary: "Ich analysiere jetzt das bestehende Projekt und suche den eigentlichen UI-Fehler." },
+    },
+    {
+      timestamp: "2026-04-02T10:05:03.000Z",
+      event: "content_generation_progress",
+      payload: { type: "status", stage: "request_started", path: "webui/app.js" },
+    },
+  ];
+
+  const thought = currentThoughtFrom({
+    activeSession: makeSession({ status: "running", current_phase: "exploring" }),
+    logs,
+  });
+
+  assert.match(thought, /analysiere jetzt das bestehende projekt/i);
+  assert.doesNotMatch(thought, /Modellstart/i);
+});
+
+test("buildConversationWindow laesst bei fertigen Threads nur die letzte Frage und Antwort offen", () => {
+  const entries = [
+    { type: "message", message: { role: "user", content: "alt 1" } },
+    { type: "message", message: { role: "assistant", content: "alt 2" } },
+    { type: "message", message: { role: "user", content: "letzte Frage" } },
+    { type: "message", message: { role: "assistant", content: "letzte Antwort" } },
+  ];
+
+  const window = buildConversationWindow(entries, { running: false });
+
+  assert.equal(window.hidden.length, 2);
+  assert.equal(window.visible.length, 2);
+  assert.equal(window.visible[0].message.content, "letzte Frage");
+  assert.equal(window.visible[1].message.content, "letzte Antwort");
 });
 
 test("buildValidationSnapshot hebt fehlgeschlagene Checks klar hervor", () => {
