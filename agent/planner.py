@@ -504,6 +504,7 @@ class Planner:
                 return self._validation_decision(
                     "Changed files must go through the remaining validation plan.",
                     command.command,
+                    session=session,
                     expected_stdout=command.expected_stdout,
                 )
             if self._requirements_review_missing(session):
@@ -532,6 +533,7 @@ class Planner:
         route: RouterOutput,
         session: SessionState,
     ) -> AgentDecision:
+        language = self._session_language(session)
         read_paths = set(self._read_paths(session))
         searched_queries = set(self._searched_queries(session))
         inspected = any(item.tool_name == "inspect_workspace" for item in session.tool_calls)
@@ -557,7 +559,11 @@ class Planner:
                     action_type=AgentActionType.CALL_TOOL,
                     tool_name="inspect_workspace",
                     tool_args={"focus": route.user_goal},
-                    expected_outcome="Collect repository structure and validation context.",
+                    expected_outcome=self._localized_text(
+                        language,
+                        de="Repository-Struktur und Validierungskontext sammeln.",
+                        en="Collect repository structure and validation context.",
+                    ),
                     final_response=None,
                 )
 
@@ -569,7 +575,11 @@ class Planner:
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="search_in_files",
                         tool_args={"query": query, "path": ".", "max_results": 30},
-                        expected_outcome="Locate candidate files that match the routed target.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Passende Kandidatdateien fuer das geroutete Ziel finden.",
+                            en="Locate candidate files that match the routed target.",
+                        ),
                         final_response=None,
                     )
 
@@ -581,17 +591,29 @@ class Planner:
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
                         tool_args={"path": candidate},
-                        expected_outcome="Inspect the most relevant file before proceeding.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Die relevanteste Datei lesen, bevor es weitergeht.",
+                            en="Inspect the most relevant file before proceeding.",
+                        ),
                         final_response=None,
                     )
                 query = self._best_search_query(route)
                 if not candidate_paths and query and query not in searched_queries:
                     return AgentDecision(
-                        thought_summary="A search is needed before concrete files can be read.",
+                        thought_summary=self._localized_text(
+                            language,
+                            de="Vor dem Lesen konkreter Dateien ist noch eine Suche noetig.",
+                            en="A search is needed before concrete files can be read.",
+                        ),
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="search_in_files",
                         tool_args={"query": query, "path": ".", "max_results": 30},
-                        expected_outcome="Find files that likely satisfy the routed goal.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Dateien finden, die das geroutete Ziel wahrscheinlich erfuellen.",
+                            en="Find files that likely satisfy the routed goal.",
+                        ),
                         final_response=None,
                     )
 
@@ -604,11 +626,19 @@ class Planner:
                 bootstrap = self._next_create_bootstrap(route, session, read_paths)
                 if bootstrap is not None:
                     return AgentDecision(
-                        thought_summary="Read a nearby manifest or example before creating new code.",
+                        thought_summary=self._localized_text(
+                            language,
+                            de="Vor neuem Code zuerst ein nahes Manifest oder Beispiel lesen.",
+                            en="Read a nearby manifest or example before creating new code.",
+                        ),
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
                         tool_args={"path": bootstrap},
-                        expected_outcome="Match existing conventions before generating a new artifact.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Bestehende Konventionen treffen, bevor ein neues Artefakt entsteht.",
+                            en="Match existing conventions before generating a new artifact.",
+                        ),
                         final_response=None,
                     )
                 draft = self._draft_create_decision(route, session)
@@ -621,11 +651,19 @@ class Planner:
                     query = self._best_search_query(route)
                     if query and query not in searched_queries:
                         return AgentDecision(
-                            thought_summary="The update target still needs to be located in the workspace.",
+                            thought_summary=self._localized_text(
+                                language,
+                                de="Das Update-Ziel muss im Workspace noch gefunden werden.",
+                                en="The update target still needs to be located in the workspace.",
+                            ),
                             action_type=AgentActionType.CALL_TOOL,
                             tool_name="search_in_files",
                             tool_args={"query": query, "path": ".", "max_results": 30},
-                            expected_outcome="Find the file that should be updated.",
+                            expected_outcome=self._localized_text(
+                                language,
+                                de="Die Datei finden, die aktualisiert werden soll.",
+                                en="Find the file that should be updated.",
+                            ),
                             final_response=None,
                         )
                     return self._final_decision(
@@ -647,11 +685,19 @@ class Planner:
                 current_content = self._current_file_content(session, target)
                 if current_content is not None and target not in read_paths:
                     return AgentDecision(
-                        thought_summary="Read the target file before generating an update.",
+                        thought_summary=self._localized_text(
+                            language,
+                            de="Vor dem Update zuerst die Zieldatei lesen.",
+                            en="Read the target file before generating an update.",
+                        ),
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
                         tool_args={"path": target},
-                        expected_outcome="Inspect the current implementation before editing it.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Die aktuelle Implementierung lesen, bevor sie bearbeitet wird.",
+                            en="Inspect the current implementation before editing it.",
+                        ),
                         final_response=None,
                     )
                 bootstrap = self._repair_bootstrap_candidate(
@@ -662,11 +708,19 @@ class Planner:
                 )
                 if bootstrap is not None:
                     return AgentDecision(
-                        thought_summary="Read the most relevant supporting artifact before creating the repair.",
+                        thought_summary=self._localized_text(
+                            language,
+                            de="Vor dem Repair zuerst das relevanteste Hilfsartefakt lesen.",
+                            en="Read the most relevant supporting artifact before creating the repair.",
+                        ),
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
                         tool_args={"path": bootstrap},
-                        expected_outcome="Inspect the surrounding validation context before creating the repair artifact.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Den umgebenden Validierungskontext lesen, bevor das Repair-Artefakt entsteht.",
+                            en="Inspect the surrounding validation context before creating the repair artifact.",
+                        ),
                         final_response=None,
                     )
                 draft = self._draft_update_decision(route, session, target)
@@ -679,11 +733,19 @@ class Planner:
                     query = self._best_search_query(route)
                     if query and query not in searched_queries:
                         return AgentDecision(
-                            thought_summary="Locate the deletion target before removing anything.",
+                            thought_summary=self._localized_text(
+                                language,
+                                de="Vor dem Loeschen zuerst das konkrete Ziel finden.",
+                                en="Locate the deletion target before removing anything.",
+                            ),
                             action_type=AgentActionType.CALL_TOOL,
                             tool_name="search_in_files",
                             tool_args={"query": query, "path": ".", "max_results": 30},
-                            expected_outcome="Find the file or artifact that should be deleted.",
+                            expected_outcome=self._localized_text(
+                                language,
+                                de="Die Datei oder das Artefakt finden, das geloescht werden soll.",
+                                en="Find the file or artifact that should be deleted.",
+                            ),
                             final_response=None,
                         )
                     return self._final_decision(
@@ -703,11 +765,19 @@ class Planner:
                     )
                 if target not in read_paths:
                     return AgentDecision(
-                        thought_summary="Read the target once before deleting it.",
+                        thought_summary=self._localized_text(
+                            language,
+                            de="Vor dem Loeschen das Ziel einmal lesen.",
+                            en="Read the target once before deleting it.",
+                        ),
                         action_type=AgentActionType.CALL_TOOL,
                         tool_name="read_file",
                         tool_args={"path": target},
-                        expected_outcome="Confirm the deletion target before removing it.",
+                        expected_outcome=self._localized_text(
+                            language,
+                            de="Das Loeschziel bestaetigen, bevor es entfernt wird.",
+                            en="Confirm the deletion target before removing it.",
+                        ),
                         final_response=None,
                     )
                 return AgentDecision(
@@ -715,7 +785,11 @@ class Planner:
                     action_type=AgentActionType.CALL_TOOL,
                     tool_name="delete_file",
                     tool_args={"path": target},
-                    expected_outcome="Delete the routed target artifact.",
+                    expected_outcome=self._localized_text(
+                        language,
+                        de="Das geroutete Zielartefakt loeschen.",
+                        en="Delete the routed target artifact.",
+                    ),
                     final_response=None,
                 )
 
@@ -731,6 +805,7 @@ class Planner:
                     return self._validation_decision(
                         step.reason,
                         command.command,
+                        session=session,
                         expected_stdout=command.expected_stdout,
                     )
 
@@ -742,11 +817,19 @@ class Planner:
 
         if route.repo_context_needed and not session.tool_calls:
             return AgentDecision(
-                thought_summary="The route needs repository context before a safe answer.",
+                thought_summary=self._localized_text(
+                    language,
+                    de="Vor einer sicheren Antwort wird noch Repository-Kontext benoetigt.",
+                    en="The route needs repository context before a safe answer.",
+                ),
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="inspect_workspace",
                 tool_args={"focus": route.user_goal},
-                expected_outcome="Collect repository structure and relevant entrypoints.",
+                expected_outcome=self._localized_text(
+                    language,
+                    de="Repository-Struktur und relevante Einstiegspunkte sammeln.",
+                    en="Collect repository structure and relevant entrypoints.",
+                ),
                 final_response=None,
             )
 
@@ -950,6 +1033,7 @@ class Planner:
         route: RouterOutput,
         session: SessionState,
     ) -> AgentDecision | None:
+        language = self._session_language(session)
         path = self._choose_create_path(route, session)
         if not path:
             return None
@@ -985,11 +1069,19 @@ class Planner:
         if tool_name == "create_file":
             tool_args["overwrite"] = False
         return AgentDecision(
-            thought_summary=f"Create the routed artifact in {path}.",
+            thought_summary=self._localized_text(
+                language,
+                de=f"Das geroutete Artefakt in {path} erstellen.",
+                en=f"Create the routed artifact in {path}.",
+            ),
             action_type=AgentActionType.CALL_TOOL,
             tool_name=tool_name,
             tool_args=tool_args,
-            expected_outcome="Add the requested artifact to the workspace.",
+            expected_outcome=self._localized_text(
+                language,
+                de="Das angefragte Artefakt zum Workspace hinzufuegen.",
+                en="Add the requested artifact to the workspace.",
+            ),
             final_response=None,
         )
 
@@ -999,6 +1091,7 @@ class Planner:
         session: SessionState,
         target: str,
     ) -> AgentDecision | None:
+        language = self._session_language(session)
         repair_context = self._repair_context_for_target(route, session, target)
         current_content = self._current_file_content(session, target)
         if current_content is None:
@@ -1016,11 +1109,19 @@ class Planner:
             )
             if bootstrap is not None:
                 return AgentDecision(
-                    thought_summary="Read the most relevant related file before creating the missing repair artifact.",
+                    thought_summary=self._localized_text(
+                        language,
+                        de="Vor dem fehlenden Repair-Artefakt zuerst die relevanteste Bezugsdatei lesen.",
+                        en="Read the most relevant related file before creating the missing repair artifact.",
+                    ),
                     action_type=AgentActionType.CALL_TOOL,
                     tool_name="read_file",
                     tool_args={"path": bootstrap},
-                    expected_outcome="Use the failing test or adjacent artifact as concrete context for the missing repair file.",
+                    expected_outcome=self._localized_text(
+                        language,
+                        de="Den fehlschlagenden Test oder ein nahes Artefakt als konkreten Kontext fuer die fehlende Repair-Datei nutzen.",
+                        en="Use the failing test or adjacent artifact as concrete context for the missing repair file.",
+                    ),
                     final_response=None,
                 )
             return self._draft_missing_repair_artifact_decision(
@@ -1146,11 +1247,19 @@ class Planner:
                         mutation=mutation,
                     )
                 return AgentDecision(
-                    thought_summary=f"Update {target} according to the routed goal.",
+                    thought_summary=self._localized_text(
+                        language,
+                        de=f"{target} gemaess dem gerouteten Ziel aktualisieren.",
+                        en=f"Update {target} according to the routed goal.",
+                    ),
                     action_type=AgentActionType.CALL_TOOL,
                     tool_name="write_file",
                     tool_args={"path": target, "content": content},
-                    expected_outcome="Apply the requested update to the target artifact.",
+                    expected_outcome=self._localized_text(
+                        language,
+                        de="Die angefragte Aktualisierung auf das Zielartefakt anwenden.",
+                        en="Apply the requested update to the target artifact.",
+                    ),
                     final_response=None,
                 )
 
@@ -1323,11 +1432,19 @@ class Planner:
                 reason=f"Prepared missing repair artifact {target} from validation evidence.",
             )
             return AgentDecision(
-                thought_summary=f"Create the validation-guided repair artifact in {target}.",
+                thought_summary=self._localized_text(
+                    self._session_language(session),
+                    de=f"Das validierungsgefuehrte Repair-Artefakt in {target} erstellen.",
+                    en=f"Create the validation-guided repair artifact in {target}.",
+                ),
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="create_file",
                 tool_args={"path": target, "content": content, "overwrite": False},
-                expected_outcome="Add the missing artifact required to repair the failed validation.",
+                expected_outcome=self._localized_text(
+                    self._session_language(session),
+                    de="Das fehlende Artefakt hinzufuegen, das fuer die Reparatur der fehlgeschlagenen Validierung noetig ist.",
+                    en="Add the missing artifact required to repair the failed validation.",
+                ),
                 final_response=None,
             )
 
@@ -2157,15 +2274,24 @@ class Planner:
         candidate_paths: list[str],
         read_paths: set[str],
     ) -> AgentDecision | None:
+        language = self._session_language(session)
         diagnostic_candidates = self._diagnostic_file_candidates(route, session, candidate_paths)
         unread_diagnostic = self._next_unread_candidate(diagnostic_candidates, read_paths)
         if unread_diagnostic is not None:
             return AgentDecision(
-                thought_summary="Read the file most strongly implicated by the current or previous diagnostics.",
+                thought_summary=self._localized_text(
+                    language,
+                    de="Zuerst die Datei lesen, die von der aktuellen oder vorherigen Diagnose am staerksten betroffen ist.",
+                    en="Read the file most strongly implicated by the current or previous diagnostics.",
+                ),
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="read_file",
                 tool_args={"path": unread_diagnostic},
-                expected_outcome="Inspect the file implicated by the failing output before editing it.",
+                expected_outcome=self._localized_text(
+                    language,
+                    de="Die von der Fehlermeldung betroffene Datei lesen, bevor sie bearbeitet wird.",
+                    en="Inspect the file implicated by the failing output before editing it.",
+                ),
                 final_response=None,
             )
 
@@ -2176,7 +2302,11 @@ class Planner:
         if command is not None and not self._command_already_ran(session, command):
             command_spec = self._diagnostic_command_spec(session, command)
             return AgentDecision(
-                thought_summary="Reproduce the issue with the strongest available runtime or validation command before editing.",
+                thought_summary=self._localized_text(
+                    language,
+                    de="Vor dem Edit den Fehler mit dem staerksten verfuegbaren Runtime- oder Validierungs-Command reproduzieren.",
+                    en="Reproduce the issue with the strongest available runtime or validation command before editing.",
+                ),
                 action_type=AgentActionType.CALL_TOOL,
                 tool_name="run_tests",
                 tool_args={
@@ -2189,7 +2319,11 @@ class Planner:
                         else {}
                     ),
                 },
-                expected_outcome="Reproduce the reported issue and collect concrete diagnostics.",
+                expected_outcome=self._localized_text(
+                    language,
+                    de="Den gemeldeten Fehler reproduzieren und konkrete Diagnostik sammeln.",
+                    en="Reproduce the reported issue and collect concrete diagnostics.",
+                ),
                 final_response=None,
             )
 
@@ -2296,6 +2430,7 @@ class Planner:
             return self._validation_decision(
                 "Only rerun validation after a substantive repair mutation has been prepared.",
                 command.command,
+                session=session,
                 expected_stdout=command.expected_stdout,
             )
 
@@ -3578,8 +3713,10 @@ class Planner:
         thought_summary: str,
         command: str,
         *,
+        session: SessionState | None = None,
         expected_stdout: str | None = None,
     ) -> AgentDecision:
+        language = self._session_language(session) if session is not None else "en"
         return AgentDecision(
             thought_summary=thought_summary,
             action_type=AgentActionType.CALL_TOOL,
@@ -3590,7 +3727,11 @@ class Planner:
                 "timeout": 120,
                 **({"expected_stdout": expected_stdout} if expected_stdout is not None else {}),
             },
-            expected_outcome="Run the next validation step for the current changes.",
+            expected_outcome=self._localized_text(
+                language,
+                de="Den naechsten Validierungsschritt fuer die aktuellen Aenderungen ausfuehren.",
+                en="Run the next validation step for the current changes.",
+            ),
             final_response=None,
         )
 
@@ -7007,6 +7148,7 @@ class Planner:
         return self._validation_decision(
             "A review-blocked target was deferred so the remaining validation can reveal the next concrete repair step.",
             validation_command,
+            session=session,
         )
 
     def _append_runtime_execution(self, session: SessionState | None, record: dict[str, object]) -> None:
@@ -10382,11 +10524,19 @@ class Planner:
             mutation=mutation,
         )
         return AgentDecision(
-            thought_summary=f"Apply the deterministic runtime repair for {path}.",
+            thought_summary=self._localized_text(
+                self._session_language(session),
+                de=f"Die deterministische Runtime-Reparatur fuer {path} anwenden.",
+                en=f"Apply the deterministic runtime repair for {path}.",
+            ),
             action_type=AgentActionType.CALL_TOOL,
             tool_name="write_file",
             tool_args={"path": path, "content": recovery.content},
-            expected_outcome="Apply the targeted repair derived directly from the failed runtime evidence.",
+            expected_outcome=self._localized_text(
+                self._session_language(session),
+                de="Die gezielte Reparatur anwenden, die direkt aus der fehlgeschlagenen Runtime-Evidenz abgeleitet wurde.",
+                en="Apply the targeted repair derived directly from the failed runtime evidence.",
+            ),
             final_response=None,
         )
 

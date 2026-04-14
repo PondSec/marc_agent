@@ -4183,3 +4183,42 @@ def test_core_initialization_uses_task_state_as_only_semantic_source_in_main_pat
     assert session.router_result.intent == RouteIntent.UPDATE
     assert session.router_result.entities.target_paths == ["app/auth.py"]
     assert len(llm.generate_json_calls) == 1
+
+
+def test_execution_policy_localizes_inspect_route_reasoning_to_german(tmp_path):
+    understanding = TaskUnderstanding(
+        original_request="Bitte analysiere das Repository und erklaere mir die wichtigsten Stellen.",
+        interpreted_goal="Inspect the repository and explain the most relevant implementation areas.",
+        intent_category="analyze",
+        conversation_relation="new_task",
+        subgoals=["Repository-Kontext sammeln", "Wichtige Artefakte lesen"],
+        target_artifacts=[],
+        relevant_context=["The workspace contains an application and tests."],
+        constraints=[],
+        missing_info=[],
+        assumptions=[],
+        user_observations=[],
+        supplied_evidence=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.84,
+        recommended_mode="inspect",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Repository lesen", action_hint="inspect"),
+            TaskPlanStep(step=2, summary="Erkenntnisse erklaeren", action_hint="explain"),
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    route = ExecutionDecisionPolicy().build_route(
+        task_state_from_understanding(understanding),
+        snapshot=build_snapshot(tmp_path),
+        session=SessionState(task=understanding.original_request, workspace_root=str(tmp_path)),
+    )
+
+    assert route.intent == RouteIntent.INSPECT
+    assert route.requested_outcome == understanding.interpreted_goal
+    assert route.action_plan[0].reason == "Gezielten Repository-Kontext sammeln, bevor ich antworte."
+    assert route.action_plan[1].reason == "Die relevantesten Artefakte lesen, bevor ich zusammenfasse."
+    assert route.action_plan[2].reason == "Die Erkenntnisse knapp und verstaendlich zusammenfassen."
