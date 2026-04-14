@@ -1775,3 +1775,63 @@ def test_workspace_preview_runs_python_entrypoint_when_no_static_site_exists(tmp
     assert response.status_code == 200
     assert "Python-Preview" in response.text
     assert "Hallo aus der Cloud" in response.text
+
+
+def test_workspace_tree_lists_nested_files_with_directory_structure(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    nested_dir = workspace_root / "src" / "components"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "Panel.js").write_text("export const Panel = () => null;\n", encoding="utf-8")
+    ignored_dir = workspace_root / "node_modules" / "pkg"
+    ignored_dir.mkdir(parents=True)
+    (ignored_dir / "index.js").write_text("ignored\n", encoding="utf-8")
+
+    response = client.get(f"/api/workspaces/{workspace['id']}/tree")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workspace_id"] == workspace["id"]
+    top_entries = payload["entries"]
+    assert [item["name"] for item in top_entries] == ["src", "README.md"]
+    src_entry = top_entries[0]
+    assert src_entry["kind"] == "directory"
+    assert src_entry["children"][0]["name"] == "components"
+    assert src_entry["children"][0]["children"][0]["path"] == "src/components/Panel.js"
+    assert "node_modules" not in json.dumps(payload)
+
+
+def test_workspace_file_content_returns_text_and_rejects_binary_files(tmp_path):
+    config = build_test_config(tmp_path)
+    config.ensure_state_dirs()
+    app = create_app(config)
+    client = build_test_client(app)
+    workspace = create_test_workspace(client, tmp_path)
+    workspace_root = tmp_path / "workspace-a"
+
+    docs_dir = workspace_root / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "notes.txt").write_text("erste zeile\nzweite zeile\n", encoding="utf-8")
+    (workspace_root / "blob.bin").write_bytes(b"\x00\x01\x02binary")
+
+    text_response = client.get(
+        f"/api/workspaces/{workspace['id']}/files/content",
+        params={"path": "docs/notes.txt"},
+    )
+    binary_response = client.get(
+        f"/api/workspaces/{workspace['id']}/files/content",
+        params={"path": "blob.bin"},
+    )
+
+    assert text_response.status_code == 200
+    assert text_response.json()["path"] == "docs/notes.txt"
+    assert "zweite zeile" in text_response.json()["content"]
+
+    assert binary_response.status_code == 400
+    assert "Binary files" in binary_response.json()["detail"]

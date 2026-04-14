@@ -133,6 +133,22 @@ const state = {
     workspaceGitInspection: null,
     workspaceGitLoading: false,
     workspaceGitInspecting: false,
+    workspaceBrowser: {
+      open: false,
+      loading: false,
+      workspaceId: null,
+      workspaceName: "",
+      entries: [],
+      selectedPath: "",
+      expandedPaths: {},
+      content: "",
+      contentLoading: false,
+      contentError: "",
+      fileTruncated: false,
+      fileSizeBytes: 0,
+      treeTruncated: false,
+      error: "",
+    },
     terminal: {
       open: false,
       starting: false,
@@ -415,6 +431,7 @@ function clearApplicationState({ preserveAuthInputs = false, preserveRoute = fal
   state.ui.page = preserveRoute ? state.ui.page : "workspace";
   state.ui.sessionLoading = false;
   state.ui.workspaceModalOpen = false;
+  resetWorkspaceBrowserState();
   resetWorkspaceGitState();
   state.ui.runQueue = {
     open: false,
@@ -506,6 +523,13 @@ async function refreshWorkspaces() {
     !state.workspaces.some((workspace) => workspace.id === state.selectedWorkspaceId)
   ) {
     state.selectedWorkspaceId = state.workspaces[0]?.id || null;
+  }
+  if (
+    state.ui.workspaceBrowser.open &&
+    state.ui.workspaceBrowser.workspaceId &&
+    !state.workspaces.some((workspace) => workspace.id === state.ui.workspaceBrowser.workspaceId)
+  ) {
+    resetWorkspaceBrowserState();
   }
   if (changed || previousSelectedWorkspaceId !== state.selectedWorkspaceId) {
     renderApp();
@@ -681,6 +705,7 @@ function clearActiveSession() {
   state.activeSession = null;
   state.logs = [];
   state.ui.expandedRunHistory = {};
+  resetWorkspaceBrowserState();
   resetDiffViewer();
   disconnectStream();
   syncHistory(null);
@@ -707,6 +732,25 @@ function primeSubmittedSession(session) {
   resetChatScrollState(chatScrollKeyForSession(session.id));
   persistPreferences();
   renderApp();
+}
+
+function resetWorkspaceBrowserState() {
+  state.ui.workspaceBrowser = {
+    open: false,
+    loading: false,
+    workspaceId: null,
+    workspaceName: "",
+    entries: [],
+    selectedPath: "",
+    expandedPaths: {},
+    content: "",
+    contentLoading: false,
+    contentError: "",
+    fileTruncated: false,
+    fileSizeBytes: 0,
+    treeTruncated: false,
+    error: "",
+  };
 }
 
 function resetDiffViewer() {
@@ -1571,6 +1615,11 @@ function handleClick(event) {
     return;
   }
 
+  if (action === "open-workspace-browser") {
+    openWorkspaceBrowser(target.dataset.workspaceId);
+    return;
+  }
+
   if (action === "logout") {
     logoutUser();
     return;
@@ -1638,6 +1687,11 @@ function handleClick(event) {
 
   if (action === "close-workspace-modal") {
     closeWorkspaceModal();
+    return;
+  }
+
+  if (action === "close-workspace-browser") {
+    closeWorkspaceBrowser();
     return;
   }
 
@@ -1724,6 +1778,16 @@ function handleClick(event) {
 
   if (action === "toggle-run-history") {
     toggleRunHistory(target.dataset.sessionId);
+    return;
+  }
+
+  if (action === "toggle-workspace-browser-folder") {
+    toggleWorkspaceBrowserDirectory(target.dataset.path);
+    return;
+  }
+
+  if (action === "open-workspace-browser-file") {
+    openWorkspaceBrowserFile(target.dataset.path);
     return;
   }
 
@@ -2282,6 +2346,127 @@ function closeWorkspaceModal() {
   renderApp();
 }
 
+async function openWorkspaceBrowser(workspaceId) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId) || selectedWorkspace();
+  if (!workspace) {
+    showToast("Waehle zuerst ein Projekt aus.", "error");
+    return;
+  }
+
+  state.ui.workspaceBrowser = {
+    ...state.ui.workspaceBrowser,
+    open: true,
+    loading: true,
+    workspaceId: workspace.id,
+    workspaceName: workspace.name,
+    entries: [],
+    selectedPath: "",
+    expandedPaths: {},
+    content: "",
+    contentLoading: false,
+    contentError: "",
+    fileTruncated: false,
+    fileSizeBytes: 0,
+    treeTruncated: false,
+    error: "",
+  };
+  renderApp();
+
+  try {
+    const payload = await fetchJSON(`/api/workspaces/${workspace.id}/tree`);
+    const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+    const selectedPath = pickFirstWorkspaceBrowserFile(entries) || "";
+    state.ui.workspaceBrowser = {
+      ...state.ui.workspaceBrowser,
+      open: true,
+      loading: false,
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+      entries,
+      selectedPath,
+      expandedPaths: selectedPath ? expandedWorkspaceBrowserPathsFor(selectedPath) : {},
+      treeTruncated: Boolean(payload?.truncated),
+      error: "",
+    };
+    renderApp();
+    if (selectedPath) {
+      await openWorkspaceBrowserFile(selectedPath);
+    }
+  } catch (error) {
+    state.ui.workspaceBrowser = {
+      ...state.ui.workspaceBrowser,
+      open: true,
+      loading: false,
+      entries: [],
+      error: error.message,
+    };
+    renderApp();
+  }
+}
+
+function closeWorkspaceBrowser() {
+  resetWorkspaceBrowserState();
+  renderApp();
+}
+
+function toggleWorkspaceBrowserDirectory(path) {
+  if (!path) {
+    return;
+  }
+  state.ui.workspaceBrowser = {
+    ...state.ui.workspaceBrowser,
+    expandedPaths: {
+      ...state.ui.workspaceBrowser.expandedPaths,
+      [path]: !state.ui.workspaceBrowser.expandedPaths?.[path],
+    },
+  };
+  renderApp();
+}
+
+async function openWorkspaceBrowserFile(path) {
+  const browser = state.ui.workspaceBrowser;
+  if (!browser.workspaceId || !path) {
+    return;
+  }
+  state.ui.workspaceBrowser = {
+    ...browser,
+    selectedPath: path,
+    expandedPaths: {
+      ...browser.expandedPaths,
+      ...expandedWorkspaceBrowserPathsFor(path),
+    },
+    contentLoading: true,
+    contentError: "",
+  };
+  renderApp();
+
+  try {
+    const payload = await fetchJSON(
+      `/api/workspaces/${browser.workspaceId}/files/content?path=${encodeURIComponent(path)}`,
+    );
+    state.ui.workspaceBrowser = {
+      ...state.ui.workspaceBrowser,
+      selectedPath: payload?.path || path,
+      content: String(payload?.content || ""),
+      contentLoading: false,
+      contentError: "",
+      fileTruncated: Boolean(payload?.truncated),
+      fileSizeBytes: Number(payload?.size_bytes || 0),
+    };
+  } catch (error) {
+    state.ui.workspaceBrowser = {
+      ...state.ui.workspaceBrowser,
+      selectedPath: path,
+      content: "",
+      contentLoading: false,
+      contentError: error.message,
+      fileTruncated: false,
+      fileSizeBytes: 0,
+    };
+  }
+  renderApp();
+}
+
 function closeSettingsPage() {
   state.ui.page = "workspace";
   syncHistory({ page: "workspace", replace: true });
@@ -2376,6 +2561,7 @@ function renderApp() {
         ${renderSettingsPage()}
         ${renderRunQueueModal()}
         ${renderWorkspaceModal()}
+        ${renderWorkspaceBrowserModal()}
         ${renderTerminalModal()}
         ${renderToast()}
       `
@@ -2392,6 +2578,7 @@ function renderApp() {
         </div>
         ${renderRunQueueModal()}
         ${renderWorkspaceModal()}
+        ${renderWorkspaceBrowserModal()}
         ${renderTerminalModal()}
         ${renderToast()}
       `;
@@ -3934,6 +4121,21 @@ function renderTopBar() {
             ${icon(workspace ? "compose" : "project-add")}
             <span>${escapeHtml(primaryActionLabel)}</span>
           </button>
+          ${
+            workspace
+              ? `
+                <button
+                  class="button-secondary thread-toolbar-button thread-toolbar-icon-button"
+                  type="button"
+                  data-action="open-workspace-browser"
+                  data-workspace-id="${escapeHtml(workspace.id)}"
+                  aria-label="Workspace-Dateien anzeigen"
+                >
+                  ${icon("folder")}
+                </button>
+              `
+              : ""
+          }
           ${renderThreadToolbarMenu(shell)}
         </div>
       </div>
@@ -6018,6 +6220,119 @@ function renderWorkspaceModal() {
   `;
 }
 
+function renderWorkspaceBrowserModal() {
+  const browser = state.ui.workspaceBrowser;
+  if (!browser.open) {
+    return "";
+  }
+
+  const body = browser.loading
+    ? `<div class="workspace-browser-empty">Dateibaum wird geladen ...</div>`
+    : browser.error
+      ? `<div class="workspace-browser-empty workspace-browser-error">${escapeHtml(browser.error)}</div>`
+      : !browser.entries.length
+        ? `<div class="workspace-browser-empty">In diesem Projekt sind aktuell keine sichtbaren Dateien vorhanden.</div>`
+        : `
+            <div class="workspace-browser-shell">
+              <aside class="workspace-browser-tree-pane">
+                <div class="workspace-browser-pane-head">
+                  <strong>Dateien</strong>
+                  <span>${escapeHtml(browser.workspaceName)}</span>
+                </div>
+                <div class="workspace-browser-tree">
+                  ${browser.entries.map((entry) => renderWorkspaceBrowserTreeNode(entry)).join("")}
+                </div>
+              </aside>
+              <section class="workspace-browser-preview-pane">
+                <div class="workspace-browser-pane-head">
+                  <strong>${escapeHtml(browser.selectedPath || "Keine Datei ausgewaehlt")}</strong>
+                  <span>${
+                    browser.fileSizeBytes ? escapeHtml(formatBytes(browser.fileSizeBytes)) : ""
+                  }</span>
+                </div>
+                ${
+                  browser.contentLoading
+                    ? `<div class="workspace-browser-empty">Datei wird geladen ...</div>`
+                    : browser.contentError
+                      ? `<div class="workspace-browser-empty workspace-browser-error">${escapeHtml(browser.contentError)}</div>`
+                      : browser.selectedPath
+                        ? `
+                            <pre class="workspace-browser-preview"><code>${escapeHtml(browser.content)}</code></pre>
+                            ${
+                              browser.fileTruncated
+                                ? `<p class="workspace-browser-note">Die Ansicht wurde auf den ersten sichtbaren Abschnitt begrenzt.</p>`
+                                : ""
+                            }
+                          `
+                        : `<div class="workspace-browser-empty">Waehle links eine Datei aus.</div>`
+                }
+              </section>
+            </div>
+          `;
+
+  return `
+    <div class="modal-backdrop" data-action="close-workspace-browser"></div>
+    <div class="modal-layer modal-layer-wide">
+      <section class="modal-card workspace-browser-modal">
+        <header class="modal-head">
+          <div>
+            <p class="modal-kicker">Workspace</p>
+            <h3>Dateibrowser</h3>
+          </div>
+          <button class="icon-button modal-close" type="button" data-action="close-workspace-browser" aria-label="Schliessen">
+            <span class="modal-close-glyph" aria-hidden="true">X</span>
+          </button>
+        </header>
+        <div class="modal-body workspace-browser-modal-body">
+          ${body}
+          ${
+            browser.treeTruncated
+              ? `<p class="workspace-browser-note">Der Dateibaum wurde fuer eine stabile Ansicht auf die ersten sichtbaren Dateien begrenzt.</p>`
+              : ""
+          }
+        </div>
+        <footer class="modal-actions">
+          <button class="button-secondary" type="button" data-action="close-workspace-browser">Schliessen</button>
+        </footer>
+      </section>
+    </div>
+  `;
+}
+
+function renderWorkspaceBrowserTreeNode(node, depth = 0) {
+  if (!node) {
+    return "";
+  }
+
+  const path = String(node.path || "");
+  const isDirectory = node.kind === "directory";
+  const expanded = isDirectory && Boolean(state.ui.workspaceBrowser.expandedPaths?.[path]);
+  const selected = !isDirectory && state.ui.workspaceBrowser.selectedPath === path;
+
+  return `
+    <div class="workspace-browser-node">
+      <button
+        class="workspace-browser-node-button ${selected ? "selected" : ""}"
+        type="button"
+        data-action="${isDirectory ? "toggle-workspace-browser-folder" : "open-workspace-browser-file"}"
+        data-path="${escapeAttribute(path)}"
+        style="--tree-depth:${depth};"
+        ${isDirectory ? `aria-expanded="${expanded ? "true" : "false"}"` : ""}
+      >
+        <span class="workspace-browser-node-icon" aria-hidden="true">${icon(isDirectory ? (expanded ? "folder-open" : "folder") : "file")}</span>
+        <span class="workspace-browser-node-label">${escapeHtml(node.name || path || "Datei")}</span>
+      </button>
+      ${
+        isDirectory && expanded && Array.isArray(node.children) && node.children.length
+          ? `<div class="workspace-browser-children">${node.children
+              .map((child) => renderWorkspaceBrowserTreeNode(child, depth + 1))
+              .join("")}</div>`
+          : ""
+      }
+    </div>
+  `;
+}
+
 function renderTerminalModal() {
   if (!state.ui.terminal.open) {
     return "";
@@ -7343,6 +7658,38 @@ function shouldOpenDetailPanel(tone, session) {
 
 function countLabel(count, singular, plural) {
   return Number(count) === 1 ? singular : plural;
+}
+
+function pickFirstWorkspaceBrowserFile(entries) {
+  const source = Array.isArray(entries) ? entries : [];
+  for (const entry of source) {
+    if (!entry) {
+      continue;
+    }
+    if (entry.kind === "file" && entry.path) {
+      return entry.path;
+    }
+    if (entry.kind === "directory") {
+      const nested = pickFirstWorkspaceBrowserFile(entry.children);
+      if (nested) {
+        return nested;
+      }
+    }
+  }
+  return "";
+}
+
+function expandedWorkspaceBrowserPathsFor(path) {
+  const parts = String(path || "")
+    .split("/")
+    .filter(Boolean);
+  const expanded = {};
+  const current = [];
+  for (const part of parts.slice(0, -1)) {
+    current.push(part);
+    expanded[current.join("/")] = true;
+  }
+  return expanded;
 }
 
 function describeLogRecord(record) {
@@ -8932,6 +9279,8 @@ function icon(name) {
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M2.5 5.5h4.2l1.6 1.8h9.2v7.2a2 2 0 0 1-2 2H4.5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.6"/></svg>',
     "folder-open":
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M2.5 6h4l1.7 1.7h8.8a1.5 1.5 0 0 1 1.4 2l-1.5 4.6a2 2 0 0 1-1.9 1.4H4.3a1.9 1.9 0 0 1-1.8-2.4L4 7.5" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
+    file:
+      '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M6 3.8h5.7l3.3 3.3v8.8a1.6 1.6 0 0 1-1.6 1.6H6a1.6 1.6 0 0 1-1.6-1.6V5.4A1.6 1.6 0 0 1 6 3.8z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/><path d="M11.7 3.8v3.3H15" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     edit:
       '<svg viewBox="0 0 20 20" class="icon" aria-hidden="true"><path d="M4 13.8V16h2.2l7.2-7.2-2.2-2.2zM12.5 4.7l2.2 2.2 1-1a1.6 1.6 0 0 0-2.2-2.2z" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5"/></svg>',
     compose:
@@ -9005,8 +9354,10 @@ if (typeof module !== "undefined" && module.exports) {
     findBlockingRunForSubmission,
     createRefreshController,
     describeLogRecord,
+    expandedWorkspaceBrowserPathsFor,
     messageDisplayState,
     parseUiRoute,
+    pickFirstWorkspaceBrowserFile,
     shouldStartRefresh,
     submissionSessionId,
     updateRefreshBackoff,

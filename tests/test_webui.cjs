@@ -18,9 +18,11 @@ const {
   createRefreshController,
   currentRunLogs,
   currentThoughtFrom,
+  expandedWorkspaceBrowserPathsFor,
   findBlockingRunForSubmission,
   formatSessionElapsed,
   parseUiRoute,
+  pickFirstWorkspaceBrowserFile,
   renderRichText,
   sanitizeAssistantMessageContent,
   sessionBadgeText,
@@ -210,6 +212,38 @@ test("buildThreadRunFeed zeigt abgeschlossene Schritte schlicht und nur den letz
   assert.ok(feed.active);
   assert.match(feed.active.text, /fasse jetzt die eigentlichen dateien an/i);
   assert.equal(feed.active.active, true);
+});
+
+test("pickFirstWorkspaceBrowserFile waehlt die erste sichtbare Datei aus verschachtelten Ordnern", () => {
+  const tree = [
+    {
+      kind: "directory",
+      name: "src",
+      path: "src",
+      children: [
+        {
+          kind: "directory",
+          name: "components",
+          path: "src/components",
+          children: [{ kind: "file", name: "Panel.js", path: "src/components/Panel.js", children: [] }],
+        },
+      ],
+    },
+    { kind: "file", name: "README.md", path: "README.md", children: [] },
+  ];
+
+  const picked = pickFirstWorkspaceBrowserFile(tree);
+
+  assert.equal(picked, "src/components/Panel.js");
+});
+
+test("expandedWorkspaceBrowserPathsFor markiert alle Ordner entlang des Dateipfads", () => {
+  const expanded = expandedWorkspaceBrowserPathsFor("src/components/Panel.js");
+
+  assert.deepEqual(expanded, {
+    src: true,
+    "src/components": true,
+  });
 });
 
 test("buildValidationSnapshot hebt fehlgeschlagene Checks klar hervor", () => {

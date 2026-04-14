@@ -42,11 +42,13 @@ from server.schemas import (
     TerminalSessionInputRequest,
     TerminalSessionResponse,
     TaskCreateRequest,
+    WorkspaceFileContentResponse,
     WorkspaceCreateRequest,
     WorkspaceGitStatus,
     WorkspaceGitSyncRequest,
     WorkspaceGitSyncResponse,
     WorkspaceRecord,
+    WorkspaceTreeResponse,
     WorkspaceUpdateRequest,
 )
 from server.terminal_manager import TerminalManager, TerminalSessionNotFoundError
@@ -580,6 +582,35 @@ def create_app(base_config: AppConfig | None = None) -> FastAPI:
         except WorkspaceNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return _build_export_response(bundle, current_runtime().task_manager)
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/tree",
+        response_model=WorkspaceTreeResponse,
+        dependencies=[Depends(require_auth)],
+    )
+    async def get_workspace_tree(workspace_id: str) -> WorkspaceTreeResponse:
+        try:
+            return current_runtime().task_manager.workspace_file_tree(workspace_id)
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/files/content",
+        response_model=WorkspaceFileContentResponse,
+        dependencies=[Depends(require_auth)],
+    )
+    async def get_workspace_file_content(
+        workspace_id: str,
+        path: str = Query(..., min_length=1),
+    ) -> WorkspaceFileContentResponse:
+        try:
+            return current_runtime().task_manager.read_workspace_file(workspace_id, path)
+        except WorkspaceNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except WorkspaceOperationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/sessions", response_model=list[SessionSummary], dependencies=[Depends(require_auth)])
     async def list_sessions(limit: int = Query(default=100, ge=1, le=500)) -> list[SessionSummary]:

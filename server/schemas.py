@@ -151,6 +151,32 @@ class WorkspaceGitSyncResponse(StrictModel):
     git: WorkspaceGitStatus
 
 
+class WorkspaceTreeNode(StrictModel):
+    name: str
+    path: str
+    kind: Literal["file", "directory"]
+    children: list["WorkspaceTreeNode"] = Field(default_factory=list)
+
+
+class WorkspaceTreeResponse(StrictModel):
+    workspace_id: str
+    workspace_name: str
+    workspace_path: str
+    entries: list[WorkspaceTreeNode] = Field(default_factory=list)
+    file_count: int = 0
+    truncated: bool = False
+
+
+class WorkspaceFileContentResponse(StrictModel):
+    workspace_id: str
+    workspace_name: str
+    workspace_path: str
+    path: str
+    content: str
+    truncated: bool = False
+    size_bytes: int = 0
+
+
 class TerminalSessionCreateRequest(StrictModel):
     workspace_id: str | None = None
     cwd: str | None = Field(default=None, min_length=1)
@@ -198,3 +224,6 @@ class RecommendedModelStatus(StrictModel):
 class ModelCatalogResponse(StrictModel):
     installed_models: list[ModelInventory] = Field(default_factory=list)
     recommended_models: list[RecommendedModelStatus] = Field(default_factory=list)
+
+
+WorkspaceTreeNode.model_rebuild()
