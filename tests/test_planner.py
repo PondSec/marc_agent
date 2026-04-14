@@ -29461,3 +29461,47 @@ def test_planner_localizes_deterministic_final_response_to_english(tmp_path):
     assert decision.action_type == AgentActionType.FINAL
     assert "I mainly inspected" in (decision.final_response or "")
     assert "Ich habe" not in (decision.final_response or "")
+
+
+def test_execute_action_from_plan_localizes_german_inspect_outcome(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Bitte analysiere das Repository und lies die wichtigsten Dateien.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="inspect",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "inspect_workspace",
+                    "reason": "Gezielten Repository-Kontext sammeln, bevor ich antworte.",
+                }
+            ],
+            requested_outcome="Inspect the repository and summarize the key areas.",
+        )
+    )
+
+    decision = planner.execute_action_from_plan(route, session)
+
+    assert decision.tool_name == "inspect_workspace"
+    assert decision.expected_outcome == "Repository-Struktur und Validierungskontext sammeln."
+
+
+def test_validation_decision_localizes_expected_outcome_for_german_sessions(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Bitte pruefe jetzt die aktuelle Aenderung.",
+        workspace_root=str(tmp_path),
+    )
+
+    decision = planner._validation_decision(
+        "Die aktuelle Aenderung pruefen.",
+        "python -m pytest",
+        session=session,
+    )
+
+    assert decision.tool_name == "run_tests"
+    assert decision.expected_outcome == "Den naechsten Validierungsschritt fuer die aktuellen Aenderungen ausfuehren."
