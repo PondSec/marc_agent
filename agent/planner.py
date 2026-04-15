@@ -30,6 +30,7 @@ from agent.prompts import (
     REPAIR_BLOCKED_SENTINEL,
     _artifact_scoped_focus,
     _best_contract_fragment_near_match,
+    _compact_read_evidence,
     _direct_main_runtime_contract,
     _direct_python_script_runtime_contract,
     _format_similar_python_name_candidates,
@@ -42,9 +43,12 @@ from agent.prompts import (
     _repair_semantic_value_text,
     _repair_target_line_hints,
     _repair_semantic_delta_lines,
+    _requires_structured_analysis_report,
     _runtime_output_contract_required_literals,
+    _read_paths,
     _source_backed_runtime_argv_contract,
     _source_backed_runtime_output_contracts,
+    _trim_text,
     choose_path_prompt,
     final_response_prompt,
     generate_content_continuation_prompt,
@@ -1061,6 +1065,183 @@ class Planner:
             )
 
         return "\n\n".join(part for part in lines if part)
+
+    def _deterministic_structured_analysis_response(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+    ) -> str:
+        if not _requires_structured_analysis_report(route, session):
+            return ""
+        task_state = session.task_state
+        snapshot = session.workspace_snapshot
+        if task_state is None or snapshot is None:
+            return ""
+        sections = [
+            str(item or "").strip(" .")
+            for item in task_state.request_requirements
+            if len(str(item or "").strip(" .")) >= 8
+        ][:6]
+        if not sections:
+            return ""
+        inspected = _read_paths(session)[-8:]
+        if not inspected:
+            return ""
+        language = self._session_language(session)
+        overview = _trim_text(snapshot.repo_summary or "", 220)
+        entrypoints = ", ".join(snapshot.entrypoints[:3])
+        lines: list[str] = []
+        if overview:
+            intro = self._localized_text(
+                language,
+                de=f"Projektueberblick: {overview}",
+                en=f"Project overview: {overview}",
+            )
+            if entrypoints:
+                intro += self._localized_text(
+                    language,
+                    de=f" Wichtige Einstiegspfade: {entrypoints}.",
+                    en=f" Key entry paths: {entrypoints}.",
+                )
+            lines.append(intro)
+        for index, section in enumerate(sections, start=1):
+            lines.append(self._structured_analysis_section_line(index, section, session, snapshot, language))
+        return "\n\n".join(item for item in lines if item)
+
+    def _structured_analysis_section_line(
+        self,
+        index: int,
+        section: str,
+        session: SessionState,
+        snapshot: WorkspaceSnapshot,
+        language: str,
+    ) -> str:
+        section_terms = prioritized_focus_terms(
+            section,
+            max_terms=8,
+            reference_terms={
+                token
+                for path in [*_read_paths(session)[-8:], *snapshot.focus_files[:8], *snapshot.important_files[:12]]
+                for token in self._structured_analysis_path_terms(path)
+            },
+        )
+        candidates = self._structured_analysis_section_candidates(
+            section_terms=section_terms,
+            session=session,
+            snapshot=snapshot,
+        )
+        if candidates:
+            direct = [item for item in candidates if item["direct"]]
+            indirect = [item for item in candidates if not item["direct"]]
+            chosen = direct[:2] or indirect[:2]
+            label = self._localized_text(
+                language,
+                de="Direkt sichtbar" if direct else "Indirekt ableitbar",
+                en="Directly visible" if direct else "Indirectly inferred",
+            )
+            paths = ", ".join(item["path"] for item in chosen)
+            details = " ".join(
+                detail
+                for detail in [*(item["detail"] for item in chosen[:2])]
+                if detail
+            ).strip()
+            sentence = f"{index}. {section}: {label} in {paths}."
+            if details:
+                sentence += f" {details}"
+            return sentence
+        inspected = ", ".join(_read_paths(session)[-4:])
+        return self._localized_text(
+            language,
+            de=f"{index}. {section}: Im gelesenen Kontext noch nicht belastbar bestaetigt. Bisher direkt gelesen: {inspected}.",
+            en=f"{index}. {section}: Not reliably confirmed in the inspected context yet. Files read so far: {inspected}.",
+        )
+
+    def _structured_analysis_section_candidates(
+        self,
+        *,
+        section_terms: list[str],
+        session: SessionState,
+        snapshot: WorkspaceSnapshot,
+    ) -> list[dict[str, object]]:
+        candidates: list[dict[str, object]] = []
+        inspected = set(_read_paths(session)[-8:])
+        candidate_paths = self._unique_paths(
+            [
+                *_read_paths(session)[-8:],
+                *snapshot.focus_files[:8],
+                *snapshot.important_files[:12],
+            ]
+        )
+        for path in candidate_paths:
+            lowered_path = str(path or "").strip().lower()
+            if not lowered_path:
+                continue
+            module_summary = str((snapshot.module_summaries or {}).get(path) or "").strip()
+            symbols = list((snapshot.symbol_index or {}).get(path) or [])[:4]
+            excerpt = self._current_or_last_read_excerpt(session, path=path)[:500]
+            score = 0
+            for term in section_terms:
+                lowered_term = str(term or "").strip().lower()
+                if not lowered_term:
+                    continue
+                if lowered_term in lowered_path:
+                    score += 4
+                if lowered_term and lowered_term in module_summary.lower():
+                    score += 3
+                if lowered_term and lowered_term in excerpt.lower():
+                    score += 2
+                if any(lowered_term == str(symbol or "").strip().lower() for symbol in symbols):
+                    score += 3
+            if path in inspected:
+                score += 3
+            if module_summary:
+                score += 1
+            if score <= 0:
+                continue
+            detail_parts: list[str] = []
+            if module_summary:
+                detail_parts.append(_trim_text(module_summary, 180))
+            elif symbols:
+                detail_parts.append(
+                    self._localized_text(
+                        self._session_language(session),
+                        de=f"Sichtbare Symbole: {', '.join(symbols)}.",
+                        en=f"Visible symbols: {', '.join(symbols)}.",
+                    )
+                )
+            elif excerpt:
+                detail_parts.append(_trim_text(excerpt.replace("\n", " "), 180))
+            candidates.append(
+                {
+                    "path": path,
+                    "score": score,
+                    "direct": path in inspected,
+                    "detail": " ".join(detail_parts).strip(),
+                }
+            )
+        candidates.sort(key=lambda item: (-int(item["score"]), str(item["path"])))
+        return candidates[:4]
+
+    def _structured_analysis_partial_is_grounded(
+        self,
+        response: str,
+        session: SessionState,
+    ) -> bool:
+        text = str(response or "").strip()
+        if len(text) < 160:
+            return False
+        inspected = _read_paths(session)[-6:]
+        if any(path in text for path in inspected):
+            return True
+        request_count = len(
+            [
+                item
+                for item in (session.task_state.request_requirements if session.task_state is not None else [])
+                if str(item or "").strip()
+            ]
+        )
+        numbered_sections = len(re.findall(r"(?:^|\n)\s*\d+[.)]\s", text))
+        return numbered_sections >= max(3, min(5, request_count))
 
     def _is_conversation_request(self, session: SessionState) -> bool:
         return (
@@ -7358,6 +7539,11 @@ class Planner:
         prompt = final_response_prompt(route, session)
         num_ctx = self._final_response_num_ctx(prompt)
         model_name = self._lightweight_generation_model_name()
+        timeout_seconds, total_timeout_seconds = self._final_response_runtime_budget(
+            route,
+            session,
+            prompt=prompt,
+        )
         self._log(
             "final_response_generation_started",
             model=model_name or self._primary_generation_model_name(),
@@ -7368,8 +7554,8 @@ class Planner:
             lambda progress: self.llm.generate(
                 prompt,
                 model=model_name,
-                timeout=max(self._llm_timeout(20), 20),
-                total_timeout=max(self._llm_timeout(60), 60),
+                timeout=timeout_seconds,
+                total_timeout=total_timeout_seconds,
                 num_ctx=num_ctx,
                 retries=0,
                 progress_callback=progress,
@@ -7382,8 +7568,8 @@ class Planner:
             prompt_variant="compact",
             model_identifier=model_name or self._primary_generation_model_name(),
             backend_identifier=self._backend_identifier(),
-            inactivity_timeout_seconds=max(self._llm_timeout(20), 20),
-            total_timeout_seconds=max(self._llm_timeout(60), 60),
+            inactivity_timeout_seconds=timeout_seconds,
+            total_timeout_seconds=total_timeout_seconds,
             context_pressure_estimate=estimate_context_pressure(prompt_chars=len(prompt)),
             event_callback=self._progress_logger("final_response_generation_progress"),
         )
@@ -7418,6 +7604,12 @@ class Planner:
                 partial_characters=issue.characters if issue is not None else 0,
             )
             partial_response = self._salvage_partial_final_response(issue)
+            if (
+                partial_response
+                and _requires_structured_analysis_report(route, session)
+                and not self._structured_analysis_partial_is_grounded(partial_response, session)
+            ):
+                partial_response = ""
             if partial_response:
                 self._log(
                     "final_response_generation_finished",
@@ -7441,6 +7633,30 @@ class Planner:
                     ),
                 )
                 return partial_response
+        structured_deterministic = self._deterministic_structured_analysis_response(route, session)
+        if structured_deterministic:
+            self._log(
+                "final_response_generation_finished",
+                characters=len(structured_deterministic),
+                source="deterministic_structured_analysis",
+            )
+            self._append_runtime_execution(
+                session,
+                build_execution_run_record(
+                    operation_name="final_response_generation",
+                    task_class="final_response_generation",
+                    final_state="degraded_success",
+                    capability_tier="tier_d",
+                    recovery_strategy="deterministic_structured_analysis",
+                    degraded=True,
+                    honest_blocked=False,
+                    artifact_bytes_generated=len(structured_deterministic),
+                    validation_possible=False,
+                    summary="Final user response used the structured deterministic analysis fallback after the model runtime did not complete cleanly.",
+                    attempts=[outcome.attempt],
+                ),
+            )
+            return structured_deterministic
         deterministic = self._deterministic_final_response(route, session)
         self._log(
             "final_response_generation_finished",
@@ -8097,6 +8313,25 @@ class Planner:
         if prompt_chars >= 1_800:
             return 1536
         return 1024
+
+    def _final_response_runtime_budget(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        prompt: str,
+    ) -> tuple[int, int]:
+        prompt_chars = len(str(prompt or ""))
+        timeout_seconds = max(self._llm_timeout(20), 20)
+        total_timeout_seconds = max(self._llm_timeout(60), 60)
+        if _requires_structured_analysis_report(route, session):
+            timeout_seconds = max(timeout_seconds, 45 if prompt_chars < 4_800 else 60)
+            total_timeout_seconds = max(total_timeout_seconds, 150 if prompt_chars < 4_800 else 180)
+            return timeout_seconds, total_timeout_seconds
+        if prompt_chars >= 5_500:
+            timeout_seconds = max(timeout_seconds, 35)
+            total_timeout_seconds = max(total_timeout_seconds, 120)
+        return timeout_seconds, total_timeout_seconds
 
     def _llm_num_ctx(self, minimum: int) -> int:
         configured = getattr(getattr(self.llm, "config", None), "ollama_num_ctx", minimum)
