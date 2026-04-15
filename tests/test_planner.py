@@ -593,7 +593,71 @@ def test_final_response_prompt_includes_read_evidence_for_explain_runs(tmp_path)
     assert '"inspected_files": ["README.md", "app.py"]' in prompt
     assert '"path": "README.md"' in prompt
     assert "A tiny Python CLI utility." in prompt
-    assert "Do not merely say that you inspected or summarized files" in prompt
+    assert "Antworte auf Deutsch." in prompt
+    assert "Erzaehle nicht den Arbeitsablauf nach" in prompt
+
+
+def test_final_response_prompt_uses_focused_grounding_rules_for_read_only_file_explanations(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="explain",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "read_relevant_files",
+                    "reason": "Read the referenced artifact before explaining it.",
+                },
+                {
+                    "step": 2,
+                    "action": "summarize_result",
+                    "reason": "Explain the result clearly.",
+                },
+            ],
+            target_paths=["app.py"],
+            target_name="app.py",
+            requested_outcome="Analysiere app.py und gib eine Zusammenfassung.",
+        )
+    )
+    session = SessionState(
+        task="analysiere bitte app.py und gib eine zusammenfassung",
+        workspace_root=str(tmp_path),
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            phase="exploring",
+            output_excerpt=(
+                "from flask import Flask\n"
+                "from flask_cors import CORS\n"
+                "import sqlite3\n"
+                "DATABASE = 'inventory.db'\n"
+            ),
+        )
+    )
+
+    prompt = final_response_prompt(route, session)
+
+    assert "Antworte auf Deutsch." in prompt
+    assert "Spekuliere nicht ueber Framework-Details, Routen, Datenbanklogik" in prompt
+    assert '"target_paths": ["app.py"]' in prompt
+    assert '"inspection_evidence": [{"path": "app.py"' in prompt
+    assert "import sqlite3" in prompt
+    assert "DATABASE = 'inventory.db'" in prompt
+    assert '"memory_context"' not in prompt
+    assert "generischen Repository-Ueberblick" in prompt
+
+
+def test_final_response_num_ctx_scales_with_prompt_size(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+
+    assert planner._final_response_num_ctx("x" * 1200) == 1024
+    assert planner._final_response_num_ctx("x" * 2200) == 1536
+    assert planner._final_response_num_ctx("x" * 4200) == 2048
+    assert planner._final_response_num_ctx("x" * 6500) == 3072
 
 
 def test_planner_routes_failed_semantic_review_into_repair_cycle(tmp_path):
@@ -29318,6 +29382,103 @@ def test_planner_deletes_only_after_target_has_been_read(tmp_path):
     assert decision.action_type == AgentActionType.CALL_TOOL
     assert decision.tool_name == "delete_file"
     assert decision.tool_args["path"] == "obsolete.py"
+
+
+def test_inspect_with_explicit_file_target_summarizes_after_reading_that_file(tmp_path):
+    llm = ScriptedLLM(
+        json_payloads=[
+            route_payload(
+                intent="inspect",
+                action_plan=[
+                    {
+                        "step": 1,
+                        "action": "inspect_workspace",
+                        "reason": "Collect repository context first.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "read_relevant_files",
+                        "reason": "Inspect the requested file before summarizing.",
+                    },
+                    {
+                        "step": 3,
+                        "action": "summarize_result",
+                        "reason": "Summarize honestly.",
+                    },
+                ],
+                target_paths=["app.py"],
+                target_name="app.py",
+                requested_outcome="Summarize app.py.",
+            )
+        ],
+        text_payloads=["app.py wires the Flask app, runtime configuration, upload limits, and auth/session helpers together."],
+    )
+    payload = llm.json_payloads[0]
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="analysiere bitte app.py und gib eine zusammenfassung",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=82,
+            language_counts={"python": 33, "html": 22, "javascript": 10},
+            top_directories=["templates", "tests", "pondsec_ai"],
+            important_files=[
+                "README.md",
+                "tests/test_server_settings.py",
+                "requirements.txt",
+                "pondsec_ai/tools/assets.py",
+                "app.py",
+            ],
+            focus_files=[],
+            file_briefs={"app.py": "Main Flask application."},
+            manifests=["README.md", "requirements.txt"],
+            configs=["instance/runtime_config.json"],
+            test_files=["tests/test_server_settings.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["app.py"],
+            repo_map=["pondsec_ai/", "templates/", "tests/"],
+            project_labels=["python", "flask"],
+            likely_commands=["python -m pytest"],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Large Flask inventory workspace.",
+        ),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="inspect_workspace",
+            tool_args={"focus": "Summarize app.py."},
+            success=True,
+            summary="Workspace inspected successfully.",
+            phase="exploring",
+            output_excerpt=(
+                "The repository contains 82 scanned files. Inspect README.md, tests/test_server_settings.py, "
+                "requirements.txt, pondsec_ai/tools/assets.py, app.py before broad edits."
+            ),
+        )
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=2,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            phase="exploring",
+            output_excerpt="from flask import Flask\napp = Flask(__name__)\n",
+        )
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "app.py" in (decision.final_response or "")
+    assert "README.md" not in (decision.final_response or "")
+    assert len(llm.generate_calls) == 1
 
 
 def test_analyze_task_returns_router_output_model(tmp_path):

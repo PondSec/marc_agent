@@ -4015,6 +4015,7 @@ class Planner:
     ) -> list[str]:
         repair_context = self._current_repair_context_hint(session)
         if repair_context is not None and route.intent in {
+            RouteIntent.INSPECT,
             RouteIntent.UPDATE,
             RouteIntent.DEBUG,
             RouteIntent.DELETE,
@@ -4027,6 +4028,7 @@ class Planner:
                 return self._unique_paths(repair_targets)
         explicit_targets = self._explicit_target_paths(route, session)
         if explicit_targets and route.intent in {
+            RouteIntent.INSPECT,
             RouteIntent.UPDATE,
             RouteIntent.DEBUG,
             RouteIntent.DELETE,
@@ -6958,10 +6960,13 @@ class Planner:
         if route.intent == RouteIntent.PLAN:
             return self._render_plan_response(route)
         prompt = final_response_prompt(route, session)
+        num_ctx = self._final_response_num_ctx(prompt)
         model_name = self._lightweight_generation_model_name()
         self._log(
             "final_response_generation_started",
             model=model_name or self._primary_generation_model_name(),
+            prompt_chars=len(prompt),
+            num_ctx=num_ctx,
         )
         outcome = invoke_model(
             lambda progress: self.llm.generate(
@@ -6969,7 +6974,7 @@ class Planner:
                 model=model_name,
                 timeout=max(self._llm_timeout(20), 20),
                 total_timeout=max(self._llm_timeout(60), 60),
-                num_ctx=1024,
+                num_ctx=num_ctx,
                 retries=0,
                 progress_callback=progress,
             ),
@@ -7640,6 +7645,16 @@ class Planner:
     def _llm_timeout(self, minimum: int) -> int:
         configured = getattr(getattr(self.llm, "config", None), "llm_timeout", minimum)
         return max(int(configured), minimum)
+
+    def _final_response_num_ctx(self, prompt: str) -> int:
+        prompt_chars = len(str(prompt or ""))
+        if prompt_chars >= 6_000:
+            return 3072
+        if prompt_chars >= 3_500:
+            return 2048
+        if prompt_chars >= 1_800:
+            return 1536
+        return 1024
 
     def _llm_num_ctx(self, minimum: int) -> int:
         configured = getattr(getattr(self.llm, "config", None), "ollama_num_ctx", minimum)

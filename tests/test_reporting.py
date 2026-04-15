@@ -151,6 +151,64 @@ def test_reporter_replaces_machine_summary_with_user_facing_response(tmp_path):
     assert "Ich habe" in response
 
 
+def test_reporter_does_not_append_inspection_meta_when_substantive_draft_exists(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    reporter = SessionReporter(config)
+    session = SessionState(
+        task="analysiere bitte app.py und gib eine zusammenfassung",
+        workspace_root=str(tmp_path),
+        status="completed",
+        current_phase="reporting",
+        workflow_stage="report",
+        validation_status="not_run",
+        task_state=TaskState(
+            latest_user_turn="analysiere bitte app.py und gib eine zusammenfassung",
+            root_goal="Analysiere app.py.",
+            active_goal="Fasse app.py fuer den Nutzer zusammen.",
+            goal_relation="new_task",
+            output_expectation="Eine knappe Zusammenfassung von app.py.",
+            open_problem=None,
+            verification_target="Nenne die sichtbaren Bestandteile von app.py.",
+            target_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.9,
+            next_action="explain",
+            execution_outline=["Lies app.py", "Fasse app.py zusammen"],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="read_file",
+            tool_args={"path": "app.py"},
+            success=True,
+            summary="Read app.py.",
+            phase="exploring",
+        )
+    )
+    session.report = reporter.build_report(session)
+
+    response = reporter.render_final_response(
+        session,
+        draft_response=(
+            "app.py initialisiert eine Flask-Anwendung und bindet unter anderem CORS, SQLite, "
+            "LDAP-, Mail- und Upload-bezogene Bausteine ein."
+        ),
+    )
+
+    assert response.startswith("app.py initialisiert eine Flask-Anwendung")
+    assert "Angesehen habe ich vor allem" not in response
+
+
 def test_reporter_requires_task_state_without_semantic_fallback(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

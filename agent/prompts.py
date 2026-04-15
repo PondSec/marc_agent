@@ -12,7 +12,7 @@ from agent.semantic_defaults import classify_conversation_request
 from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
-from llm.schemas import RouteActionName, RouterOutput
+from llm.schemas import RouteActionName, RouteIntent, RouterOutput
 
 
 REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
@@ -1070,6 +1070,7 @@ def _single_file_boundary_instruction(path: str, target_paths: list[str] | None)
 
 
 def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
+    language = _session_language(session)
     if (
         classify_conversation_request(session.task) is not None
         and not session.changed_files
@@ -1090,6 +1091,57 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
                 "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
             ]
         )
+    inspection_evidence = _compact_read_evidence(session)
+    if route.intent in {RouteIntent.EXPLAIN, RouteIntent.INSPECT} and not session.changed_files and inspection_evidence:
+        focused_evidence = _compact_read_evidence(
+            session,
+            limit=2,
+            excerpt_chars=1400,
+            preferred_paths=route.entities.target_paths[:4],
+        )
+        focused_context = {
+            "user_task": session.task,
+            "requested_outcome": route.requested_outcome,
+            "target_paths": route.entities.target_paths[:4],
+            "inspected_files": _read_paths(session)[-6:],
+            "inspection_evidence": focused_evidence,
+            "recent_tool_calls": _compact_recent_calls(session),
+            "notes": session.notes[-8:],
+            "validation_status": session.validation_status,
+        }
+        return "\n".join(
+            _localized_prompt_lines(
+                language,
+                de=[
+                    "Schreibe eine knappe, nutzerfreundliche Antwort auf die letzte Repository-Frage.",
+                    "Antworte auf Deutsch.",
+                    f"Kontext: {json.dumps(focused_context, ensure_ascii=False)}",
+                    "Konzentriere dich zuerst auf die explizit angefragten target_paths.",
+                    "Stuetze jede konkrete Aussage direkt auf die inspection_evidence oben.",
+                    "Nutze sichtbare Imports, Konstanten, Konfigurationswerte und andere klar erkennbare Signale aus dem gelesenen Ausschnitt.",
+                    "Erzaehle nicht den Arbeitsablauf nach und erwaehne Lesen oder Inspizieren nur, wenn der Nutzer genau danach fragt.",
+                    "Vermeide Metasaetze wie 'die Evidenz zeigt' oder 'der Ausschnitt enthaelt'; sprich natuerlich ueber die Datei.",
+                    "Spekuliere nicht ueber Framework-Details, Routen, Datenbanklogik, Integrationen, Validierungen oder Laufzeitverhalten, die im Ausschnitt nicht sichtbar sind.",
+                    "Wenn ein wichtiger Punkt im Ausschnitt nicht bestaetigt ist, sage kurz, dass er dort nicht sichtbar ist, statt ihn zu erraten.",
+                    "Beantworte die eigentliche Nutzerfrage direkt und nicht als generischen Repository-Ueberblick.",
+                    "Gib kein JSON aus.",
+                ],
+                en=[
+                    "Write a concise user-facing explanation for the user's latest repository question.",
+                    "Reply in English.",
+                    f"Context: {json.dumps(focused_context, ensure_ascii=False)}",
+                    "Focus first on the explicitly requested target paths when target_paths are present.",
+                    "Base every concrete claim directly on the inspection_evidence above.",
+                    "Use visible imports, constants, configuration values, and other clearly observable signals from the inspected excerpt.",
+                    "Do not narrate the workflow or mention reading or inspection unless the user explicitly asked about your process.",
+                    "Avoid meta phrasing like 'the evidence shows' or 'the excerpt contains'; speak naturally about the file.",
+                    "Do not speculate about framework details, routes, database logic, integrations, validations, or runtime behavior that are not visible in the excerpt.",
+                    "If an important detail is not confirmed by the excerpt, say briefly that it is not visible there instead of inferring it.",
+                    "Answer the user's actual question directly, not as a generic repository overview.",
+                    "Do not emit JSON.",
+                ],
+            )
+        )
     recent_notes = session.notes[-12:]
     recent_calls = _compact_recent_calls(session)
     report_context = {
@@ -1099,7 +1151,7 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
         "memory_context": _compact_memory_context(session),
         "changed_files": [item.path for item in session.changed_files[-8:]],
         "inspected_files": _read_paths(session)[-8:],
-        "inspection_evidence": _compact_read_evidence(session),
+        "inspection_evidence": inspection_evidence,
         "validation_status": session.validation_status,
         "recent_tool_calls": recent_calls,
         "recent_diagnostics": _compact_recent_diagnostics(session),
@@ -1108,14 +1160,31 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
         "blockers": session.blockers[-6:],
     }
     return "\n".join(
-        [
-            "Write a concise user-facing response for the completed or blocked task.",
-            f"Context: {json.dumps(report_context, ensure_ascii=False)}",
-            "Mention the main outcome, changed files or inspected files when relevant, and any blocker or validation status.",
-            "When no files were changed and inspection evidence is present, summarize the concrete observed contents, behaviors, or technologies from that evidence.",
-            "Do not merely say that you inspected or summarized files; use the evidence to answer the user's actual request.",
-            "Do not emit JSON.",
-        ]
+        _localized_prompt_lines(
+            language,
+            de=[
+                "Schreibe eine knappe nutzerfreundliche Antwort fuer die abgeschlossene oder blockierte Aufgabe.",
+                "Antworte auf Deutsch.",
+                f"Kontext: {json.dumps(report_context, ensure_ascii=False)}",
+                "Nenne das Hauptergebnis, relevante geaenderte oder gelesene Dateien und sichtbare Blocker oder Validierungsresultate.",
+                "Wenn keine Dateien geaendert wurden und inspection_evidence vorhanden ist, fasse die konkret sichtbaren Inhalte, Verhaltenshinweise oder Technologien daraus zusammen.",
+                "Erzaehle nicht nur, dass du Dateien gelesen oder zusammengefasst hast; beantworte die eigentliche Nutzerfrage.",
+                "Erwaehne den Arbeitsablauf nur, wenn er fuer die Antwort wirklich relevant ist oder der Nutzer danach gefragt hat.",
+                "Spekuliere nicht ueber Details, die die sichtbare Evidenz nicht bestaetigt; benenne Unsicherheit kurz statt zu raten.",
+                "Gib kein JSON aus.",
+            ],
+            en=[
+                "Write a concise user-facing response for the completed or blocked task.",
+                "Reply in English.",
+                f"Context: {json.dumps(report_context, ensure_ascii=False)}",
+                "Mention the main outcome, relevant changed or inspected files, and any visible blocker or validation result.",
+                "When no files were changed and inspection_evidence is present, summarize the concrete observed contents, behavior hints, or technologies from that evidence.",
+                "Do not merely say that you inspected or summarized files; answer the user's actual request.",
+                "Mention the workflow only when it is genuinely relevant to the answer or the user asked about it.",
+                "Do not speculate about details the visible evidence does not confirm; state uncertainty briefly instead of guessing.",
+                "Do not emit JSON.",
+            ],
+        )
     )
 
 
@@ -1363,15 +1432,22 @@ def _compact_recent_calls(session: SessionState | None) -> list[dict[str, object
     ]
 
 
-def _compact_read_evidence(session: SessionState | None, *, limit: int = 4) -> list[dict[str, object]]:
+def _compact_read_evidence(
+    session: SessionState | None,
+    *,
+    limit: int = 4,
+    excerpt_chars: int = 220,
+    preferred_paths: list[str] | None = None,
+) -> list[dict[str, object]]:
     if session is None:
         return []
+    preferred = [str(path or "").strip() for path in (preferred_paths or []) if str(path or "").strip()]
     evidence: list[dict[str, object]] = []
     for item in session.tool_calls:
         if item.tool_name != "read_file" or not item.success:
             continue
         path = str(item.tool_args.get("path") or "").strip()
-        excerpt = _trim_text(item.output_excerpt or "", 220)
+        excerpt = _trim_text(item.output_excerpt or "", excerpt_chars)
         summary = _trim_text(item.summary, 120)
         if not path and not excerpt and not summary:
             continue
@@ -1383,7 +1459,55 @@ def _compact_read_evidence(session: SessionState | None, *, limit: int = 4) -> l
         elif summary:
             payload["summary"] = summary
         evidence.append(payload)
-    return evidence[-limit:]
+    if preferred:
+        prioritized = [item for item in evidence if str(item.get("path") or "").strip() in preferred]
+        fallback = [item for item in evidence if item not in prioritized]
+        evidence = prioritized + fallback
+    return evidence[-limit:] if not preferred else evidence[:limit]
+
+
+def _session_language(session: SessionState | None) -> str:
+    if session is None:
+        return "en"
+    task_state = session.task_state
+    if task_state is not None and task_state.latest_user_turn:
+        return _language_for_text(task_state.latest_user_turn)
+    return _language_for_text(session.task)
+
+
+def _language_for_text(text: str | None) -> str:
+    normalized = str(text or "").lower()
+    german_markers = (
+        " lies ",
+        " fasse ",
+        " ich ",
+        " bitte ",
+        " mach",
+        " bau",
+        " aenderung",
+        " pruef",
+        "prüf",
+        "fehler",
+        "datei",
+        "sicher",
+        "backend",
+        "frontend",
+        "kannst",
+        "moechte",
+        "möchte",
+        "jetzt",
+        "dazu",
+        "nur ",
+        " zusammen",
+    )
+    padded = f" {normalized} "
+    if any(marker in padded for marker in german_markers) or any(char in normalized for char in "äöüß"):
+        return "de"
+    return "en"
+
+
+def _localized_prompt_lines(language: str, *, de: list[str], en: list[str]) -> list[str]:
+    return de if language == "de" else en
 
 
 def _compact_follow_up_context(session: SessionState | None) -> dict[str, object]:
