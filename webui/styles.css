@@ -1666,6 +1666,7 @@ pre {
   justify-items: center;
   align-items: start;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: max(6vh, var(--space-5)) var(--space-4);
 }
 
@@ -1713,7 +1714,12 @@ pre {
   gap: var(--space-4);
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: var(--space-5);
+}
+
+.workspace-modal-card {
+  align-self: start;
 }
 
 .modal-field {
