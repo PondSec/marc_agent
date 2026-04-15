@@ -281,6 +281,9 @@ class WorkingMemoryEntry(MemoryEntryBase):
     current_subtask: str | None = None
     primary_target: str | None = None
     verification_target: str | None = None
+    request_excerpt: str | None = None
+    request_requirements: list[str] = Field(default_factory=list)
+    request_chunks: list[str] = Field(default_factory=list)
     active_constraints: list[str] = Field(default_factory=list)
     active_failure_signature: str | None = None
     recent_attempts: list[str] = Field(default_factory=list)

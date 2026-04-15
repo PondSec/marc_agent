@@ -3793,6 +3793,7 @@ def test_compact_generation_prompt_keeps_late_large_request_requirements(tmp_pat
     )
 
     assert "Latest user request:" in prompt or "User request digest:" in prompt
+    assert "Request memory:" in prompt
     assert "Formular mit einfacher Frontend-Validierung" in prompt
     assert "dynamisches Nachladen oder Umschalten von Inhalten per JavaScript" in prompt
 
@@ -13508,9 +13509,11 @@ def test_generate_content_prompt_compacts_large_request_context_only_when_needed
     )
 
     assert "Generation brief:" in prompt
+    assert "Request memory:" in prompt
     assert "User goal:" not in prompt
     assert "Requested outcome:" not in prompt
     assert "other_pending_requirements" not in prompt
+    assert "Kontaktformular" in prompt
     assert estimate_context_pressure(prompt_chars=len(prompt)) == "low"
 
 

@@ -268,6 +268,20 @@ def make_conversation_entry(store: AgentMemoryStore, *, session_id: str, summary
 def test_working_memory_stays_relevant_and_compact_for_active_run(tmp_path):
     store = build_store(tmp_path)
     session = build_session(store)
+    session.task_state = session.task_state.model_copy(
+        update={
+            "request_excerpt": "Build the auth hardening flow and keep the validation contract intact.",
+            "request_requirements": [
+                "Keep the auth flow stable.",
+                "Preserve the runtime validation contract.",
+                "Avoid broad rewrites.",
+            ],
+            "request_chunks": [
+                "Keep the auth flow stable; preserve the runtime validation contract.",
+                "Avoid broad rewrites.",
+            ],
+        }
+    )
     session.candidate_files = [f"app/file_{index}.py" for index in range(20)] + ["app/auth.py"]
     session.changed_files = [FileChangeRecord(path="app/auth.py", operation="update")]
     session.active_repair_context = build_failure_context()
@@ -280,6 +294,8 @@ def test_working_memory_stays_relevant_and_compact_for_active_run(tmp_path):
     assert working.primary_target == "app/auth.py"
     assert len(working.relevant_files) <= 8
     assert len(working.active_constraints) <= 6
+    assert working.request_chunks
+    assert "runtime validation contract" in working.request_chunks[0]
     assert len(working.compact_state_summary) <= 340
     assert "app/auth.py" in working.relevant_files
 

@@ -25,6 +25,9 @@ ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET = 900
 DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET = 1280
 TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET = 760
 TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET = 520
+REQUEST_MEMORY_PACKET_CHAR_BUDGET = 760
+REQUEST_MEMORY_STATE_CHAR_BUDGET = 1600
+REQUEST_MEMORY_CHUNK_CHAR_BUDGET = 200
 GENERATION_BRIEF_CHAR_BUDGET = 760
 GENERATION_FILE_FOCUS_CHAR_BUDGET = 480
 GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 420
@@ -208,6 +211,14 @@ def task_state_update_prompt(
         task,
         max_chars=TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET,
     )
+    request_memory_packet = build_request_memory_packet(
+        task,
+        max_chars=REQUEST_MEMORY_PACKET_CHAR_BUDGET if compact else 900,
+    )
+    include_request_memory_packet = (
+        bool(request_memory_packet.get("requirement_chunks"))
+        and len(str(task or "").strip()) > TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET
+    )
     if mode == "resume" and str(resume_partial or "").strip():
         lines = [
             "Finish the partially emitted task-state JSON object for this turn.",
@@ -218,6 +229,8 @@ def task_state_update_prompt(
         ]
         if request_digest:
             lines.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+        if include_request_memory_packet:
+            lines.append(f"Request memory packet: {json.dumps(request_memory_packet, ensure_ascii=False)}")
         lines.extend(
             [
                 f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
@@ -238,13 +251,24 @@ def task_state_update_prompt(
     ]
     if request_digest:
         lines.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+    if include_request_memory_packet:
+        lines.insert(3 if request_digest else 2, f"Request memory packet: {json.dumps(request_memory_packet, ensure_ascii=False)}")
     if follow_up_context:
-        lines.insert(3 if request_digest else 2, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
+        follow_up_index = 4 if request_digest and include_request_memory_packet else 3 if request_digest or include_request_memory_packet else 2
+        lines.insert(follow_up_index, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
     if memory_context:
-        insert_at = 4 if request_digest and follow_up_context else 3 if request_digest or follow_up_context else 2
+        insert_at = 2
+        if request_digest:
+            insert_at += 1
+        if include_request_memory_packet:
+            insert_at += 1
+        if follow_up_context:
+            insert_at += 1
         lines.insert(insert_at, f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}")
     if previous_task_state:
         insert_at = 3 if not request_digest else 4
+        if include_request_memory_packet:
+            insert_at += 1
         if follow_up_context:
             insert_at += 1
         if memory_context:
@@ -540,6 +564,7 @@ def generate_content_prompt(
         )
         compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
         generation_brief = _compact_generation_brief(route, session, path=path)
+        request_memory = _generation_request_memory(session)
         request_digest = _compact_request_digest(
             request_text,
             max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
@@ -572,10 +597,17 @@ def generate_content_prompt(
                 if include_request_digest:
                     sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
                 sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+                if request_memory:
+                    sections.insert(
+                        4 if include_request_digest else 3,
+                        f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}",
+                    )
             else:
                 sections.insert(1, f"Latest user request: {_trim_balanced_text(request_text, 520)}")
                 if include_request_digest:
                     sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+                if request_memory and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET:
+                    sections.insert(3 if include_request_digest else 2, f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}")
             if explicit_constraints != "none":
                 sections.append(f"Explicit constraints: {explicit_constraints}")
             sections.append(
@@ -649,11 +681,18 @@ def generate_content_prompt(
             if include_request_digest:
                 sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
             sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
-            sections.insert(5 if include_request_digest else 4, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+            if request_memory:
+                sections.insert(
+                    4 if include_request_digest else 3,
+                    f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}",
+                )
+            sections.insert(6 if include_request_digest else 5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
         else:
             sections.insert(1, f"Latest user request: {_trim_balanced_text(request_text, 520)}")
             if include_request_digest:
                 sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            if request_memory and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET:
+                sections.insert(3 if include_request_digest else 2, f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}")
             sections.insert(3 if include_request_digest else 2, f"User goal: {_trim_text(route.user_goal, 240)}")
             sections.insert(4 if include_request_digest else 3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
             sections.insert(6 if include_request_digest else 5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
@@ -854,6 +893,7 @@ def generate_content_retry_prompt(
             current_content=current_content,
         )
         generation_brief = _compact_generation_brief(route, session, path=path)
+        request_memory = _generation_request_memory(session)
         request_digest = _compact_request_digest(
             request_text,
             max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
@@ -908,6 +948,11 @@ def generate_content_retry_prompt(
             if include_request_digest:
                 sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
             sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            if request_memory:
+                sections.insert(
+                    4 if include_request_digest else 3,
+                    f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}",
+                )
             sections.insert(6 if include_request_digest else 5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
         else:
             sections.insert(
@@ -916,6 +961,8 @@ def generate_content_retry_prompt(
             )
             if include_request_digest:
                 sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            if request_memory and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET:
+                sections.insert(3 if include_request_digest else 2, f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}")
             sections.insert(3 if include_request_digest else 2, f"User goal: {_trim_text(route.user_goal, 240)}")
             sections.insert(4 if include_request_digest else 3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
             if session is not None:
@@ -1774,6 +1821,9 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
         "current_subtask": _trim_text(working.current_subtask or "", 160),
         "primary_target": working.primary_target,
         "verification_target": _trim_text(working.verification_target or "", 180),
+        "request_excerpt": _trim_text(working.request_excerpt or "", 180),
+        "request_requirements": [_trim_text(item, 120) for item in working.request_requirements[:4]],
+        "request_chunks": [_trim_text(item, 140) for item in working.request_chunks[:3]],
         "active_constraints": [_trim_text(item, 120) for item in working.active_constraints[:6]],
         "active_failure_signature": _trim_text(working.active_failure_signature or "", 180),
         "relevant_files": working.relevant_files[:6],
@@ -1788,6 +1838,9 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
             "current_goal",
             "primary_target",
             "verification_target",
+            "request_chunks",
+            "request_requirements",
+            "request_excerpt",
             "current_subtask",
             "active_failure_signature",
             "active_constraints",
@@ -2140,6 +2193,9 @@ def _compact_task_state(state: TaskState | None) -> dict[str, object]:
     return {
         "root_goal": _trim_text(state.root_goal, 220),
         "active_goal": _trim_text(state.active_goal, 220),
+        "request_excerpt": _trim_text(state.request_excerpt or "", 220),
+        "request_requirements": [_trim_text(item, 120) for item in state.request_requirements[:4]],
+        "request_chunks": [_trim_text(item, 140) for item in state.request_chunks[:3]],
         "goal_relation": state.goal_relation,
         "output_expectation": _trim_text(state.output_expectation, 220),
         "current_user_intent": state.current_user_intent,
@@ -2536,6 +2592,7 @@ def _compact_generation_brief(
         _append_unique_compact_text(execution_outline, candidate, limit=120)
     for step in list(getattr(understanding, "execution_plan", []) or []):
         _append_unique_compact_text(execution_outline, getattr(step, "summary", ""), limit=120)
+    request_memory = _generation_request_memory(session)
     payload: dict[str, object] = {
         "target_path": path,
         "goal": _trim_text(goal, 220),
@@ -2547,6 +2604,7 @@ def _compact_generation_brief(
             if str(item or "").strip()
         ],
         "execution_outline": execution_outline[:4],
+        "request_memory": request_memory[:3],
     }
     if working:
         payload["working_summary"] = _trim_text(str(working.get("summary") or "").strip(), 180)
@@ -2558,6 +2616,7 @@ def _compact_generation_brief(
             "goal",
             "expected_output",
             "constraints",
+            "request_memory",
             "execution_outline",
             "requested_artifacts",
             "working_summary",
@@ -2595,6 +2654,25 @@ def _should_compact_generation_request(
         current_content_chars=len(str(current_content or "")),
     )
     return pressure != "low"
+
+
+def _generation_request_memory(session: SessionState | None) -> list[str]:
+    task_state = session.task_state if session is not None else None
+    request_memory = list(getattr(task_state, "request_chunks", []) or [])
+    if not request_memory:
+        request_memory = list(getattr(task_state, "request_requirements", []) or [])
+    if not request_memory and session is not None:
+        packet = build_request_memory_packet(
+            session.task,
+            max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
+            max_items=8,
+            max_chunks=3,
+        )
+        request_memory = list(packet.get("requirement_chunks", []) or packet.get("requirements", []) or [])
+    compacted: list[str] = []
+    for item in request_memory:
+        _append_unique_compact_text(compacted, item, limit=140)
+    return compacted[:4]
 
 
 def _compact_generation_file_focus(
@@ -7554,6 +7632,85 @@ def _derived_requirement_sentences(
     return sentences[:8]
 
 
+def build_request_memory_packet(
+    text: str,
+    *,
+    max_chars: int = REQUEST_MEMORY_PACKET_CHAR_BUDGET,
+    max_items: int = 10,
+    max_chunks: int = 4,
+) -> dict[str, object]:
+    effective_budget = max(int(max_chars or 0), 160)
+    digest = _compact_request_digest(
+        text,
+        max_chars=min(max(effective_budget, REQUEST_MEMORY_PACKET_CHAR_BUDGET), REQUEST_MEMORY_STATE_CHAR_BUDGET),
+        max_items=max_items,
+    )
+    requirements = [str(item).strip() for item in list(digest.get("requirements", [])) if str(item).strip()]
+    compact_requirements = [
+        _trim_text(item, 96 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 140)
+        for item in requirements[:max_items]
+        if str(item).strip()
+    ]
+    requirement_chunks = _chunk_requirement_groups(
+        requirements,
+        max_chars=min(
+            REQUEST_MEMORY_CHUNK_CHAR_BUDGET,
+            160 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 220,
+        ),
+        max_chunks=max_chunks,
+    )
+    request_excerpt = _trim_text(
+        str(digest.get("request_excerpt") or "").strip(),
+        180 if requirement_chunks and effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 260,
+    )
+    packet = _fit_prioritized_payload_fields(
+        [
+            ("requirement_chunks", requirement_chunks),
+            ("requirements", compact_requirements),
+            ("request_excerpt", request_excerpt),
+        ],
+        max_chars=effective_budget,
+    )
+    if "requirements" not in packet and compact_requirements:
+        packet["requirements"] = compact_requirements[: min(len(compact_requirements), 3)]
+    return _fit_prioritized_payload_fields(
+        [
+            ("requirement_chunks", packet.get("requirement_chunks", [])),
+            ("requirements", packet.get("requirements", [])),
+            ("request_excerpt", packet.get("request_excerpt", "")),
+        ],
+        max_chars=effective_budget,
+    )
+
+
+def _fit_prioritized_payload_fields(
+    fields: list[tuple[str, object]],
+    *,
+    max_chars: int,
+) -> dict[str, object]:
+    compacted: dict[str, object] = {}
+    remaining_budget = max(int(max_chars or 0), 0)
+    for key, value in fields:
+        if not _has_payload_signal(value) or remaining_budget <= 0:
+            continue
+        candidate = {**compacted, key: value}
+        if _json_char_cost(candidate) <= max_chars:
+            compacted[key] = value
+            remaining_budget = max_chars - _json_char_cost(compacted)
+            continue
+        trimmed = _trim_value_to_budget(
+            value,
+            max_chars=max(remaining_budget - len(str(key)) - 8, 12),
+        )
+        if not _has_payload_signal(trimmed):
+            continue
+        candidate = {**compacted, key: trimmed}
+        if _json_char_cost(candidate) <= max_chars:
+            compacted[key] = trimmed
+            remaining_budget = max_chars - _json_char_cost(compacted)
+    return compacted
+
+
 def _compact_request_digest(
     text: str,
     *,
@@ -7609,6 +7766,33 @@ def _compact_request_digest(
         ordered_keys=["requirements", "request_excerpt"],
         max_chars=max_chars,
     )
+
+
+def _chunk_requirement_groups(
+    requirements: list[str],
+    *,
+    max_chars: int,
+    max_chunks: int,
+) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    for requirement in requirements:
+        item = _trim_text(requirement, min(max_chars, 180))
+        extra_chars = len(item) + (2 if current else 0)
+        if current and (current_chars + extra_chars > max_chars or len(current) >= 3):
+            chunks.append("; ".join(current))
+            current = []
+            current_chars = 0
+            if len(chunks) >= max_chunks:
+                break
+        if len(chunks) >= max_chunks:
+            break
+        current.append(item)
+        current_chars += len(item) + (2 if len(current) > 1 else 0)
+    if current and len(chunks) < max_chunks:
+        chunks.append("; ".join(current))
+    return chunks[:max_chunks]
 
 
 def _requirement_sentences(text: str) -> list[str]:

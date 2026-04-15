@@ -416,6 +416,9 @@ class TaskState(StrictModel):
     active_goal: str
     goal_relation: GoalRelation = "unknown"
     output_expectation: str
+    request_excerpt: str | None = None
+    request_requirements: list[str] = Field(default_factory=list)
+    request_chunks: list[str] = Field(default_factory=list)
     current_user_intent: UserIntent | None = None
     execution_strategy: ExecutionStrategy | None = None
     open_problem: str | None = None
@@ -451,6 +454,8 @@ class TaskState(StrictModel):
             "active_artifacts",
             "evidence",
             "supplied_evidence",
+            "request_requirements",
+            "request_chunks",
             "relevant_context",
             "constraints",
             "assumptions",
@@ -488,10 +493,13 @@ class TaskState(StrictModel):
         self.root_goal = str(self.root_goal or "").strip()
         self.active_goal = str(self.active_goal or "").strip()
         self.output_expectation = str(self.output_expectation or "").strip()
+        self.request_excerpt = str(self.request_excerpt or "").strip() or None
         self.open_problem = str(self.open_problem or "").strip() or None
         self.verification_target = str(self.verification_target or "").strip() or None
         self.target_artifacts = _merge_artifacts(self.target_artifacts, self.active_artifacts)
         self.active_artifacts = _merge_artifacts(self.active_artifacts, self.target_artifacts)
+        self.request_requirements = _compact_strings(self.request_requirements, limit=10)
+        self.request_chunks = _compact_strings(self.request_chunks, limit=5)
         inferred_supplied_evidence = [item.summary for item in self.evidence if item.summary]
         self.supplied_evidence = _compact_strings(
             [*self.supplied_evidence, *inferred_supplied_evidence],
@@ -662,6 +670,9 @@ class TaskState(StrictModel):
         ]
         artifacts = self.active_artifacts or self.target_artifacts
         relevant_context = list(self.relevant_context)
+        request_memory = self.request_chunks or self.request_requirements
+        if request_memory:
+            relevant_context.insert(0, "Request memory: " + " | ".join(request_memory[:2 if self.request_chunks else 3]))
         if self.execution_strategy:
             relevant_context.insert(0, f"Execution strategy: {self.execution_strategy}")
         if self.current_user_intent:

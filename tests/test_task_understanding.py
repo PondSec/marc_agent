@@ -15,6 +15,7 @@ from agent.prompts import (
     _compact_request_digest,
     _compact_workspace_snapshot,
     _prioritized_compact_payload,
+    build_request_memory_packet,
     task_state_update_prompt,
 )
 from agent.semantic_defaults import (
@@ -3676,14 +3677,19 @@ def test_task_state_update_prompt_compact_keeps_tail_requirements_for_large_requ
         "Baue Hero, Features, Galerie und Statistikbereich. "
         "Interaktivitaet: Navigation mit smooth scrolling, Tabs oder Modal, Formular mit einfacher Frontend-Validierung "
         "und dynamisches Umschalten von Inhalten per JavaScript. "
+        "Ergaenze ausserdem Team-Sektion, Testimonials, Pricing, FAQ, Kontaktformular, Karten mit Hover-Zustaenden, "
+        "Filter fuer Inhalte, kleine Scroll-Animationen, Dark-Light-Umschalter und klare Loading-States. "
+        "Achte zusaetzlich auf Mobile-Navigation, Suchfunktion, Tabellen mit Statusanzeigen, Export-Hinweise und "
+        "eine hochwertige, nicht-templatehafte Gesamtwirkung. "
         "Wichtig: Die Website soll wie ein echtes kleines Produkt wirken und nicht wie ein leeres Template."
     )
 
     compact_prompt = task_state_update_prompt(prompt, snapshot=build_snapshot(tmp_path), mode="compact")
 
     assert "User request digest:" in compact_prompt
+    assert "Request memory packet:" in compact_prompt
     assert "smooth scrolling" in compact_prompt
-    assert "Formular mit einfacher Frontend-Validierung" in compact_prompt
+    assert "Export-Hinweise" in compact_prompt
 
 
 def test_task_state_updater_preserves_full_latest_user_turn_after_semantic_compaction():
@@ -3722,6 +3728,9 @@ def test_task_state_updater_preserves_full_latest_user_turn_after_semantic_compa
     task_state = TaskStateUpdater(llm).update_task_state(prompt)
 
     assert task_state.latest_user_turn == prompt
+    assert any("Kontaktformular" in item for item in task_state.request_requirements)
+    assert any("FAQ-Bereich" in item for item in task_state.request_requirements)
+    assert task_state.request_chunks
 
 
 def test_compact_request_digest_captures_late_requirements():
@@ -3738,6 +3747,47 @@ def test_compact_request_digest_captures_late_requirements():
     assert "requirements" in digest
     assert any("smooth scrolling" in item for item in digest["requirements"])
     assert any("Kontaktformular" in item for item in digest["requirements"])
+
+
+def test_request_memory_packet_chunks_large_prompt_into_compact_groups():
+    packet = build_request_memory_packet(
+        (
+            "Erstelle eine grosse Webapp mit vielen Bereichen. "
+            "Baue Dashboard, Detailansichten, Filter, Suche, Formulare, Validierung, Tabellen, Diagramme und ein Settings-Modul. "
+            "Achte spaeter im Prompt auch auf Audit-Log, Rollenrechte, Exportfunktion, Undo-Hinweise und klare Loading-States. "
+            "Wichtig ist ausserdem, dass Desktop und Mobile sauber funktionieren und die App nicht wie ein Template wirkt."
+        )
+    )
+
+    assert packet["requirements"]
+    assert packet["requirement_chunks"]
+    assert len(packet["requirement_chunks"]) <= 4
+    assert any("Audit-Log" in chunk for chunk in packet["requirement_chunks"])
+
+
+def test_task_state_prefers_chunked_request_memory_in_relevant_context():
+    task_state = TaskState(
+        latest_user_turn="Baue ein grosses Dashboard mit Audit-Log und Export.",
+        root_goal="Baue ein grosses Dashboard.",
+        active_goal="Implementiere das Dashboard.",
+        output_expectation="Ein funktionierendes Dashboard.",
+        request_requirements=[
+            "Baue das Dashboard.",
+            "Beruecksichtige Audit-Log.",
+            "Füge Export hinzu.",
+        ],
+        request_chunks=[
+            "Baue das Dashboard; beruecksichtige Audit-Log.",
+            "Fuege Export hinzu.",
+        ],
+        next_action="modify",
+    )
+
+    understanding = task_state.to_task_understanding()
+
+    assert understanding.relevant_context
+    assert understanding.relevant_context[0].startswith("Request memory:")
+    assert "Audit-Log" in understanding.relevant_context[0]
 
 
 def test_prioritized_compact_payload_keeps_high_value_keys_under_budget():

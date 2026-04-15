@@ -8,7 +8,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from agent.prompts import task_state_system_prompt, task_state_update_prompt
+from agent.prompts import (
+    REQUEST_MEMORY_STATE_CHAR_BUDGET,
+    build_request_memory_packet,
+    task_state_system_prompt,
+    task_state_update_prompt,
+)
 from agent.semantic_defaults import classify_conversation_request
 from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
@@ -965,6 +970,23 @@ class TaskStateUpdater:
 
     def _finalize_state(self, state: TaskState, *, semantic_resolution: str) -> TaskState:
         self._ground_explicit_request_paths(state)
+        request_memory_packet = build_request_memory_packet(
+            state.latest_user_turn,
+            max_chars=REQUEST_MEMORY_STATE_CHAR_BUDGET,
+            max_items=12,
+            max_chunks=5,
+        )
+        state.request_excerpt = str(request_memory_packet.get("request_excerpt") or "").strip() or None
+        state.request_requirements = [
+            str(item).strip()
+            for item in list(request_memory_packet.get("requirements", []))
+            if str(item).strip()
+        ][:10]
+        state.request_chunks = [
+            str(item).strip()
+            for item in list(request_memory_packet.get("requirement_chunks", []))
+            if str(item).strip()
+        ][:5]
         state.semantic_resolution = semantic_resolution
         state.secondary_semantics_limited = secondary_semantics_limited(semantic_resolution)
         state.semantic_inference_mode = "conservative" if semantic_resolution == "minimal_inference" else "full"
