@@ -11079,3 +11079,126 @@ body {
     max-height: 46vh;
   }
 }
+
+/* Final workspace layout correction */
+
+.workspace-modal-layer {
+  padding:
+    clamp(20px, 4.2vh, 42px)
+    clamp(16px, 2.8vw, 36px)
+    clamp(28px, 6.4vh, 68px);
+}
+
+.workspace-modal-card {
+  width: min(100%, 720px);
+  max-height: calc(100vh - clamp(56px, 10.6vh, 104px));
+}
+
+.thread-toolbar-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.thread-toolbar-icon-button {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+}
+
+.thread-toolbar-icon-button .icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.chat-stage-inner {
+  width: min(100%, 1540px);
+  margin: 0 auto;
+  display: grid;
+  justify-items: center;
+}
+
+.chat-input-inner {
+  width: min(100%, 860px);
+  margin: 0 auto;
+  display: grid;
+  justify-items: stretch;
+}
+
+.workbench-composer {
+  width: min(100%, 760px);
+  justify-self: center;
+}
+
+.workspace-browser-modal {
+  width: min(100%, calc(100vw - 40px));
+  max-width: min(1680px, calc(100vw - 40px));
+  max-height: calc(100vh - clamp(48px, 8vh, 88px));
+}
+
+.workspace-browser-modal-body {
+  padding: 0;
+}
+
+.workspace-browser-shell {
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+  min-height: min(80vh, 940px);
+}
+
+.workspace-browser-tree {
+  max-height: min(80vh, 940px);
+  padding: 14px 12px 18px;
+}
+
+.workspace-browser-node {
+  gap: 4px;
+}
+
+.workspace-browser-node-button {
+  min-height: 34px;
+  padding: 0 12px;
+}
+
+.workspace-browser-children {
+  display: grid;
+  gap: 4px;
+  margin-left: 18px;
+  padding-left: 12px;
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.workspace-browser-preview {
+  padding: 22px 24px;
+}
+
+@media (max-width: 980px) {
+  .workspace-modal-layer {
+    padding:
+      clamp(14px, 3vh, 22px)
+      14px
+      clamp(18px, 4vh, 30px);
+  }
+
+  .workspace-modal-card,
+  .workspace-browser-modal {
+    max-height: calc(100vh - 32px);
+  }
+
+  .chat-input-inner {
+    width: min(100%, 760px);
+  }
+
+  .workspace-browser-modal {
+    width: min(100%, calc(100vw - 24px));
+    max-width: min(100vw - 24px, 1480px);
+  }
+
+  .workspace-browser-shell {
+    grid-template-columns: 1fr;
+    min-height: auto;
+  }
+}
