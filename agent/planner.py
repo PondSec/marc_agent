@@ -5854,6 +5854,38 @@ class Planner:
         if (
             issue.no_start_failure
             and issue.context_pressure_likely
+            and lightweight_model
+            and lightweight_model != primary_model
+        ):
+            compact_fallback_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "compact"
+                    and attempt.model_name == lightweight_model
+                ),
+                None,
+            )
+            full_fallback_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "fallback_model"
+                    and attempt.model_name == lightweight_model
+                ),
+                None,
+            )
+            if compact_fallback_model is not None and full_fallback_model is not None:
+                reordered: list[GenerationRecoveryAttempt] = [compact_fallback_model]
+                for attempt in attempts:
+                    if attempt is compact_fallback_model:
+                        continue
+                    reordered.append(attempt)
+                attempts = reordered
+        if (
+            issue.no_start_failure
+            and issue.context_pressure_likely
             and (not lightweight_model or lightweight_model == primary_model)
         ):
             compact_same_model = next(
@@ -5918,6 +5950,7 @@ class Planner:
                 repair_context=repair_context,
                 repair_strategy=repair_strategy,
                 review_feedback=review_feedback,
+                mode="compact",
             )
         return generate_content_prompt(
             route,

@@ -28417,6 +28417,95 @@ def test_planner_uses_compact_prompt_for_fallback_model_after_primary_no_start(t
     assert attempts[0].strategy == "fallback_model"
 
 
+def test_planner_prefers_compact_fallback_model_after_primary_no_start_when_context_pressure_likely(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:14b",
+                router_model_name="qwen2.5-coder:7b",
+            )
+        ),
+        "",
+    )
+
+    attempts = planner._content_generation_recovery_attempts(
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:14b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=False,
+            raw_reason="startup_timeout",
+        )
+    )
+
+    assert attempts
+    assert attempts[0].model_name == "qwen2.5-coder:7b"
+    assert attempts[0].prompt_kind == "compact"
+    assert attempts[0].strategy == "compact_fallback_model"
+    assert any(
+        attempt.prompt_kind == "full"
+        and attempt.strategy == "fallback_model"
+        and attempt.model_name == "qwen2.5-coder:7b"
+        for attempt in attempts[1:]
+    )
+
+
+def test_planner_builds_compact_generation_retry_prompt_for_compact_attempt(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "update_artifact",
+                "reason": "Refresh the interactive web bundle.",
+            }
+        ],
+        target_paths=["index.html", "styles.css", "script.js"],
+        requested_outcome="Refresh the website bundle.",
+    )
+    route = RouterOutput.model_validate(payload)
+    session = SessionState(
+        task="Refresh the website bundle with a stronger interactive UI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    current_content = "<!DOCTYPE html><html><body><main>Legacy demo</main></body></html>"
+    attempt = GenerationRecoveryAttempt(
+        strategy="compact_fallback_model",
+        prompt_kind="compact",
+        model_name="qwen3:8b",
+        capability_tier="tier_b",
+    )
+
+    prompt = planner._content_generation_prompt_for_attempt(
+        attempt,
+        route,
+        session,
+        path="index.html",
+        current_content=current_content,
+        prompt="",
+        partial_text="",
+        repair_context=None,
+        repair_strategy=None,
+    )
+
+    expected = generate_content_retry_prompt(
+        route,
+        session,
+        path="index.html",
+        current_content=current_content,
+        mode="compact",
+    )
+
+    assert prompt == expected
+
+
 def test_planner_uses_compact_same_model_retry_after_retryable_no_start(tmp_path):
     planner = Planner(
         ScriptedLLM(
