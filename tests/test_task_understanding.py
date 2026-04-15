@@ -3864,6 +3864,47 @@ def test_request_digest_structures_targets_constraints_and_validation(tmp_path):
     assert any("Tests" in item or "tests" in item for item in digest.validation_needs)
 
 
+def test_request_digest_preserves_inline_enumerated_sections_for_large_prompts():
+    digest = build_request_digest(
+        (
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "Lies die wirklich relevanten Stellen und fasse dann kompakt zusammen: "
+            "1. Was fuer ein System ist das insgesamt? "
+            "2. Welche Rollen haben planner, prompts, layered_memory, task_state, state_updater und server? "
+            "3. Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen? "
+            "4. Woher kommt das Repo-Mapping und wie wird es spaeter wieder in Prompts oder Retrieval eingespeist? "
+            "5. Welche Stellen sind fuer grosse Nutzerprompts, Request-Digests, Request-Memory und kompakte Generationsprompts entscheidend? "
+            "6. Welche groessten technischen Risiken oder Restluecken siehst du noch bei grossen Repos oder langen Arbeitslaeufen? "
+            "Randbedingungen: bitte keine Halluzinationen, nenne Dateipfade und verliere spaete Anforderungen nicht."
+        ),
+        max_chars=900,
+    )
+
+    assert any("Welche Rollen haben planner" in item for item in digest.requirements)
+    assert any("Conversation Memory zusammen" in item for item in digest.requirements)
+    assert any("Repo-Mapping" in item for item in digest.requirements)
+    assert any("grosse Nutzerprompts" in item for item in digest.requirements)
+    assert any("technischen Risiken" in item for item in digest.requirements)
+
+
+def test_request_memory_packet_keeps_late_inline_enumerated_sections():
+    packet = build_request_memory_packet(
+        (
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp "
+            "2. Rollen von planner, prompts, layered_memory, task_state, state_updater und server "
+            "3. Memory-Zusammenspiel "
+            "4. Repo-Mapping und Rueckeinspeisung "
+            "5. grosse Nutzerprompts, Request-Digests, Request-Memory und kompakte Generationsprompts "
+            "6. Risiken. "
+            "Randbedingungen: Dateipfade nennen, nichts halluzinieren, auf Deutsch antworten."
+        )
+    )
+
+    assert any("Rollen von planner" in item for item in packet["requirements"])
+    assert any("grosse Nutzerprompts" in chunk for chunk in packet["requirement_chunks"])
+
+
 def test_request_memory_packet_chunks_large_prompt_into_compact_groups():
     packet = build_request_memory_packet(
         (

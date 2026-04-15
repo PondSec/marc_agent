@@ -8016,13 +8016,21 @@ def build_request_digest(
         return RequestDigest()
     all_requirements: list[str] = []
     line_requirements: list[str] = []
+    enumerated_requirements = _extract_enumerated_requirements(normalized)
     for raw_line in normalized.splitlines():
         cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", str(raw_line or "")).strip(" .")
         if len(cleaned_line) < 8 or _is_generation_metadata_constraint(cleaned_line):
             continue
+        if enumerated_requirements and len(cleaned_line) > 240:
+            continue
         trimmed_line = _trim_balanced_text(cleaned_line, 180)
         _append_unique_compact_text(line_requirements, trimmed_line, limit=180)
         _append_unique_compact_text(all_requirements, trimmed_line, limit=180)
+    for item in enumerated_requirements:
+        cleaned = _trim_balanced_text(item, 180)
+        if not cleaned or _is_generation_metadata_constraint(cleaned):
+            continue
+        _append_unique_compact_text(all_requirements, cleaned, limit=180)
     expanded = normalized.replace("*", "; ").replace("•", "; ")
     for sentence in _requirement_sentences(expanded):
         clauses = _split_requirement_clauses(sentence)
@@ -8032,12 +8040,20 @@ def build_request_digest(
             if not cleaned or _is_generation_metadata_constraint(cleaned):
                 continue
             _append_unique_compact_text(all_requirements, cleaned, limit=180)
-    prioritized_requirements = list(line_requirements or all_requirements)
+    prioritized_requirements = list(enumerated_requirements)
+    for candidate in line_requirements:
+        _append_unique_compact_text(prioritized_requirements, candidate, limit=180)
+    if not prioritized_requirements:
+        prioritized_requirements = list(line_requirements or all_requirements)
     for candidate in all_requirements:
         _append_unique_compact_text(prioritized_requirements, candidate, limit=180)
     requirements = prioritized_requirements[:max_items]
-    balancing_source = line_requirements if len(line_requirements) >= max_items else prioritized_requirements
-    if len(balancing_source) > max_items:
+    balancing_source = (
+        []
+        if enumerated_requirements
+        else line_requirements if len(line_requirements) >= max_items else prioritized_requirements
+    )
+    if balancing_source and len(balancing_source) > max_items:
         head_count = max(1, max_items // 2)
         tail_count = max(1, max_items - head_count)
         balanced: list[str] = []
@@ -8272,6 +8288,27 @@ def _chunk_requirement_groups(
     if current and len(chunks) < max_chunks:
         chunks.append("; ".join(current))
     return chunks[:max_chunks]
+
+
+def _extract_enumerated_requirements(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+    matches = list(
+        re.finditer(r"(?:(?<=^)|(?<=[\s:;(]))(?:\d{1,2}[.)])\s+", normalized)
+    )
+    if len(matches) < 2:
+        return []
+    sections: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        cleaned = normalized[start:end].strip(" .;:-")
+        if len(cleaned) < 8:
+            continue
+        if cleaned not in sections:
+            sections.append(cleaned)
+    return sections
 
 
 def _requirement_sentences(text: str) -> list[str]:
