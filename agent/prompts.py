@@ -127,6 +127,16 @@ REQUEST_DIGEST_COMPLETION_MARKERS = (
     "ausgabeformat",
     "ergebnis",
 )
+REQUEST_DIGEST_HEADING_MARKERS = (
+    "anforderungen",
+    "requirements",
+    "randbedingungen",
+    "arbeite sinnvoll",
+    "vorgehen",
+    "am ende",
+    "deliverables",
+    "output",
+)
 
 
 def system_prompt() -> str:
@@ -6610,6 +6620,14 @@ def _artifact_scoped_focus(
         if candidate not in current_requirements:
             current_requirements.append(candidate)
 
+    current_requirements, other_requirements, general_constraints = _rebalance_web_bundle_requirements(
+        path=path,
+        explicit_targets=explicit_targets,
+        current_requirements=current_requirements,
+        other_requirements=other_requirements,
+        general_constraints=general_constraints,
+    )
+
     if not current_requirements:
         if len(explicit_targets) <= 1 or current_artifact_role == "primary_target" or is_explicit_target:
             fallback = _trim_text(
@@ -6637,6 +6655,142 @@ def _artifact_scoped_focus(
         "other_pending_requirements": other_requirements[:4],
         "general_constraints": general_constraints[:4],
     }
+
+
+def _rebalance_web_bundle_requirements(
+    *,
+    path: str,
+    explicit_targets: list[str],
+    current_requirements: list[str],
+    other_requirements: list[str],
+    general_constraints: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    target_role = _web_bundle_target_role(path, explicit_targets)
+    if not target_role:
+        return current_requirements, other_requirements, general_constraints
+
+    promoted = list(current_requirements)
+    remaining_other: list[str] = []
+    remaining_general: list[str] = []
+    script_markers = {
+        "javascript",
+        "js",
+        "search",
+        "filter",
+        "state",
+        "event",
+        "logic",
+        "data",
+        "daten",
+        "render",
+        "suche",
+        "such",
+        "darstellung",
+    }
+    style_markers = {"css", "style", "ui", "ux", "responsive", "layout", "visual", "theme", "modern", "animation"}
+
+    for source_name, items in (("other", other_requirements), ("general", general_constraints)):
+        for item in items:
+            normalized = normalize_text(item)
+            if not normalized:
+                continue
+            target_bucket = remaining_other if source_name == "other" else remaining_general
+            if target_role == "script" and any(marker in normalized for marker in script_markers):
+                if item not in promoted:
+                    promoted.append(item)
+                continue
+            if target_role == "style" and any(marker in normalized for marker in style_markers):
+                if item not in promoted:
+                    promoted.append(item)
+                continue
+            if target_role == "html":
+                if any(marker in normalized for marker in script_markers | style_markers):
+                    target_bucket.append(item)
+                    continue
+                if not _looks_like_requirement_heading(item) and not _looks_like_bare_path_requirement(item, explicit_targets):
+                    if item not in promoted:
+                        promoted.append(item)
+                    continue
+            target_bucket.append(item)
+
+    promoted = _sort_web_bundle_requirements(promoted, target_role=target_role, explicit_targets=explicit_targets)
+    remaining_other = _sort_web_bundle_requirements(remaining_other, target_role=target_role, explicit_targets=explicit_targets)
+    remaining_general = _sort_web_bundle_requirements(remaining_general, target_role=target_role, explicit_targets=explicit_targets)
+
+    return (
+        _dedupe_requirement_items(promoted),
+        _dedupe_requirement_items(remaining_other),
+        _dedupe_requirement_items(remaining_general),
+    )
+
+
+def _web_bundle_target_role(path: str, explicit_targets: list[str]) -> str | None:
+    if len(explicit_targets) < 2:
+        return None
+    suffixes = {Path(str(item or "")).suffix.lower() for item in explicit_targets if str(item or "").strip()}
+    has_html = bool(suffixes.intersection({".html", ".htm", ".xhtml"}))
+    has_style = bool(suffixes.intersection({".css", ".scss", ".sass", ".less"}))
+    has_script = bool(suffixes.intersection({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}))
+    if not (has_html and has_style and has_script):
+        return None
+    suffix = Path(str(path or "")).suffix.lower()
+    if suffix in {".html", ".htm", ".xhtml"}:
+        return "html"
+    if suffix in {".css", ".scss", ".sass", ".less"}:
+        return "style"
+    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        return "script"
+    return None
+
+
+def _sort_web_bundle_requirements(
+    items: list[str],
+    *,
+    target_role: str,
+    explicit_targets: list[str],
+) -> list[str]:
+    style_markers = {"css", "style", "ui", "ux", "responsive", "layout", "visual", "theme", "modern", "animation"}
+    script_markers = {
+        "javascript",
+        "js",
+        "search",
+        "filter",
+        "state",
+        "event",
+        "logic",
+        "data",
+        "daten",
+        "render",
+        "suche",
+        "such",
+        "darstellung",
+    }
+
+    def score(item: str) -> tuple[int, str]:
+        normalized = normalize_text(item)
+        priority = _request_requirement_priority(
+            item,
+            explicit_paths=explicit_targets,
+            source_name="line",
+        )
+        style_hits = sum(1 for marker in style_markers if marker in normalized)
+        script_hits = sum(1 for marker in script_markers if marker in normalized)
+        if target_role == "style":
+            priority += style_hits * 4
+            priority -= script_hits * 2
+        elif target_role == "script":
+            priority += script_hits * 4
+            priority -= style_hits * 2
+        else:
+            if style_hits == 0 and script_hits == 0:
+                priority += 3
+            if any(marker in normalized for marker in ("anzeigen", "display", "show", "modell", "section", "karte", "card")):
+                priority += 3
+            else:
+                priority -= (style_hits + script_hits)
+        return (-priority, item)
+
+    return [item for item in sorted(_dedupe_requirement_items(items), key=score)]
 
 
 def _cross_file_consistency_requirements(
@@ -7889,18 +8043,35 @@ def _derived_requirement_sentences(
     task_state = session.task_state if session is not None else None
     sentences: list[str] = []
     sources: list[str] = []
+    explicit_targets = [
+        str(item or "").strip()
+        for item in getattr(getattr(route, "entities", None), "target_paths", []) or []
+        if str(item or "").strip()
+    ]
+    if task_state is not None and task_state.request_digest is not None:
+        sources.extend(str(item or "").strip() for item in task_state.request_digest.requirements[:8])
+        sources.extend(str(item or "").strip() for item in task_state.request_digest.requirement_chunks[:5])
+    if task_state is not None:
+        sources.extend(str(item or "").strip() for item in task_state.request_chunks[:6])
     if task_state is not None and task_state.output_expectation:
         sources.append(task_state.output_expectation)
-    if task_state is not None and task_state.latest_user_turn:
-        sources.append(task_state.latest_user_turn)
     if route.requested_outcome:
         sources.append(route.requested_outcome)
+    if task_state is not None and task_state.latest_user_turn:
+        sources.extend(
+            _request_line_requirements(
+                task_state.latest_user_turn,
+                enumerated_requirements=_extract_enumerated_requirements(task_state.latest_user_turn),
+            )
+        )
 
     for source in sources:
         for sentence in _requirement_sentences(source):
+            if _looks_like_requirement_heading(sentence) or _looks_like_bare_path_requirement(sentence, explicit_targets):
+                continue
             if sentence not in sentences:
                 sentences.append(sentence)
-    return sentences[:8]
+    return sentences[:16]
 
 
 def build_request_memory_packet(
@@ -8018,18 +8189,15 @@ def build_request_digest(
     normalized = str(text or "").strip()
     if not normalized:
         return RequestDigest()
+    explicit_paths = [str(item).strip() for item in _extract_explicit_paths(normalized) if str(item).strip()][:8]
     all_requirements: list[str] = []
-    line_requirements: list[str] = []
     enumerated_requirements = _extract_enumerated_requirements(normalized)
-    for raw_line in normalized.splitlines():
-        cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", str(raw_line or "")).strip(" .")
-        if len(cleaned_line) < 8 or _is_generation_metadata_constraint(cleaned_line):
-            continue
-        if enumerated_requirements and len(cleaned_line) > 240:
-            continue
-        trimmed_line = _trim_balanced_text(cleaned_line, 180)
-        _append_unique_compact_text(line_requirements, trimmed_line, limit=180)
-        _append_unique_compact_text(all_requirements, trimmed_line, limit=180)
+    line_requirements = _request_line_requirements(
+        normalized,
+        enumerated_requirements=enumerated_requirements,
+    )
+    for item in line_requirements:
+        _append_unique_compact_text(all_requirements, item, limit=180)
     for item in enumerated_requirements:
         cleaned = _trim_balanced_text(item, 180)
         if not cleaned or _is_generation_metadata_constraint(cleaned):
@@ -8051,22 +8219,40 @@ def build_request_digest(
         prioritized_requirements = list(line_requirements or all_requirements)
     for candidate in all_requirements:
         _append_unique_compact_text(prioritized_requirements, candidate, limit=180)
-    requirements = prioritized_requirements[:max_items]
-    balancing_source = (
-        []
-        if enumerated_requirements
-        else line_requirements if len(line_requirements) >= max_items else prioritized_requirements
-    )
-    if balancing_source and len(balancing_source) > max_items:
-        head_count = max(1, max_items // 2)
-        tail_count = max(1, max_items - head_count)
-        balanced: list[str] = []
-        for candidate in [*balancing_source[:head_count], *balancing_source[-tail_count:]]:
-            _append_unique_compact_text(balanced, candidate, limit=180)
-            if len(balanced) >= max_items:
-                break
-        if balanced:
-            requirements = balanced[:max_items]
+    candidate_pool: list[tuple[int, int, int, str]] = []
+    seen_candidates: set[str] = set()
+    for source_rank, (source_name, candidates) in enumerate(
+        (
+            ("line", line_requirements),
+            ("enumerated", enumerated_requirements),
+            ("sentence", all_requirements),
+        )
+    ):
+        for index, candidate in enumerate(candidates):
+            cleaned = str(candidate or "").strip()
+            if not cleaned:
+                continue
+            if _looks_like_requirement_heading(cleaned) and ":" in cleaned:
+                continue
+            dedupe_key = _requirement_dedupe_key(cleaned)
+            if dedupe_key in seen_candidates:
+                continue
+            seen_candidates.add(dedupe_key)
+            score = _request_requirement_priority(
+                cleaned,
+                explicit_paths=explicit_paths,
+                source_name=source_name,
+            )
+            candidate_pool.append((score, source_rank, index, cleaned))
+    requirements = [
+        candidate
+        for _score, _source_rank, _index, candidate in sorted(
+            candidate_pool,
+            key=lambda item: (-item[0], item[1], item[2]),
+        )[:max_items]
+    ]
+    if not requirements:
+        requirements = prioritized_requirements[:max_items]
     hard_constraints: list[str] = []
     soft_preferences: list[str] = []
     non_goals: list[str] = []
@@ -8087,7 +8273,6 @@ def build_request_digest(
             _append_unique_compact_text(risk_indicators, clause, limit=180)
         if any(marker in lowered for marker in REQUEST_DIGEST_COMPLETION_MARKERS):
             _append_unique_compact_text(completion_criteria, clause, limit=180)
-    explicit_paths = [str(item).strip() for item in _extract_explicit_paths(normalized) if str(item).strip()][:8]
     explicit_symbols = _request_digest_explicit_symbols(normalized, snapshot)
     affected_areas = _request_digest_affected_areas(
         normalized,
@@ -8320,14 +8505,119 @@ def _extract_enumerated_requirements(text: str) -> list[str]:
     return sections
 
 
+def _request_line_requirements(
+    text: str,
+    *,
+    enumerated_requirements: list[str] | None = None,
+) -> list[str]:
+    lines: list[str] = []
+    enumerated = list(enumerated_requirements or [])
+    for raw_line in str(text or "").splitlines():
+        cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", str(raw_line or "")).strip(" .")
+        if len(cleaned_line) < 8 or _is_generation_metadata_constraint(cleaned_line):
+            continue
+        if enumerated and len(re.findall(r"(?:(?<=^)|(?<=[\s:;(]))\d{1,2}[.)]\s+", cleaned_line)) >= 2:
+            continue
+        if enumerated and len(cleaned_line) > 240:
+            continue
+        trimmed_line = _trim_balanced_text(cleaned_line, 180)
+        if trimmed_line not in lines:
+            lines.append(trimmed_line)
+    return lines
+
+
+def _request_requirement_priority(
+    text: str,
+    *,
+    explicit_paths: list[str],
+    source_name: str,
+) -> int:
+    normalized = normalize_text(text)
+    if not normalized:
+        return -999
+    explicit_target_hits = sum(1 for item in explicit_paths if _explicit_target_reference_hit(text, item))
+    word_count = len([token for token in normalized.split() if token])
+    score = 0
+    if source_name == "line":
+        score += 4
+    elif source_name == "sentence":
+        score += 1
+    else:
+        score -= 3
+    if _looks_like_requirement_heading(text):
+        score -= 10
+    if _looks_like_bare_path_requirement(text, explicit_paths):
+        score -= 8
+    if explicit_target_hits >= 2:
+        score -= 4
+    if explicit_target_hits >= 1 and any(marker in normalized for marker in ("workspace", "projekt", "repo", "repository")):
+        score -= 3
+    if re.match(r"^\d+[.)]\s+", str(text or "").strip()):
+        score -= 3
+    if word_count >= 6:
+        score += 4
+    elif word_count >= 3:
+        score += 2
+    if "," in text or ";" in text:
+        score += 1
+    if any(marker in normalized for marker in REQUEST_DIGEST_HARD_MARKERS):
+        score += 2
+    if any(marker in normalized for marker in REQUEST_DIGEST_COMPLETION_MARKERS):
+        score -= 1
+    if any(marker in normalized for marker in REQUEST_DIGEST_VALIDATION_MARKERS):
+        score += 1
+    return score
+
+
+def _looks_like_requirement_heading(text: str) -> bool:
+    normalized = normalize_text(text).strip()
+    raw = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in REQUEST_DIGEST_HEADING_MARKERS:
+        return True
+    if any(raw.startswith(f"{marker}:") for marker in REQUEST_DIGEST_HEADING_MARKERS):
+        return True
+    return str(text or "").strip().endswith(":") and len(normalized.split()) <= 4
+
+
+def _looks_like_bare_path_requirement(text: str, explicit_paths: list[str]) -> bool:
+    normalized = str(text or "").strip().replace("\\", "/")
+    lowered = normalized.lower()
+    if not lowered:
+        return False
+    explicit_set = {
+        str(item or "").strip().replace("\\", "/").lower()
+        for item in explicit_paths
+        if str(item or "").strip()
+    }
+    if lowered in explicit_set:
+        return True
+    if " " in lowered:
+        return False
+    path_obj = Path(lowered)
+    return bool(path_obj.suffix and ("/" in lowered or "." in path_obj.name))
+
+
 def _requirement_sentences(text: str) -> list[str]:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if not normalized:
         return []
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])|\n+|;", normalized)
+    protected = normalized
+    abbreviation_protections = {
+        "z. b.": "__ZB__",
+        "z.b.": "__ZB__",
+        "e.g.": "__EG__",
+        "i.e.": "__IE__",
+    }
+    for raw, marker in abbreviation_protections.items():
+        protected = re.sub(re.escape(raw), marker, protected, flags=re.IGNORECASE)
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])|\n+|;", protected)
     sentences: list[str] = []
     for part in parts:
         cleaned = str(part or "").strip(" .")
+        for raw, marker in abbreviation_protections.items():
+            cleaned = cleaned.replace(marker, raw)
         if len(cleaned) >= 8 and cleaned not in sentences:
             sentences.append(cleaned)
     return sentences
@@ -8339,7 +8629,18 @@ def _split_requirement_clauses(text: str) -> list[str]:
         return []
     if re.search(r"[\"'`<>]", normalized) or _contains_structured_symbol_reference(normalized):
         return [normalized]
-    fragments = re.split(r",\s+|\s+(?:and|und)\s+", normalized)
+    lowered = normalize_text(normalized)
+    comma_split_allowed = not any(
+        marker in lowered
+        for marker in ("for example", "such as", "including", "wie", "z. b.", "zum beispiel")
+    )
+    fragments = re.split(r"\s+(?:and|und)\s+", normalized)
+    if comma_split_allowed:
+        comma_fragments = re.split(r",\s+", normalized)
+        if _comma_fragments_look_independent(comma_fragments):
+            fragments = []
+            for chunk in comma_fragments:
+                fragments.extend(re.split(r"\s+(?:and|und)\s+", chunk))
     clauses: list[str] = []
     for fragment in fragments:
         cleaned = str(fragment or "").strip(" .")
@@ -8348,6 +8649,28 @@ def _split_requirement_clauses(text: str) -> list[str]:
             continue
         clauses.append(cleaned)
     return clauses or [normalized]
+
+
+def _comma_fragments_look_independent(fragments: list[str]) -> bool:
+    cleaned_fragments = [str(item or "").strip(" .") for item in fragments if str(item or "").strip(" .")]
+    if len(cleaned_fragments) < 2:
+        return False
+    return all(_fragment_has_structural_anchor(fragment) for fragment in cleaned_fragments[1:])
+
+
+def _fragment_has_structural_anchor(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    if _contains_structured_symbol_reference(normalized):
+        return True
+    for token in re.findall(r"[A-Za-z0-9_./-]+", normalized):
+        candidate = str(token or "").strip()
+        if "/" in candidate:
+            return True
+        if "." in candidate and Path(candidate).suffix:
+            return True
+    return False
 
 
 def _contains_structured_symbol_reference(text: str) -> bool:

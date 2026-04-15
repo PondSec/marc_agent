@@ -31271,6 +31271,104 @@ def test_build_request_digest_splits_trailing_heading_from_last_enumerated_requi
     assert all("Randbedingungen:" not in item for item in digest.requirements)
 
 
+def test_split_requirement_clauses_keeps_example_lists_together_but_splits_path_scoped_actions():
+    assert _split_requirement_clauses(
+        "pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor"
+    ) == [
+        "pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor"
+    ]
+    assert _split_requirement_clauses(
+        "Add a keep_case option to texttools/normalize.py, support it in normalize_cli.py, update README.md if needed"
+    ) == [
+        "Add a keep_case option to texttools/normalize.py",
+        "support it in normalize_cli.py",
+        "update README.md if needed",
+    ]
+
+
+def test_build_request_digest_prioritizes_large_prompt_feature_requirements_over_path_noise():
+    digest = build_request_digest(
+        (
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+            "Anforderungen:\n"
+            "- mehrere Automodelle anzeigen\n"
+            "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+            "- funktionierende Suchfunktion nach Marke und Modell\n"
+            "- modernes, sauberes UI\n"
+            "- gutes UX\n"
+            "- responsive Layout\n"
+            "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+            "- keine Frameworks, nur HTML, CSS und JavaScript\n\n"
+            "Arbeite sinnvoll:\n"
+            "1. baue erst eine klare Struktur\n"
+            "2. halte die Autodaten sauber in JavaScript\n"
+            "3. implementiere dann Darstellung und Suche\n"
+            "4. prüfe am Ende, ob alles zusammen funktioniert"
+        ),
+        max_items=8,
+    )
+
+    assert any("pro Auto mehrere Daten anzeigen" in item for item in digest.requirements)
+    assert any("funktionierende Suchfunktion" in item for item in digest.requirements)
+    assert any("modernes, sauberes UI" in item for item in digest.requirements)
+    assert all(item not in {"index.html", "styles.css", "script.js", "Anforderungen:"} for item in digest.requirements)
+
+
+def test_artifact_scoped_focus_distributes_web_bundle_requirements_by_file_role(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+            "Anforderungen:\n"
+            "- mehrere Automodelle anzeigen\n"
+            "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+            "- funktionierende Suchfunktion nach Marke und Modell\n"
+            "- modernes, sauberes UI\n"
+            "- gutes UX\n"
+            "- responsive Layout\n"
+            "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+            "- keine Frameworks, nur HTML, CSS und JavaScript\n\n"
+            "Arbeite sinnvoll:\n"
+            "1. baue erst eine klare Struktur\n"
+            "2. halte die Autodaten sauber in JavaScript\n"
+            "3. implementiere dann Darstellung und Suche\n"
+            "4. prüfe am Ende, ob alles zusammen funktioniert\n\n"
+            "Am Ende kurz angeben:\n"
+            "- welche Dateien erstellt wurden\n"
+            "- wie die Suchfunktion funktioniert\n"
+            "- was geprüft wurde"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    index_focus = _artifact_scoped_focus(session.router_result, session, "index.html", current_content="")
+    styles_focus = _artifact_scoped_focus(session.router_result, session, "styles.css", current_content="")
+    script_focus = _artifact_scoped_focus(session.router_result, session, "script.js", current_content="")
+
+    assert any("mehrere Automodelle anzeigen" in item for item in index_focus["current_write_requirements"])
+    assert any("modernes, sauberes UI" in item for item in styles_focus["current_write_requirements"])
+    assert any("responsive Layout" in item for item in styles_focus["current_write_requirements"])
+    assert any("Autodaten sauber in JavaScript" in item for item in script_focus["current_write_requirements"])
+    assert any("Suchfunktion" in item or "such" in item.lower() for item in script_focus["current_write_requirements"])
+
+
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):
     payload = route_payload(
         intent="inspect",

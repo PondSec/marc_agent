@@ -969,11 +969,26 @@ class TaskStateUpdater:
         request = str(state.latest_user_turn or "").strip()
         requirement_count = sum(1 for item in (state.request_requirements or []) if str(item or "").strip())
         chunk_count = sum(1 for item in (state.request_chunks or []) if str(item or "").strip())
+        digest = getattr(state, "request_digest", None)
+        digest_requirement_count = sum(
+            1 for item in list(getattr(digest, "requirements", []) or []) if str(item or "").strip()
+        )
+        digest_completion_count = sum(
+            1 for item in list(getattr(digest, "completion_criteria", []) or []) if str(item or "").strip()
+        )
+        digest_hard_constraint_count = sum(
+            1 for item in list(getattr(digest, "hard_constraints", []) or []) if str(item or "").strip()
+        )
+        explicit_path_count = sum(
+            1 for item in list(getattr(digest, "explicit_paths", []) or []) if str(item or "").strip()
+        )
+        rich_signal_count = max(requirement_count, digest_requirement_count) + digest_completion_count + digest_hard_constraint_count
         enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
         return (
-            len(request) >= 320
+            len(request) >= 280
             or chunk_count >= 4
-            or requirement_count >= 6
+            or rich_signal_count >= 6
+            or (explicit_path_count >= 2 and len(request) >= 240)
             or enumerated_sections >= 3
         )
 
