@@ -15,6 +15,7 @@ from agent.prompts import (
     _compact_request_digest,
     _compact_workspace_snapshot,
     _prioritized_compact_payload,
+    build_request_digest,
     build_request_memory_packet,
     task_state_update_prompt,
 )
@@ -3844,6 +3845,23 @@ def test_compact_request_digest_captures_late_requirements():
     assert "requirements" in digest
     assert any("smooth scrolling" in item for item in digest["requirements"])
     assert any("Kontaktformular" in item for item in digest["requirements"])
+
+
+def test_request_digest_structures_targets_constraints_and_validation(tmp_path):
+    digest = build_request_digest(
+        (
+            "Analysiere app/auth.py gruendlich, erklaere check_role und login_user, "
+            "nenne relevante Tests, verliere spaetere Anforderungen nicht und fuehre keine Aenderungen aus."
+        ),
+        snapshot=build_snapshot(tmp_path),
+        max_chars=900,
+    )
+
+    assert "app/auth.py" in digest.explicit_paths
+    assert any(item in {"check_role", "login_user"} for item in digest.explicit_symbols)
+    assert any("verliere spaetere anforderungen nicht" in item.lower() for item in digest.hard_constraints)
+    assert any("keine aenderungen" in item.lower() for item in digest.non_goals)
+    assert any("Tests" in item or "tests" in item for item in digest.validation_needs)
 
 
 def test_request_memory_packet_chunks_large_prompt_into_compact_groups():

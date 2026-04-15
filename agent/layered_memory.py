@@ -400,6 +400,7 @@ class AgentMemoryStore(RepoMemoryStore):
             request_excerpt=str(getattr(task_state, "request_excerpt", "") or "").strip() or None,
             request_requirements=list(getattr(task_state, "request_requirements", [])[:6] if task_state is not None else []),
             request_chunks=list(getattr(task_state, "request_chunks", [])[:4] if task_state is not None else []),
+            request_digest=getattr(task_state, "request_digest", None),
             active_constraints=active_constraints,
             active_failure_signature=active_failure_signature,
             recent_attempts=[self._trim_text(item, 140) for item in recent_attempts],
@@ -428,6 +429,11 @@ class AgentMemoryStore(RepoMemoryStore):
             include_types = ["conversation"] if recall_subject else ["episodic", "conversation", "project", "failure"]
         target_paths = self._unique_strings(
             [
+                *(
+                    list(getattr(getattr(working, "request_digest", None), "explicit_paths", []) or [])
+                    if working is not None
+                    else []
+                ),
                 *(working.relevant_files if working is not None else []),
                 *session.candidate_files[:8],
                 *[item.path for item in session.changed_files[-6:]],
@@ -442,7 +448,12 @@ class AgentMemoryStore(RepoMemoryStore):
             recall_subject=recall_subject,
             recall_attributes=list(recall_attributes),
             target_paths=target_paths,
-            symbol_names=list(working.relevant_symbols[:6] if working is not None else []),
+            symbol_names=self._unique_strings(
+                [
+                    *(list(getattr(getattr(working, "request_digest", None), "explicit_symbols", []) or []) if working is not None else []),
+                    *(working.relevant_symbols[:6] if working is not None else []),
+                ]
+            )[:6],
             error_terms=self._request_error_terms(session),
             failure_signature=working.active_failure_signature if working is not None else None,
             current_goal=working.current_goal if working is not None else None,

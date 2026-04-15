@@ -8,8 +8,9 @@ import re
 import shlex
 
 from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
-from agent.semantic_defaults import classify_conversation_request
-from agent.task_state import TaskState
+from agent.semantic_guardrails import _extract_explicit_paths
+from agent.semantic_defaults import classify_conversation_request, normalize_text, prioritized_focus_terms
+from agent.task_state import RequestDigest, TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
@@ -37,6 +38,94 @@ UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
     re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
     re.compile(r"['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]\s+as undefined"),
     re.compile(r"undefined symbol ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
+)
+REQUEST_DIGEST_HARD_MARKERS = (
+    "must",
+    "muss",
+    "soll",
+    "sollen",
+    "required",
+    "verpflichtend",
+    "exactly",
+    "genau",
+    "strict",
+    "zwingend",
+    "without",
+    "ohne",
+    "do not",
+    "don't",
+    "never",
+    "kein",
+    "keine",
+    "nicht",
+)
+REQUEST_DIGEST_SOFT_MARKERS = (
+    "prefer",
+    "preferred",
+    "ideally",
+    "optional",
+    "nice to have",
+    "waere gut",
+    "wäre gut",
+    "gern",
+    "bitte",
+)
+REQUEST_DIGEST_NON_GOAL_MARKERS = (
+    "do not",
+    "don't",
+    "never",
+    "without",
+    "avoid",
+    "kein",
+    "keine",
+    "nicht",
+    "ohne",
+    "verboten",
+)
+REQUEST_DIGEST_VALIDATION_MARKERS = (
+    "test",
+    "tests",
+    "pytest",
+    "unittest",
+    "validate",
+    "validation",
+    "verify",
+    "verification",
+    "lint",
+    "build",
+    "smoke",
+    "regression",
+    "run",
+    "check",
+)
+REQUEST_DIGEST_RISK_MARKERS = (
+    "risk",
+    "risiko",
+    "security",
+    "sicherheit",
+    "performance",
+    "memory",
+    "kontext",
+    "context",
+    "regression",
+    "fallback",
+    "halluz",
+    "hardcod",
+    "fragil",
+    "reliable",
+    "robust",
+)
+REQUEST_DIGEST_COMPLETION_MARKERS = (
+    "am ende",
+    "endbedingung",
+    "completion",
+    "done when",
+    "fertig",
+    "liefere",
+    "deliver",
+    "return",
+    "ausgabeformat",
+    "ergebnis",
 )
 
 
@@ -225,10 +314,12 @@ def task_state_update_prompt(
     )
     request_digest = _compact_request_digest(
         task,
+        snapshot=snapshot,
         max_chars=TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET,
     )
     request_memory_packet = build_request_memory_packet(
         task,
+        snapshot=snapshot,
         max_chars=REQUEST_MEMORY_PACKET_CHAR_BUDGET if compact else 900,
     )
     include_request_memory_packet = (
@@ -584,6 +675,7 @@ def generate_content_prompt(
         request_memory = _generation_request_memory(session)
         request_digest = _compact_request_digest(
             request_text,
+            snapshot=session.workspace_snapshot if session is not None else None,
             max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
         )
         include_request_digest = bool(request_digest) and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET
@@ -913,6 +1005,7 @@ def generate_content_retry_prompt(
         request_memory = _generation_request_memory(session)
         request_digest = _compact_request_digest(
             request_text,
+            snapshot=session.workspace_snapshot if session is not None else None,
             max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
         )
         include_request_digest = bool(request_digest) and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET
@@ -1874,6 +1967,7 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
         "request_excerpt": _trim_text(working.request_excerpt or "", 180),
         "request_requirements": [_trim_text(item, 120) for item in working.request_requirements[:4]],
         "request_chunks": [_trim_text(item, 140) for item in working.request_chunks[:3]],
+        "request_digest": _compact_request_digest_payload(getattr(working, "request_digest", None), max_chars=260),
         "active_constraints": [_trim_text(item, 120) for item in working.active_constraints[:6]],
         "active_failure_signature": _trim_text(working.active_failure_signature or "", 180),
         "relevant_files": working.relevant_files[:6],
@@ -1889,6 +1983,7 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
             "primary_target",
             "verification_target",
             "request_chunks",
+            "request_digest",
             "request_requirements",
             "request_excerpt",
             "current_subtask",
@@ -2316,6 +2411,7 @@ def _compact_task_state(state: TaskState | None) -> dict[str, object]:
         "request_excerpt": _trim_text(state.request_excerpt or "", 220),
         "request_requirements": [_trim_text(item, 120) for item in state.request_requirements[:4]],
         "request_chunks": [_trim_text(item, 140) for item in state.request_chunks[:3]],
+        "request_digest": _compact_request_digest_payload(state.request_digest, max_chars=300),
         "remembered_facts": [
             {
                 "subject": item.subject,
@@ -2793,6 +2889,7 @@ def _generation_request_memory(session: SessionState | None) -> list[str]:
     if not request_memory and session is not None:
         packet = build_request_memory_packet(
             session.task,
+            snapshot=session.workspace_snapshot if session is not None else None,
             max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
             max_items=8,
             max_chunks=3,
@@ -7764,39 +7861,48 @@ def _derived_requirement_sentences(
 def build_request_memory_packet(
     text: str,
     *,
+    snapshot: WorkspaceSnapshot | None = None,
     max_chars: int = REQUEST_MEMORY_PACKET_CHAR_BUDGET,
     max_items: int = 10,
     max_chunks: int = 4,
 ) -> dict[str, object]:
     effective_budget = max(int(max_chars or 0), 160)
-    digest = _compact_request_digest(
+    digest_model = build_request_digest(
         text,
+        snapshot=snapshot,
         max_chars=min(max(effective_budget, REQUEST_MEMORY_PACKET_CHAR_BUDGET), REQUEST_MEMORY_STATE_CHAR_BUDGET),
         max_items=max_items,
     )
-    requirements = [str(item).strip() for item in list(digest.get("requirements", [])) if str(item).strip()]
+    digest = _compact_request_digest_payload(
+        digest_model,
+        max_chars=min(max(effective_budget, REQUEST_MEMORY_PACKET_CHAR_BUDGET), REQUEST_MEMORY_STATE_CHAR_BUDGET),
+    )
+    requirements = [str(item).strip() for item in list(digest_model.requirements) if str(item).strip()]
     compact_requirements = [
         _trim_text(item, 96 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 140)
         for item in requirements[:max_items]
         if str(item).strip()
     ]
-    requirement_chunks = _chunk_requirement_groups(
-        requirements,
-        max_chars=min(
-            REQUEST_MEMORY_CHUNK_CHAR_BUDGET,
-            160 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 220,
-        ),
-        max_chunks=max_chunks,
-    )
+    requirement_chunks = list(digest_model.requirement_chunks[:max_chunks])
+    if not requirement_chunks:
+        requirement_chunks = _chunk_requirement_groups(
+            requirements,
+            max_chars=min(
+                REQUEST_MEMORY_CHUNK_CHAR_BUDGET,
+                160 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 220,
+            ),
+            max_chunks=max_chunks,
+        )
     request_excerpt = _trim_text(
-        str(digest.get("request_excerpt") or "").strip(),
+        str(digest_model.request_excerpt or digest.get("request_excerpt") or "").strip(),
         180 if requirement_chunks and effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 260,
     )
     packet = _fit_prioritized_payload_fields(
         [
-            ("requirement_chunks", requirement_chunks),
             ("requirements", compact_requirements),
+            ("requirement_chunks", requirement_chunks),
             ("request_excerpt", request_excerpt),
+            ("request_digest", digest),
         ],
         max_chars=effective_budget,
     )
@@ -7804,9 +7910,10 @@ def build_request_memory_packet(
         packet["requirements"] = compact_requirements[: min(len(compact_requirements), 3)]
     return _fit_prioritized_payload_fields(
         [
-            ("requirement_chunks", packet.get("requirement_chunks", [])),
             ("requirements", packet.get("requirements", [])),
+            ("requirement_chunks", packet.get("requirement_chunks", [])),
             ("request_excerpt", packet.get("request_excerpt", "")),
+            ("request_digest", packet.get("request_digest", {})),
         ],
         max_chars=effective_budget,
     )
@@ -7843,19 +7950,36 @@ def _fit_prioritized_payload_fields(
 def _compact_request_digest(
     text: str,
     *,
+    snapshot: WorkspaceSnapshot | None = None,
     max_chars: int,
     max_items: int = 8,
 ) -> dict[str, object]:
+    digest = build_request_digest(
+        text,
+        snapshot=snapshot,
+        max_chars=max_chars,
+        max_items=max_items,
+    )
+    return _compact_request_digest_payload(digest, max_chars=max_chars)
+
+
+def build_request_digest(
+    text: str,
+    *,
+    snapshot: WorkspaceSnapshot | None = None,
+    max_chars: int = REQUEST_MEMORY_STATE_CHAR_BUDGET,
+    max_items: int = 8,
+) -> RequestDigest:
     normalized = str(text or "").strip()
     if not normalized:
-        return {}
+        return RequestDigest()
     all_requirements: list[str] = []
     line_requirements: list[str] = []
-    for raw_line in str(text or "").splitlines():
+    for raw_line in normalized.splitlines():
         cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", str(raw_line or "")).strip(" .")
         if len(cleaned_line) < 8 or _is_generation_metadata_constraint(cleaned_line):
             continue
-        trimmed_line = _trim_text(cleaned_line, 180)
+        trimmed_line = _trim_balanced_text(cleaned_line, 180)
         _append_unique_compact_text(line_requirements, trimmed_line, limit=180)
         _append_unique_compact_text(all_requirements, trimmed_line, limit=180)
     expanded = normalized.replace("*", "; ").replace("•", "; ")
@@ -7863,14 +7987,13 @@ def _compact_request_digest(
         clauses = _split_requirement_clauses(sentence)
         candidates = clauses if len(clauses) > 1 else [sentence]
         for candidate in candidates:
-            cleaned = _trim_text(candidate, 180)
+            cleaned = _trim_balanced_text(candidate, 180)
             if not cleaned or _is_generation_metadata_constraint(cleaned):
                 continue
             _append_unique_compact_text(all_requirements, cleaned, limit=180)
     prioritized_requirements = list(line_requirements or all_requirements)
     for candidate in all_requirements:
         _append_unique_compact_text(prioritized_requirements, candidate, limit=180)
-
     requirements = prioritized_requirements[:max_items]
     balancing_source = line_requirements if len(line_requirements) >= max_items else prioritized_requirements
     if len(balancing_source) > max_items:
@@ -7883,18 +8006,204 @@ def _compact_request_digest(
                 break
         if balanced:
             requirements = balanced[:max_items]
-    payload = {
-        "requirements": requirements[:max_items],
-        "request_excerpt": _trim_balanced_text(
+    hard_constraints: list[str] = []
+    soft_preferences: list[str] = []
+    non_goals: list[str] = []
+    validation_needs: list[str] = []
+    risk_indicators: list[str] = []
+    completion_criteria: list[str] = []
+    for clause in prioritized_requirements[: max(max_items * 2, 12)]:
+        lowered = normalize_text(clause)
+        if any(marker in lowered for marker in REQUEST_DIGEST_HARD_MARKERS):
+            _append_unique_compact_text(hard_constraints, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_SOFT_MARKERS):
+            _append_unique_compact_text(soft_preferences, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_NON_GOAL_MARKERS):
+            _append_unique_compact_text(non_goals, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_VALIDATION_MARKERS):
+            _append_unique_compact_text(validation_needs, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_RISK_MARKERS):
+            _append_unique_compact_text(risk_indicators, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_COMPLETION_MARKERS):
+            _append_unique_compact_text(completion_criteria, clause, limit=180)
+    explicit_paths = [str(item).strip() for item in _extract_explicit_paths(normalized) if str(item).strip()][:8]
+    explicit_symbols = _request_digest_explicit_symbols(normalized, snapshot)
+    affected_areas = _request_digest_affected_areas(
+        normalized,
+        requirements,
+        snapshot=snapshot,
+        explicit_paths=explicit_paths,
+        explicit_symbols=explicit_symbols,
+    )
+    goal = next(
+        (
+            _trim_text(item, 180)
+            for item in [*requirements, _trim_balanced_text(normalized, 200)]
+            if str(item or "").strip()
+        ),
+        None,
+    )
+    return RequestDigest(
+        goal=goal,
+        requirements=requirements[:max_items],
+        hard_constraints=hard_constraints[:8],
+        soft_preferences=soft_preferences[:6],
+        non_goals=non_goals[:6],
+        affected_areas=affected_areas[:8],
+        explicit_paths=explicit_paths,
+        explicit_symbols=explicit_symbols[:8],
+        validation_needs=validation_needs[:6],
+        risk_indicators=risk_indicators[:6],
+        completion_criteria=completion_criteria[:6],
+        requirement_chunks=_chunk_requirement_groups(
+            prioritized_requirements,
+            max_chars=min(REQUEST_MEMORY_CHUNK_CHAR_BUDGET, max(140, max_chars // 5)),
+            max_chunks=5,
+        ),
+        request_excerpt=_trim_balanced_text(
             normalized,
             min(max(max_chars // 2, 220), 420),
         ),
-    }
+    )
+
+
+def _compact_request_digest_payload(
+    digest: RequestDigest | dict[str, object] | None,
+    *,
+    max_chars: int,
+) -> dict[str, object]:
+    if digest is None:
+        return {}
+    if isinstance(digest, RequestDigest):
+        if not digest.has_signal():
+            return {}
+        payload = {
+            "goal": _trim_text(digest.goal or "", 180),
+            "requirements": [_trim_balanced_text(item, 160) for item in digest.requirements[:6]],
+            "hard_constraints": [_trim_text(item, 120) for item in digest.hard_constraints[:4]],
+            "soft_preferences": [_trim_text(item, 120) for item in digest.soft_preferences[:3]],
+            "non_goals": [_trim_text(item, 120) for item in digest.non_goals[:3]],
+            "affected_areas": [_trim_text(item, 120) for item in digest.affected_areas[:5]],
+            "explicit_paths": digest.explicit_paths[:5],
+            "explicit_symbols": digest.explicit_symbols[:5],
+            "validation_needs": [_trim_text(item, 120) for item in digest.validation_needs[:3]],
+            "risk_indicators": [_trim_text(item, 120) for item in digest.risk_indicators[:3]],
+            "completion_criteria": [_trim_text(item, 120) for item in digest.completion_criteria[:3]],
+            "request_excerpt": _trim_text(digest.request_excerpt or "", 260),
+        }
+    else:
+        payload = {key: value for key, value in dict(digest).items() if _has_payload_signal(value)}
+        if not payload:
+            return {}
     return _prioritized_compact_payload(
         payload,
-        ordered_keys=["requirements", "request_excerpt"],
+        ordered_keys=[
+            "requirements",
+            "goal",
+            "hard_constraints",
+            "validation_needs",
+            "completion_criteria",
+            "affected_areas",
+            "explicit_paths",
+            "explicit_symbols",
+            "risk_indicators",
+            "soft_preferences",
+            "non_goals",
+            "requirements",
+            "request_excerpt",
+        ],
         max_chars=max_chars,
     )
+
+
+def _request_digest_explicit_symbols(
+    text: str,
+    snapshot: WorkspaceSnapshot | None,
+) -> list[str]:
+    raw = str(text or "")
+    hints: list[str] = []
+    for candidate in re.findall(r"`([^`]+)`", raw):
+        cleaned = str(candidate or "").strip()
+        if cleaned and cleaned not in hints and "/" not in cleaned:
+            hints.append(cleaned)
+    if snapshot is None:
+        return hints[:8]
+    token_candidates = {
+        token
+        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", raw)
+        if len(token) >= 3
+    }
+    symbol_lookup = {
+        str(symbol or "").strip().lower(): str(symbol or "").strip()
+        for symbols in list(getattr(snapshot, "symbol_index", {}).values())
+        for symbol in list(symbols or [])
+        if str(symbol or "").strip()
+    }
+    for token in token_candidates:
+        resolved = symbol_lookup.get(token.lower())
+        if resolved and resolved not in hints:
+            hints.append(resolved)
+        elif (
+            token not in hints
+            and ("_" in token or any(char.isupper() for char in token[1:]))
+            and len(token) <= 48
+        ):
+            hints.append(token)
+    return hints[:8]
+
+
+def _request_digest_affected_areas(
+    text: str,
+    requirements: list[str],
+    *,
+    snapshot: WorkspaceSnapshot | None,
+    explicit_paths: list[str],
+    explicit_symbols: list[str],
+) -> list[str]:
+    affected: list[str] = []
+    for item in [*explicit_paths, *explicit_symbols]:
+        if item and item not in affected:
+            affected.append(item)
+    if snapshot is None:
+        for item in prioritized_focus_terms(text, *requirements, max_terms=8):
+            if item not in affected:
+                affected.append(item)
+        return affected[:8]
+    symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+    candidate_paths = [
+        *list(getattr(snapshot, "focus_files", []) or []),
+        *list(getattr(snapshot, "important_files", []) or []),
+        *list(getattr(snapshot, "entrypoints", []) or []),
+        *list(getattr(snapshot, "service_files", []) or []),
+        *list(symbol_index.keys()),
+    ]
+    reference_terms = {
+        token
+        for item in [*candidate_paths, *explicit_symbols]
+        for token in prioritized_focus_terms(str(item or ""), max_terms=6)
+    }
+    query_terms = set(prioritized_focus_terms(text, *requirements, reference_terms=reference_terms, max_terms=18))
+    ranked: list[tuple[float, str]] = []
+    for path in dict.fromkeys(path for path in candidate_paths if str(path or "").strip()):
+        path_terms = set(prioritized_focus_terms(path, max_terms=8))
+        symbol_terms = {
+            token
+            for symbol in list(symbol_index.get(path, []) or [])[:6]
+            for token in prioritized_focus_terms(str(symbol or ""), max_terms=4)
+        }
+        overlap = len(query_terms & (path_terms | symbol_terms))
+        if overlap <= 0:
+            continue
+        score = overlap
+        if path in explicit_paths:
+            score += 4
+        if any(symbol.lower() in {item.lower() for item in explicit_symbols} for symbol in list(symbol_index.get(path, []) or [])[:6]):
+            score += 2
+        ranked.append((score, path))
+    for _score, path in sorted(ranked, key=lambda item: (-item[0], item[1]))[:5]:
+        if path not in affected:
+            affected.append(path)
+    return affected[:8]
 
 
 def _chunk_requirement_groups(

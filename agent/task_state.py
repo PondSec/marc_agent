@@ -430,6 +430,58 @@ class RememberedFactState(StrictModel):
         return self
 
 
+class RequestDigest(StrictModel):
+    goal: str | None = None
+    requirements: list[str] = Field(default_factory=list)
+    hard_constraints: list[str] = Field(default_factory=list)
+    soft_preferences: list[str] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    affected_areas: list[str] = Field(default_factory=list)
+    explicit_paths: list[str] = Field(default_factory=list)
+    explicit_symbols: list[str] = Field(default_factory=list)
+    validation_needs: list[str] = Field(default_factory=list)
+    risk_indicators: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
+    requirement_chunks: list[str] = Field(default_factory=list)
+    request_excerpt: str | None = None
+
+    @model_validator(mode="after")
+    def normalize(self) -> RequestDigest:
+        self.goal = str(self.goal or "").strip() or None
+        self.request_excerpt = str(self.request_excerpt or "").strip() or None
+        self.requirements = _compact_strings(self.requirements, limit=10)
+        self.hard_constraints = _compact_strings(self.hard_constraints, limit=8)
+        self.soft_preferences = _compact_strings(self.soft_preferences, limit=6)
+        self.non_goals = _compact_strings(self.non_goals, limit=6)
+        self.affected_areas = _compact_strings(self.affected_areas, limit=8)
+        self.explicit_paths = _compact_strings(self.explicit_paths, limit=8)
+        self.explicit_symbols = _compact_strings(self.explicit_symbols, limit=8)
+        self.validation_needs = _compact_strings(self.validation_needs, limit=6)
+        self.risk_indicators = _compact_strings(self.risk_indicators, limit=6)
+        self.completion_criteria = _compact_strings(self.completion_criteria, limit=6)
+        self.requirement_chunks = _compact_strings(self.requirement_chunks, limit=5)
+        return self
+
+    def has_signal(self) -> bool:
+        return any(
+            [
+                self.goal,
+                self.requirements,
+                self.hard_constraints,
+                self.soft_preferences,
+                self.non_goals,
+                self.affected_areas,
+                self.explicit_paths,
+                self.explicit_symbols,
+                self.validation_needs,
+                self.risk_indicators,
+                self.completion_criteria,
+                self.requirement_chunks,
+                self.request_excerpt,
+            ]
+        )
+
+
 def _merge_remembered_facts(*groups: list[RememberedFactState]) -> list[RememberedFactState]:
     merged: list[RememberedFactState] = []
     seen: set[tuple[str, str, str]] = set()
@@ -456,6 +508,7 @@ class TaskState(StrictModel):
     request_excerpt: str | None = None
     request_requirements: list[str] = Field(default_factory=list)
     request_chunks: list[str] = Field(default_factory=list)
+    request_digest: RequestDigest | None = None
     remembered_facts: list[RememberedFactState] = Field(default_factory=list)
     current_user_intent: UserIntent | None = None
     execution_strategy: ExecutionStrategy | None = None
@@ -539,6 +592,15 @@ class TaskState(StrictModel):
         self.active_artifacts = _merge_artifacts(self.active_artifacts, self.target_artifacts)
         self.request_requirements = _compact_strings(self.request_requirements, limit=10)
         self.request_chunks = _compact_strings(self.request_chunks, limit=5)
+        if self.request_digest is not None and not self.request_digest.has_signal():
+            self.request_digest = None
+        if self.request_digest is not None:
+            if not self.request_excerpt and self.request_digest.request_excerpt:
+                self.request_excerpt = self.request_digest.request_excerpt
+            self.request_chunks = _compact_strings(
+                [*self.request_digest.requirement_chunks, *self.request_chunks],
+                limit=5,
+            )
         self.remembered_facts = _merge_remembered_facts(self.remembered_facts)
         inferred_supplied_evidence = [item.summary for item in self.evidence if item.summary]
         self.supplied_evidence = _compact_strings(
@@ -713,6 +775,17 @@ class TaskState(StrictModel):
         request_memory = self.request_chunks or self.request_requirements
         if request_memory:
             relevant_context.insert(0, "Request memory: " + " | ".join(request_memory[:2 if self.request_chunks else 3]))
+        if self.request_digest is not None:
+            if self.request_digest.goal:
+                relevant_context.insert(0, f"Request digest goal: {self.request_digest.goal}")
+            if self.request_digest.validation_needs:
+                relevant_context.append(
+                    "Validation needs: " + " | ".join(self.request_digest.validation_needs[:2])
+                )
+            if self.request_digest.affected_areas:
+                relevant_context.append(
+                    "Affected areas: " + " | ".join(self.request_digest.affected_areas[:3])
+                )
         if self.execution_strategy:
             relevant_context.insert(0, f"Execution strategy: {self.execution_strategy}")
         if self.current_user_intent:

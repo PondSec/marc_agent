@@ -284,6 +284,29 @@ def test_refresh_session_memory_retains_late_module_terms_for_large_analysis_pro
     assert "server/app.py" in session.memory_context.suggested_files
 
 
+def test_refresh_session_memory_reinjects_request_digest_targets_into_retrieval(tmp_path):
+    store = build_store(tmp_path)
+    session = build_session(store)
+    session.task_state = session.task_state.model_copy(
+        update={
+            "request_digest": {
+                "goal": "Inspect auth behavior before patching.",
+                "requirements": ["Explain the auth behavior with concrete evidence."],
+                "explicit_paths": ["app/auth.py"],
+                "explicit_symbols": ["check_role"],
+                "validation_needs": ["Name the relevant test coverage."],
+            }
+        }
+    )
+
+    store.refresh_session_memory(session.task, session)
+
+    assert session.working_memory is not None
+    assert session.working_memory.request_digest is not None
+    assert "app/auth.py" in session.memory_context.request.target_paths
+    assert "check_role" in session.memory_context.request.symbol_names
+
+
 def make_conversation_entry(store: AgentMemoryStore, *, session_id: str, summary: str) -> ConversationMemoryEntry:
     return ConversationMemoryEntry(
         project_id=store.project_id,

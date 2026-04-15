@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from agent.prompts import (
     REQUEST_MEMORY_STATE_CHAR_BUDGET,
+    build_request_digest,
     build_request_memory_packet,
     task_state_system_prompt,
     task_state_update_prompt,
@@ -241,7 +242,7 @@ class TaskStateUpdater:
                         local_intent=local_state.current_user_intent,
                         local_strategy=local_state.execution_strategy,
                     )
-                state = self._finalize_state(state, semantic_resolution="full_model")
+                state = self._finalize_state(state, semantic_resolution="full_model", snapshot=snapshot)
             except ValidationError as exc:
                 self._log(
                     "task_state_validation_failed",
@@ -396,7 +397,7 @@ class TaskStateUpdater:
                             local_intent=local_state.current_user_intent,
                             local_strategy=local_state.execution_strategy,
                         )
-                    state = self._finalize_state(state, semantic_resolution=resolution)
+                    state = self._finalize_state(state, semantic_resolution=resolution, snapshot=snapshot)
                 except ValidationError as exc:
                     self._log(
                         "task_state_validation_failed",
@@ -531,7 +532,7 @@ class TaskStateUpdater:
             snapshot=snapshot,
             semantic_resolution="minimal_inference",
         )
-        state = self._finalize_state(state, semantic_resolution="minimal_inference")
+        state = self._finalize_state(state, semantic_resolution="minimal_inference", snapshot=snapshot)
         return self._compact_large_request_fallback_state(state)
 
     def _compact_large_request_fallback_state(self, state: TaskState) -> TaskState:
@@ -1085,10 +1086,18 @@ class TaskStateUpdater:
         session.runtime_executions.append(record)
         session.runtime_executions = session.runtime_executions[-20:]
 
-    def _finalize_state(self, state: TaskState, *, semantic_resolution: str) -> TaskState:
+    def _finalize_state(self, state: TaskState, *, semantic_resolution: str, snapshot=None) -> TaskState:
         self._ground_explicit_request_paths(state)
+        request_digest = build_request_digest(
+            state.latest_user_turn,
+            snapshot=snapshot,
+            max_chars=REQUEST_MEMORY_STATE_CHAR_BUDGET,
+            max_items=12,
+        )
+        state.request_digest = request_digest if request_digest.has_signal() else None
         request_memory_packet = build_request_memory_packet(
             state.latest_user_turn,
+            snapshot=snapshot,
             max_chars=REQUEST_MEMORY_STATE_CHAR_BUDGET,
             max_items=12,
             max_chunks=5,
