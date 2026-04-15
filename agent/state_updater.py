@@ -470,12 +470,52 @@ class TaskStateUpdater:
         return "compact"
 
     def _fallback_state(self, user_input: str, *, snapshot=None, session=None) -> TaskState:
-        return build_minimal_task_state(
+        state = build_minimal_task_state(
             user_input,
             session=session,
             snapshot=snapshot,
             semantic_resolution="minimal_inference",
         )
+        state = self._finalize_state(state, semantic_resolution="minimal_inference")
+        return self._compact_large_request_fallback_state(state)
+
+    def _compact_large_request_fallback_state(self, state: TaskState) -> TaskState:
+        request_focus = next(
+            (
+                str(item or "").strip()
+                for item in [*state.request_chunks, *state.request_requirements, state.request_excerpt]
+                if str(item or "").strip()
+            ),
+            "",
+        )
+        if not request_focus:
+            return state
+        if len(str(state.root_goal or "").strip()) > 220:
+            state.root_goal = self._trim_compact_goal(request_focus, limit=220)
+        if len(str(state.active_goal or "").strip()) > 220:
+            state.active_goal = self._trim_compact_goal(
+                self._fallback_active_goal_text(state, request_focus),
+                limit=220,
+            )
+        if len(str(state.output_expectation or "").strip()) > 220:
+            state.output_expectation = self._trim_compact_goal(state.output_expectation, limit=220)
+        return state
+
+    def _fallback_active_goal_text(self, state: TaskState, request_focus: str) -> str:
+        intent = str(state.current_user_intent or "").strip()
+        if intent in ANALYSIS_LIKE_INTENTS:
+            return f"Grounded analysis focus: {request_focus}"
+        if intent in MUTATION_LIKE_INTENTS:
+            return f"Focused implementation scope: {request_focus}"
+        return request_focus
+
+    def _trim_compact_goal(self, text: str, *, limit: int) -> str:
+        normalized = " ".join(str(text or "").split()).strip()
+        if len(normalized) <= limit:
+            return normalized
+        if limit <= 1:
+            return normalized[:limit]
+        return normalized[: limit - 1].rstrip() + "…"
 
     def _reconcile_with_local_state(
         self,

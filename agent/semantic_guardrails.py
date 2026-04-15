@@ -1090,6 +1090,8 @@ def _unresolved_explicit_snapshot_symbols(
         return []
     if _extract_explicit_paths(request):
         return []
+    if signal.intent in {"explain", "search", "plan", "validate"}:
+        return []
     if signal.use_context and context.get("artifacts"):
         return []
 

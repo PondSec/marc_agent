@@ -1697,6 +1697,29 @@ def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     assert task_state.semantic_resolution == "minimal_inference"
 
 
+def test_task_state_timeout_fallback_keeps_large_project_analysis_executable_and_compact(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Ich moechte trotz kleinem Modell eine wirklich brauchbare Architektur-Zusammenfassung. "
+        "Lies die relevanten Stellen und beantworte dann kompakt: "
+        "Welche Rollen haben planner, prompts, layered_memory, task_state, state_updater und server? "
+        "Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen? "
+        "Woher kommt das Repo-Mapping und welche Stellen sind fuer grosse Nutzerprompts, Request-Digests, Request-Memory "
+        "und kompakte Generationsprompts entscheidend? "
+        "Nenne zentrale Dateipfade, bleibe geerdet und antworte auf Deutsch."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "explain"
+    assert task_state.needs_clarification is False
+    assert task_state.request_chunks
+    assert len(task_state.root_goal) <= 220
+    assert len(task_state.active_goal) <= 220
+
+
 def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
     session = SessionState(
