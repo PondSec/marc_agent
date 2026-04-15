@@ -3733,6 +3733,44 @@ def test_task_state_updater_preserves_full_latest_user_turn_after_semantic_compa
     assert task_state.request_chunks
 
 
+def test_task_state_updater_keeps_model_extracted_remembered_facts():
+    prompt = "Bitte behalte fuer spaetere Projekte, dass meine Lieblingsfarbe Petrol ist."
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": prompt,
+                "root_goal": "Merke dir die persoenliche Praeferenz.",
+                "active_goal": "Speichere die stabile Nutzerpraeferenz.",
+                "goal_relation": "new_task",
+                "output_expectation": "Die Praeferenz soll fuer spaetere Rueckfragen gespeichert werden.",
+                "remembered_facts": [
+                    {
+                        "subject": "user",
+                        "attribute": "lieblingsfarbe",
+                        "value": "Petrol",
+                        "summary": "User preference: Lieblingsfarbe Petrol.",
+                    }
+                ],
+                "current_user_intent": "explain",
+                "execution_strategy": "validation_inspection",
+                "ambiguity_level": "low",
+                "risk_level": "low",
+                "confidence": 0.91,
+                "next_action": "explain",
+                "execution_outline": ["Speichere die Praeferenz fuer spaetere Rueckfragen."],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(prompt)
+
+    assert task_state.remembered_facts
+    assert task_state.remembered_facts[0].attribute == "lieblingsfarbe"
+    assert task_state.remembered_facts[0].value == "Petrol"
+
+
 def test_compact_request_digest_captures_late_requirements():
     digest = _compact_request_digest(
         (

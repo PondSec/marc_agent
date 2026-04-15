@@ -142,6 +142,14 @@ def task_state_update_prompt(
         "active_goal": "string",
         "goal_relation": "new_task | continue | refine | correct | report_problem | scope_change | validation_request | rollback_request | approval | rejection | update_constraints | clarify | unknown",
         "output_expectation": "string",
+        "remembered_facts": [
+            {
+                "subject": "user | assistant",
+                "attribute": "string",
+                "value": "string",
+                "summary": "string | null (optional)",
+            }
+        ],
         "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null (optional)",
         "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null (optional)",
         "open_problem": "string | null (optional)",
@@ -177,6 +185,14 @@ def task_state_update_prompt(
         "active_goal": "string",
         "goal_relation": "new_task | continue | refine | correct | report_problem | scope_change | clarify | unknown",
         "output_expectation": "string",
+        "remembered_facts": [
+            {
+                "subject": "user | assistant",
+                "attribute": "string",
+                "value": "string",
+                "summary": "string | null (optional)",
+            }
+        ],
         "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null (optional)",
         "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null (optional)",
         "verification_target": "string | null (optional)",
@@ -296,6 +312,7 @@ def task_state_update_prompt(
                 "- For bugs or regressions, prefer inspect/debug/test before modify.",
                 "- For scope corrections or rollbacks, narrow or revert only the necessary part of the prior work.",
                 "- Update constraints and assumptions explicitly.",
+                "- remembered_facts is optional and only for stable cross-project facts explicitly stated about the user or assistant; never store secrets, transient task instructions, repo details, or guesses there.",
                 "- Keep root_goal stable across refinements unless the user clearly starts a new task.",
                 "- If a compatible active artifact already exists and the user is extending its behavior, prefer modify over create unless the user clearly asks for a distinct new artifact or file surface.",
                 "- next_action and next_best_action should be the single best next move, not a full route tree.",
@@ -2196,6 +2213,15 @@ def _compact_task_state(state: TaskState | None) -> dict[str, object]:
         "request_excerpt": _trim_text(state.request_excerpt or "", 220),
         "request_requirements": [_trim_text(item, 120) for item in state.request_requirements[:4]],
         "request_chunks": [_trim_text(item, 140) for item in state.request_chunks[:3]],
+        "remembered_facts": [
+            {
+                "subject": item.subject,
+                "attribute": _trim_text(item.attribute, 60),
+                "value": _trim_text(item.value, 120),
+                "summary": _trim_text(item.summary or "", 140),
+            }
+            for item in state.remembered_facts[:3]
+        ],
         "goal_relation": state.goal_relation,
         "output_expectation": _trim_text(state.output_expectation, 220),
         "current_user_intent": state.current_user_intent,

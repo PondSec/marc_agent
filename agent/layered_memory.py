@@ -58,6 +58,88 @@ _FIRST_PERSON_TOKENS = {"i", "ich", "me", "mein", "meine", "mich", "mir", "my"}
 _SECOND_PERSON_TOKENS = {"dein", "deine", "dich", "dir", "du", "you", "your"}
 _IDENTITY_QUERY_TOKENS = {"bin", "heisse", "heisst", "identity", "identitaet", "name", "person", "profil", "profile", "who", "wer"}
 _PROFILE_QUERY_PHRASES = ("about me", "ueber mich", "uber mich")
+_PERSONAL_QUERY_STOPWORDS = {
+    *_QUESTION_WORD_TOKENS,
+    *_FIRST_PERSON_TOKENS,
+    *_SECOND_PERSON_TOKENS,
+    "am",
+    "bin",
+    "bist",
+    "bist",
+    "das",
+    "denn",
+    "der",
+    "die",
+    "du",
+    "ein",
+    "eine",
+    "einem",
+    "einer",
+    "erinnern",
+    "erinnere",
+    "from",
+    "fuer",
+    "für",
+    "hab",
+    "habe",
+    "haben",
+    "heisse",
+    "heisst",
+    "identity",
+    "identitaet",
+    "ist",
+    "mein",
+    "meine",
+    "mich",
+    "mir",
+    "my",
+    "noch",
+    "profil",
+    "profile",
+    "remember",
+    "seid",
+    "sind",
+    "ueber",
+    "uber",
+    "von",
+    "weiss",
+    "weisst",
+    "weißt",
+    "werde",
+    "wirst",
+}
+_PERSONAL_RECALL_EXCLUDE_TOKENS = {
+    "api",
+    "app",
+    "auth",
+    "backend",
+    "bug",
+    "build",
+    "cli",
+    "code",
+    "config",
+    "css",
+    "datei",
+    "diff",
+    "feature",
+    "file",
+    "frontend",
+    "html",
+    "index",
+    "js",
+    "modul",
+    "module",
+    "projekt",
+    "python",
+    "repo",
+    "route",
+    "script",
+    "server",
+    "stacktrace",
+    "test",
+    "ui",
+    "workspace",
+}
 _HISTORY_TEMPORAL_TOKENS = {"already", "bereits", "bisher", "earlier", "frueher", "history", "last", "letzte", "letzten", "letzter", "mal", "previous", "schon", "status", "stand", "vorher"}
 _HISTORY_CONTINUITY_TOKENS = {"again", "gebaut", "did", "done", "gemacht", "have", "haben", "implemented", "schon", "we", "wir"}
 _MEMORY_DIRECTIVE_PATTERNS = (
@@ -1371,6 +1453,24 @@ class AgentMemoryStore(RepoMemoryStore):
 
     def _extract_remembered_facts(self, session: SessionState) -> list[RememberedFact]:
         facts: list[RememberedFact] = []
+        task_state_facts = list(getattr(session.task_state, "remembered_facts", []) or [])
+        for item in task_state_facts:
+            attribute = self._clean_fact_value(str(getattr(item, "attribute", "") or ""))
+            value = self._clean_fact_value(str(getattr(item, "value", "") or ""))
+            if not attribute or not value:
+                continue
+            subject = str(getattr(item, "subject", "user") or "user").strip().lower()
+            if subject not in {"user", "assistant"}:
+                subject = "user"
+            summary = self._clean_fact_value(str(getattr(item, "summary", "") or ""))
+            facts.append(
+                RememberedFact(
+                    subject=subject,
+                    attribute=attribute,
+                    value=value,
+                    summary=summary or f"{subject}:{attribute}={value}",
+                )
+            )
         for message in session.messages[-12:]:
             if message.role != "user":
                 continue
@@ -1481,14 +1581,26 @@ class AgentMemoryStore(RepoMemoryStore):
         if not first_person and not second_person:
             return None, ()
         identity_like = bool(set(tokens) & _IDENTITY_QUERY_TOKENS) or any(phrase in normalized for phrase in _PROFILE_QUERY_PHRASES)
-        if not identity_like:
+        content_tokens = [
+            token
+            for token in tokens
+            if len(token) >= 4 and token not in _PERSONAL_QUERY_STOPWORDS
+        ]
+        if not identity_like and any(token in _PERSONAL_RECALL_EXCLUDE_TOKENS for token in content_tokens):
+            return None, ()
+        if not identity_like and not content_tokens:
             return None, ()
         subject = "user" if first_person else "assistant"
-        attributes = ["identity", "profile"]
-        if "name" in tokens or "heisse" in tokens or "heisst" in tokens:
-            attributes.insert(0, "name")
-        elif subject == "user":
-            attributes.append("name")
+        attributes: list[str] = []
+        if identity_like:
+            attributes.extend(["identity", "profile"])
+            if "name" in tokens or "heisse" in tokens or "heisst" in tokens:
+                attributes.insert(0, "name")
+            elif subject == "user":
+                attributes.append("name")
+        for token in content_tokens:
+            if token not in attributes:
+                attributes.append(token)
         return subject, tuple(self._unique_strings(attributes))
 
     def _looks_like_history_recall_query(self, normalized: str) -> bool:
@@ -1512,6 +1624,7 @@ class AgentMemoryStore(RepoMemoryStore):
     ) -> RememberedFact | None:
         preferred_subject = str(request.recall_subject or "").strip().lower()
         preferred_attributes = {str(item or "").strip().lower() for item in request.recall_attributes if str(item or "").strip()}
+        query_terms = self._query_terms(request)
         best_fact: RememberedFact | None = None
         best_score = -1.0
         for item in selected:
@@ -1528,6 +1641,10 @@ class AgentMemoryStore(RepoMemoryStore):
                     score += 0.6
                 if preferred_attributes & {"identity", "profile"} and fact_attribute == "name":
                     score += 0.45
+                fact_terms = set(self._terms_from_text(" ".join([fact.attribute, fact.summary, fact.value])))
+                overlap = len(query_terms & fact_terms)
+                if overlap:
+                    score += min(0.45, 0.12 * overlap)
                 if score > best_score:
                     best_fact = fact
                     best_score = score

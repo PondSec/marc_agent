@@ -984,3 +984,56 @@ def test_planner_answers_personal_identity_questions_from_memory(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert "Joshua Pond" in str(decision.final_response or "")
+
+
+def test_model_extracted_personal_fact_recalls_across_projects_without_literal_trigger(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    remembered = SessionState(
+        task="Bitte behalte fuer spaetere Projekte, dass meine Lieblingsfarbe Petrol ist.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    remembered.task_state = TaskState(
+        latest_user_turn=remembered.task,
+        root_goal="Merke dir die persoenliche Praeferenz.",
+        active_goal="Speichere die stabile Nutzerpraeferenz.",
+        goal_relation="new_task",
+        output_expectation="Die Praeferenz soll fuer spaetere Rueckfragen gespeichert werden.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        confidence=0.88,
+        next_action="explain",
+        next_best_action="explain",
+        remembered_facts=[
+            {
+                "subject": "user",
+                "attribute": "lieblingsfarbe",
+                "value": "Petrol",
+                "summary": "User preference: Lieblingsfarbe Petrol.",
+            }
+        ],
+    )
+    remembered.append_message("user", remembered.task)
+    remembered.append_message("assistant", remembered.final_response or "")
+    remembered.workspace_snapshot = store_a.build_snapshot(remembered.task)
+    store_a.persist_session_memory(remembered)
+
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+    recall = SessionState(
+        task="Welche Lieblingsfarbe habe ich?",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    recall.workspace_snapshot = store_b.build_snapshot(recall.task)
+
+    request = store_b.build_retrieval_request(recall.task, recall)
+    result = store_b.retrieve(request)
+
+    assert request.use_case == "user_recall"
+    assert request.recall_subject == "user"
+    assert "lieblingsfarbe" in request.recall_attributes
+    assert "Petrol" in result.recall_brief

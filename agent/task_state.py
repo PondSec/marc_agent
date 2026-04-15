@@ -410,6 +410,43 @@ class EvidenceItem(StrictModel):
         return self
 
 
+class RememberedFactState(StrictModel):
+    subject: Literal["user", "assistant"] = "user"
+    attribute: str
+    value: str
+    summary: str | None = None
+
+    @model_validator(mode="after")
+    def normalize(self) -> RememberedFactState:
+        self.attribute = str(self.attribute or "").strip()
+        self.value = str(self.value or "").strip()
+        self.summary = str(self.summary or "").strip() or None
+        if not self.attribute:
+            raise ValueError("attribute is required")
+        if not self.value:
+            raise ValueError("value is required")
+        if self.summary is None:
+            self.summary = f"{self.subject}:{self.attribute}={self.value}"
+        return self
+
+
+def _merge_remembered_facts(*groups: list[RememberedFactState]) -> list[RememberedFactState]:
+    merged: list[RememberedFactState] = []
+    seen: set[tuple[str, str, str]] = set()
+    for group in groups:
+        for item in group:
+            key = (
+                str(item.subject or "").strip().lower(),
+                str(item.attribute or "").strip().lower(),
+                str(item.value or "").strip().lower(),
+            )
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged[:8]
+
+
 class TaskState(StrictModel):
     latest_user_turn: str
     root_goal: str
@@ -419,6 +456,7 @@ class TaskState(StrictModel):
     request_excerpt: str | None = None
     request_requirements: list[str] = Field(default_factory=list)
     request_chunks: list[str] = Field(default_factory=list)
+    remembered_facts: list[RememberedFactState] = Field(default_factory=list)
     current_user_intent: UserIntent | None = None
     execution_strategy: ExecutionStrategy | None = None
     open_problem: str | None = None
@@ -456,6 +494,7 @@ class TaskState(StrictModel):
             "supplied_evidence",
             "request_requirements",
             "request_chunks",
+            "remembered_facts",
             "relevant_context",
             "constraints",
             "assumptions",
@@ -500,6 +539,7 @@ class TaskState(StrictModel):
         self.active_artifacts = _merge_artifacts(self.active_artifacts, self.target_artifacts)
         self.request_requirements = _compact_strings(self.request_requirements, limit=10)
         self.request_chunks = _compact_strings(self.request_chunks, limit=5)
+        self.remembered_facts = _merge_remembered_facts(self.remembered_facts)
         inferred_supplied_evidence = [item.summary for item in self.evidence if item.summary]
         self.supplied_evidence = _compact_strings(
             [*self.supplied_evidence, *inferred_supplied_evidence],
