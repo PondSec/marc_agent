@@ -1056,10 +1056,10 @@ class AgentCore:
             "report_dir": str(self.config.report_dir_path),
         }
         existing = dict(getattr(session, "runtime_options", {}) or {})
-        for key in ("agent_profile", "execution_profile"):
-            value = existing.get(key)
-            if value:
-                options[key] = value
+        options["agent_profile"] = str(existing.get("agent_profile") or "a2").strip().lower() or "a2"
+        execution_profile = existing.get("execution_profile")
+        if execution_profile:
+            options["execution_profile"] = execution_profile
         return options
 
     def _debug_repair_incomplete(self, session: SessionState) -> bool:

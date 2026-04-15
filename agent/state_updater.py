@@ -833,6 +833,8 @@ class TaskStateUpdater:
             return False
         if self._requires_semantic_model_execution(session, state):
             return False
+        if self._requires_structured_repository_analysis(state):
+            return False
         if initial_mode != "compact":
             return False
         config = getattr(self.llm, "config", None)
@@ -845,6 +847,25 @@ class TaskStateUpdater:
         if state.needs_clarification or state.ambiguity_level == "high":
             return False
         return float(state.confidence or 0.0) >= 0.65
+
+    def _requires_structured_repository_analysis(self, state: TaskState) -> bool:
+        intent = str(state.current_user_intent or "").strip()
+        action = str(state.next_best_action or state.next_action or "").strip()
+        if intent not in ANALYSIS_LIKE_INTENTS and action not in ANALYSIS_LIKE_ACTIONS:
+            return False
+        request = str(state.latest_user_turn or "").strip()
+        if len(request) < 320:
+            return False
+        requirement_count = sum(1 for item in state.request_requirements if str(item or "").strip())
+        chunk_count = sum(1 for item in state.request_chunks if str(item or "").strip())
+        enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
+        question_count = request.count("?")
+        return (
+            chunk_count >= 4
+            or requirement_count >= 6
+            or enumerated_sections >= 3
+            or (question_count >= 3 and requirement_count >= 4)
+        )
 
     def _should_short_circuit_direct_chat(
         self,

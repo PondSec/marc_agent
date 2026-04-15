@@ -1360,6 +1360,39 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
                 "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
             ]
         )
+    if _requires_structured_analysis_report(route, session):
+        analysis_context = _compact_structured_analysis_context(route, session)
+        return "\n".join(
+            _localized_prompt_lines(
+                language,
+                de=[
+                    "Schreibe eine belastbare Architektur-Zusammenfassung zur letzten Repository-Frage.",
+                    "Antworte auf Deutsch.",
+                    f"Kontext: {json.dumps(analysis_context, ensure_ascii=False)}",
+                    "Beantworte die Teilfragen des Nutzers in derselben Reihenfolge. Lasse keinen spaeteren Punkt stillschweigend weg.",
+                    "Nenne in jedem Abschnitt die relevanten Dateipfade und sichtbaren Funktionen, Klassen, Signale oder Datenfluesse, wenn sie im Kontext sichtbar sind.",
+                    "Trenne sauber zwischen direkt sichtbar, indirekt ableitbar und im gelesenen Kontext nicht bestaetigt.",
+                    "Wenn ein Punkt nach Repo-Mapping, Memory, Retrieval, Request-Digests oder kompakter Promptbildung fragt, erklaere auch, wo diese Informationen erzeugt, gespeichert oder wieder eingespeist werden, soweit das im Kontext sichtbar ist.",
+                    "Nenne 2 bis 4 groesste technische Risiken oder Restluecken nur dann, wenn sie an sichtbaren Code- oder Architekturhinweisen festzumachen sind.",
+                    "Schreibe natuerlich und kompakt, aber mit klaren Abschnitten statt generischem Fliesstext.",
+                    "Spekuliere nicht. Wenn etwas fehlt oder nur indirekt ableitbar ist, sag das knapp und klar.",
+                    "Gib kein JSON aus.",
+                ],
+                en=[
+                    "Write a reliable architecture summary for the latest repository question.",
+                    "Reply in English.",
+                    f"Context: {json.dumps(analysis_context, ensure_ascii=False)}",
+                    "Answer the user's sub-questions in the same order. Do not silently drop later requirements.",
+                    "For each section, cite the relevant file paths and any visible functions, classes, signals, or data flow when they are present in the context.",
+                    "Clearly separate what is directly visible, indirectly inferred, and not confirmed in the inspected context.",
+                    "When the user asks about repo mapping, memory, retrieval, request digests, or compact prompt building, explain where those pieces are produced, stored, or fed back into prompts/retrieval when that is visible in context.",
+                    "Name 2 to 4 biggest technical risks or remaining gaps only when they are grounded in visible code or architecture signals.",
+                    "Write naturally and concisely, but use clear sections instead of generic filler prose.",
+                    "Do not speculate. If something is missing or only indirectly inferable, say so briefly and clearly.",
+                    "Do not emit JSON.",
+                ],
+            )
+        )
     inspection_evidence = _compact_read_evidence(session)
     if route.intent in {RouteIntent.EXPLAIN, RouteIntent.INSPECT} and not session.changed_files and inspection_evidence:
         focused_evidence = _compact_read_evidence(
@@ -2106,6 +2139,76 @@ def _recent_diagnostics(session: SessionState | None):
     if session.follow_up_context is not None:
         diagnostics.extend(session.follow_up_context.diagnostics[-6:])
     return diagnostics[-6:]
+
+
+def _requires_structured_analysis_report(route: RouterOutput, session: SessionState) -> bool:
+    if route.intent not in {RouteIntent.EXPLAIN, RouteIntent.INSPECT}:
+        return False
+    if session.changed_files:
+        return False
+    task_state = session.task_state
+    if task_state is None:
+        return False
+    request = str(task_state.latest_user_turn or session.task or "").strip()
+    if len(request) < 180:
+        return False
+    request_requirements = sum(1 for item in task_state.request_requirements if str(item or "").strip())
+    request_chunks = sum(1 for item in task_state.request_chunks if str(item or "").strip())
+    enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
+    if request_chunks < 4 and request_requirements < 6 and enumerated_sections < 3:
+        return False
+    if len(route.entities.target_paths) == 1 and request_requirements <= 4 and enumerated_sections < 3:
+        return False
+    return True
+
+
+def _compact_structured_analysis_context(route: RouterOutput, session: SessionState) -> dict[str, object]:
+    snapshot = session.workspace_snapshot
+    task_state = session.task_state
+    payload: dict[str, object] = {
+        "user_task": _trim_text(session.task, 420),
+        "requested_outcome": _trim_text(route.requested_outcome, 260),
+        "request_requirements": [_trim_text(item, 120) for item in (task_state.request_requirements if task_state else [])[:8]],
+        "request_chunks": [_trim_text(item, 160) for item in (task_state.request_chunks if task_state else [])[:5]],
+        "route": {
+            "intent": route.intent,
+            "target_paths": route.entities.target_paths[:8],
+            "search_terms": route.search_terms[:6],
+        },
+        "inspected_files": _read_paths(session)[-10:],
+        "inspection_evidence": _compact_read_evidence(session, limit=6, excerpt_chars=420),
+        "recent_tool_calls": _compact_recent_calls(session),
+        "workspace_summary": _trim_text(snapshot.repo_summary if snapshot is not None else "", 320),
+        "workspace_entrypoints": snapshot.entrypoints[:6] if snapshot is not None else [],
+        "workspace_important_files": snapshot.important_files[:10] if snapshot is not None else [],
+        "workspace_repo_map": [_trim_text(item, 120) for item in (snapshot.repo_map[:10] if snapshot is not None else [])],
+        "workspace_symbols": {
+            path: list(symbols[:4])
+            for path, symbols in list((snapshot.symbol_index if snapshot is not None else {}).items())[:6]
+        },
+        "memory_context": _compact_memory_context(session),
+        "notes": [_trim_text(item, 140) for item in session.notes[-8:]],
+    }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "user_task",
+            "request_requirements",
+            "request_chunks",
+            "inspected_files",
+            "inspection_evidence",
+            "workspace_repo_map",
+            "workspace_summary",
+            "workspace_important_files",
+            "workspace_entrypoints",
+            "workspace_symbols",
+            "route",
+            "memory_context",
+            "recent_tool_calls",
+            "notes",
+        ],
+        max_chars=2200,
+    )
 
 
 def _compact_workspace_snapshot(

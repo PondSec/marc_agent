@@ -651,6 +651,129 @@ def test_final_response_prompt_uses_focused_grounding_rules_for_read_only_file_e
     assert "generischen Repository-Ueberblick" in prompt
 
 
+def test_final_response_prompt_uses_structured_architecture_report_for_large_analysis_requests(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="inspect",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "inspect_workspace",
+                    "reason": "Collect repository context before summarizing.",
+                },
+                {
+                    "step": 2,
+                    "action": "read_relevant_files",
+                    "reason": "Read the strongest implementation files before summarizing.",
+                },
+                {
+                    "step": 3,
+                    "action": "summarize_result",
+                    "reason": "Return the grounded architecture summary.",
+                },
+            ],
+            requested_outcome="Analysiere Systemtyp, Datenfluss, Memory, Repo-Mapping, grosse Prompts und Risiken.",
+        )
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp 2. Rollen 3. Memory 4. Repo-Mapping 5. grosse Prompts 6. Risiken. "
+            "Nenne Dateipfade und sag klar, wenn etwas nicht bestaetigt ist."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        task_state=TaskState(
+            latest_user_turn=(
+                "Analysiere dieses Projekt gruendlich und belastbar. "
+                "1. Systemtyp 2. Rollen 3. Memory 4. Repo-Mapping 5. grosse Prompts 6. Risiken. "
+                "Nenne Dateipfade und sag klar, wenn etwas nicht bestaetigt ist."
+            ),
+            root_goal="Analysiere das Projekt belastbar.",
+            active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+            goal_relation="new_task",
+            output_expectation=(
+                "Inspect the relevant repository areas, then answer each requested point with concrete file paths, "
+                "visible symbols or flows when available, and explicit uncertainty for anything not found."
+            ),
+            current_user_intent="explain",
+            execution_strategy="validation_inspection",
+            target_artifacts=[],
+            active_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.88,
+            next_action="inspect",
+            next_best_action="inspect",
+            request_requirements=[
+                "Systemtyp",
+                "Rollen",
+                "Memory",
+                "Repo-Mapping",
+                "grosse Prompts",
+                "Risiken",
+            ],
+            request_chunks=[
+                "Systemtyp; Rollen; Memory",
+                "Repo-Mapping; grosse Prompts; Risiken",
+                "Nenne Dateipfade",
+                "Sag klar, wenn etwas nicht bestaetigt ist",
+            ],
+            execution_outline=[
+                "Inspect the repository structure first.",
+                "Read the strongest implementation files.",
+                "Answer each requested point with grounded evidence.",
+            ],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="inspect_workspace",
+                tool_args={"focus": session.task},
+                success=True,
+                summary="Inspected workspace.",
+                phase="exploring",
+                output_excerpt="Repo map:\n- app/\n- tests/\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "app/main.py"},
+                success=True,
+                summary="Read app/main.py.",
+                phase="exploring",
+                output_excerpt="def main():\n    return run_server()\n",
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_main.py"},
+                success=True,
+                summary="Read tests/test_main.py.",
+                phase="exploring",
+                output_excerpt="def test_main():\n    assert main() is not None\n",
+            ),
+        ]
+    )
+
+    prompt = final_response_prompt(route, session)
+
+    assert "Beantworte die Teilfragen des Nutzers in derselben Reihenfolge." in prompt
+    assert '"request_requirements": ["Systemtyp", "Rollen", "Memory", "Repo-Mapping"' in prompt
+    assert '"workspace_repo_map":' in prompt
+    assert '"inspection_evidence": [{"path": "app/main.py"' in prompt
+    assert "direkt sichtbar, indirekt ableitbar und im gelesenen Kontext nicht bestaetigt" in prompt
+
+
 def test_final_response_num_ctx_scales_with_prompt_size(tmp_path):
     planner = Planner(ScriptedLLM(), "")
 

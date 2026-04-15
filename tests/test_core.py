@@ -94,6 +94,20 @@ def test_core_runtime_options_preserve_agent_profile_overrides(tmp_path):
     assert options["execution_profile"] == "fast"
 
 
+def test_core_runtime_options_default_agent_profile_to_a2(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+    session = SessionState(
+        task="Inspect the repo",
+        workspace_root=str(tmp_path),
+    )
+
+    options = core._runtime_options(session)
+
+    assert options["agent_profile"] == "a2"
+
+
 def test_core_requires_semantic_review_before_marking_changed_run_complete(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

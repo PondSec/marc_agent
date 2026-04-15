@@ -1713,11 +1713,77 @@ def test_task_state_timeout_fallback_keeps_large_project_analysis_executable_and
     task_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path))
 
     assert task_state.current_user_intent == "explain"
-    assert task_state.next_action == "explain"
+    assert task_state.next_action == "inspect"
     assert task_state.needs_clarification is False
     assert task_state.request_chunks
+    assert task_state.target_artifacts == []
     assert len(task_state.root_goal) <= 220
     assert len(task_state.active_goal) <= 220
+
+
+def test_task_state_a2_shared_model_stack_bypasses_local_short_circuit_for_large_analysis(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Beantworte in mehreren Punkten Systemtyp, Datenfluss, Memory, Repo-Mapping, grosse Prompts und Risiken. "
+        "Nenne dabei konkrete Dateipfade und verliere spaetere Anforderungen nicht."
+    )
+    payload = {
+        "latest_user_turn": prompt,
+        "root_goal": "Analysiere das Projekt belastbar.",
+        "active_goal": "Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        "goal_relation": "new_task",
+        "output_expectation": (
+            "Inspect the relevant repository areas, then answer each requested point with concrete file paths, "
+            "visible symbols or flows when available, and explicit uncertainty for anything not found."
+        ),
+        "current_user_intent": "explain",
+        "execution_strategy": "validation_inspection",
+        "open_problem": None,
+        "verification_target": None,
+        "target_artifacts": [],
+        "active_artifacts": [],
+        "evidence": [],
+        "supplied_evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": [],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.82,
+        "next_action": "inspect",
+        "next_best_action": "inspect",
+        "execution_outline": [
+            "Inspect the repository structure first.",
+            "Read the strongest implementation files.",
+            "Answer the requested points with concrete evidence.",
+        ],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ScriptedLLM(json_payloads=[payload])
+    llm.config = config
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        prompt,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.next_action == "inspect"
+    assert llm.generate_json_calls
 
 
 def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
