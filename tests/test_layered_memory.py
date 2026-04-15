@@ -52,6 +52,16 @@ def build_store(tmp_path: Path, *, state_root_override: Path | None = None) -> A
     return AgentMemoryStore(config, WorkspaceManager(tmp_path))
 
 
+def build_empty_store(tmp_path: Path, *, state_root_override: Path | None = None) -> AgentMemoryStore:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        state_root_override=str(state_root_override) if state_root_override is not None else None,
+    )
+    config.ensure_state_dirs()
+    return AgentMemoryStore(config, WorkspaceManager(tmp_path))
+
+
 def build_task_state(task: str, *, target: str = "app/auth.py") -> TaskState:
     return TaskState(
         latest_user_turn=task,
@@ -773,6 +783,54 @@ def test_project_identity_does_not_drift_after_snapshot_refresh(tmp_path):
 
     assert store.project_id == original_project_id
     assert session.project_id == original_project_id
+
+
+def test_empty_workspace_project_identity_stays_stable_after_generic_web_bootstrap(tmp_path):
+    store = build_empty_store(tmp_path / "web")
+    original_project_id = store.project_id
+    session = SessionState(
+        task="Erstelle eine einfache Website.",
+        workspace_root=str(store.workspace.root),
+        project_id=store.project_id,
+    )
+    session.workspace_snapshot = store.build_snapshot(session.task)
+    store.refresh_session_memory(session.task, session)
+
+    (store.workspace.root / "index.html").write_text("<!DOCTYPE html><html></html>", encoding="utf-8")
+    session.workspace_snapshot = store.build_snapshot(session.task)
+    store.refresh_session_memory(session.task, session)
+
+    assert store.project_id == original_project_id
+    assert session.project_id == original_project_id
+
+
+def test_generic_single_file_workspaces_do_not_share_project_identity(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_empty_store(tmp_path / "web_a", state_root_override=shared_state)
+    store_b = build_empty_store(tmp_path / "web_b", state_root_override=shared_state)
+
+    (store_a.workspace.root / "index.html").write_text("<!DOCTYPE html><title>A</title>", encoding="utf-8")
+    (store_b.workspace.root / "index.html").write_text("<!DOCTYPE html><title>B</title>", encoding="utf-8")
+
+    session_a = SessionState(
+        task="Erstelle eine Landingpage.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+    )
+    session_a.workspace_snapshot = store_a.build_snapshot(session_a.task)
+    store_a.refresh_session_memory(session_a.task, session_a)
+
+    session_b = SessionState(
+        task="Erstelle eine andere Landingpage.",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    session_b.workspace_snapshot = store_b.build_snapshot(session_b.task)
+    store_b.refresh_session_memory(session_b.task, session_b)
+
+    assert store_a.project_id != store_b.project_id
+    assert session_a.project_id == store_a.project_id
+    assert session_b.project_id == store_b.project_id
 
 
 def test_failure_memory_persists_multiple_failure_signatures_from_same_session(tmp_path):

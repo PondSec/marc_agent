@@ -1961,11 +1961,18 @@ class AgentMemoryStore(RepoMemoryStore):
         return dict(counts)
 
     def _resolve_project_id(self, snapshot: Any | None = None) -> str:
-        identity_tokens = (
-            self._git_identity_tokens()
-            or self._project_identity_tokens_from_snapshot(snapshot)
-            or self._workspace_identity_tokens()
-        )
+        git_tokens = self._git_identity_tokens()
+        if git_tokens:
+            return self._project_id_from_tokens(git_tokens)
+        snapshot_tokens = self._project_identity_tokens_from_snapshot(snapshot)
+        if snapshot_tokens:
+            return self._project_id_from_tokens(snapshot_tokens)
+        workspace_tokens = self._workspace_identity_tokens()
+        if self._workspace_identity_tokens_are_stable(workspace_tokens):
+            return self._project_id_from_tokens(workspace_tokens)
+        return self._project_id_for_root(self.workspace.root)
+
+    def _project_id_from_tokens(self, identity_tokens: list[str]) -> str:
         if not identity_tokens:
             return self._project_id_for_root(self.workspace.root)
         slug = self._project_slug_from_tokens(identity_tokens) or "project"
@@ -2054,6 +2061,19 @@ class AgentMemoryStore(RepoMemoryStore):
         if len(tokens) < 3:
             tokens.extend(f"path:{item.lower()}" for item in relative_paths[:18])
         return self._unique_strings(tokens)
+
+    def _workspace_identity_tokens_are_stable(self, tokens: list[str]) -> bool:
+        if not tokens:
+            return False
+        structural_prefixes = ("manifest:", "entry:", "dir:", "test:")
+        if any(str(token).startswith(structural_prefixes) for token in tokens):
+            return True
+        path_tokens = [
+            str(token).split(":", 1)[1]
+            for token in tokens
+            if str(token).startswith("path:") and ":" in str(token)
+        ]
+        return any("/" in path for path in path_tokens)
 
     def _project_slug_from_tokens(self, tokens: list[str]) -> str:
         for token in tokens:
