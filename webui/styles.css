@@ -11082,16 +11082,29 @@ body {
 
 /* Final workspace layout correction */
 
+.modal-backdrop {
+  z-index: 1200;
+}
+
+.modal-layer {
+  z-index: 1201;
+  isolation: isolate;
+}
+
+.modal-card {
+  position: relative;
+}
+
 .workspace-modal-layer {
   padding:
-    clamp(20px, 4.2vh, 42px)
+    clamp(20px, 4vh, 40px)
     clamp(16px, 2.8vw, 36px)
-    clamp(28px, 6.4vh, 68px);
+    clamp(24px, 5vh, 52px);
 }
 
 .workspace-modal-card {
-  width: min(100%, 720px);
-  max-height: calc(100vh - clamp(56px, 10.6vh, 104px));
+  width: min(100%, 700px);
+  max-height: min(820px, calc(100vh - clamp(92px, 15vh, 148px)));
 }
 
 .thread-toolbar-button {
@@ -11123,14 +11136,14 @@ body {
 }
 
 .chat-input-inner {
-  width: min(100%, 860px);
+  width: min(100%, 760px);
   margin: 0 auto;
   display: grid;
   justify-items: stretch;
 }
 
 .workbench-composer {
-  width: min(100%, 760px);
+  width: 100%;
   justify-self: center;
 }
 
@@ -11185,11 +11198,11 @@ body {
 
   .workspace-modal-card,
   .workspace-browser-modal {
-    max-height: calc(100vh - 32px);
+    max-height: calc(100vh - 36px);
   }
 
   .chat-input-inner {
-    width: min(100%, 760px);
+    width: min(100%, 100%);
   }
 
   .workspace-browser-modal {
