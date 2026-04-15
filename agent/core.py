@@ -96,7 +96,12 @@ class AgentCore:
         session.runtime_options = self._runtime_options(session)
         session.touch()
 
-        logger = AgentLogger(self.config.log_dir_path, session.id, verbose=self.config.verbose)
+        logger = AgentLogger(
+            self.config.log_dir_path,
+            session.id,
+            verbose=self.config.verbose,
+            activity_heartbeat=lambda: self._heartbeat_session_activity(session),
+        )
         filesystem = FileSystemTools(self.config, self.workspace, self.safety)
         search = SearchTools(self.config, self.workspace, self.memory)
         shell = ShellTools(self.config, self.workspace, self.safety)
@@ -240,6 +245,12 @@ class AgentCore:
             report_path=session.report.report_path if session.report else None,
         )
         return session
+
+    def _heartbeat_session_activity(self, session: SessionState) -> None:
+        if session.status != "running":
+            return
+        session.touch()
+        self.session_store.save(session)
 
     def _should_stop(
         self,
