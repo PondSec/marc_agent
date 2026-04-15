@@ -133,6 +133,7 @@ const state = {
     workspaceGitInspection: null,
     workspaceGitLoading: false,
     workspaceGitInspecting: false,
+    workspaceModalScrollResetPending: false,
     workspaceBrowser: {
       open: false,
       loading: false,
@@ -492,6 +493,7 @@ function resetWorkspaceGitState() {
   state.ui.workspaceGitInspection = null;
   state.ui.workspaceGitLoading = false;
   state.ui.workspaceGitInspecting = false;
+  state.ui.workspaceModalScrollResetPending = false;
 }
 
 async function refreshHealth() {
@@ -1935,6 +1937,7 @@ function handleChange(event) {
     state.composer.dryRun = event.target.checked;
   } else if (event.target.id === "workspaceSourceSelect") {
     state.ui.workspaceSource = event.target.value;
+    requestWorkspaceModalScrollReset();
   } else if (event.target.id === "workspaceGitSyncToggle") {
     state.ui.workspaceGitSyncOnSave = event.target.checked;
   } else if (event.target.id === "workspaceGitRepositorySelect") {
@@ -1945,6 +1948,7 @@ function handleChange(event) {
       applyGitDiscoveryCandidate(candidate);
     } else {
       state.ui.workspaceGitSyncSource = selectedPath;
+      requestWorkspaceModalScrollReset();
     }
   } else {
     return;
@@ -2187,6 +2191,7 @@ function applyGitDiscoveryCandidate(candidate) {
       (Array.isArray(candidate.remote_branches) ? candidate.remote_branches[0] : "") ||
       "";
   }
+  requestWorkspaceModalScrollReset();
 }
 
 async function loadWorkspaceGitContext(workspaceId = null) {
@@ -2205,6 +2210,7 @@ async function loadWorkspaceGitContext(workspaceId = null) {
     if (gitStatus) {
       if (gitStatus.is_repo || gitStatus.configured_source || gitStatus.configured_branch) {
         state.ui.workspaceSource = "git";
+        requestWorkspaceModalScrollReset();
       }
       if (!state.ui.workspaceGitSyncSource) {
         state.ui.workspaceGitSyncSource = gitStatus.configured_source || gitStatus.remote_url || gitStatus.workspace_path || "";
@@ -2262,6 +2268,7 @@ async function inspectWorkspaceGitSource({ silent = false } = {}) {
       state.ui.workspaceGitBranch =
         inspection.current_branch || inspection.default_branch || inspection.remote_branches?.[0] || "";
     }
+    requestWorkspaceModalScrollReset();
     renderApp();
     return inspection;
   } catch (error) {
@@ -2315,6 +2322,7 @@ function openWorkspaceModal(mode, workspaceId = null) {
   state.ui.workspaceMode = mode;
   state.ui.editingWorkspaceId = workspaceId;
   resetWorkspaceGitState();
+  requestWorkspaceModalScrollReset();
 
   if (mode === "edit" && workspaceId) {
     const workspace = state.workspaces.find((item) => item.id === workspaceId);
@@ -2586,6 +2594,7 @@ function renderApp() {
     syncComposerControls();
   }
   restoreUiSnapshot(uiSnapshot);
+  applyPendingWorkspaceModalScrollReset();
   if (!settingsPage) {
     restoreChatScrollState();
     window.requestAnimationFrame(() => {
@@ -2593,6 +2602,30 @@ function renderApp() {
       ensureSidebarSelectionVisible();
     });
   }
+}
+
+function requestWorkspaceModalScrollReset() {
+  if (!state.ui.workspaceModalOpen) {
+    return;
+  }
+  state.ui.workspaceModalScrollResetPending = true;
+}
+
+function applyPendingWorkspaceModalScrollReset() {
+  if (!state.ui.workspaceModalOpen || !state.ui.workspaceModalScrollResetPending) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    const layer = document.querySelector(".workspace-modal-layer");
+    const body = document.querySelector(".workspace-modal-card .modal-body");
+    if (layer instanceof HTMLElement) {
+      layer.scrollTop = 0;
+    }
+    if (body instanceof HTMLElement) {
+      body.scrollTop = 0;
+    }
+    state.ui.workspaceModalScrollResetPending = false;
+  });
 }
 
 function closePreservedDetails(except = null) {
@@ -6067,8 +6100,8 @@ function renderWorkspaceModal() {
     : "";
   return `
     <div class="modal-backdrop" data-action="close-workspace-modal"></div>
-    <div class="modal-layer">
-      <section class="modal-card">
+    <div class="modal-layer workspace-modal-layer">
+      <section class="modal-card workspace-modal-card">
         <header class="modal-head">
           <div>
             <p class="modal-kicker">Projekt</p>
