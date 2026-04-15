@@ -9925,11 +9925,14 @@ body {
 .workspace-browser-modal-body {
   display: grid;
   gap: 16px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .workspace-browser-shell {
   display: grid;
   grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  height: min(70vh, 760px);
   min-height: min(70vh, 760px);
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 18px;
@@ -9940,6 +9943,7 @@ body {
 .workspace-browser-tree-pane,
 .workspace-browser-preview-pane {
   min-width: 0;
+  min-height: 0;
   display: grid;
   align-content: start;
 }
@@ -9974,6 +9978,7 @@ body {
   min-height: 0;
   max-height: min(70vh, 760px);
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 10px 8px 12px;
 }
 
@@ -10029,13 +10034,23 @@ body {
 
 .workspace-browser-preview-pane {
   grid-template-rows: auto minmax(0, 1fr);
+  align-content: stretch;
+  overflow: hidden;
+}
+
+.workspace-browser-preview-body {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  overflow: hidden;
 }
 
 .workspace-browser-preview {
   margin: 0;
   min-height: 0;
-  height: 100%;
+  height: auto;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 18px 20px;
   color: rgba(240, 235, 229, 0.9);
   font-size: 12px;
@@ -11159,6 +11174,7 @@ body {
 
 .workspace-browser-shell {
   grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+  height: min(80vh, 940px);
   min-height: min(80vh, 940px);
 }
 
@@ -11212,6 +11228,7 @@ body {
 
   .workspace-browser-shell {
     grid-template-columns: 1fr;
+    height: auto;
     min-height: auto;
   }
 }

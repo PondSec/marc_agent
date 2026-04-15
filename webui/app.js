@@ -6290,12 +6290,14 @@ function renderWorkspaceBrowserModal() {
                       ? `<div class="workspace-browser-empty workspace-browser-error">${escapeHtml(browser.contentError)}</div>`
                       : browser.selectedPath
                         ? `
-                            <pre class="workspace-browser-preview"><code>${escapeHtml(browser.content)}</code></pre>
-                            ${
-                              browser.fileTruncated
-                                ? `<p class="workspace-browser-note">Die Ansicht wurde auf den ersten sichtbaren Abschnitt begrenzt.</p>`
-                                : ""
-                            }
+                            <div class="workspace-browser-preview-body">
+                              <pre class="workspace-browser-preview"><code>${escapeHtml(browser.content)}</code></pre>
+                              ${
+                                browser.fileTruncated
+                                  ? `<p class="workspace-browser-note">Die Ansicht wurde auf den ersten sichtbaren Abschnitt begrenzt.</p>`
+                                  : ""
+                              }
+                            </div>
                           `
                         : `<div class="workspace-browser-empty">Waehle links eine Datei aus.</div>`
                 }
