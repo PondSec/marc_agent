@@ -5788,6 +5788,41 @@ class Planner:
         lightweight_model = recovery_model
         current_model = str(issue.model_identifier or "").strip()
         if (
+            issue.failed_after_progress
+            and current_model
+            and primary_model
+            and current_model != primary_model
+        ):
+            resume_current_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "resume"
+                    and attempt.model_name == current_model
+                ),
+                None,
+            )
+            if resume_current_model is None:
+                capability_tier = (
+                    "tier_b" if lightweight_model and current_model == lightweight_model else "tier_a"
+                )
+                attempts.insert(
+                    0,
+                    GenerationRecoveryAttempt(
+                        strategy="resume_fallback_model",
+                        prompt_kind="resume",
+                        model_name=current_model,
+                        capability_tier=capability_tier,
+                    ),
+                )
+            else:
+                reordered = [resume_current_model]
+                for attempt in attempts:
+                    if attempt is resume_current_model:
+                        continue
+                    reordered.append(attempt)
+                attempts = reordered
+        if (
             issue.no_start_failure
             and primary_model
             and lightweight_model

@@ -28604,6 +28604,40 @@ def test_planner_prefers_compact_same_model_retry_for_high_pressure_single_model
     assert any(attempt.strategy == "retry_same_model" and attempt.prompt_kind == "full" for attempt in attempts[1:])
 
 
+def test_planner_prefers_resume_on_progress_model_after_fallback_timeout(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:7b",
+                router_model_name="qwen3:8b",
+            )
+        ),
+        "",
+    )
+
+    attempts = planner._content_generation_recovery_attempts(
+        ExecutionFailure(
+            failure_class="total_timeout",
+            state="failed_total_timeout",
+            had_progress=True,
+            first_output_received=True,
+            model_identifier="qwen3:8b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=True,
+            raw_reason="total_timeout",
+            partial_text="<main>partial website",
+            characters=24,
+        )
+    )
+
+    assert attempts
+    assert attempts[0].strategy == "resume_fallback_model"
+    assert attempts[0].prompt_kind == "resume"
+    assert attempts[0].model_name == "qwen3:8b"
+
+
 def test_planner_recovers_from_retryable_no_start_with_same_model_retry(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
