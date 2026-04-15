@@ -1947,6 +1947,8 @@ def test_task_state_a2_uses_local_mutation_bootstrap_for_large_create_prompt(tmp
         "styles.css",
         "script.js",
     ]
+    assert "minimal scaffold" in task_state.output_expectation
+    assert "Die Website soll professionell" in " ".join(task_state.constraints)
     assert llm.generate_json_calls == []
 
 
@@ -2004,6 +2006,8 @@ def test_task_state_a2_uses_local_mutation_bootstrap_for_large_analyze_then_modi
         "styles.css",
         "script.js",
     }
+    assert "preserving surrounding behavior" in task_state.output_expectation
+    assert "Completion criteria:" in " ".join(task_state.relevant_context)
     assert llm.generate_json_calls == []
 
 

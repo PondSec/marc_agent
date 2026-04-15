@@ -108,6 +108,7 @@ class TaskStateUpdater:
             self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
             return local_state
         if self._should_use_local_mutation_bootstrap(session=session, state=local_state):
+            local_state = self._enrich_local_mutation_bootstrap_state(local_state)
             self._log(
                 "task_state_local_short_circuit",
                 strategy="deterministic_fallback",
@@ -975,6 +976,84 @@ class TaskStateUpdater:
             or requirement_count >= 6
             or enumerated_sections >= 3
         )
+
+    def _enrich_local_mutation_bootstrap_state(self, state: TaskState) -> TaskState:
+        enriched = state.model_copy(deep=True)
+        digest = enriched.request_digest
+        explicit_paths = [
+            path
+            for path in (
+                list(getattr(digest, "explicit_paths", []) or [])
+                or [str(artifact.path or "").strip() for artifact in enriched.target_artifacts]
+            )
+            if str(path or "").strip()
+        ][:4]
+        named_surface = ", ".join(explicit_paths[:3]) if explicit_paths else "the named files"
+        request_focus = next(
+            (
+                str(item or "").strip()
+                for item in [
+                    *(list(getattr(digest, "requirement_chunks", []) or [])),
+                    *(list(getattr(digest, "requirements", []) or [])),
+                    enriched.request_excerpt,
+                ]
+                if str(item or "").strip()
+            ),
+            "",
+        )
+        hard_constraints = [
+            str(item).strip()
+            for item in list(getattr(digest, "hard_constraints", []) or [])
+            if str(item).strip()
+        ][:3]
+        completion_criteria = [
+            str(item).strip()
+            for item in list(getattr(digest, "completion_criteria", []) or [])
+            if str(item).strip()
+        ][:3]
+
+        if str(enriched.next_best_action or enriched.next_action or "").strip() == "create":
+            enriched.output_expectation = (
+                f"Implement the requested scope cohesively across {named_surface}, not as a minimal scaffold."
+            )
+            enriched.verification_target = (
+                f"Verify the requested behavior across {named_surface} and report what was created and checked."
+            )
+        else:
+            enriched.output_expectation = (
+                f"Apply the requested change cohesively across {named_surface} while preserving surrounding behavior."
+            )
+            enriched.verification_target = (
+                f"Verify the updated behavior across {named_surface} and report what changed and what was checked."
+            )
+
+        for item in hard_constraints:
+            if item not in enriched.constraints:
+                enriched.constraints.append(item)
+
+        enriched.assumptions = [
+            item
+            for item in enriched.assumptions
+            if "conventional default artifact" not in str(item).lower()
+            and "smallest runnable" not in str(item).lower()
+        ]
+
+        enriched.execution_outline = [
+            "Inspect the named targets and shared request contract before writing.",
+            "Implement the requested scope cohesively across the named files.",
+            "Verify the requested behavior and report the concrete result honestly.",
+        ]
+        if request_focus and len(str(enriched.active_goal or "").strip()) <= 220:
+            enriched.active_goal = self._trim_compact_goal(
+                f"Focused implementation scope: {request_focus}",
+                limit=220,
+            )
+        if completion_criteria:
+            enriched.relevant_context = [
+                *enriched.relevant_context,
+                f"Completion criteria: {' | '.join(completion_criteria[:2])}",
+            ][:8]
+        return enriched
 
     def _requires_structured_repository_analysis(self, state: TaskState) -> bool:
         return is_structured_repository_analysis_request(
