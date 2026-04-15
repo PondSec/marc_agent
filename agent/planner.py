@@ -63,6 +63,7 @@ from agent.router import IntentRouter
 from agent.semantic_defaults import (
     classify_conversation_request,
     is_structured_repository_analysis_request,
+    normalize_text,
     prioritized_focus_terms,
 )
 from agent.semantic_runtime import availability_recovery_model
@@ -248,6 +249,40 @@ WEB_CONTRACT_BEHAVIORAL_HTML_TAGS = {
     "select",
     "summary",
     "textarea",
+}
+STRUCTURED_ANALYSIS_SECTION_STOPWORDS = {
+    "was",
+    "wer",
+    "wie",
+    "wo",
+    "woher",
+    "wieder",
+    "spaeter",
+    "spater",
+    "welche",
+    "welcher",
+    "welches",
+    "kommt",
+    "kommen",
+    "ist",
+    "sind",
+    "fuer",
+    "fur",
+    "mit",
+    "und",
+    "oder",
+    "noch",
+    "den",
+    "dem",
+    "des",
+    "die",
+    "das",
+    "ein",
+    "eine",
+    "einer",
+    "einem",
+    "einen",
+    "insgesamt",
 }
 
 
@@ -1088,25 +1123,77 @@ class Planner:
         if not inspected:
             return ""
         language = self._session_language(session)
-        overview = _trim_text(snapshot.repo_summary or "", 220)
-        entrypoints = ", ".join(snapshot.entrypoints[:3])
         lines: list[str] = []
-        if overview:
-            intro = self._localized_text(
-                language,
-                de=f"Projektueberblick: {overview}",
-                en=f"Project overview: {overview}",
-            )
-            if entrypoints:
-                intro += self._localized_text(
-                    language,
-                    de=f" Wichtige Einstiegspfade: {entrypoints}.",
-                    en=f" Key entry paths: {entrypoints}.",
-                )
+        intro = self._structured_analysis_intro(snapshot, language)
+        if intro:
             lines.append(intro)
         for index, section in enumerate(sections, start=1):
             lines.append(self._structured_analysis_section_line(index, section, session, snapshot, language))
         return "\n\n".join(item for item in lines if item)
+
+    def _structured_analysis_intro(
+        self,
+        snapshot: WorkspaceSnapshot,
+        language: str,
+    ) -> str:
+        parts: list[str] = []
+        file_count = int(getattr(snapshot, "file_count", 0) or 0)
+        if file_count > 0:
+            parts.append(
+                self._localized_text(
+                    language,
+                    de=f"Das Repository enthaelt {file_count} gescannte Dateien.",
+                    en=f"The repository contains {file_count} scanned files.",
+                )
+            )
+        language_counts = sorted(
+            ((str(name or "").strip(), int(count or 0)) for name, count in dict(snapshot.language_counts or {}).items()),
+            key=lambda item: (-item[1], item[0]),
+        )
+        dominant = ", ".join(f"{name} ({count})" for name, count in language_counts[:4] if name and count > 0)
+        if dominant:
+            parts.append(
+                self._localized_text(
+                    language,
+                    de=f"Dominante Dateitypen: {dominant}.",
+                    en=f"Dominant file types: {dominant}.",
+                )
+            )
+        labels = ", ".join(str(item or "").strip() for item in list(snapshot.project_labels or [])[:6] if str(item or "").strip())
+        if labels:
+            parts.append(
+                self._localized_text(
+                    language,
+                    de=f"Projektlabels: {labels}.",
+                    en=f"Project labels: {labels}.",
+                )
+            )
+        entrypoints = ", ".join(str(item or "").strip() for item in list(snapshot.entrypoints or [])[:3] if str(item or "").strip())
+        if entrypoints:
+            parts.append(
+                self._localized_text(
+                    language,
+                    de=f"Wichtige Einstiegspfade: {entrypoints}.",
+                    en=f"Key entry paths: {entrypoints}.",
+                )
+            )
+        summary = _trim_text(str(snapshot.repo_summary or "").strip(), 220)
+        if summary and self._language_for_text(summary) == language:
+            parts.insert(
+                0,
+                self._localized_text(
+                    language,
+                    de=f"Projektueberblick: {summary}.",
+                    en=f"Project overview: {summary}.",
+                ),
+            )
+        if not parts:
+            return ""
+        prefix = self._localized_text(language, de="Projektueberblick:", en="Project overview:")
+        first = parts[0]
+        if first.lower().startswith(prefix.lower()):
+            return " ".join(parts)
+        return f"{prefix} {' '.join(parts)}"
 
     def _structured_analysis_section_line(
         self,
@@ -1121,10 +1208,11 @@ class Planner:
             max_terms=8,
             reference_terms={
                 token
-                for path in [*_read_paths(session)[-8:], *snapshot.focus_files[:8], *snapshot.important_files[:12]]
+                for path in [*_read_paths(session)[-8:], *snapshot.focus_files[:16], *snapshot.important_files[:40]]
                 for token in self._structured_analysis_path_terms(path)
             },
         )
+        section_terms = self._structured_analysis_filter_section_terms(section_terms)
         candidates = self._structured_analysis_section_candidates(
             section_terms=section_terms,
             session=session,
@@ -1133,19 +1221,23 @@ class Planner:
         if candidates:
             direct = [item for item in candidates if item["direct"]]
             indirect = [item for item in candidates if not item["direct"]]
-            chosen = direct[:4] or indirect[:3]
+            path_matched = [item for item in candidates if item["path_match"]]
+            chosen = self._structured_analysis_select_section_candidates(
+                path_matched=path_matched,
+                direct=direct,
+                indirect=indirect,
+            )
             status = self._localized_text(
                 language,
                 de="Direkt sichtbar" if direct else "Indirekt ableitbar",
                 en="Directly visible" if direct else "Indirectly inferred",
             )
-            paths = ", ".join(str(item["path"]) for item in chosen[:3])
-            visible_signals = self._unique_strings(
+            default_visible_signals = self._unique_strings(
                 [
                     *(
                         field
                         for item in chosen
-                        for field in list(item["fields"])
+                        for field in list(item["evidence_names"])
                     ),
                     *(
                         signal
@@ -1170,12 +1262,12 @@ class Planner:
             answer_parts: list[str] = []
             if claims:
                 answer_parts.append(" ".join(claims))
-            if visible_signals:
+            if default_visible_signals:
                 answer_parts.append(
                     self._localized_text(
                         language,
-                        de=f"Sichtbare Strukturanker: {', '.join(visible_signals[:4])}.",
-                        en=f"Visible structural anchors: {', '.join(visible_signals[:4])}.",
+                        de=f"Sichtbare Strukturanker: {', '.join(default_visible_signals[:4])}.",
+                        en=f"Visible structural anchors: {', '.join(default_visible_signals[:4])}.",
                     )
                 )
             if relationships:
@@ -1186,7 +1278,31 @@ class Planner:
                         en=f"Nearby relationships: {', '.join(relationships)}.",
                     )
                 )
-            answer = " ".join(part for part in answer_parts if part).strip()
+            answer, answer_items = self._structured_analysis_section_answer(
+                section=section,
+                chosen=chosen,
+                candidates=candidates,
+                language=language,
+                fallback=" ".join(part for part in answer_parts if part).strip(),
+            )
+            evidence_items = self._unique_candidate_items([*list(answer_items or []), *chosen]) or chosen
+            paths = ", ".join(str(item["path"]) for item in evidence_items[:6])
+            visible_signals = self._unique_strings(
+                [
+                    *(
+                        field
+                        for item in evidence_items
+                        for field in list(item["evidence_names"])
+                    ),
+                    *(
+                        signal
+                        for item in evidence_items
+                        for signal in list(item["signals"])
+                    ),
+                    *default_visible_signals,
+                ],
+                limit=6,
+            )
             return "\n".join(
                 [
                     f"{index}. {section}",
@@ -1235,8 +1351,8 @@ class Planner:
         candidate_paths = self._unique_paths(
             [
                 *_read_paths(session)[-8:],
-                *snapshot.focus_files[:8],
-                *snapshot.important_files[:12],
+                *snapshot.focus_files[:16],
+                *snapshot.important_files[:40],
             ]
         )
         for path in candidate_paths:
@@ -1244,25 +1360,46 @@ class Planner:
             if not lowered_path:
                 continue
             module_summary = str((snapshot.module_summaries or {}).get(path) or "").strip()
-            symbols = list((snapshot.symbol_index or {}).get(path) or [])[:4]
-            excerpt = self._current_or_last_read_excerpt(session, path=path)[:500]
+            profile = self._structured_analysis_content_profile(
+                path,
+                session=session,
+                snapshot=snapshot,
+            )
+            symbols = list(profile["symbols"])[:4]
+            excerpt = str(profile["content"] or "")[:500]
             score = 0
+            lowered_summary = module_summary.lower()
+            path_terms = self._structured_analysis_path_terms(path)
+            profile_terms = set(profile["concept_tokens"]) | set(profile["name_tokens"])
+            path_match = False
             for term in section_terms:
                 lowered_term = str(term or "").strip().lower()
                 if not lowered_term:
                     continue
                 if lowered_term in lowered_path:
                     score += 4
-                if lowered_term and lowered_term in module_summary.lower():
+                    path_match = True
+                if lowered_term and lowered_term in lowered_summary:
                     score += 3
                 if lowered_term and lowered_term in excerpt.lower():
                     score += 2
                 if any(lowered_term == str(symbol or "").strip().lower() for symbol in symbols):
                     score += 3
+                if lowered_term in profile_terms:
+                    score += 3
+                if lowered_term in path_terms:
+                    score += 2
             if path in inspected:
                 score += 3
             if module_summary:
                 score += 1
+            if self._path_is_test_like(path) and not any("test" in str(term or "").lower() for term in section_terms):
+                score -= 6
+            if Path(path).suffix.lower() in STRUCTURED_ANALYSIS_DOC_SUFFIXES and not any(
+                str(term or "").lower() in {"readme", "doc", "docs", "documentation"}
+                for term in section_terms
+            ):
+                score -= 4
             if score <= 0:
                 continue
             fields = self._structured_analysis_visible_fields(
@@ -1270,26 +1407,37 @@ class Planner:
                 session=session,
                 section_terms=section_terms,
             )
+            section_names = self._structured_analysis_names_for_section(
+                profile,
+                section_terms=section_terms,
+                fields=fields,
+            )
+            action_phrases = self._structured_analysis_action_phrases(section_names)
             claim = self._structured_analysis_claim_for_path(
                 path,
                 session=session,
                 snapshot=snapshot,
-                signals=symbols,
-                fields=fields,
+                evidence_names=section_names,
+                action_phrases=action_phrases,
             )
             candidates.append(
                 {
                     "path": path,
                     "score": score,
                     "direct": path in inspected,
+                    "path_match": path_match,
                     "claim": claim,
                     "signals": symbols,
                     "fields": fields,
+                    "evidence_names": section_names,
+                    "all_names": self._unique_strings([*section_names, *list(profile["evidence_names"])], limit=16),
+                    "action_phrases": action_phrases,
+                    "categories": self._structured_analysis_categories(path, section_names),
                     "relationships": list((snapshot.file_relationships or {}).get(path) or [])[:3],
                 }
             )
         candidates.sort(key=lambda item: (-int(item["score"]), str(item["path"])))
-        return candidates[:4]
+        return candidates[:8]
 
     def _structured_analysis_claim_for_path(
         self,
@@ -1297,24 +1445,23 @@ class Planner:
         *,
         session: SessionState,
         snapshot: WorkspaceSnapshot,
-        signals: list[str],
-        fields: list[str],
+        evidence_names: list[str],
+        action_phrases: list[str],
     ) -> str:
         module_summary = str((snapshot.module_summaries or {}).get(path) or "").strip()
         language = self._session_language(session)
-        if signals:
-            sentence = self._localized_text(
+        if action_phrases:
+            return self._localized_text(
                 language,
-                de=f"In {path} sind {', '.join(signals[:3])} sichtbar.",
-                en=f"In {path}, {', '.join(signals[:3])} are visible.",
+                de=f"`{path}` {self._structured_analysis_join_phrases(action_phrases[:3], language)}.",
+                en=f"`{path}` {self._structured_analysis_join_phrases(action_phrases[:3], language)}.",
             )
-            if fields:
-                sentence += " " + self._localized_text(
-                    language,
-                    de=f"Dazu kommen die Strukturfelder {', '.join(fields[:3])}.",
-                    en=f"Relevant structural fields include {', '.join(fields[:3])}.",
-                )
-            return sentence
+        if evidence_names:
+            return self._localized_text(
+                language,
+                de=f"In `{path}` sind vor allem {', '.join(f'`{name}`' for name in evidence_names[:3])} sichtbar.",
+                en=f"In `{path}`, the strongest visible anchors are {', '.join(f'`{name}`' for name in evidence_names[:3])}.",
+            )
         if module_summary and not module_summary.lower().startswith(("from __future__", "import ", "from ")):
             parts = [part.strip() for part in module_summary.split(";") if part.strip()]
             if parts:
@@ -1330,6 +1477,877 @@ class Planner:
         )
         return _trim_text(excerpt_line.replace("\n", " "), 220)
 
+    def _structured_analysis_select_section_candidates(
+        self,
+        *,
+        path_matched: list[dict[str, object]],
+        direct: list[dict[str, object]],
+        indirect: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        return self._unique_candidate_items([*path_matched[:6], *direct[:6], *indirect[:4]])[:6]
+
+    def _unique_candidate_items(self, items: list[dict[str, object]]) -> list[dict[str, object]]:
+        unique: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for item in items:
+            path = str(item.get("path") or "").strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            unique.append(item)
+        return unique
+
+    def _structured_analysis_section_answer(
+        self,
+        *,
+        section: str,
+        chosen: list[dict[str, object]],
+        candidates: list[dict[str, object]],
+        language: str,
+        fallback: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        pool = self._unique_candidate_items([*chosen, *candidates]) or chosen
+        section_kind = self._structured_analysis_section_kind(section)
+        if section_kind == "repo_mapping":
+            answer, evidence_items = self._structured_analysis_repo_mapping_answer(pool, language)
+            if answer:
+                return answer, evidence_items
+        if section_kind == "roles":
+            answer, evidence_items = self._structured_analysis_roles_answer(pool, language)
+            if answer:
+                return answer, evidence_items
+        if section_kind == "request_context":
+            answer, evidence_items = self._structured_analysis_request_context_answer(pool, language)
+            if answer:
+                return answer, evidence_items
+        if section_kind == "memory_layers":
+            answer, evidence_items = self._structured_analysis_memory_layers_answer(pool, language)
+            if answer:
+                return answer, evidence_items
+        if section_kind == "risks":
+            answer, evidence_items = self._structured_analysis_risks_answer(pool, language)
+            if answer:
+                return answer, evidence_items
+        path_matched = [item for item in chosen if item["path_match"]]
+        if len(path_matched) >= 2:
+            clauses = [
+                str(item["claim"]).strip()
+                for item in path_matched[:6]
+                if str(item["claim"]).strip()
+            ]
+            if clauses:
+                return " ".join(clauses), path_matched[:6]
+        categories = self._unique_strings(
+            [category for item in chosen for category in list(item.get("categories") or [])],
+            limit=5,
+        )
+        if categories and section_kind == "overall":
+            return (
+                self._localized_text(
+                    language,
+                    de=(
+                        f"Die gelesenen Dateien decken {self._structured_analysis_join_phrases(categories[:4], language)} ab; "
+                        "zusammen wirkt das Repo wie ein lokaler Coding-Agent mit klar getrennter Runtime-, Prompt-, State- und Memory-Schicht."
+                    ),
+                    en=(
+                        f"The inspected files cover {self._structured_analysis_join_phrases(categories[:4], language)}; "
+                        "together the repository looks like a local coding agent with separate runtime, prompt, state, and memory layers."
+                    ),
+                ),
+                chosen[:4],
+            )
+        return (
+            fallback
+            or self._localized_text(
+                language,
+                de="Im gelesenen Kontext ist hier nur die Dateinaehe sichtbar, aber noch keine belastbare tiefere Aussage.",
+                en="The inspected context currently shows file proximity here, but not a deeper reliable conclusion yet.",
+            ),
+            chosen[:4],
+        )
+
+    def _structured_analysis_section_kind(self, section: str) -> str:
+        lowered = normalize_text(section)
+        if any(token in lowered for token in {"repo-mapping", "repo mapping", "repo-map", "repo map"}):
+            return "repo_mapping"
+        if any(token in lowered for token in {"request-digest", "request digest", "request-memory", "request memory", "generationsprompt", "generationsprompts"}):
+            return "request_context"
+        if any(token in lowered for token in {"working", "episodic", "project", "failure", "conversation"}):
+            return "memory_layers"
+        if any(token in lowered for token in {"risiko", "risiken", "restluecke", "restluecken"}):
+            return "risks"
+        if any(token in lowered for token in {"rolle", "rollen"}):
+            return "roles"
+        if any(token in lowered for token in {"system", "insgesamt", "overall"}):
+            return "overall"
+        return "generic"
+
+    def _structured_analysis_repo_mapping_answer(
+        self,
+        chosen: list[dict[str, object]],
+        language: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        source = self._structured_analysis_find_candidate(chosen, {"repo", "map"}, {"snapshot", "repo", "map"})
+        retrieval = self._structured_analysis_find_candidate(chosen, {"repo", "hint"}, {"retrieval"}, {"repo", "summary"})
+        prompt = self._structured_analysis_find_candidate(chosen, {"prompt"}, {"memory", "context"}, {"request", "memory"}, {"repo", "hint"})
+        sentences: list[str] = []
+        evidence_items: list[dict[str, object]] = []
+        if source is not None:
+            evidence_items.append(source)
+            names = self._structured_analysis_candidate_evidence(
+                source,
+                preferred={"build", "repo", "map", "snapshot", "relationship", "summary"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{source['path']}` zeigt mit {names}, dass die Repo-Karte aus Workspace-Snapshot, Beziehungs- und Summary-Signalen aufgebaut wird.",
+                    en=f"`{source['path']}` shows with {names} that the repo map is assembled from workspace snapshot, relationship, and summary signals.",
+                )
+            )
+        if retrieval is not None:
+            evidence_items.append(retrieval)
+            names = self._structured_analysis_candidate_evidence(
+                retrieval,
+                preferred={"repo", "hint", "retrieval", "summary"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{retrieval['path']}` zeigt mit {names}, dass daraus verdichtete Repo-Hinweise fuer Retrieval und Memory entstehen.",
+                    en=f"`{retrieval['path']}` shows with {names} that compact repo hints are derived from it for retrieval and memory.",
+                )
+            )
+        if prompt is not None:
+            evidence_items.append(prompt)
+            names = self._structured_analysis_candidate_evidence(
+                prompt,
+                preferred={"prompt", "memory", "context", "repo", "hint"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{prompt['path']}` zeigt mit {names}, dass diese Hinweise spaeter wieder in kompakte Prompt- und Memory-Payloads einfliessen.",
+                    en=f"`{prompt['path']}` shows with {names} that those hints later flow back into compact prompt and memory payloads.",
+                )
+            )
+        return " ".join(sentences), self._unique_candidate_items(evidence_items)
+
+    def _structured_analysis_roles_answer(
+        self,
+        chosen: list[dict[str, object]],
+        language: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        role_items = [
+            item
+            for item in ([item for item in chosen if item["path_match"]] or chosen)
+            if list(item.get("all_names") or [])
+        ]
+        clauses: list[str] = []
+        evidence_items: list[dict[str, object]] = []
+        for item in role_items[:6]:
+            role_text = self._structured_analysis_role_summary(item, language)
+            if role_text:
+                clauses.append(f"`{item['path']}` {role_text}.")
+                evidence_items.append(item)
+        return " ".join(clauses), self._unique_candidate_items(evidence_items)
+
+    def _structured_analysis_request_context_answer(
+        self,
+        chosen: list[dict[str, object]],
+        language: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        prompt = self._structured_analysis_find_candidate(chosen, {"request", "digest"}, {"prompt"}, {"compact"})
+        state = self._structured_analysis_find_candidate(chosen, {"task", "state"}, {"request", "digest"}, {"request", "memory"})
+        memory = self._structured_analysis_find_candidate(chosen, {"memory", "context"}, {"working", "memory"}, {"request", "memory"})
+        sentences: list[str] = []
+        evidence_items: list[dict[str, object]] = []
+        if prompt is not None:
+            evidence_items.append(prompt)
+            names = self._structured_analysis_candidate_evidence(
+                prompt,
+                preferred={"request", "digest", "memory", "prompt", "compact"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{prompt['path']}` zeigt mit {names}, wo grosse Requests in kompakte Digest- und Prompt-Bausteine zerlegt werden.",
+                    en=f"`{prompt['path']}` shows with {names} where large requests are decomposed into compact digest and prompt building blocks.",
+                )
+            )
+        if state is not None:
+            evidence_items.append(state)
+            names = self._structured_analysis_candidate_evidence(
+                state,
+                preferred={"task", "state", "request", "digest", "memory"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{state['path']}` zeigt mit {names}, wo Request-Digest, Request-Memory und Task-State fuer spaetere Schritte gehalten werden.",
+                    en=f"`{state['path']}` shows with {names} where request digest, request memory, and task state are kept for later steps.",
+                )
+            )
+        if memory is not None:
+            evidence_items.append(memory)
+            names = self._structured_analysis_candidate_evidence(
+                memory,
+                preferred={"memory", "context", "working", "request", "repo"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{memory['path']}` zeigt mit {names}, wie diese verdichteten Signale wieder in Memory- und Retrieval-Kontext einfliessen.",
+                    en=f"`{memory['path']}` shows with {names} how those compact signals flow back into memory and retrieval context.",
+                )
+            )
+        return " ".join(sentences), self._unique_candidate_items(evidence_items)
+
+    def _structured_analysis_memory_layers_answer(
+        self,
+        chosen: list[dict[str, object]],
+        language: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        layered = self._structured_analysis_find_candidate(chosen, {"working", "memory"}, {"episodic"}, {"conversation"})
+        repo = self._structured_analysis_find_candidate(chosen, {"repo", "map"}, {"snapshot"}, {"summary"})
+        state = self._structured_analysis_find_candidate(chosen, {"task", "state"}, {"request", "digest"})
+        sentences: list[str] = []
+        evidence_items: list[dict[str, object]] = []
+        if layered is not None:
+            evidence_items.append(layered)
+            names = self._structured_analysis_candidate_evidence(
+                layered,
+                preferred={"working", "episodic", "project", "failure", "conversation", "memory"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{layered['path']}` zeigt mit {names}, dass Working Memory und persistente Episodic/Project/Failure/Conversation-Eintraege in einer Schicht zusammenlaufen.",
+                    en=f"`{layered['path']}` shows with {names} that working memory and persistent episodic/project/failure/conversation entries are coordinated in one layer.",
+                )
+            )
+        if repo is not None:
+            evidence_items.append(repo)
+            names = self._structured_analysis_candidate_evidence(
+                repo,
+                preferred={"repo", "map", "snapshot", "summary", "relationship"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{repo['path']}` zeigt mit {names}, wie Projekt- und Repo-Wissen als Snapshot, Repo-Map und Beziehungswissen aufgebaut wird.",
+                    en=f"`{repo['path']}` shows with {names} how project and repo knowledge is built as snapshot, repo map, and relationship knowledge.",
+                )
+            )
+        if state is not None:
+            evidence_items.append(state)
+            names = self._structured_analysis_candidate_evidence(
+                state,
+                preferred={"task", "state", "request", "digest", "memory"},
+                language=language,
+            )
+            sentences.append(
+                self._localized_text(
+                    language,
+                    de=f"`{state['path']}` zeigt mit {names}, wie der laufende Task-Zustand und die verdichtete Nutzeranfrage fuer Folge-Schritte stabil gehalten werden.",
+                    en=f"`{state['path']}` shows with {names} how the active task state and condensed user request are kept stable for follow-up steps.",
+                )
+            )
+        return " ".join(sentences), self._unique_candidate_items(evidence_items)
+
+    def _structured_analysis_risks_answer(
+        self,
+        chosen: list[dict[str, object]],
+        language: str,
+    ) -> tuple[str, list[dict[str, object]]]:
+        risks: list[str] = []
+        evidence_items: list[dict[str, object]] = []
+        repo_item = self._structured_analysis_find_candidate(chosen, {"repo", "map"})
+        request_item = self._structured_analysis_find_candidate(chosen, {"request", "digest"})
+        memory_item = self._structured_analysis_find_candidate(chosen, {"working", "memory"})
+        if repo_item is not None:
+            evidence_items.append(repo_item)
+            risks.append(
+                self._localized_text(
+                    language,
+                    de="Ein zentrales Risiko ist stale Repo-Wissen: Wenn Snapshot, Repo-Map oder Repo-Hints nach grossen Aenderungen zu spaet aktualisiert werden, arbeitet spaeteres Retrieval mit veralteten Strukturannahmen.",
+                    en="A central risk is stale repo knowledge: if snapshot, repo map, or repo hints are refreshed too late after larger edits, later retrieval works from outdated structural assumptions.",
+                )
+            )
+        if request_item is not None:
+            evidence_items.append(request_item)
+            risks.append(
+                self._localized_text(
+                    language,
+                    de="Ein weiteres Risiko ist zu aggressive Verdichtung: Grosse Nutzerprompts koennen spaete Randbedingungen verlieren, wenn Request-Digest, Request-Memory und Final-Prompt nicht dieselben Prioritaeten halten.",
+                    en="Another risk is overly aggressive compaction: large user prompts can lose late constraints if request digest, request memory, and the final prompt do not preserve the same priorities.",
+                )
+            )
+        if memory_item is not None:
+            evidence_items.append(memory_item)
+            risks.append(
+                self._localized_text(
+                    language,
+                    de="Bei langen Laeufen bleibt Drift zwischen Working Memory, Task-State und spaeterem Final-Prompt ein Risiko, weil kleine Modelle ueber viele Schritte sonst wieder in generische Antworten kippen.",
+                    en="Across long runs, drift between working memory, task state, and the later final prompt remains a risk because small models otherwise fall back into generic answers.",
+                )
+            )
+        return " ".join(risks[:3]), self._unique_candidate_items(evidence_items)
+
+    def _structured_analysis_find_candidate(
+        self,
+        chosen: list[dict[str, object]],
+        *required_token_sets: set[str],
+    ) -> dict[str, object] | None:
+        for token_set in required_token_sets:
+            non_test_items = [item for item in chosen if not self._path_is_test_like(str(item.get("path") or ""))]
+            for item in [*non_test_items, *chosen]:
+                item_tokens = set(self._structured_analysis_name_tokens(" ".join(item.get("all_names") or [])))
+                item_tokens |= set(self._structured_analysis_name_tokens(str(item.get("path") or "")))
+                if token_set and token_set <= item_tokens:
+                    return item
+        return None
+
+    def _structured_analysis_candidate_evidence(
+        self,
+        item: dict[str, object],
+        *,
+        preferred: set[str],
+        language: str,
+    ) -> str:
+        matches: list[tuple[int, int, str]] = []
+        for name in list(item.get("all_names") or []):
+            tokens = set(self._structured_analysis_name_tokens(name))
+            overlap = len(preferred & tokens)
+            if overlap:
+                matches.append((overlap, len(tokens), name))
+        matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        names = [f"`{name}`" for _, _, name in matches[:3]]
+        if not names:
+            names = [f"`{name}`" for name in list(item.get("all_names") or [])[:3]]
+        return self._structured_analysis_join_phrases(names, language)
+
+    def _structured_analysis_role_summary(
+        self,
+        item: dict[str, object],
+        language: str,
+    ) -> str:
+        categories = list(item.get("categories") or [])
+        path_tokens = set(self._structured_analysis_name_tokens(str(item.get("path") or "")))
+        if path_tokens & {"server", "app"}:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"runtime", "app", "export", "session", "auth"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"stellt mit {evidence} die Runtime- und API-Schicht bereit",
+                en=f"provides the runtime and API layer with {evidence}",
+            )
+        if path_tokens & {"planner", "router", "decision"}:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"planner", "route", "decision", "task", "state"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"steuert mit {evidence} Planung, Routing und Abschlussentscheidungen",
+                en=f"drives planning, routing, and completion decisions with {evidence}",
+            )
+        if path_tokens & {"state", "updater"}:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"task", "state", "request", "digest", "memory"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"haelt mit {evidence} Task-State und verdichtete Nutzeranfrage stabil",
+                en=f"keeps task state and the condensed user request stable with {evidence}",
+            )
+        if path_tokens & {"memory", "layered"}:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"memory", "episodic", "project", "failure", "conversation", "working", "repo"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"verwaltet mit {evidence} Memory-, Repo- und Retrieval-Kontext",
+                en=f"manages memory, repo, and retrieval context with {evidence}",
+            )
+        if path_tokens & {"prompt", "prompts"}:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"prompt", "request", "digest", "memory", "compact"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"verdichtet mit {evidence} Requests, Digests und Prompt-Kontext",
+                en=f"compacts requests, digests, and prompt context with {evidence}",
+            )
+        if "die HTTP-/Runtime-Schicht" in categories:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"runtime", "app", "export", "session", "auth"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"stellt mit {evidence} die Runtime- und API-Schicht bereit",
+                en=f"provides the runtime and API layer with {evidence}",
+            )
+        if "die Planungs- und Routinglogik" in categories:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"planner", "route", "decision", "task", "state"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"steuert mit {evidence} Planung, Routing und Abschlussentscheidungen",
+                en=f"drives planning, routing, and completion decisions with {evidence}",
+            )
+        if "den Task-State" in categories:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"task", "state", "request", "digest", "memory"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"haelt mit {evidence} Task-State und verdichtete Nutzeranfrage stabil",
+                en=f"keeps task state and the condensed user request stable with {evidence}",
+            )
+        if "das mehrschichtige Memory" in categories:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"memory", "episodic", "project", "failure", "conversation", "working", "repo"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"verwaltet mit {evidence} Memory-, Repo- und Retrieval-Kontext",
+                en=f"manages memory, repo, and retrieval context with {evidence}",
+            )
+        if "die Prompt- und Request-Verdichtung" in categories:
+            evidence = self._structured_analysis_candidate_evidence(
+                item,
+                preferred={"prompt", "request", "digest", "memory", "compact"},
+                language=language,
+            )
+            return self._localized_text(
+                language,
+                de=f"verdichtet mit {evidence} Requests, Digests und Prompt-Kontext",
+                en=f"compacts requests and prompt context with {evidence}",
+            )
+        return str(item.get("claim") or "").strip()
+
+    def _structured_analysis_join_phrases(
+        self,
+        phrases: list[str],
+        language: str,
+    ) -> str:
+        items = [str(item or "").strip() for item in phrases if str(item or "").strip()]
+        if not items:
+            return ""
+        if len(items) == 1:
+            return items[0]
+        conjunction = " und " if language == "de" else " and "
+        return ", ".join(items[:-1]) + f"{conjunction}{items[-1]}"
+
+    def _structured_analysis_content_profile(
+        self,
+        path: str,
+        *,
+        session: SessionState,
+        snapshot: WorkspaceSnapshot,
+    ) -> dict[str, object]:
+        content = self._current_or_last_read_excerpt(session, path=path)
+        defined_functions: list[str] = []
+        defined_classes: list[str] = []
+        constants: list[str] = []
+        imported_names: list[str] = []
+        called_names: list[str] = []
+        identifier_names: list[str] = []
+        module_summary = str((snapshot.module_summaries or {}).get(path) or "").strip()
+        suffix = Path(path).suffix.lower()
+        if content:
+            architecture_tokens = {
+                "repo",
+                "map",
+                "hint",
+                "request",
+                "digest",
+                "memory",
+                "prompt",
+                "state",
+                "task",
+                "retrieval",
+                "summary",
+                "relationship",
+                "validation",
+                "repair",
+                "runtime",
+                "app",
+                "session",
+                "workspace",
+                "module",
+                "project",
+                "failure",
+                "episodic",
+                "conversation",
+                "working",
+            }
+            for identifier in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", content):
+                cleaned = str(identifier or "").strip().lstrip("_")
+                if not cleaned or cleaned in identifier_names:
+                    continue
+                tokens = set(self._structured_analysis_name_tokens(cleaned))
+                if tokens & architecture_tokens:
+                    identifier_names.append(cleaned)
+                if len(identifier_names) >= 64:
+                    break
+        if content and suffix in {".py", ".pyi"}:
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                for node in tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        defined_functions.append(node.name)
+                    elif isinstance(node, ast.ClassDef):
+                        defined_classes.append(node.name)
+                    elif isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and target.id.isupper():
+                                constants.append(target.id)
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id.isupper():
+                        constants.append(node.target.id)
+                    elif isinstance(node, ast.ImportFrom):
+                        imported_names.extend(alias.name for alias in node.names)
+                    elif isinstance(node, ast.Import):
+                        imported_names.extend(alias.name for alias in node.names)
+
+                class _CallCollector(ast.NodeVisitor):
+                    def __init__(self) -> None:
+                        self.names: list[str] = []
+
+                    def visit_Call(self, node: ast.Call) -> None:
+                        name = ""
+                        if isinstance(node.func, ast.Name):
+                            name = node.func.id
+                        elif isinstance(node.func, ast.Attribute):
+                            name = node.func.attr
+                        if name:
+                            self.names.append(name)
+                        self.generic_visit(node)
+
+                collector = _CallCollector()
+                collector.visit(tree)
+                called_names = collector.names
+
+        snapshot_symbols = list((snapshot.symbol_index or {}).get(path) or [])
+        name_entries = [
+            *((name, "defined_class") for name in defined_classes),
+            *((name, "defined_function") for name in defined_functions),
+            *((name, "constant") for name in constants),
+            *((name, "snapshot_symbol") for name in snapshot_symbols),
+            *((name, "call") for name in called_names),
+            *((name, "identifier") for name in identifier_names),
+            *((name, "import") for name in imported_names),
+        ]
+        evidence_names = self._structured_analysis_relevant_names(name_entries)
+        action_phrases = self._structured_analysis_action_phrases(evidence_names)
+        categories = self._structured_analysis_categories(path, evidence_names)
+        return {
+            "content": content,
+            "name_entries": name_entries,
+            "symbols": self._unique_strings([*snapshot_symbols, *defined_classes, *defined_functions], limit=8),
+            "evidence_names": evidence_names,
+            "action_phrases": action_phrases,
+            "categories": categories,
+            "concept_tokens": self._structured_analysis_name_tokens(" ".join([*action_phrases, module_summary, path])),
+            "name_tokens": self._structured_analysis_name_tokens(" ".join(evidence_names)),
+        }
+
+    def _structured_analysis_relevant_names(self, names: list[tuple[str, str]]) -> list[str]:
+        prioritized: list[tuple[int, str]] = []
+        for raw_name, source in names:
+            name = str(raw_name or "").strip().lstrip("_")
+            if not name or len(name) < 3:
+                continue
+            if name in {"annotations", "Any", "Path", "Field", "ConfigDict", "BaseModel"}:
+                continue
+            lowered = name.lower()
+            if lowered in {"json", "re", "time", "hashlib", "dataclass", "field", "defaultdict", "counter", "replace"}:
+                continue
+            tokens = self._structured_analysis_name_tokens(name)
+            score = 0
+            score += {
+                "defined_function": 6,
+                "defined_class": 5,
+                "constant": 4,
+                "snapshot_symbol": 3,
+                "identifier": 3,
+                "call": 2,
+                "import": 0,
+            }.get(source, 0)
+            if source == "import" and re.match(r"^[A-Z][A-Za-z0-9_]+$", name) and not name.endswith(
+                ("Store", "Updater", "Planner", "Digest", "State", "Memory", "Snapshot", "Prompt", "Runtime", "App")
+            ):
+                continue
+            if re.match(r"^[A-Z][A-Za-z0-9_]+$", name):
+                score += 2
+            if tokens and tokens[0] in {
+                "build",
+                "create",
+                "update",
+                "generate",
+                "compose",
+                "compact",
+                "retrieve",
+                "upsert",
+                "merge",
+                "render",
+                "classify",
+                "infer",
+                "validate",
+                "route",
+                "decide",
+                "plan",
+                "refresh",
+                "require",
+                "select",
+            }:
+                score += 4
+            score += sum(
+                1
+                for token in tokens
+                if token
+                in {
+                    "memory",
+                    "request",
+                    "digest",
+                    "prompt",
+                    "state",
+                    "task",
+                    "repo",
+                    "map",
+                    "snapshot",
+                    "relationship",
+                    "summary",
+                    "runtime",
+                    "app",
+                    "planner",
+                    "validation",
+                    "repair",
+                    "conversation",
+                    "episodic",
+                    "project",
+                    "failure",
+                }
+            )
+            prioritized.append((score, name))
+        prioritized.sort(key=lambda item: (-item[0], item[1]))
+        return self._unique_strings([name for _, name in prioritized], limit=8)
+
+    def _structured_analysis_names_for_section(
+        self,
+        profile: dict[str, object],
+        *,
+        section_terms: list[str],
+        fields: list[str],
+    ) -> list[str]:
+        section_tokens = {
+            token
+            for term in section_terms
+            for token in self._structured_analysis_name_tokens(term)
+        }
+        prioritized: list[tuple[int, int, str]] = []
+        for raw_name, source in list(profile.get("name_entries") or []):
+            name = str(raw_name or "").strip().lstrip("_")
+            if not name:
+                continue
+            tokens = set(self._structured_analysis_name_tokens(name))
+            overlap = len(tokens & section_tokens)
+            if section_tokens and not overlap and source == "import":
+                continue
+            score = overlap * 6
+            score += {
+                "defined_function": 5,
+                "defined_class": 4,
+                "constant": 3,
+                "snapshot_symbol": 3,
+                "identifier": 3,
+                "call": 2,
+                "import": 1,
+            }.get(str(source), 0)
+            prioritized.append((overlap, score, name))
+        for field in fields:
+            name = str(field or "").strip()
+            if not name:
+                continue
+            tokens = set(self._structured_analysis_name_tokens(name))
+            overlap = len(tokens & section_tokens)
+            prioritized.append((overlap, max(1, overlap * 7), name))
+        has_overlap = any(overlap > 0 for overlap, _, _ in prioritized)
+        if has_overlap:
+            prioritized = [item for item in prioritized if item[0] > 0]
+        prioritized.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        selected = self._unique_strings([name for _, _, name in prioritized], limit=8)
+        return selected or list(profile.get("evidence_names") or [])
+
+    def _structured_analysis_name_tokens(self, value: str) -> list[str]:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
+        return [
+            token.lower()
+            for token in re.split(r"[^A-Za-z0-9]+", text)
+            if len(token) >= 3
+        ]
+
+    def _structured_analysis_filter_section_terms(self, section_terms: list[str]) -> list[str]:
+        filtered: list[str] = []
+        for term in section_terms:
+            normalized_tokens = [
+                token
+                for token in self._structured_analysis_name_tokens(term)
+                if token not in STRUCTURED_ANALYSIS_SECTION_STOPWORDS
+            ]
+            if not normalized_tokens:
+                continue
+            filtered.append("_".join(normalized_tokens))
+        return filtered or section_terms
+
+    def _structured_analysis_action_phrases(self, evidence_names: list[str]) -> list[str]:
+        return self._unique_strings(
+            [
+                phrase
+                for name in evidence_names
+                for phrase in [self._structured_analysis_action_phrase(name)]
+                if phrase
+            ],
+            limit=4,
+        )
+
+    def _structured_analysis_action_phrase(self, name: str) -> str:
+        tokens = self._structured_analysis_name_tokens(name)
+        if not tokens:
+            return ""
+        verb = tokens[0]
+        object_phrase = self._structured_analysis_humanized_object(tokens[1:] or tokens)
+        if verb == "build":
+            return f"baut {object_phrase}"
+        if verb == "create":
+            return f"erstellt {object_phrase}"
+        if verb == "update":
+            return f"aktualisiert {object_phrase}"
+        if verb == "generate":
+            return f"erzeugt {object_phrase}"
+        if verb == "compose":
+            return f"komponiert {object_phrase}"
+        if verb == "compact":
+            return f"komprimiert {object_phrase}"
+        if verb == "retrieve":
+            return f"holt {object_phrase}"
+        if verb in {"upsert", "store", "persist", "save"}:
+            return f"persistiert {object_phrase}"
+        if verb == "merge":
+            return f"fuehrt {object_phrase} zusammen"
+        if verb == "render":
+            return f"rendert {object_phrase}"
+        if verb in {"classify", "infer"}:
+            return f"leitet {object_phrase} ab"
+        if verb in {"validate", "review"}:
+            return f"prueft {object_phrase}"
+        if verb in {"route", "decide", "plan", "select"}:
+            return f"steuert {object_phrase}"
+        if verb == "refresh":
+            return f"aktualisiert {object_phrase}"
+        if verb == "require":
+            return f"erzwingt {object_phrase}"
+        if name.endswith("Store"):
+            return f"enthaelt `{name}` als Persistenzschicht"
+        if name.endswith("Updater"):
+            return f"enthaelt `{name}` fuer Zustandsaktualisierung"
+        if name.endswith("Planner"):
+            return f"enthaelt `{name}` fuer Planungslogik"
+        return ""
+
+    def _structured_analysis_humanized_object(self, tokens: list[str]) -> str:
+        mapping = {
+            "request": "Request",
+            "memory": "Memory",
+            "digest": "Digest",
+            "packet": "Paket",
+            "prompt": "Prompt",
+            "prompts": "Prompts",
+            "response": "Response",
+            "content": "Content",
+            "final": "Final",
+            "task": "Task",
+            "state": "State",
+            "working": "Working",
+            "project": "Project",
+            "failure": "Failure",
+            "conversation": "Conversation",
+            "episodic": "Episodic",
+            "repo": "Repo",
+            "map": "Map",
+            "mapping": "Mapping",
+            "snapshot": "Snapshot",
+            "relationship": "Beziehung",
+            "relationships": "Beziehungen",
+            "module": "Modul",
+            "summary": "Summary",
+            "summaries": "Summaries",
+            "runtime": "Runtime",
+            "app": "App",
+            "file": "Datei",
+            "files": "Dateien",
+            "validation": "Validierung",
+            "repair": "Repair",
+            "retrieval": "Retrieval",
+            "context": "Kontext",
+        }
+        parts = [mapping.get(token, token.capitalize()) for token in tokens if token not in {"safe"}]
+        if not parts:
+            return "die relevante Schicht"
+        return "-".join(parts)
+
+    def _structured_analysis_categories(
+        self,
+        path: str,
+        evidence_names: list[str],
+    ) -> list[str]:
+        tokens = set(self._structured_analysis_name_tokens(" ".join([path, *evidence_names])))
+        categories: list[str] = []
+        if tokens & {"runtime", "app", "server", "auth", "http"}:
+            categories.append("die HTTP-/Runtime-Schicht")
+        if tokens & {"planner", "route", "decision", "plan"}:
+            categories.append("die Planungs- und Routinglogik")
+        if tokens & {"prompt", "request", "digest", "content", "response", "context"}:
+            categories.append("die Prompt- und Request-Verdichtung")
+        if tokens & {"memory", "episodic", "project", "failure", "conversation", "retrieval"}:
+            categories.append("das mehrschichtige Memory")
+        if tokens & {"task", "state", "evidence", "goal", "constraint"}:
+            categories.append("den Task-State")
+        if tokens & {"validation", "review", "repair"}:
+            categories.append("die Verifikations- und Repair-Schicht")
+        return self._unique_strings(categories, limit=4)
+
     def _structured_analysis_visible_fields(
         self,
         path: str,
@@ -1337,7 +2355,7 @@ class Planner:
         session: SessionState,
         section_terms: list[str],
     ) -> list[str]:
-        content = self._current_or_last_read_excerpt(session, path=path)[:6000]
+        content = self._current_or_last_read_excerpt(session, path=path)[:24000]
         if not content:
             return []
         fields: list[str] = []
@@ -1369,6 +2387,17 @@ class Planner:
             cleaned = str(field or "").strip()
             if cleaned and cleaned not in fields and len(cleaned) >= 4:
                 fields.append(cleaned)
+        if normalized_terms:
+            for field in re.findall(r"\b([a-z_][A-Za-z0-9_]*)\b", content):
+                cleaned = str(field or "").strip()
+                lowered = cleaned.lower()
+                if (
+                    cleaned
+                    and cleaned not in fields
+                    and len(cleaned) >= 4
+                    and any(term in lowered for term in normalized_terms)
+                ):
+                    fields.append(cleaned)
         for field in fields:
             lowered = field.lower()
             field_tokens = {
@@ -1399,6 +2428,14 @@ class Planner:
         path_hits = sum(1 for path in inspected if path in text)
         status_markers = len(re.findall(r"(?:^|\n)\s*(?:Belegstatus|Evidence status):", text))
         file_markers = len(re.findall(r"(?:^|\n)\s*(?:Dateien|Files):", text))
+        answer_lines = re.findall(r"(?:^|\n)\s*(?:Antwort|Answer):\s*(.+)", text)
+        semantic_answer_lines = [
+            line
+            for line in answer_lines
+            if line.strip()
+            and not re.match(r"^(?:from\s+\S+\s+import\s+|import\s+\S+)", line.strip(), re.IGNORECASE)
+            and len(self._structured_analysis_name_tokens(line)) >= 4
+        ]
         request_count = len(
             [
                 item
@@ -1412,6 +2449,7 @@ class Planner:
             and numbered_sections >= max(3, min(5, request_count))
             and status_markers >= max(3, min(5, request_count))
             and file_markers >= max(3, min(5, request_count))
+            and len(semantic_answer_lines) >= max(2, min(4, request_count))
         )
 
     def _is_conversation_request(self, session: SessionState) -> bool:

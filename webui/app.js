@@ -4912,7 +4912,9 @@ function renderMessageBubble(message, options = {}) {
           <span class="message-author">${escapeHtml(roleLabel(message.role))}</span>
           <span class="message-time">${escapeHtml(formatTime(message.created_at))}</span>
         </div>
-        <div class="message-body rich-text">${renderRichText(display.content)}</div>
+        <div class="message-body rich-text">${
+          display.structuredAnalysis ? renderStructuredAnalysisReport(display.structuredAnalysis) : renderRichText(display.content)
+        }</div>
         ${display.note ? `<p class="message-note">${escapeHtml(display.note)}</p>` : ""}
       </article>
     </div>
@@ -6974,12 +6976,116 @@ function threadPreview(session) {
   return candidate;
 }
 
+function parseStructuredAnalysisReport(text) {
+  const value = String(text || "").trim();
+  if (!value || !/(?:^|\n)\s*1\.\s+/.test(value) || !/(?:Belegstatus|Evidence status):/.test(value)) {
+    return null;
+  }
+  const lines = value.replace(/\r\n?/g, "\n").split("\n");
+  const intro = [];
+  const sections = [];
+  let current = null;
+  let answerLines = [];
+
+  const flushSection = () => {
+    if (!current) {
+      return;
+    }
+    current.answer = answerLines.join("\n").trim();
+    sections.push(current);
+    current = null;
+    answerLines = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "");
+    const sectionMatch = line.match(/^\s*(\d+)\.\s+(.+)$/);
+    if (sectionMatch) {
+      flushSection();
+      current = {
+        index: sectionMatch[1],
+        title: sectionMatch[2].trim(),
+        status: "",
+        files: "",
+        symbols: "",
+        answer: "",
+      };
+      continue;
+    }
+    if (!current) {
+      if (line.trim()) {
+        intro.push(line.trim());
+      }
+      continue;
+    }
+    if (/^\s*(Belegstatus|Evidence status):/i.test(line)) {
+      current.status = line.replace(/^\s*(Belegstatus|Evidence status):\s*/i, "").trim();
+      continue;
+    }
+    if (/^\s*(Dateien|Files):/i.test(line)) {
+      current.files = line.replace(/^\s*(Dateien|Files):\s*/i, "").trim();
+      continue;
+    }
+    if (/^\s*(Sichtbare Symbole\/Felder|Visible symbols\/fields):/i.test(line)) {
+      current.symbols = line.replace(/^\s*(Sichtbare Symbole\/Felder|Visible symbols\/fields):\s*/i, "").trim();
+      continue;
+    }
+    if (/^\s*(Antwort|Answer):/i.test(line)) {
+      answerLines.push(line.replace(/^\s*(Antwort|Answer):\s*/i, "").trim());
+      continue;
+    }
+    answerLines.push(line);
+  }
+  flushSection();
+  return sections.length ? { intro: intro.join("\n\n").trim(), sections } : null;
+}
+
+function renderStructuredAnalysisReport(report) {
+  if (!report || !Array.isArray(report.sections) || !report.sections.length) {
+    return "";
+  }
+  const intro = report.intro ? `<div class="analysis-report-intro">${renderRichText(report.intro)}</div>` : "";
+  const sections = report.sections
+    .map((section) => {
+      const summaryLabel = section.files ? "Beleg anzeigen" : "Details anzeigen";
+      const details = [
+        section.status ? `<div class="analysis-report-meta"><span>Belegstatus:</span> ${escapeHtml(section.status)}</div>` : "",
+        section.files ? `<div class="analysis-report-meta"><span>Dateien:</span> <code>${escapeHtml(section.files)}</code></div>` : "",
+        section.symbols ? `<div class="analysis-report-meta"><span>Sichtbare Symbole/Felder:</span> <code>${escapeHtml(section.symbols)}</code></div>` : "",
+      ]
+        .filter(Boolean)
+        .join("");
+      return `
+        <section class="analysis-report-section">
+          <div class="analysis-report-copy">
+            <p class="analysis-report-heading">${escapeHtml(`${section.index}. ${section.title}`)}</p>
+            <div class="analysis-report-answer">${renderRichText(section.answer || "Noch keine belastbare Antwort.")}</div>
+          </div>
+          ${
+            details
+              ? `
+                <details class="analysis-report-details">
+                  <summary>${escapeHtml(summaryLabel)}</summary>
+                  <div class="analysis-report-evidence">${details}</div>
+                </details>
+              `
+              : ""
+          }
+        </section>
+      `;
+    })
+    .join("");
+  return `<div class="analysis-report">${intro}${sections}</div>`;
+}
+
 function messageDisplayState(message, session) {
   const raw = String(message?.content || "").trim();
   if (!raw) {
-    return { content: raw, note: "" };
+    return { content: raw, note: "", structuredAnalysis: null };
   }
-  return { content: raw, note: "" };
+  const structuredAnalysis =
+    message?.role === "assistant" || message?.role === "system" ? parseStructuredAnalysisReport(raw) : null;
+  return { content: raw, note: "", structuredAnalysis };
 }
 
 function isLatestAssistantMessage(session, message) {
@@ -9391,6 +9497,7 @@ if (typeof module !== "undefined" && module.exports) {
     describeLogRecord,
     expandedWorkspaceBrowserPathsFor,
     messageDisplayState,
+    parseStructuredAnalysisReport,
     parseUiRoute,
     pickFirstWorkspaceBrowserFile,
     shouldStartRefresh,

@@ -21,6 +21,8 @@ const {
   expandedWorkspaceBrowserPathsFor,
   findBlockingRunForSubmission,
   formatSessionElapsed,
+  messageDisplayState,
+  parseStructuredAnalysisReport,
   parseUiRoute,
   pickFirstWorkspaceBrowserFile,
   renderRichText,
@@ -424,6 +426,65 @@ test("sanitizeAssistantMessageContent blendet technische Nachsaetze aus der Haup
   const cleaned = sanitizeAssistantMessageContent(raw);
 
   assert.equal(cleaned, "Ich habe den Fehler eingegrenzt und den relevanten Bereich vorbereitet.");
+});
+
+test("parseStructuredAnalysisReport trennt Architekturantwort und Belege sauber", () => {
+  const report = parseStructuredAnalysisReport([
+    "Projektueberblick: Lokaler Coding-Agent.",
+    "",
+    "1. Was fuer ein System ist das insgesamt?",
+    "Belegstatus: Direkt sichtbar.",
+    "Dateien: agent/planner.py, agent/prompts.py.",
+    "Sichtbare Symbole/Felder: Planner, build_request_digest.",
+    "Antwort: Das Repo trennt Planner, Prompt-Komposition und Memory.",
+  ].join("\n"));
+
+  assert.ok(report);
+  assert.equal(report.sections.length, 1);
+  assert.match(report.intro, /Lokaler Coding-Agent/);
+  assert.equal(report.sections[0].title, "Was fuer ein System ist das insgesamt?");
+  assert.match(report.sections[0].answer, /Prompt-Komposition/);
+  assert.match(report.sections[0].files, /agent\/planner\.py/);
+});
+
+test("messageDisplayState erkennt strukturierte Architekturberichte fuer den UI-Renderer", () => {
+  const display = messageDisplayState(
+    {
+      role: "assistant",
+      content: [
+        "1. Welche Rollen haben planner und prompts?",
+        "Belegstatus: Direkt sichtbar.",
+        "Dateien: agent/planner.py, agent/prompts.py.",
+        "Sichtbare Symbole/Felder: Planner, build_request_digest.",
+        "Antwort: planner steuert den Ablauf, prompts verdichtet den Prompt-Kontext.",
+      ].join("\n"),
+    },
+    null,
+  );
+
+  assert.ok(display.structuredAnalysis);
+  assert.equal(display.structuredAnalysis.sections.length, 1);
+  assert.match(display.structuredAnalysis.sections[0].answer, /Prompt-Kontext/);
+});
+
+test("parseStructuredAnalysisReport laesst die menschliche Antwort sichtbar und den Beleg separat", () => {
+  const display = messageDisplayState(
+    {
+      role: "assistant",
+      content: [
+        "1. Woher kommt das Repo-Mapping?",
+        "Belegstatus: Direkt sichtbar.",
+        "Dateien: agent/memory.py, agent/layered_memory.py, agent/prompts.py.",
+        "Sichtbare Symbole/Felder: build_repo_map, render_repo_hint_summary, build_request_memory_packet.",
+        "Antwort: Das Repo-Mapping wird in agent/memory.py aufgebaut, in layered_memory verdichtet und spaeter in prompts wieder eingespeist.",
+      ].join("\n"),
+    },
+    null,
+  );
+
+  assert.ok(display.structuredAnalysis);
+  assert.equal(display.structuredAnalysis.sections[0].answer, "Das Repo-Mapping wird in agent/memory.py aufgebaut, in layered_memory verdichtet und spaeter in prompts wieder eingespeist.");
+  assert.equal(display.structuredAnalysis.sections[0].files, "agent/memory.py, agent/layered_memory.py, agent/prompts.py.");
 });
 
 test("renderRichText rendert grundlegende Markdown-Struktur fuer den Thread", () => {

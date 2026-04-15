@@ -8308,6 +8308,11 @@ def _extract_enumerated_requirements(text: str) -> list[str]:
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
         cleaned = normalized[start:end].strip(" .;:-")
+        cleaned = re.split(
+            r"(?<=[.!?])\s+(?=[A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9 /_-]{2,40}:)",
+            cleaned,
+            maxsplit=1,
+        )[0].strip(" .;:-")
         if len(cleaned) < 8:
             continue
         if cleaned not in sections:
