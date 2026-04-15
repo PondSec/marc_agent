@@ -5449,6 +5449,7 @@ class Planner:
         attempted_recovery_keys: set[tuple[str, str, str | None]] = set()
         forced_follow_up: GenerationRecoveryAttempt | None = None
         used_resume_retry_after_no_start = False
+        used_resume_retry_after_progress = False
         retry_attempts: list[ExecutionAttemptRecord] = []
         while True:
             attempt: GenerationRecoveryAttempt | None = None
@@ -5603,6 +5604,21 @@ class Planner:
                     capability_tier=attempt.capability_tier,
                 )
                 used_resume_retry_after_no_start = True
+            if (
+                retry_issue is not None
+                and retry_issue.failed_after_progress
+                and attempt.prompt_kind == "resume"
+                and attempt.model_name is not None
+                and retry_issue.partial_text
+                and not used_resume_retry_after_progress
+            ):
+                forced_follow_up = GenerationRecoveryAttempt(
+                    strategy=f"{attempt.strategy}_retry",
+                    prompt_kind="resume",
+                    model_name=attempt.model_name,
+                    capability_tier=attempt.capability_tier,
+                )
+                used_resume_retry_after_progress = True
             issue = retry_issue or issue
         return GenerationRetryResult(attempts=retry_attempts)
 

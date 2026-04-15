@@ -28864,6 +28864,80 @@ def test_planner_retries_resume_once_after_no_start_during_partial_progress_reco
     assert llm.generate_calls[2]["kwargs"]["total_timeout"] >= 270
 
 
+def test_retry_content_generation_retries_resume_on_same_fallback_model_after_progress_timeout(tmp_path):
+    llm = ScriptedLLM(
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion after 240.0 seconds",
+                reason="total_timeout",
+                partial_text="<main>partial website",
+                characters=200,
+                model_name="qwen3:8b",
+                total_timeout_seconds=240,
+            ),
+            OllamaGenerationError(
+                "timed out waiting for model completion after 270.0 seconds",
+                reason="total_timeout",
+                partial_text="<main>partial website expanded",
+                characters=320,
+                model_name="qwen3:8b",
+                total_timeout_seconds=270,
+            ),
+            "<main>completed website</main>\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen3:8b",
+        ),
+    )
+    planner = Planner(llm, "")
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="update",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "update_artifact",
+                    "reason": "Refresh the interactive website bundle.",
+                }
+            ],
+            target_paths=["index.html", "styles.css", "script.js"],
+            requested_outcome="Refresh the interactive website bundle.",
+        )
+    )
+    session = SessionState(
+        task="Refresh the interactive website bundle with a stronger UI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+
+    result = planner._retry_content_generation(
+        route,
+        session,
+        path="index.html",
+        current_content="<!DOCTYPE html><html><body><main>legacy</main></body></html>",
+        cause=ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=False,
+            raw_reason="startup_timeout",
+        ),
+        prompt="x" * 8000,
+    )
+
+    assert result.content == "<main>completed website</main>"
+    seen_models = [call["kwargs"]["model"] for call in llm.generate_calls]
+    assert seen_models == ["qwen3:8b", "qwen3:8b", "qwen3:8b"]
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[1]["args"][0]
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[2]["args"][0]
+
+
 def test_planner_preserves_progress_budget_for_compact_retry_after_resume_no_start(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
