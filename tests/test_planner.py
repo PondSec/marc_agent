@@ -28789,6 +28789,62 @@ def test_planner_extends_compact_resume_budget_after_timeout_progress(tmp_path):
     assert num_ctx == 3072
 
 
+def test_planner_extends_fallback_compact_budget_for_context_heavy_cold_start(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+
+    timeout_seconds, total_timeout_seconds, num_ctx = planner._content_generation_runtime_for_attempt(
+        GenerationRecoveryAttempt(
+            strategy="compact_fallback_model",
+            prompt_kind="compact",
+            model_name="qwen3:8b",
+            capability_tier="tier_b",
+        ),
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=True,
+            raw_reason="startup_timeout",
+        ),
+    )
+
+    assert timeout_seconds == 60
+    assert total_timeout_seconds == 330
+    assert num_ctx == 2048
+
+
+def test_planner_extends_fallback_resume_budget_for_context_heavy_progress_timeout(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+
+    timeout_seconds, total_timeout_seconds, num_ctx = planner._content_generation_runtime_for_attempt(
+        GenerationRecoveryAttempt(
+            strategy="resume_fallback_model",
+            prompt_kind="resume",
+            model_name="qwen3:8b",
+            capability_tier="tier_b",
+        ),
+        ExecutionFailure(
+            failure_class="total_timeout",
+            state="failed_after_progress",
+            had_progress=True,
+            first_output_received=True,
+            model_identifier="qwen3:8b",
+            backend_identifier="ollama",
+            context_pressure_estimate="high",
+            retryable=True,
+            raw_reason="total_timeout",
+        ),
+    )
+
+    assert timeout_seconds == 60
+    assert total_timeout_seconds == 390
+    assert num_ctx == 2048
+
+
 def test_planner_retries_resume_once_after_no_start_during_partial_progress_recovery(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
