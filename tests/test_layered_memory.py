@@ -236,6 +236,54 @@ def make_failure_entry(
     return entry
 
 
+def test_refresh_session_memory_retains_late_module_terms_for_large_analysis_prompt(tmp_path):
+    (tmp_path / "agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "server").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "agent" / "planner.py").write_text("def plan():\n    return 'ok'\n", encoding="utf-8")
+    (tmp_path / "agent" / "prompts.py").write_text("def build_prompt():\n    return 'prompt'\n", encoding="utf-8")
+    (tmp_path / "agent" / "layered_memory.py").write_text("class LayeredMemory:\n    pass\n", encoding="utf-8")
+    (tmp_path / "agent" / "task_state.py").write_text("class TaskState:\n    pass\n", encoding="utf-8")
+    (tmp_path / "server" / "app.py").write_text("def create_app():\n    return object()\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    store = AgentMemoryStore(config, WorkspaceManager(tmp_path))
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Beantworte danach Systemtyp, Datenfluss, Repo-Mapping, grosse Prompts sowie die Rollen von "
+        "planner, prompts, layered_memory, task_state und server."
+    )
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(store.workspace.root),
+        project_id=store.project_id,
+        runtime_options={"agent_profile": "a2"},
+    )
+    session.workspace_snapshot = store.build_snapshot(prompt)
+    session.task_state = TaskState(
+        latest_user_turn=prompt,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="A grounded architecture summary with concrete file paths.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        confidence=0.82,
+        next_action="inspect",
+    )
+
+    store.refresh_session_memory(prompt, session)
+
+    assert session.memory_context is not None
+    top_suggestions = session.memory_context.suggested_files[:6]
+    assert top_suggestions
+    assert "agent/prompts.py" in top_suggestions
+    assert "agent/planner.py" in session.memory_context.suggested_files[:6]
+    assert "agent/layered_memory.py" in top_suggestions
+    assert "server/app.py" in session.memory_context.suggested_files
+
+
 def make_conversation_entry(store: AgentMemoryStore, *, session_id: str, summary: str) -> ConversationMemoryEntry:
     return ConversationMemoryEntry(
         project_id=store.project_id,

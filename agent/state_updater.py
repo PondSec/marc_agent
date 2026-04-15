@@ -103,6 +103,36 @@ class TaskStateUpdater:
             )
             self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
             return local_state
+        if self._should_use_local_analysis_bootstrap(session=session, state=local_state):
+            self._log(
+                "task_state_local_short_circuit",
+                strategy="deterministic_fallback",
+                reason="structured_repository_analysis",
+            )
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary=(
+                            "Task understanding used deterministic request-digest and repo-aware local inference "
+                            "for a large structured repository analysis request."
+                        ),
+                        attempts=[],
+                    ),
+                    semantic_resolution="minimal_inference",
+                ),
+            )
+            self._log("task_state_updated", task_state=local_state.model_dump(), source="local_structured_analysis")
+            return local_state
         if self._should_short_circuit_with_local_state(
             initial_mode=initial_mode,
             session=session,
@@ -409,6 +439,31 @@ class TaskStateUpdater:
 
         self._log("task_state_fallback", error=str(outcome.exception), payload=payload or {})
         if a2_semantic_mode or strict_semantic_execution:
+            if self._should_use_local_analysis_bootstrap(session=session, state=local_state):
+                self._append_runtime_execution(
+                    session,
+                    annotate_semantic_record(
+                        build_execution_run_record(
+                            operation_name="task_state_generation",
+                            task_class="task_state_generation",
+                            final_state="degraded_success",
+                            capability_tier="tier_d",
+                            recovery_strategy="deterministic_fallback",
+                            degraded=True,
+                            honest_blocked=False,
+                            artifact_bytes_generated=0,
+                            validation_possible=False,
+                            summary=(
+                                "Structured repository analysis fell back to deterministic request-digest "
+                                "and repo-aware local inference after semantic recovery exhausted."
+                            ),
+                            attempts=attempts,
+                        ),
+                        semantic_resolution="minimal_inference",
+                    ),
+                )
+                self._log("task_state_updated", task_state=local_state.model_dump(), source="analysis_fallback")
+                return local_state
             state = self._blocked_state_for_missing_semantics(user_input, local_state)
             self._append_runtime_execution(
                 session,
@@ -847,6 +902,17 @@ class TaskStateUpdater:
         if state.needs_clarification or state.ambiguity_level == "high":
             return False
         return float(state.confidence or 0.0) >= 0.65
+
+    def _should_use_local_analysis_bootstrap(self, *, session, state: TaskState) -> bool:
+        if state.needs_clarification or state.ambiguity_level == "high":
+            return False
+        if self._requires_semantic_model_execution(session, state):
+            return False
+        if not self._requires_structured_repository_analysis(state):
+            return False
+        intent = str(state.current_user_intent or "").strip()
+        action = str(state.next_best_action or state.next_action or "").strip()
+        return intent in ANALYSIS_LIKE_INTENTS or action in ANALYSIS_LIKE_ACTIONS
 
     def _requires_structured_repository_analysis(self, state: TaskState) -> bool:
         intent = str(state.current_user_intent or "").strip()

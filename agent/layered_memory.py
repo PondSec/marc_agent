@@ -26,7 +26,7 @@ from agent.models import (
     WorkingMemoryEntry,
     utc_now,
 )
-from agent.semantic_defaults import classify_conversation_request, normalize_text
+from agent.semantic_defaults import classify_conversation_request, normalize_text, prioritized_focus_terms
 from config.settings import AppConfig
 from runtime.workspace import WorkspaceManager
 
@@ -1701,13 +1701,18 @@ class AgentMemoryStore(RepoMemoryStore):
             ]
         )
 
-    def _query_terms(self, request: RetrievalRequest) -> set[str]:
+    def _query_terms(
+        self,
+        request: RetrievalRequest,
+        *,
+        reference_terms: set[str] | None = None,
+    ) -> set[str]:
         recall_chunks: list[str] = []
         if request.recall_subject:
             recall_chunks.append(request.recall_subject)
         recall_chunks.extend(request.recall_attributes)
         return set(
-            self._terms_from_text(
+            prioritized_focus_terms(
                 " ".join(
                     part
                     for part in [
@@ -1721,7 +1726,9 @@ class AgentMemoryStore(RepoMemoryStore):
                         request.failure_signature or "",
                     ]
                     if part
-                )
+                ),
+                max_terms=32,
+                reference_terms=reference_terms,
             )
         )
 
@@ -1786,9 +1793,6 @@ class AgentMemoryStore(RepoMemoryStore):
     ) -> tuple[list[str], list[str], list[str]]:
         if snapshot is None:
             return [], [], []
-        query_terms = self._query_terms(request)
-        if not query_terms and not request.target_paths and not request.symbol_names and not request.error_terms:
-            return [], [], []
         ranked: list[tuple[float, str]] = []
         exact_targets = {str(path or "").strip() for path in request.target_paths if str(path or "").strip()}
         exact_names = {Path(path).name.lower() for path in exact_targets}
@@ -1808,8 +1812,22 @@ class AgentMemoryStore(RepoMemoryStore):
                 *list(symbol_index.keys()),
             ]
         )
+        query_terms = self._query_terms(
+            request,
+            reference_terms=self._candidate_reference_terms(candidate_paths, symbol_index),
+        )
+        if not query_terms and not request.target_paths and not request.symbol_names and not request.error_terms:
+            return [], [], []
+        path_terms_by_candidate = {
+            path: set(self._terms_from_text(path))
+            for path in candidate_paths
+        }
+        query_term_frequency: dict[str, int] = defaultdict(int)
+        for terms in path_terms_by_candidate.values():
+            for term in query_terms & terms:
+                query_term_frequency[term] += 1
         for path in candidate_paths:
-            path_terms = set(self._terms_from_text(path))
+            path_terms = path_terms_by_candidate.get(path, set())
             score = 0.0
             if path in exact_targets:
                 score += 3.2
@@ -1817,7 +1835,11 @@ class AgentMemoryStore(RepoMemoryStore):
                 score += 1.6
             matched_terms = query_terms & path_terms
             if matched_terms:
-                score += min(2.0, 0.6 * len(matched_terms))
+                specificity = sum(
+                    1.0 / max(query_term_frequency.get(term, 1), 1)
+                    for term in matched_terms
+                )
+                score += min(2.2, 1.2 * specificity)
             path_symbols = [str(item or "").strip() for item in symbol_index.get(path, []) if str(item or "").strip()]
             lowered_symbols = {item.lower() for item in path_symbols}
             if requested_symbols & lowered_symbols:
@@ -2144,14 +2166,31 @@ class AgentMemoryStore(RepoMemoryStore):
         return intersection / union if union else 0.0
 
     def _terms_from_text(self, text: str) -> list[str]:
-        terms: list[str] = []
-        for raw in str(text or "").lower().replace("/", " ").replace("-", " ").split():
-            token = "".join(ch for ch in raw if ch.isalnum() or ch == "_").strip("_")
-            if len(token) < 3:
+        return prioritized_focus_terms(text, max_terms=32)
+
+    def _candidate_reference_terms(
+        self,
+        candidate_paths: list[str],
+        symbol_index: dict[str, list[str]],
+    ) -> set[str]:
+        reference_terms: set[str] = set()
+        for path in candidate_paths:
+            lowered = str(path or "").strip().lower()
+            if not lowered:
                 continue
-            if token not in terms:
-                terms.append(token)
-        return terms[:32]
+            stem = Path(lowered).stem
+            if len(stem) >= 3:
+                reference_terms.add(stem)
+            for raw in re.split(r"[^a-z0-9_]+", lowered):
+                token = raw.strip("_")
+                if len(token) >= 3:
+                    reference_terms.add(token)
+            for symbol in list(symbol_index.get(path, []) or [])[:8]:
+                for raw in re.split(r"[^a-z0-9_]+", str(symbol or "").strip().lower()):
+                    token = raw.strip("_")
+                    if len(token) >= 3:
+                        reference_terms.add(token)
+        return reference_terms
 
     def _index_list_add(self, bucket: dict[str, list[str]], key: str, value: str) -> None:
         if key not in bucket:

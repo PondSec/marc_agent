@@ -617,6 +617,71 @@ def infer_scope_tokens(*texts: str | None) -> list[str]:
     return tokens
 
 
+def prioritized_focus_terms(
+    *texts: str | None,
+    max_terms: int = 12,
+    reference_terms: set[str] | None = None,
+) -> list[str]:
+    normalized = " ".join(normalize_text(text or "") for text in texts if text)
+    if not normalized:
+        return []
+    segments = [
+        infer_scope_tokens(segment)
+        for segment in re.split(r"(?:\n+|;|(?<=[.!?])\s+)", normalized)
+        if str(segment or "").strip()
+    ]
+    global_terms = infer_scope_tokens(normalized)
+    normalized_reference_terms = {
+        token
+        for item in (reference_terms or set())
+        for token in _text_tokens(normalize_text(item))
+        if token
+    }
+    ordered: list[str] = []
+
+    def add(term: str) -> None:
+        token = str(term or "").strip()
+        if not token or token in ordered:
+            return
+        ordered.append(token)
+
+    for segment_terms in segments:
+        for term in segment_terms:
+            if term in normalized_reference_terms and _looks_like_specific_focus_term(term):
+                add(term)
+    for segment_terms in segments:
+        for term in segment_terms:
+            if term in normalized_reference_terms:
+                add(term)
+    for segment_terms in segments:
+        for term in segment_terms:
+            if _looks_like_specific_focus_term(term):
+                add(term)
+    for segment_terms in segments:
+        informative = [
+            term
+            for term in segment_terms
+            if term in normalized_reference_terms or len(term) >= 8
+        ]
+        for term in informative[:3]:
+            add(term)
+        for term in informative[-2:]:
+            add(term)
+    tail_window = global_terms[-max(max_terms * 2, 12):]
+    for term in tail_window:
+        add(term)
+    for term in global_terms:
+        add(term)
+    return ordered[:max_terms]
+
+
+def _looks_like_specific_focus_term(term: str) -> bool:
+    token = str(term or "").strip()
+    if not token:
+        return False
+    return any(char in token for char in {"_", ".", "/"}) or len(token) >= 12
+
+
 def infer_artifact_name_hint(*texts: str | None) -> str | None:
     normalized = " ".join(normalize_text(text or "") for text in texts if text)
     if not normalized:

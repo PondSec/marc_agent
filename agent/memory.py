@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 from agent.models import FileInsight, ValidationCommand, WorkspaceSnapshot
+from agent.semantic_defaults import prioritized_focus_terms
 from config.settings import AppConfig
 from runtime.workspace import WorkspaceManager
 
@@ -137,7 +138,7 @@ class RepoMemoryStore:
         build_files: list[str] = []
         deploy_files: list[str] = []
         entrypoints: list[str] = []
-        focus_terms = self._focus_terms(focus)
+        focus_terms = self._focus_terms(focus, files)
 
         for path in files:
             try:
@@ -976,14 +977,33 @@ class RepoMemoryStore:
             )
         )
 
-    def _focus_terms(self, focus: str | None) -> list[str]:
+    def _focus_terms(self, focus: str | None, files: list[Path] | None = None) -> list[str]:
         if not focus:
             return []
-        tokens = []
-        for raw in focus.lower().replace("/", " ").replace("-", " ").split():
-            token = raw.strip(".,:;()[]{}!?\"'")
-            if len(token) < 3 or token in FOCUS_STOPWORDS:
+        reference_terms = self._path_focus_reference_terms(files or [])
+        tokens = prioritized_focus_terms(
+            focus,
+            max_terms=12,
+            reference_terms=reference_terms,
+        )
+        return [
+            token
+            for token in tokens
+            if len(token) >= 3 and token not in FOCUS_STOPWORDS
+        ][:12]
+
+    def _path_focus_reference_terms(self, files: list[Path]) -> set[str]:
+        reference_terms: set[str] = set()
+        for path in files:
+            try:
+                relative_path = path.relative_to(self.workspace.root).as_posix().lower()
+            except ValueError:
                 continue
-            if token not in tokens:
-                tokens.append(token)
-        return tokens[:8]
+            stem = Path(relative_path).stem.lower()
+            if stem:
+                reference_terms.add(stem)
+            for raw in re.split(r"[^a-z0-9_]+", relative_path):
+                token = raw.strip("_")
+                if len(token) >= 3:
+                    reference_terms.add(token)
+        return reference_terms
