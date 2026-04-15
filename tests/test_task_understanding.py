@@ -1913,6 +1913,160 @@ def test_task_state_a2_uses_local_structured_bootstrap_for_large_analysis(tmp_pa
     assert llm.generate_json_calls == []
 
 
+def test_task_state_a2_uses_local_mutation_bootstrap_for_large_create_prompt(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM(json_payloads=[])
+    llm.config = config
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und "
+            "script.js. Die Website soll professionell und hochwertig wirken. Zeige mehrere Modelle mit Daten an, "
+            "halte die Autodaten sauber in JavaScript, implementiere Darstellung und Suche und gib am Ende kurz an, "
+            "welche Dateien erstellt wurden, wie die Suchfunktion funktioniert und was geprüft wurde."
+        ),
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "create"
+    assert [artifact.path for artifact in task_state.target_artifacts] == [
+        "index.html",
+        "styles.css",
+        "script.js",
+    ]
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_a2_uses_local_mutation_bootstrap_for_large_analyze_then_modify_prompt(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=3,
+        language_counts={"html": 1, "css": 1, "javascript": 1},
+        top_directories=[],
+        important_files=["index.html", "styles.css", "script.js"],
+        focus_files=["index.html", "styles.css", "script.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["index.html"],
+        repo_map=[],
+        project_labels=["website"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small static site.",
+    )
+    llm = ScriptedLLM(json_payloads=[])
+    llm.config = config
+    session = SessionState(
+        task=(
+            "Analysiere zuerst die bestehende Auto-Website im Repo und ändere dann gezielt index.html, styles.css "
+            "und script.js, damit ein Filter nach Kraftstoff und Preisbereich hinzukommt. Lies die relevanten "
+            "Stellen erst, halte das UI konsistent und gib am Ende kurz an, was du geändert und geprüft hast."
+        ),
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=snapshot,
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "modify"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "styles.css",
+        "script.js",
+    }
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_a2_keeps_small_create_prompt_on_semantic_model_path(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    payload = {
+        "latest_user_turn": "ich brauche ein snake spiel in html",
+        "root_goal": "Build a small Snake game in HTML.",
+        "active_goal": "Create the first playable Snake implementation.",
+        "goal_relation": "new_task",
+        "output_expectation": "Create a small runnable implementation with a conventional default artifact and minimal scope.",
+        "current_user_intent": "implement",
+        "execution_strategy": "feature_implementation",
+        "open_problem": None,
+        "verification_target": "Create the initial implementation and run the most relevant validation or entry command.",
+        "target_artifacts": [
+            {
+                "path": None,
+                "name": "snake",
+                "kind": ".html",
+                "role": "primary_target",
+                "confidence": 0.8,
+            }
+        ],
+        "active_artifacts": [],
+        "evidence": [],
+        "relevant_context": [],
+        "constraints": [],
+        "assumptions": ["A conventional default artifact is acceptable."],
+        "missing_info": [],
+        "ambiguity_level": "low",
+        "risk_level": "low",
+        "confidence": 0.9,
+        "next_action": "create",
+        "next_best_action": "create",
+        "execution_outline": ["Choose a conventional default artifact.", "Implement the smallest runnable version."],
+        "needs_clarification": False,
+        "clarification_questions": [],
+    }
+    llm = ScriptedLLM(json_payloads=[payload])
+    llm.config = config
+    session = SessionState(
+        task="ich brauche ein snake spiel in html",
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "full_model"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "create"
+    assert llm.generate_json_calls != []
+
+
 def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
     session = SessionState(

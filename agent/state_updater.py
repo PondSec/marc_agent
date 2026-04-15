@@ -41,6 +41,9 @@ ANALYSIS_LIKE_ACTIONS = {"inspect", "search", "explain", "plan", "test"}
 MUTATION_LIKE_INTENTS = {"implement", "repair", "correct"}
 MUTATION_LIKE_ACTIONS = {"create", "modify", "debug"}
 DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt"}
+LOCAL_MUTATION_BOOTSTRAP_INTENTS = {"implement", "correct"}
+LOCAL_MUTATION_BOOTSTRAP_ACTIONS = {"create", "modify"}
+MIN_LOCAL_MUTATION_BOOTSTRAP_CONFIDENCE = 0.7
 
 
 class TaskStateUpdater:
@@ -103,6 +106,36 @@ class TaskStateUpdater:
                 ),
             )
             self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
+            return local_state
+        if self._should_use_local_mutation_bootstrap(session=session, state=local_state):
+            self._log(
+                "task_state_local_short_circuit",
+                strategy="deterministic_fallback",
+                reason="clear_large_mutation_request",
+            )
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary=(
+                            "Task understanding used deterministic request-digest and explicit-target local inference "
+                            "for a large clear mutation request."
+                        ),
+                        attempts=[],
+                    ),
+                    semantic_resolution="minimal_inference",
+                ),
+            )
+            self._log("task_state_updated", task_state=local_state.model_dump(), source="local_mutation_bootstrap")
             return local_state
         if self._should_use_local_analysis_bootstrap(session=session, state=local_state):
             self._log(
@@ -914,6 +947,34 @@ class TaskStateUpdater:
         intent = str(state.current_user_intent or "").strip()
         action = str(state.next_best_action or state.next_action or "").strip()
         return intent in ANALYSIS_LIKE_INTENTS or action in ANALYSIS_LIKE_ACTIONS
+
+    def _should_use_local_mutation_bootstrap(self, *, session, state: TaskState) -> bool:
+        if self._agent_profile(session) != "a2":
+            return False
+        if state.needs_clarification or state.ambiguity_level == "high":
+            return False
+        if self._requires_structured_repository_analysis(state):
+            return False
+        intent = str(state.current_user_intent or "").strip()
+        action = str(state.next_best_action or state.next_action or "").strip()
+        if intent not in LOCAL_MUTATION_BOOTSTRAP_INTENTS and action not in LOCAL_MUTATION_BOOTSTRAP_ACTIONS:
+            return False
+        if action not in LOCAL_MUTATION_BOOTSTRAP_ACTIONS:
+            return False
+        if float(state.confidence or 0.0) < MIN_LOCAL_MUTATION_BOOTSTRAP_CONFIDENCE:
+            return False
+        if not any(str(artifact.path or "").strip() for artifact in state.target_artifacts):
+            return False
+        request = str(state.latest_user_turn or "").strip()
+        requirement_count = sum(1 for item in (state.request_requirements or []) if str(item or "").strip())
+        chunk_count = sum(1 for item in (state.request_chunks or []) if str(item or "").strip())
+        enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
+        return (
+            len(request) >= 320
+            or chunk_count >= 4
+            or requirement_count >= 6
+            or enumerated_sections >= 3
+        )
 
     def _requires_structured_repository_analysis(self, state: TaskState) -> bool:
         return is_structured_repository_analysis_request(
