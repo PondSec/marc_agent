@@ -5813,6 +5813,46 @@ class Planner:
             )
         if (
             issue.no_start_failure
+            and primary_model
+            and lightweight_model
+            and current_model == primary_model
+            and lightweight_model != primary_model
+        ):
+            fallback_full = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "fallback_model"
+                    and attempt.model_name == lightweight_model
+                ),
+                None,
+            )
+            full_same_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "retry_same_model"
+                    and (attempt.model_name is None or attempt.model_name == primary_model)
+                ),
+                None,
+            )
+            if fallback_full is not None and full_same_model is not None:
+                reordered: list[GenerationRecoveryAttempt] = []
+                inserted_fallback = False
+                for attempt in attempts:
+                    if attempt is fallback_full:
+                        continue
+                    if attempt is full_same_model and not inserted_fallback:
+                        reordered.append(fallback_full)
+                        inserted_fallback = True
+                    reordered.append(attempt)
+                if not inserted_fallback:
+                    reordered.insert(0, fallback_full)
+                attempts = reordered
+        if (
+            issue.no_start_failure
             and issue.context_pressure_likely
             and (not lightweight_model or lightweight_model == primary_model)
         ):
