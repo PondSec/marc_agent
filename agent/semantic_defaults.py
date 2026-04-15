@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from agent.local_nlp import classify_fallback_intent
 
@@ -673,6 +673,39 @@ def prioritized_focus_terms(
     for term in global_terms:
         add(term)
     return ordered[:max_terms]
+
+
+def is_structured_repository_analysis_request(
+    *,
+    latest_user_turn: str | None,
+    current_user_intent: str | None,
+    next_action: str | None,
+    request_requirements: Sequence[str] | None = None,
+    request_chunks: Sequence[str] | None = None,
+) -> bool:
+    intent = str(current_user_intent or "").strip().lower()
+    action = str(next_action or "").strip().lower()
+    if intent not in {"explain", "inspect", "search", "plan", "validate"} and action not in {
+        "inspect",
+        "search",
+        "explain",
+        "plan",
+        "test",
+    }:
+        return False
+    request = str(latest_user_turn or "").strip()
+    if len(request) < 320:
+        return False
+    requirement_count = sum(1 for item in (request_requirements or []) if str(item or "").strip())
+    chunk_count = sum(1 for item in (request_chunks or []) if str(item or "").strip())
+    enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
+    question_count = request.count("?")
+    return (
+        chunk_count >= 4
+        or requirement_count >= 6
+        or enumerated_sections >= 3
+        or (question_count >= 3 and requirement_count >= 4)
+    )
 
 
 def _looks_like_specific_focus_term(term: str) -> bool:

@@ -774,6 +774,239 @@ def test_final_response_prompt_uses_structured_architecture_report_for_large_ana
     assert "direkt sichtbar, indirekt ableitbar und im gelesenen Kontext nicht bestaetigt" in prompt
 
 
+def test_large_structured_analysis_read_candidates_prioritize_requested_implementation_files(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    payload = route_payload(
+        intent="inspect",
+        action_plan=[
+            {"step": 1, "action": "inspect_workspace", "reason": "Collect repository context before summarizing."},
+            {"step": 2, "action": "read_relevant_files", "reason": "Read the strongest implementation files before summarizing."},
+            {"step": 3, "action": "summarize_result", "reason": "Return the grounded architecture summary."},
+        ],
+        requested_outcome="Analysiere planner, prompts, layered_memory, task_state, state_updater, server und grosse Prompts.",
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp 2. planner 3. prompts 4. layered_memory 5. task_state 6. state_updater 7. server "
+            "8. grosse Prompts 9. Risiken. Nenne Dateipfade und bleibe geerdet. "
+            "Ich will ausserdem, dass spaete Anforderungen nicht verloren gehen, dass du Request-Digests, "
+            "Request-Memory und kompakte Generationsprompts sauber beruecksichtigst und klar markierst, "
+            "was direkt sichtbar, nur indirekt ableitbar oder nicht bestaetigt ist."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=24,
+            language_counts={"python": 20, "markdown": 2},
+            top_directories=["agent", "server", "tests"],
+            important_files=["server/app.py", "README.md", "agent/planner.py", "agent/prompts.py"],
+            focus_files=["agent/layered_memory.py", "agent/planner.py", "agent/prompts.py", "agent/state_updater.py", "agent/task_state.py", "server/app.py"],
+            file_briefs={},
+            manifests=["README.md"],
+            configs=[],
+            test_files=["tests/test_layered_memory.py", "tests/test_planner.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["server/app.py"],
+            repo_map=["agent/", "server/", "tests/"],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Local coding agent.",
+        ),
+    )
+    session.candidate_files = [
+        "agent/layered_memory.py",
+        "agent/memory.py",
+        "agent/planner.py",
+        "agent/prompts.py",
+        "agent/state_updater.py",
+        "agent/task_state.py",
+        "server/app.py",
+        "README.md",
+        "deploy/appliance/README.md",
+        "ollama_usb_staging/qwen3_coder_30b/README.txt",
+        "tests/test_layered_memory.py",
+        "tests/test_planner.py",
+    ]
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="Answer each requested point with concrete file paths and grounded evidence.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        target_artifacts=[],
+        active_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.84,
+        next_action="inspect",
+        next_best_action="inspect",
+        request_requirements=["Systemtyp", "planner", "prompts", "layered_memory", "task_state", "state_updater", "server", "grosse Prompts", "Risiken"],
+        request_chunks=[
+            "Systemtyp; planner; prompts",
+            "layered_memory; task_state; state_updater",
+            "server; grosse Prompts",
+            "Risiken; Dateipfade; geerdete Aussagen",
+        ],
+        execution_outline=[
+            "Inspect the repository structure first.",
+            "Read the strongest implementation files.",
+            "Answer each requested point with grounded evidence.",
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    route = planner.validate_router_output(payload)
+
+    candidates = planner._read_candidates(route, session, session.candidate_files)
+
+    assert candidates[:5] == [
+        "agent/layered_memory.py",
+        "agent/planner.py",
+        "agent/prompts.py",
+        "agent/state_updater.py",
+        "agent/task_state.py",
+    ]
+    assert {"server/app.py", "agent/memory.py"} <= set(candidates[:7])
+    assert "README.md" not in candidates[:7]
+    assert "tests/test_layered_memory.py" not in candidates[:7]
+    assert len(candidates) <= 10
+
+
+def test_large_structured_analysis_reaches_summary_once_focused_candidates_are_read(tmp_path):
+    llm = ScriptedLLM(text_payloads=["Zusammenfassung mit Belegen."])
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="inspect",
+        action_plan=[
+            {"step": 1, "action": "inspect_workspace", "reason": "Collect repository context before summarizing."},
+            {"step": 2, "action": "read_relevant_files", "reason": "Read the strongest implementation files before summarizing."},
+            {"step": 3, "action": "summarize_result", "reason": "Return the grounded architecture summary."},
+        ],
+        requested_outcome="Analysiere planner, prompts, layered_memory, task_state, state_updater, server und grosse Prompts.",
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp 2. planner 3. prompts 4. layered_memory 5. task_state 6. state_updater 7. server "
+            "8. grosse Prompts 9. Risiken. Nenne Dateipfade und bleibe geerdet. "
+            "Ich will ausserdem, dass spaete Anforderungen nicht verloren gehen, dass du Request-Digests, "
+            "Request-Memory und kompakte Generationsprompts sauber beruecksichtigst und klar markierst, "
+            "was direkt sichtbar, nur indirekt ableitbar oder nicht bestaetigt ist."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=24,
+            language_counts={"python": 20, "markdown": 2},
+            top_directories=["agent", "server", "tests"],
+            important_files=["server/app.py", "README.md", "agent/planner.py", "agent/prompts.py"],
+            focus_files=["agent/layered_memory.py", "agent/planner.py", "agent/prompts.py", "agent/state_updater.py", "agent/task_state.py", "server/app.py"],
+            file_briefs={},
+            manifests=["README.md"],
+            configs=[],
+            test_files=["tests/test_layered_memory.py", "tests/test_planner.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["server/app.py"],
+            repo_map=["agent/", "server/", "tests/"],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Local coding agent.",
+        ),
+    )
+    session.candidate_files = [
+        "agent/layered_memory.py",
+        "agent/memory.py",
+        "agent/planner.py",
+        "agent/prompts.py",
+        "agent/state_updater.py",
+        "agent/task_state.py",
+        "server/app.py",
+        "README.md",
+        "tests/test_layered_memory.py",
+    ]
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="Answer each requested point with concrete file paths and grounded evidence.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        target_artifacts=[],
+        active_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.84,
+        next_action="inspect",
+        next_best_action="inspect",
+        request_requirements=["Systemtyp", "planner", "prompts", "layered_memory", "task_state", "state_updater", "server", "grosse Prompts", "Risiken"],
+        request_chunks=[
+            "Systemtyp; planner; prompts",
+            "layered_memory; task_state; state_updater",
+            "server; grosse Prompts",
+            "Risiken; Dateipfade; geerdete Aussagen",
+        ],
+        execution_outline=[
+            "Inspect the repository structure first.",
+            "Read the strongest implementation files.",
+            "Answer each requested point with grounded evidence.",
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    route = planner.validate_router_output(payload)
+    focused_candidates = planner._read_candidates(route, session, session.candidate_files)
+    session.router_result = route
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="inspect_workspace",
+            tool_args={"focus": session.task},
+            success=True,
+            summary="Inspected workspace.",
+            phase="exploring",
+            output_excerpt="Repo map:\n- agent/\n- server/\n- tests/\n",
+        )
+    )
+    for index, path in enumerate(focused_candidates, start=2):
+        session.tool_calls.append(
+            ToolCallRecord(
+                iteration=index,
+                tool_name="read_file",
+                tool_args={"path": path},
+                success=True,
+                summary=f"Read {path}.",
+                phase="exploring",
+                output_excerpt=f"# {path}\nvisible implementation\n",
+            )
+        )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert decision.final_response == "Zusammenfassung mit Belegen."
+    assert llm.generate_calls
+
+
 def test_final_response_num_ctx_scales_with_prompt_size(tmp_path):
     planner = Planner(ScriptedLLM(), "")
 

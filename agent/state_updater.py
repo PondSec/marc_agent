@@ -14,7 +14,7 @@ from agent.prompts import (
     task_state_system_prompt,
     task_state_update_prompt,
 )
-from agent.semantic_defaults import classify_conversation_request
+from agent.semantic_defaults import classify_conversation_request, is_structured_repository_analysis_request
 from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
@@ -915,22 +915,12 @@ class TaskStateUpdater:
         return intent in ANALYSIS_LIKE_INTENTS or action in ANALYSIS_LIKE_ACTIONS
 
     def _requires_structured_repository_analysis(self, state: TaskState) -> bool:
-        intent = str(state.current_user_intent or "").strip()
-        action = str(state.next_best_action or state.next_action or "").strip()
-        if intent not in ANALYSIS_LIKE_INTENTS and action not in ANALYSIS_LIKE_ACTIONS:
-            return False
-        request = str(state.latest_user_turn or "").strip()
-        if len(request) < 320:
-            return False
-        requirement_count = sum(1 for item in state.request_requirements if str(item or "").strip())
-        chunk_count = sum(1 for item in state.request_chunks if str(item or "").strip())
-        enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
-        question_count = request.count("?")
-        return (
-            chunk_count >= 4
-            or requirement_count >= 6
-            or enumerated_sections >= 3
-            or (question_count >= 3 and requirement_count >= 4)
+        return is_structured_repository_analysis_request(
+            latest_user_turn=state.latest_user_turn,
+            current_user_intent=state.current_user_intent,
+            next_action=state.next_best_action or state.next_action,
+            request_requirements=state.request_requirements,
+            request_chunks=state.request_chunks,
         )
 
     def _should_short_circuit_direct_chat(
