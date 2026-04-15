@@ -56,7 +56,11 @@ from agent.prompts import (
     semantic_change_review_system_prompt,
 )
 from agent.router import IntentRouter
-from agent.semantic_defaults import classify_conversation_request
+from agent.semantic_defaults import (
+    classify_conversation_request,
+    is_structured_repository_analysis_request,
+    prioritized_focus_terms,
+)
 from agent.semantic_runtime import availability_recovery_model
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import TaskState
@@ -135,6 +139,43 @@ LIGHTWEIGHT_UPDATE_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+STRUCTURED_ANALYSIS_IMPLEMENTATION_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cfg",
+    ".conf",
+    ".cpp",
+    ".css",
+    ".cxx",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".ini",
+    ".java",
+    ".js",
+    ".json",
+    ".jsx",
+    ".kt",
+    ".less",
+    ".lua",
+    ".mjs",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".vue",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+STRUCTURED_ANALYSIS_DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt"}
 EXACT_TEXT_CONTRACT_SUFFIXES = {
     ".conf",
     ".cfg",
@@ -4027,6 +4068,15 @@ class Planner:
             if repair_targets:
                 return self._unique_paths(repair_targets)
         explicit_targets = self._explicit_target_paths(route, session)
+        if route.intent in {RouteIntent.INSPECT, RouteIntent.EXPLAIN} and self._is_structured_repository_analysis(session):
+            focused = self._structured_analysis_read_candidates(
+                route,
+                session,
+                candidate_paths,
+                explicit_targets=explicit_targets,
+            )
+            if focused:
+                return focused
         if explicit_targets and route.intent in {
             RouteIntent.INSPECT,
             RouteIntent.UPDATE,
@@ -4036,6 +4086,204 @@ class Planner:
         }:
             return explicit_targets
         return candidate_paths
+
+    def _is_structured_repository_analysis(self, session: SessionState) -> bool:
+        task_state = session.task_state
+        if task_state is None:
+            return False
+        return is_structured_repository_analysis_request(
+            latest_user_turn=task_state.latest_user_turn,
+            current_user_intent=task_state.current_user_intent,
+            next_action=task_state.next_best_action or task_state.next_action,
+            request_requirements=task_state.request_requirements,
+            request_chunks=task_state.request_chunks,
+        )
+
+    def _structured_analysis_read_candidates(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        candidate_paths: list[str],
+        *,
+        explicit_targets: list[str] | None = None,
+    ) -> list[str]:
+        candidates = [path for path in self._unique_paths(candidate_paths) if path and Path(path).suffix]
+        if not candidates:
+            return []
+
+        focus_terms = self._structured_analysis_focus_terms(route, session, candidates)
+        if not focus_terms:
+            return candidates[: min(len(candidates), 8)]
+
+        snapshot = session.workspace_snapshot
+        focus_files = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "focus_files", []) or []
+            if str(path or "").strip()
+        }
+        entrypoints = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "entrypoints", []) or []
+            if str(path or "").strip()
+        }
+        important_files = {
+            str(path or "").strip()
+            for path in getattr(snapshot, "important_files", []) or []
+            if str(path or "").strip()
+        }
+        scored = [
+            (
+                self._structured_analysis_candidate_score(
+                    path,
+                    focus_terms=focus_terms,
+                    focus_files=focus_files,
+                    entrypoints=entrypoints,
+                    important_files=important_files,
+                ),
+                index,
+                path,
+            )
+            for index, path in enumerate(candidates)
+        ]
+        strong_scored = [item for item in scored if item[0] > 0]
+        if len(strong_scored) >= 6:
+            scored = strong_scored
+        ranked = [path for _score, _index, path in sorted(scored, key=lambda item: (-item[0], item[1]))]
+        primary_ranked = [
+            path
+            for path in ranked
+            if not self._structured_analysis_supporting_context_path(path)
+        ]
+        supporting_ranked = [
+            path
+            for path in ranked
+            if self._structured_analysis_supporting_context_path(path)
+        ]
+        ranked = self._unique_paths([*(explicit_targets or []), *primary_ranked, *supporting_ranked])
+        limit = min(len(ranked), self._structured_analysis_read_limit(session, focus_terms))
+        return ranked[:limit]
+
+    def _structured_analysis_focus_terms(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        candidate_paths: list[str],
+    ) -> list[str]:
+        task_state = session.task_state
+        texts: list[str] = [str(session.task or "").strip(), str(route.requested_outcome or "").strip()]
+        if task_state is not None:
+            texts.append(str(task_state.latest_user_turn or "").strip())
+            texts.extend(str(item or "").strip() for item in task_state.request_requirements)
+            texts.extend(str(item or "").strip() for item in task_state.request_chunks)
+            texts.extend(str(item or "").strip() for item in task_state.execution_outline)
+        reference_terms = {
+            token
+            for path in candidate_paths
+            for token in self._structured_analysis_path_terms(path)
+        }
+        return prioritized_focus_terms(
+            *texts,
+            max_terms=16,
+            reference_terms=reference_terms,
+        )
+
+    def _structured_analysis_read_limit(self, session: SessionState, focus_terms: list[str]) -> int:
+        task_state = session.task_state
+        requirement_count = sum(
+            1
+            for item in (getattr(task_state, "request_requirements", []) if task_state is not None else [])
+            if str(item or "").strip()
+        )
+        target = max(6, min(requirement_count + 1, 8), min(len(focus_terms), 7))
+        return min(8, target)
+
+    def _structured_analysis_candidate_score(
+        self,
+        path: str,
+        *,
+        focus_terms: list[str],
+        focus_files: set[str],
+        entrypoints: set[str],
+        important_files: set[str],
+    ) -> int:
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return -10_000
+        lowered_path = normalized_path.lower()
+        suffix = Path(normalized_path).suffix.lower()
+        basename = Path(normalized_path).name.lower()
+        path_terms = self._structured_analysis_path_terms(normalized_path)
+
+        score = 0
+        overlap = 0
+        for term in focus_terms:
+            if term in path_terms or term in lowered_path:
+                overlap += 1
+                score += 120 if term in path_terms else 80
+        if basename in focus_terms or Path(normalized_path).stem.lower() in focus_terms:
+            score += 60
+        if normalized_path in focus_files:
+            score += 35
+        if normalized_path in entrypoints:
+            score += 24
+        if normalized_path in important_files:
+            score += 16
+        if suffix in STRUCTURED_ANALYSIS_IMPLEMENTATION_SUFFIXES:
+            score += 18
+        if self._looks_like_test_path(normalized_path):
+            score -= 70
+        if suffix in STRUCTURED_ANALYSIS_DOC_SUFFIXES or basename.startswith("readme"):
+            score -= 55
+        if any(marker in lowered_path for marker in ("ollama_usb_staging/", "node_modules/", ".venv/", "dist/", "build/")):
+            score -= 90
+        if overlap == 0:
+            score -= 25
+        return score
+
+    def _structured_analysis_path_terms(self, path: str) -> set[str]:
+        lowered = str(path or "").strip().lower()
+        if not lowered:
+            return set()
+        tokens = {
+            token
+            for token in re.split(r"[^a-z0-9_]+", lowered)
+            if token and token not in {"src", "lib", "app", "agent", "server", "tests", "test"}
+        }
+        stem = Path(lowered).stem.lower()
+        if stem:
+            tokens.add(stem)
+        basename = Path(lowered).name.lower()
+        if basename:
+            tokens.add(basename)
+        return tokens
+
+    def _looks_like_test_path(self, path: str) -> bool:
+        lowered = str(path or "").strip().lower()
+        if not lowered:
+            return False
+        basename = Path(lowered).name
+        return (
+            "/tests/" in lowered
+            or lowered.startswith("tests/")
+            or basename.startswith("test_")
+            or basename.endswith("_test.py")
+            or basename.endswith(".spec.js")
+            or basename.endswith(".test.js")
+            or basename.endswith(".spec.ts")
+            or basename.endswith(".test.ts")
+        )
+
+    def _structured_analysis_supporting_context_path(self, path: str) -> bool:
+        lowered = str(path or "").strip().lower()
+        if not lowered:
+            return False
+        suffix = Path(lowered).suffix.lower()
+        basename = Path(lowered).name
+        if self._looks_like_test_path(lowered):
+            return True
+        if suffix in STRUCTURED_ANALYSIS_DOC_SUFFIXES or basename.startswith("readme"):
+            return True
+        return any(marker in lowered for marker in ("ollama_usb_staging/", "node_modules/", ".venv/", "dist/", "build/"))
 
     def _primary_target_path(self, route: RouterOutput, session: SessionState) -> str | None:
         candidates = self._candidate_paths(route, session)
@@ -5449,6 +5697,7 @@ class Planner:
         attempted_recovery_keys: set[tuple[str, str, str | None]] = set()
         forced_follow_up: GenerationRecoveryAttempt | None = None
         used_resume_retry_after_no_start = False
+        used_resume_retry_after_progress = False
         retry_attempts: list[ExecutionAttemptRecord] = []
         while True:
             attempt: GenerationRecoveryAttempt | None = None
@@ -5603,6 +5852,21 @@ class Planner:
                     capability_tier=attempt.capability_tier,
                 )
                 used_resume_retry_after_no_start = True
+            if (
+                retry_issue is not None
+                and retry_issue.failed_after_progress
+                and attempt.prompt_kind == "resume"
+                and attempt.model_name is not None
+                and retry_issue.partial_text
+                and not used_resume_retry_after_progress
+            ):
+                forced_follow_up = GenerationRecoveryAttempt(
+                    strategy=f"{attempt.strategy}_retry",
+                    prompt_kind="resume",
+                    model_name=attempt.model_name,
+                    capability_tier=attempt.capability_tier,
+                )
+                used_resume_retry_after_progress = True
             issue = retry_issue or issue
         return GenerationRetryResult(attempts=retry_attempts)
 
@@ -5788,6 +6052,41 @@ class Planner:
         lightweight_model = recovery_model
         current_model = str(issue.model_identifier or "").strip()
         if (
+            issue.failed_after_progress
+            and current_model
+            and primary_model
+            and current_model != primary_model
+        ):
+            resume_current_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "resume"
+                    and attempt.model_name == current_model
+                ),
+                None,
+            )
+            if resume_current_model is None:
+                capability_tier = (
+                    "tier_b" if lightweight_model and current_model == lightweight_model else "tier_a"
+                )
+                attempts.insert(
+                    0,
+                    GenerationRecoveryAttempt(
+                        strategy="resume_fallback_model",
+                        prompt_kind="resume",
+                        model_name=current_model,
+                        capability_tier=capability_tier,
+                    ),
+                )
+            else:
+                reordered = [resume_current_model]
+                for attempt in attempts:
+                    if attempt is resume_current_model:
+                        continue
+                    reordered.append(attempt)
+                attempts = reordered
+        if (
             issue.no_start_failure
             and primary_model
             and lightweight_model
@@ -5811,6 +6110,78 @@ class Planner:
                     capability_tier="tier_a",
                 )
             )
+        if (
+            issue.no_start_failure
+            and primary_model
+            and lightweight_model
+            and current_model == primary_model
+            and lightweight_model != primary_model
+        ):
+            fallback_full = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "fallback_model"
+                    and attempt.model_name == lightweight_model
+                ),
+                None,
+            )
+            full_same_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "retry_same_model"
+                    and (attempt.model_name is None or attempt.model_name == primary_model)
+                ),
+                None,
+            )
+            if fallback_full is not None and full_same_model is not None:
+                reordered: list[GenerationRecoveryAttempt] = []
+                inserted_fallback = False
+                for attempt in attempts:
+                    if attempt is fallback_full:
+                        continue
+                    if attempt is full_same_model and not inserted_fallback:
+                        reordered.append(fallback_full)
+                        inserted_fallback = True
+                    reordered.append(attempt)
+                if not inserted_fallback:
+                    reordered.insert(0, fallback_full)
+                attempts = reordered
+        if (
+            issue.no_start_failure
+            and issue.context_pressure_likely
+            and lightweight_model
+            and lightweight_model != primary_model
+        ):
+            compact_fallback_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "compact"
+                    and attempt.model_name == lightweight_model
+                ),
+                None,
+            )
+            full_fallback_model = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt.prompt_kind == "full"
+                    and attempt.strategy == "fallback_model"
+                    and attempt.model_name == lightweight_model
+                ),
+                None,
+            )
+            if compact_fallback_model is not None and full_fallback_model is not None:
+                reordered: list[GenerationRecoveryAttempt] = [compact_fallback_model]
+                for attempt in attempts:
+                    if attempt is compact_fallback_model:
+                        continue
+                    reordered.append(attempt)
+                attempts = reordered
         if (
             issue.no_start_failure
             and issue.context_pressure_likely
@@ -5878,6 +6249,7 @@ class Planner:
                 repair_context=repair_context,
                 repair_strategy=repair_strategy,
                 review_feedback=review_feedback,
+                mode="compact",
             )
         return generate_content_prompt(
             route,
@@ -5898,6 +6270,14 @@ class Planner:
         retained_progress_issue: ExecutionFailure | None = None,
     ) -> tuple[int, int, int]:
         cold_start_recovery = issue.no_start_failure
+        heavy_context_recovery = (
+            issue.context_pressure_estimate in {"medium", "high"}
+            or (
+                retained_progress_issue is not None
+                and retained_progress_issue.context_pressure_estimate in {"medium", "high"}
+            )
+        )
+        heavy_fallback_recovery = attempt.model_name is not None and heavy_context_recovery
         progress_timeout_recovery = (
             issue.timeout_like and issue.had_progress
         ) or (
@@ -5909,17 +6289,33 @@ class Planner:
         if attempt.prompt_kind == "resume":
             base_timeout = 60 if issue.timeout_like else 45
             total_timeout = (
-                270
-                if progress_timeout_recovery
-                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+                390
+                if progress_timeout_recovery and heavy_fallback_recovery
+                else (
+                    270
+                    if progress_timeout_recovery
+                    else (
+                        360
+                        if cold_start_recovery and heavy_fallback_recovery
+                        else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+                    )
+                )
             )
             num_ctx = 3072 if attempt.model_name is None else 2048
         elif attempt.prompt_kind == "compact":
             base_timeout = 60 if issue.timeout_like else 45
             total_timeout = (
-                270
-                if progress_timeout_recovery
-                else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+                360
+                if progress_timeout_recovery and heavy_fallback_recovery
+                else (
+                    270
+                    if progress_timeout_recovery
+                    else (
+                        330
+                        if cold_start_recovery and heavy_fallback_recovery
+                        else (240 if cold_start_recovery else (210 if issue.timeout_like else 150))
+                    )
+                )
             )
             num_ctx = 2048
         else:
@@ -7021,6 +7417,30 @@ class Planner:
                 had_progress=issue.had_progress if issue is not None else False,
                 partial_characters=issue.characters if issue is not None else 0,
             )
+            partial_response = self._salvage_partial_final_response(issue)
+            if partial_response:
+                self._log(
+                    "final_response_generation_finished",
+                    characters=len(partial_response),
+                    source="partial_salvage",
+                )
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="final_response_generation",
+                        task_class="final_response_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_c",
+                        recovery_strategy="partial_response_salvage",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=len(partial_response),
+                        validation_possible=False,
+                        summary="Final user response was salvaged from partial model output after the runtime timed out.",
+                        attempts=[outcome.attempt],
+                    ),
+                )
+                return partial_response
         deterministic = self._deterministic_final_response(route, session)
         self._log(
             "final_response_generation_finished",
@@ -7044,6 +7464,28 @@ class Planner:
             ),
         )
         return deterministic
+
+    def _salvage_partial_final_response(self, issue) -> str:
+        if issue is None or not issue.failed_after_progress:
+            return ""
+        partial = self._strip_code_fences(str(issue.partial_text or "")).strip()
+        if len(partial) < 120:
+            return ""
+        candidates = [
+            partial.rfind("\n\n"),
+            partial.rfind(". "),
+            partial.rfind("! "),
+            partial.rfind("? "),
+            partial.rfind("\n"),
+        ]
+        cutoff = max(candidates)
+        minimum_safe_cutoff = max(80, len(partial) // 2)
+        if cutoff >= minimum_safe_cutoff:
+            if partial[cutoff:cutoff + 2] in {". ", "! ", "? "}:
+                partial = partial[: cutoff + 1].rstrip()
+            else:
+                partial = partial[:cutoff].rstrip()
+        return partial if len(partial) >= 120 else ""
 
     def _final_decision(
         self,

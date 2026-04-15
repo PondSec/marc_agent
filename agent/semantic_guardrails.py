@@ -155,7 +155,13 @@ def build_minimal_task_state(
     request = str(user_input or "").strip() or "Unclear request"
     context = _context_anchor(session)
     signal = _minimal_semantic_signal(request, context=context)
-    inferred_snapshot_targets = _snapshot_target_artifacts(request, snapshot)
+    broad_repo_analysis = _is_broad_repository_analysis_request(
+        request,
+        signal=signal,
+        snapshot=snapshot,
+        context=context,
+    )
+    inferred_snapshot_targets = [] if broad_repo_analysis else _snapshot_target_artifacts(request, snapshot)
     unresolved_explicit_symbols = _unresolved_explicit_snapshot_symbols(
         request,
         snapshot=snapshot,
@@ -256,6 +262,10 @@ def build_minimal_task_state(
         assumptions.append("Current-turn wording is treated as a same-task reference only because there is one safe active anchor.")
     elif inferred_snapshot_targets:
         assumptions.append("The target artifacts were inferred conservatively from strong lexical overlap between the request and workspace filenames.")
+    if broad_repo_analysis:
+        assumptions.append(
+            "Broad repository analysis should treat filename overlap as a hint, not as a locked single-file target."
+        )
     if unresolved_explicit_symbols:
         assumptions.append(
             "Avoid inferring a different target from filename overlap when the explicitly requested symbol is absent from the repo map."
@@ -320,18 +330,32 @@ def build_minimal_task_state(
     elif signal.intent == "explain":
         current_user_intent = "explain"
         execution_strategy = "validation_inspection"
-        next_action = "explain"
+        next_action = "inspect" if broad_repo_analysis else "explain"
         risk_level = "low"
-        active_goal = (
-            f"Explain the active task state around {previous_goal}."
-            if signal.use_context
-            else request
-        )
-        output_expectation = "Explain the relevant behavior or code path clearly and honestly."
-        execution_outline = [
-            "Inspect the most relevant context if needed.",
-            "Explain the result in clear user-facing language.",
-        ]
+        if broad_repo_analysis:
+            active_goal = "Inspect the repository architecture and answer the requested analysis points with grounded evidence."
+            output_expectation = (
+                "Inspect the relevant repository areas, then answer each requested point with concrete file paths, "
+                "visible symbols or flows when available, and explicit uncertainty for anything not found."
+            )
+            execution_outline = [
+                "Inspect the repository structure and focus-matched files before concluding.",
+                "Read the strongest implementation files for the requested analysis points.",
+                "Answer each requested point with concrete file paths, visible evidence, and explicit gaps.",
+            ]
+            target_artifacts = []
+            active_artifacts = []
+        else:
+            active_goal = (
+                f"Explain the active task state around {previous_goal}."
+                if signal.use_context
+                else request
+            )
+            output_expectation = "Explain the relevant behavior or code path clearly and honestly."
+            execution_outline = [
+                "Inspect the most relevant context if needed.",
+                "Explain the result in clear user-facing language.",
+            ]
     elif signal.intent == "validate":
         current_user_intent = "validate"
         execution_strategy = "validation_inspection"
@@ -1044,6 +1068,43 @@ def _extract_explicit_name(text: str) -> str | None:
     return candidate if candidate and len(candidate) >= 3 else None
 
 
+def _is_broad_repository_analysis_request(
+    request: str,
+    *,
+    signal: MinimalSemanticSignal,
+    snapshot,
+    context: dict[str, Any],
+) -> bool:
+    if snapshot is None or signal.intent != "explain":
+        return False
+    if _extract_explicit_paths(request):
+        return False
+    if signal.use_context and context.get("artifacts"):
+        return False
+    normalized = str(request or "").strip()
+    if len(normalized) < 320:
+        return False
+    clause_count = len(
+        [
+            segment
+            for segment in re.split(r"(?:\n+|[;?])", normalized)
+            if len(segment.strip()) >= 24
+        ]
+    )
+    enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", normalized))
+    scope_tokens = {
+        token
+        for token in infer_scope_tokens(normalized)
+        if len(token) >= 4
+    }
+    requested_symbols = _requested_symbol_candidates(normalized)
+    return (
+        enumerated_sections >= 3
+        or (clause_count >= 4 and len(scope_tokens) >= 6)
+        or (len(requested_symbols) >= 2 and clause_count >= 3)
+    )
+
+
 def _requested_symbol_candidates(text: str) -> list[str]:
     source = str(text or "")
     requested: list[str] = []
@@ -1089,6 +1150,8 @@ def _unresolved_explicit_snapshot_symbols(
     if snapshot is None:
         return []
     if _extract_explicit_paths(request):
+        return []
+    if signal.intent in {"explain", "search", "plan", "validate"}:
         return []
     if signal.use_context and context.get("artifacts"):
         return []

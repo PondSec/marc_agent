@@ -8,8 +8,14 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from agent.prompts import task_state_system_prompt, task_state_update_prompt
-from agent.semantic_defaults import classify_conversation_request
+from agent.prompts import (
+    REQUEST_MEMORY_STATE_CHAR_BUDGET,
+    build_request_digest,
+    build_request_memory_packet,
+    task_state_system_prompt,
+    task_state_update_prompt,
+)
+from agent.semantic_defaults import classify_conversation_request, is_structured_repository_analysis_request
 from agent.semantic_guardrails import _extract_explicit_paths, build_minimal_task_state
 from agent.semantic_runtime import (
     annotate_semantic_record,
@@ -97,6 +103,36 @@ class TaskStateUpdater:
                 ),
             )
             self._log("task_state_updated", task_state=local_state.model_dump(), source="local_short_circuit")
+            return local_state
+        if self._should_use_local_analysis_bootstrap(session=session, state=local_state):
+            self._log(
+                "task_state_local_short_circuit",
+                strategy="deterministic_fallback",
+                reason="structured_repository_analysis",
+            )
+            self._append_runtime_execution(
+                session,
+                annotate_semantic_record(
+                    build_execution_run_record(
+                        operation_name="task_state_generation",
+                        task_class="task_state_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_d",
+                        recovery_strategy="deterministic_fallback",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=0,
+                        validation_possible=False,
+                        summary=(
+                            "Task understanding used deterministic request-digest and repo-aware local inference "
+                            "for a large structured repository analysis request."
+                        ),
+                        attempts=[],
+                    ),
+                    semantic_resolution="minimal_inference",
+                ),
+            )
+            self._log("task_state_updated", task_state=local_state.model_dump(), source="local_structured_analysis")
             return local_state
         if self._should_short_circuit_with_local_state(
             initial_mode=initial_mode,
@@ -190,6 +226,7 @@ class TaskStateUpdater:
             payload = outcome.value
             try:
                 state = TaskState.model_validate(payload)
+                state.latest_user_turn = str(user_input or "").strip() or state.latest_user_turn
                 reconcile_reason = self._local_reconciliation_reason(state, local_state)
                 if reconcile_reason is not None:
                     self._reconcile_with_local_state(
@@ -205,7 +242,7 @@ class TaskStateUpdater:
                         local_intent=local_state.current_user_intent,
                         local_strategy=local_state.execution_strategy,
                     )
-                state = self._finalize_state(state, semantic_resolution="full_model")
+                state = self._finalize_state(state, semantic_resolution="full_model", snapshot=snapshot)
             except ValidationError as exc:
                 self._log(
                     "task_state_validation_failed",
@@ -344,6 +381,7 @@ class TaskStateUpdater:
                 )
                 try:
                     state = TaskState.model_validate(payload)
+                    state.latest_user_turn = str(user_input or "").strip() or state.latest_user_turn
                     reconcile_reason = self._local_reconciliation_reason(state, local_state)
                     if reconcile_reason is not None:
                         self._reconcile_with_local_state(
@@ -359,7 +397,7 @@ class TaskStateUpdater:
                             local_intent=local_state.current_user_intent,
                             local_strategy=local_state.execution_strategy,
                         )
-                    state = self._finalize_state(state, semantic_resolution=resolution)
+                    state = self._finalize_state(state, semantic_resolution=resolution, snapshot=snapshot)
                 except ValidationError as exc:
                     self._log(
                         "task_state_validation_failed",
@@ -402,6 +440,31 @@ class TaskStateUpdater:
 
         self._log("task_state_fallback", error=str(outcome.exception), payload=payload or {})
         if a2_semantic_mode or strict_semantic_execution:
+            if self._should_use_local_analysis_bootstrap(session=session, state=local_state):
+                self._append_runtime_execution(
+                    session,
+                    annotate_semantic_record(
+                        build_execution_run_record(
+                            operation_name="task_state_generation",
+                            task_class="task_state_generation",
+                            final_state="degraded_success",
+                            capability_tier="tier_d",
+                            recovery_strategy="deterministic_fallback",
+                            degraded=True,
+                            honest_blocked=False,
+                            artifact_bytes_generated=0,
+                            validation_possible=False,
+                            summary=(
+                                "Structured repository analysis fell back to deterministic request-digest "
+                                "and repo-aware local inference after semantic recovery exhausted."
+                            ),
+                            attempts=attempts,
+                        ),
+                        semantic_resolution="minimal_inference",
+                    ),
+                )
+                self._log("task_state_updated", task_state=local_state.model_dump(), source="analysis_fallback")
+                return local_state
             state = self._blocked_state_for_missing_semantics(user_input, local_state)
             self._append_runtime_execution(
                 session,
@@ -463,12 +526,52 @@ class TaskStateUpdater:
         return "compact"
 
     def _fallback_state(self, user_input: str, *, snapshot=None, session=None) -> TaskState:
-        return build_minimal_task_state(
+        state = build_minimal_task_state(
             user_input,
             session=session,
             snapshot=snapshot,
             semantic_resolution="minimal_inference",
         )
+        state = self._finalize_state(state, semantic_resolution="minimal_inference", snapshot=snapshot)
+        return self._compact_large_request_fallback_state(state)
+
+    def _compact_large_request_fallback_state(self, state: TaskState) -> TaskState:
+        request_focus = next(
+            (
+                str(item or "").strip()
+                for item in [*state.request_chunks, *state.request_requirements, state.request_excerpt]
+                if str(item or "").strip()
+            ),
+            "",
+        )
+        if not request_focus:
+            return state
+        if len(str(state.root_goal or "").strip()) > 220:
+            state.root_goal = self._trim_compact_goal(request_focus, limit=220)
+        if len(str(state.active_goal or "").strip()) > 220:
+            state.active_goal = self._trim_compact_goal(
+                self._fallback_active_goal_text(state, request_focus),
+                limit=220,
+            )
+        if len(str(state.output_expectation or "").strip()) > 220:
+            state.output_expectation = self._trim_compact_goal(state.output_expectation, limit=220)
+        return state
+
+    def _fallback_active_goal_text(self, state: TaskState, request_focus: str) -> str:
+        intent = str(state.current_user_intent or "").strip()
+        if intent in ANALYSIS_LIKE_INTENTS:
+            return f"Grounded analysis focus: {request_focus}"
+        if intent in MUTATION_LIKE_INTENTS:
+            return f"Focused implementation scope: {request_focus}"
+        return request_focus
+
+    def _trim_compact_goal(self, text: str, *, limit: int) -> str:
+        normalized = " ".join(str(text or "").split()).strip()
+        if len(normalized) <= limit:
+            return normalized
+        if limit <= 1:
+            return normalized[:limit]
+        return normalized[: limit - 1].rstrip() + "…"
 
     def _reconcile_with_local_state(
         self,
@@ -786,6 +889,8 @@ class TaskStateUpdater:
             return False
         if self._requires_semantic_model_execution(session, state):
             return False
+        if self._requires_structured_repository_analysis(state):
+            return False
         if initial_mode != "compact":
             return False
         config = getattr(self.llm, "config", None)
@@ -798,6 +903,26 @@ class TaskStateUpdater:
         if state.needs_clarification or state.ambiguity_level == "high":
             return False
         return float(state.confidence or 0.0) >= 0.65
+
+    def _should_use_local_analysis_bootstrap(self, *, session, state: TaskState) -> bool:
+        if state.needs_clarification or state.ambiguity_level == "high":
+            return False
+        if self._requires_semantic_model_execution(session, state):
+            return False
+        if not self._requires_structured_repository_analysis(state):
+            return False
+        intent = str(state.current_user_intent or "").strip()
+        action = str(state.next_best_action or state.next_action or "").strip()
+        return intent in ANALYSIS_LIKE_INTENTS or action in ANALYSIS_LIKE_ACTIONS
+
+    def _requires_structured_repository_analysis(self, state: TaskState) -> bool:
+        return is_structured_repository_analysis_request(
+            latest_user_turn=state.latest_user_turn,
+            current_user_intent=state.current_user_intent,
+            next_action=state.next_best_action or state.next_action,
+            request_requirements=state.request_requirements,
+            request_chunks=state.request_chunks,
+        )
 
     def _should_short_circuit_direct_chat(
         self,
@@ -961,8 +1086,33 @@ class TaskStateUpdater:
         session.runtime_executions.append(record)
         session.runtime_executions = session.runtime_executions[-20:]
 
-    def _finalize_state(self, state: TaskState, *, semantic_resolution: str) -> TaskState:
+    def _finalize_state(self, state: TaskState, *, semantic_resolution: str, snapshot=None) -> TaskState:
         self._ground_explicit_request_paths(state)
+        request_digest = build_request_digest(
+            state.latest_user_turn,
+            snapshot=snapshot,
+            max_chars=REQUEST_MEMORY_STATE_CHAR_BUDGET,
+            max_items=12,
+        )
+        state.request_digest = request_digest if request_digest.has_signal() else None
+        request_memory_packet = build_request_memory_packet(
+            state.latest_user_turn,
+            snapshot=snapshot,
+            max_chars=REQUEST_MEMORY_STATE_CHAR_BUDGET,
+            max_items=12,
+            max_chunks=5,
+        )
+        state.request_excerpt = str(request_memory_packet.get("request_excerpt") or "").strip() or None
+        state.request_requirements = [
+            str(item).strip()
+            for item in list(request_memory_packet.get("requirements", []))
+            if str(item).strip()
+        ][:10]
+        state.request_chunks = [
+            str(item).strip()
+            for item in list(request_memory_packet.get("requirement_chunks", []))
+            if str(item).strip()
+        ][:5]
         state.semantic_resolution = semantic_resolution
         state.secondary_semantics_limited = secondary_semantics_limited(semantic_resolution)
         state.semantic_inference_mode = "conservative" if semantic_resolution == "minimal_inference" else "full"

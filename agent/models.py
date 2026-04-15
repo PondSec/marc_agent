@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent.task_state import TaskState
+from agent.task_state import RequestDigest, TaskState
 from agent.task_schema import TaskUnderstanding
 from llm.schemas import RouterOutput
 
@@ -281,6 +281,10 @@ class WorkingMemoryEntry(MemoryEntryBase):
     current_subtask: str | None = None
     primary_target: str | None = None
     verification_target: str | None = None
+    request_excerpt: str | None = None
+    request_requirements: list[str] = Field(default_factory=list)
+    request_chunks: list[str] = Field(default_factory=list)
+    request_digest: RequestDigest | None = None
     active_constraints: list[str] = Field(default_factory=list)
     active_failure_signature: str | None = None
     recent_attempts: list[str] = Field(default_factory=list)
@@ -317,6 +321,8 @@ class ProjectMemoryEntry(MemoryEntryBase):
     common_file_relationships: list[str] = Field(default_factory=list)
     test_mappings: list[str] = Field(default_factory=list)
     symbol_index: dict[str, list[str]] = Field(default_factory=dict)
+    file_relationships: dict[str, list[str]] = Field(default_factory=dict)
+    module_summaries: dict[str, str] = Field(default_factory=dict)
     architecture_notes: list[str] = Field(default_factory=list)
     known_hotspots: list[str] = Field(default_factory=list)
     conventions: list[str] = Field(default_factory=list)
@@ -339,6 +345,13 @@ class FailureMemoryEntry(MemoryEntryBase):
     last_result: str | None = None
 
 
+class RememberedFact(StrictModel):
+    subject: Literal["user", "assistant"]
+    attribute: str
+    value: str
+    summary: str
+
+
 class ConversationMemoryEntry(MemoryEntryBase):
     memory_type: Literal["conversation"] = "conversation"
     request_summary: str
@@ -347,6 +360,7 @@ class ConversationMemoryEntry(MemoryEntryBase):
     decision_notes: list[str] = Field(default_factory=list)
     implemented_features: list[str] = Field(default_factory=list)
     referenced_sessions: list[str] = Field(default_factory=list)
+    remembered_facts: list[RememberedFact] = Field(default_factory=list)
 
 
 class RetrievedMemoryItem(StrictModel):
@@ -385,6 +399,8 @@ class RetrievalRequest(StrictModel):
     project_id: str | None = None
     workspace_root: str | None = None
     session_id: str | None = None
+    recall_subject: Literal["user", "assistant"] | None = None
+    recall_attributes: list[str] = Field(default_factory=list)
     target_paths: list[str] = Field(default_factory=list)
     symbol_names: list[str] = Field(default_factory=list)
     error_terms: list[str] = Field(default_factory=list)
@@ -459,6 +475,9 @@ class WorkspaceSnapshot(StrictModel):
     service_files: list[str] = Field(default_factory=list)
     import_hotspots: list[str] = Field(default_factory=list)
     symbol_index: dict[str, list[str]] = Field(default_factory=dict)
+    file_relationships: dict[str, list[str]] = Field(default_factory=dict)
+    module_summaries: dict[str, str] = Field(default_factory=dict)
+    subsystem_summaries: dict[str, str] = Field(default_factory=dict)
     project_labels: list[str] = Field(default_factory=list)
     likely_commands: list[str] = Field(default_factory=list)
     validation_commands: list[ValidationCommand] = Field(default_factory=list)

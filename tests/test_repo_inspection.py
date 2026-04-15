@@ -167,3 +167,34 @@ def test_repo_snapshot_collects_service_files_and_symbols_for_repo_map(tmp_path)
     assert "app/router.py" in snapshot.service_files
     assert "app/service.py" in snapshot.service_files
     assert snapshot.symbol_index["app/service.py"][:2] == ["AuthService", "fetch_user"]
+    assert "app/service.py" in snapshot.file_relationships["app/router.py"]
+    assert "AuthService" in snapshot.module_summaries["app/service.py"]
+    assert "app" in snapshot.subsystem_summaries
+
+
+def test_repo_snapshot_focus_matches_late_repo_specific_terms_from_large_prompt(tmp_path):
+    (tmp_path / "agent").mkdir()
+    (tmp_path / "server").mkdir()
+    (tmp_path / "agent" / "planner.py").write_text("def plan():\n    return 'ok'\n", encoding="utf-8")
+    (tmp_path / "agent" / "prompts.py").write_text("def build_prompt():\n    return 'prompt'\n", encoding="utf-8")
+    (tmp_path / "agent" / "layered_memory.py").write_text("class LayeredMemory:\n    pass\n", encoding="utf-8")
+    (tmp_path / "agent" / "task_state.py").write_text("class TaskState:\n    pass\n", encoding="utf-8")
+    (tmp_path / "server" / "app.py").write_text("def create_app():\n    return object()\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    memory = RepoMemoryStore(config, WorkspaceManager(tmp_path))
+
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Ich moechte eine Architektur-Zusammenfassung, die spaete Anforderungen nicht verliert. "
+        "Erklaere danach planner, prompts, layered_memory, task_state und server."
+    )
+    snapshot = memory.build_snapshot(prompt)
+
+    assert "agent/planner.py" in snapshot.focus_files
+    assert "agent/prompts.py" in snapshot.focus_files
+    assert "agent/layered_memory.py" in snapshot.focus_files
+    assert "agent/task_state.py" in snapshot.focus_files
+    assert "server/app.py" in snapshot.focus_files

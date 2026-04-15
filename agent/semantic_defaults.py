@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from agent.local_nlp import classify_fallback_intent
 
@@ -254,6 +254,14 @@ _PROBLEM_REPORT_TOKENS = (
     "warning",
 )
 
+_NEGATED_PROBLEM_CONSTRAINT_PATTERNS = (
+    re.compile(
+        r"\b(?:kein|keine|keinen|keinem|keiner|ohne|no|not)\s+"
+        r"(?:[a-z0-9_äöüß-]+\s+){0,3}"
+        r"(?:bug|bugs|broken|crash(?:es)?|error(?:s)?|exception(?:s)?|fail(?:ed|ing|s)?|fehler|kaputt[a-z0-9_äöüß-]*|problem(?:e|s)?)\b"
+    ),
+)
+
 _DEBUG_REQUEST_TOKENS = (
     "beheb",
     "debug",
@@ -343,12 +351,23 @@ _BACKEND_SCOPE_TOKENS = (
 
 _FRONTEND_SCOPE_TOKENS = (
     "client only",
-    "frontend",
     "frontend only",
     "nur frontend",
     "nur im frontend",
     "only frontend",
     "ui only",
+)
+
+_BACKEND_SCOPE_PATTERNS = (
+    re.compile(r"\b(?:backend|server|api)\s+only\b"),
+    re.compile(r"\bonly\s+(?:the\s+)?(?:backend|server|api)\b"),
+    re.compile(r"\b(?:nur|just|lediglich|ausschliesslich|ausschließlich)\s+(?:im\s+|den\s+|das\s+)?(?:backend|server)\b"),
+)
+
+_FRONTEND_SCOPE_PATTERNS = (
+    re.compile(r"\b(?:frontend|client|ui)\s+only\b"),
+    re.compile(r"\bonly\s+(?:the\s+)?(?:frontend|client|ui)\b"),
+    re.compile(r"\b(?:nur|just|lediglich|ausschliesslich|ausschließlich)\s+(?:im\s+|das\s+|die\s+)?(?:frontend|client|ui)\b"),
 )
 
 _QUESTION_WORD_TOKENS = (
@@ -598,6 +617,104 @@ def infer_scope_tokens(*texts: str | None) -> list[str]:
     return tokens
 
 
+def prioritized_focus_terms(
+    *texts: str | None,
+    max_terms: int = 12,
+    reference_terms: set[str] | None = None,
+) -> list[str]:
+    normalized = " ".join(normalize_text(text or "") for text in texts if text)
+    if not normalized:
+        return []
+    segments = [
+        infer_scope_tokens(segment)
+        for segment in re.split(r"(?:\n+|;|(?<=[.!?])\s+)", normalized)
+        if str(segment or "").strip()
+    ]
+    global_terms = infer_scope_tokens(normalized)
+    normalized_reference_terms = {
+        token
+        for item in (reference_terms or set())
+        for token in _text_tokens(normalize_text(item))
+        if token
+    }
+    ordered: list[str] = []
+
+    def add(term: str) -> None:
+        token = str(term or "").strip()
+        if not token or token in ordered:
+            return
+        ordered.append(token)
+
+    for segment_terms in segments:
+        for term in segment_terms:
+            if term in normalized_reference_terms and _looks_like_specific_focus_term(term):
+                add(term)
+    for segment_terms in segments:
+        for term in segment_terms:
+            if term in normalized_reference_terms:
+                add(term)
+    for segment_terms in segments:
+        for term in segment_terms:
+            if _looks_like_specific_focus_term(term):
+                add(term)
+    for segment_terms in segments:
+        informative = [
+            term
+            for term in segment_terms
+            if term in normalized_reference_terms or len(term) >= 8
+        ]
+        for term in informative[:3]:
+            add(term)
+        for term in informative[-2:]:
+            add(term)
+    tail_window = global_terms[-max(max_terms * 2, 12):]
+    for term in tail_window:
+        add(term)
+    for term in global_terms:
+        add(term)
+    return ordered[:max_terms]
+
+
+def is_structured_repository_analysis_request(
+    *,
+    latest_user_turn: str | None,
+    current_user_intent: str | None,
+    next_action: str | None,
+    request_requirements: Sequence[str] | None = None,
+    request_chunks: Sequence[str] | None = None,
+) -> bool:
+    intent = str(current_user_intent or "").strip().lower()
+    action = str(next_action or "").strip().lower()
+    if intent not in {"explain", "inspect", "search", "plan", "validate"} and action not in {
+        "inspect",
+        "search",
+        "explain",
+        "plan",
+        "test",
+    }:
+        return False
+    request = str(latest_user_turn or "").strip()
+    if len(request) < 320:
+        return False
+    requirement_count = sum(1 for item in (request_requirements or []) if str(item or "").strip())
+    chunk_count = sum(1 for item in (request_chunks or []) if str(item or "").strip())
+    enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
+    question_count = request.count("?")
+    return (
+        chunk_count >= 4
+        or requirement_count >= 6
+        or enumerated_sections >= 3
+        or (question_count >= 3 and requirement_count >= 4)
+    )
+
+
+def _looks_like_specific_focus_term(term: str) -> bool:
+    token = str(term or "").strip()
+    if not token:
+        return False
+    return any(char in token for char in {"_", ".", "/"}) or len(token) >= 12
+
+
 def infer_artifact_name_hint(*texts: str | None) -> str | None:
     normalized = " ".join(normalize_text(text or "") for text in texts if text)
     if not normalized:
@@ -690,7 +807,12 @@ def looks_like_additive_request(text: str) -> bool:
 
 def looks_like_problem_report(text: str) -> bool:
     normalized = normalize_text(text)
-    return bool(normalized) and any(token in normalized for token in _PROBLEM_REPORT_TOKENS)
+    if not normalized:
+        return False
+    scrubbed = normalized
+    for pattern in _NEGATED_PROBLEM_CONSTRAINT_PATTERNS:
+        scrubbed = pattern.sub(" ", scrubbed)
+    return any(token in scrubbed for token in _PROBLEM_REPORT_TOKENS)
 
 
 def looks_like_debug_request(text: str) -> bool:
@@ -837,22 +959,24 @@ def looks_like_scope_narrowing_request(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
-    narrowing_markers = ("nur", "only", "just", "lediglich", "ausschliesslich", "ausschließlich")
-    has_narrowing = any(marker in normalized for marker in narrowing_markers)
-    return has_narrowing and (
-        any(token in normalized for token in _BACKEND_SCOPE_TOKENS)
-        or any(token in normalized for token in _FRONTEND_SCOPE_TOKENS)
+    return _has_explicit_scope_constraint(normalized, _BACKEND_SCOPE_PATTERNS) or _has_explicit_scope_constraint(
+        normalized,
+        _FRONTEND_SCOPE_PATTERNS,
     )
 
 
 def extract_scope_constraints(text: str) -> list[str]:
     normalized = normalize_text(text)
     constraints: list[str] = []
-    if any(token in normalized for token in _BACKEND_SCOPE_TOKENS):
+    if _has_explicit_scope_constraint(normalized, _BACKEND_SCOPE_PATTERNS):
         constraints.append("Backend only.")
-    if any(token in normalized for token in _FRONTEND_SCOPE_TOKENS):
+    if _has_explicit_scope_constraint(normalized, _FRONTEND_SCOPE_PATTERNS):
         constraints.append("Frontend only.")
     return constraints[:2]
+
+
+def _has_explicit_scope_constraint(normalized: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return any(pattern.search(normalized) for pattern in patterns)
 
 
 def is_structural_follow_up_request(

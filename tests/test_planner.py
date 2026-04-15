@@ -44,14 +44,14 @@ from agent.prompts import (
     generate_content_retry_prompt,
     proposed_update_review_prompt,
 )
-from agent.task_schema import TaskArtifact
+from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
 from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 from agent.memory import RepoMemoryStore
 from agent.decision import ExecutionDecisionPolicy
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
-from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure
+from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure, estimate_context_pressure
 from llm.schemas import AgentActionType, AgentDecision, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
 from runtime.workspace import WorkspaceManager
@@ -649,6 +649,362 @@ def test_final_response_prompt_uses_focused_grounding_rules_for_read_only_file_e
     assert "DATABASE = 'inventory.db'" in prompt
     assert '"memory_context"' not in prompt
     assert "generischen Repository-Ueberblick" in prompt
+
+
+def test_final_response_prompt_uses_structured_architecture_report_for_large_analysis_requests(tmp_path):
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="inspect",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "inspect_workspace",
+                    "reason": "Collect repository context before summarizing.",
+                },
+                {
+                    "step": 2,
+                    "action": "read_relevant_files",
+                    "reason": "Read the strongest implementation files before summarizing.",
+                },
+                {
+                    "step": 3,
+                    "action": "summarize_result",
+                    "reason": "Return the grounded architecture summary.",
+                },
+            ],
+            requested_outcome="Analysiere Systemtyp, Datenfluss, Memory, Repo-Mapping, grosse Prompts und Risiken.",
+        )
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp 2. Rollen 3. Memory 4. Repo-Mapping 5. grosse Prompts 6. Risiken. "
+            "Nenne Dateipfade und sag klar, wenn etwas nicht bestaetigt ist."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+        task_state=TaskState(
+            latest_user_turn=(
+                "Analysiere dieses Projekt gruendlich und belastbar. "
+                "1. Systemtyp 2. Rollen 3. Memory 4. Repo-Mapping 5. grosse Prompts 6. Risiken. "
+                "Nenne Dateipfade und sag klar, wenn etwas nicht bestaetigt ist."
+            ),
+            root_goal="Analysiere das Projekt belastbar.",
+            active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+            goal_relation="new_task",
+            output_expectation=(
+                "Inspect the relevant repository areas, then answer each requested point with concrete file paths, "
+                "visible symbols or flows when available, and explicit uncertainty for anything not found."
+            ),
+            current_user_intent="explain",
+            execution_strategy="validation_inspection",
+            target_artifacts=[],
+            active_artifacts=[],
+            evidence=[],
+            relevant_context=[],
+            constraints=[],
+            assumptions=[],
+            missing_info=[],
+            ambiguity_level="low",
+            risk_level="low",
+            confidence=0.88,
+            next_action="inspect",
+            next_best_action="inspect",
+            request_requirements=[
+                "Systemtyp",
+                "Rollen",
+                "Memory",
+                "Repo-Mapping",
+                "grosse Prompts",
+                "Risiken",
+            ],
+            request_chunks=[
+                "Systemtyp; Rollen; Memory",
+                "Repo-Mapping; grosse Prompts; Risiken",
+                "Nenne Dateipfade",
+                "Sag klar, wenn etwas nicht bestaetigt ist",
+            ],
+            execution_outline=[
+                "Inspect the repository structure first.",
+                "Read the strongest implementation files.",
+                "Answer each requested point with grounded evidence.",
+            ],
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="inspect_workspace",
+                tool_args={"focus": session.task},
+                success=True,
+                summary="Inspected workspace.",
+                phase="exploring",
+                output_excerpt="Repo map:\n- app/\n- tests/\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "app/main.py"},
+                success=True,
+                summary="Read app/main.py.",
+                phase="exploring",
+                output_excerpt="def main():\n    return run_server()\n",
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "tests/test_main.py"},
+                success=True,
+                summary="Read tests/test_main.py.",
+                phase="exploring",
+                output_excerpt="def test_main():\n    assert main() is not None\n",
+            ),
+        ]
+    )
+
+    prompt = final_response_prompt(route, session)
+
+    assert "Beantworte die Teilfragen des Nutzers in derselben Reihenfolge." in prompt
+    assert '"request_requirements": ["Systemtyp", "Rollen", "Memory", "Repo-Mapping"' in prompt
+    assert '"workspace_repo_map":' in prompt
+    assert '"inspection_evidence": [{"path": "app/main.py"' in prompt
+    assert "direkt sichtbar, indirekt ableitbar und im gelesenen Kontext nicht bestaetigt" in prompt
+
+
+def test_large_structured_analysis_read_candidates_prioritize_requested_implementation_files(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    payload = route_payload(
+        intent="inspect",
+        action_plan=[
+            {"step": 1, "action": "inspect_workspace", "reason": "Collect repository context before summarizing."},
+            {"step": 2, "action": "read_relevant_files", "reason": "Read the strongest implementation files before summarizing."},
+            {"step": 3, "action": "summarize_result", "reason": "Return the grounded architecture summary."},
+        ],
+        requested_outcome="Analysiere planner, prompts, layered_memory, task_state, state_updater, server und grosse Prompts.",
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp 2. planner 3. prompts 4. layered_memory 5. task_state 6. state_updater 7. server "
+            "8. grosse Prompts 9. Risiken. Nenne Dateipfade und bleibe geerdet. "
+            "Ich will ausserdem, dass spaete Anforderungen nicht verloren gehen, dass du Request-Digests, "
+            "Request-Memory und kompakte Generationsprompts sauber beruecksichtigst und klar markierst, "
+            "was direkt sichtbar, nur indirekt ableitbar oder nicht bestaetigt ist."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=24,
+            language_counts={"python": 20, "markdown": 2},
+            top_directories=["agent", "server", "tests"],
+            important_files=["server/app.py", "README.md", "agent/planner.py", "agent/prompts.py"],
+            focus_files=["agent/layered_memory.py", "agent/planner.py", "agent/prompts.py", "agent/state_updater.py", "agent/task_state.py", "server/app.py"],
+            file_briefs={},
+            manifests=["README.md"],
+            configs=[],
+            test_files=["tests/test_layered_memory.py", "tests/test_planner.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["server/app.py"],
+            repo_map=["agent/", "server/", "tests/"],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Local coding agent.",
+        ),
+    )
+    session.candidate_files = [
+        "agent/layered_memory.py",
+        "agent/memory.py",
+        "agent/planner.py",
+        "agent/prompts.py",
+        "agent/state_updater.py",
+        "agent/task_state.py",
+        "server/app.py",
+        "README.md",
+        "deploy/appliance/README.md",
+        "ollama_usb_staging/qwen3_coder_30b/README.txt",
+        "tests/test_layered_memory.py",
+        "tests/test_planner.py",
+    ]
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="Answer each requested point with concrete file paths and grounded evidence.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        target_artifacts=[],
+        active_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.84,
+        next_action="inspect",
+        next_best_action="inspect",
+        request_requirements=["Systemtyp", "planner", "prompts", "layered_memory", "task_state", "state_updater", "server", "grosse Prompts", "Risiken"],
+        request_chunks=[
+            "Systemtyp; planner; prompts",
+            "layered_memory; task_state; state_updater",
+            "server; grosse Prompts",
+            "Risiken; Dateipfade; geerdete Aussagen",
+        ],
+        execution_outline=[
+            "Inspect the repository structure first.",
+            "Read the strongest implementation files.",
+            "Answer each requested point with grounded evidence.",
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    route = planner.validate_router_output(payload)
+
+    candidates = planner._read_candidates(route, session, session.candidate_files)
+
+    assert candidates[:5] == [
+        "agent/layered_memory.py",
+        "agent/planner.py",
+        "agent/prompts.py",
+        "agent/state_updater.py",
+        "agent/task_state.py",
+    ]
+    assert {"server/app.py", "agent/memory.py"} <= set(candidates[:7])
+    assert "README.md" not in candidates[:7]
+    assert "tests/test_layered_memory.py" not in candidates[:7]
+    assert len(candidates) <= 8
+
+
+def test_large_structured_analysis_reaches_summary_once_focused_candidates_are_read(tmp_path):
+    llm = ScriptedLLM(text_payloads=["Zusammenfassung mit Belegen."])
+    planner = Planner(llm, "")
+    payload = route_payload(
+        intent="inspect",
+        action_plan=[
+            {"step": 1, "action": "inspect_workspace", "reason": "Collect repository context before summarizing."},
+            {"step": 2, "action": "read_relevant_files", "reason": "Read the strongest implementation files before summarizing."},
+            {"step": 3, "action": "summarize_result", "reason": "Return the grounded architecture summary."},
+        ],
+        requested_outcome="Analysiere planner, prompts, layered_memory, task_state, state_updater, server und grosse Prompts.",
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Systemtyp 2. planner 3. prompts 4. layered_memory 5. task_state 6. state_updater 7. server "
+            "8. grosse Prompts 9. Risiken. Nenne Dateipfade und bleibe geerdet. "
+            "Ich will ausserdem, dass spaete Anforderungen nicht verloren gehen, dass du Request-Digests, "
+            "Request-Memory und kompakte Generationsprompts sauber beruecksichtigst und klar markierst, "
+            "was direkt sichtbar, nur indirekt ableitbar oder nicht bestaetigt ist."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=24,
+            language_counts={"python": 20, "markdown": 2},
+            top_directories=["agent", "server", "tests"],
+            important_files=["server/app.py", "README.md", "agent/planner.py", "agent/prompts.py"],
+            focus_files=["agent/layered_memory.py", "agent/planner.py", "agent/prompts.py", "agent/state_updater.py", "agent/task_state.py", "server/app.py"],
+            file_briefs={},
+            manifests=["README.md"],
+            configs=[],
+            test_files=["tests/test_layered_memory.py", "tests/test_planner.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["server/app.py"],
+            repo_map=["agent/", "server/", "tests/"],
+            project_labels=["python"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Local coding agent.",
+        ),
+    )
+    session.candidate_files = [
+        "agent/layered_memory.py",
+        "agent/memory.py",
+        "agent/planner.py",
+        "agent/prompts.py",
+        "agent/state_updater.py",
+        "agent/task_state.py",
+        "server/app.py",
+        "README.md",
+        "tests/test_layered_memory.py",
+    ]
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="Answer each requested point with concrete file paths and grounded evidence.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        target_artifacts=[],
+        active_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.84,
+        next_action="inspect",
+        next_best_action="inspect",
+        request_requirements=["Systemtyp", "planner", "prompts", "layered_memory", "task_state", "state_updater", "server", "grosse Prompts", "Risiken"],
+        request_chunks=[
+            "Systemtyp; planner; prompts",
+            "layered_memory; task_state; state_updater",
+            "server; grosse Prompts",
+            "Risiken; Dateipfade; geerdete Aussagen",
+        ],
+        execution_outline=[
+            "Inspect the repository structure first.",
+            "Read the strongest implementation files.",
+            "Answer each requested point with grounded evidence.",
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    route = planner.validate_router_output(payload)
+    focused_candidates = planner._read_candidates(route, session, session.candidate_files)
+    session.router_result = route
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="inspect_workspace",
+            tool_args={"focus": session.task},
+            success=True,
+            summary="Inspected workspace.",
+            phase="exploring",
+            output_excerpt="Repo map:\n- agent/\n- server/\n- tests/\n",
+        )
+    )
+    for index, path in enumerate(focused_candidates, start=2):
+        session.tool_calls.append(
+            ToolCallRecord(
+                iteration=index,
+                tool_name="read_file",
+                tool_args={"path": path},
+                success=True,
+                summary=f"Read {path}.",
+                phase="exploring",
+                output_excerpt=f"# {path}\nvisible implementation\n",
+            )
+        )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert decision.final_response == "Zusammenfassung mit Belegen."
+    assert llm.generate_calls
 
 
 def test_final_response_num_ctx_scales_with_prompt_size(tmp_path):
@@ -3730,6 +4086,74 @@ def test_planner_surfaces_explicit_constraints_in_compact_generation_prompt(tmp_
     assert "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required." in prompt
 
 
+def test_compact_generation_prompt_keeps_late_large_request_requirements(tmp_path):
+    planner = Planner(ScriptedLLM(text_payloads=["<html></html>"]), "")
+    session = SessionState(
+        task=(
+            "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js.\n\n"
+            "Ziel:\n"
+            "Die Website soll nicht simpel oder leer wirken, sondern wie eine hochwertige moderne Demo-Seite mit viel Inhalt, Interaktion und gutem UX.\n\n"
+            "Anforderungen:\n"
+            "- Lege genau diese Dateien an: index.html, styles.css, script.js.\n"
+            "- Nutze nur Vanilla HTML, CSS und JavaScript.\n"
+            "- Keine Frameworks.\n"
+            "- Alles soll direkt lokal im Browser funktionieren.\n\n"
+            "Design:\n"
+            "- modernes, professionelles, hochwertiges UI\n"
+            "- umfangreiches Styling\n"
+            "- sauberes Layout mit mehreren klaren Sektionen\n"
+            "- starke Typografie, Karten, Hover-Effekte, Uebergaenge und kleine Animationen\n"
+            "- responsive fuer Desktop und Mobile\n\n"
+            "Inhalt / Aufbau:\n"
+            "- Hero-Bereich mit starkem Einstieg\n"
+            "- Feature- oder Service-Sektion\n"
+            "- interaktive Karten oder Elemente\n"
+            "- Galerie / Vorschau-Bereich\n"
+            "- Statistik- oder Fortschrittsbereich\n"
+            "- FAQ oder Info-Bereich\n"
+            "- Kontakt-/Formularbereich\n"
+            "- Navigation mit sauberem Scroll-Verhalten\n"
+            "- Footer\n\n"
+            "Interaktivitaet:\n"
+            "- Navigation mit smooth scrolling\n"
+            "- Filter- oder Suchfunktion fuer Inhalte/Karten\n"
+            "- anklickbare Elemente mit dynamischen Detailanzeigen\n"
+            "- Tabs, Accordion oder Modal\n"
+            "- kleine Animationen beim Scrollen\n"
+            "- Formular mit einfacher Frontend-Validierung\n"
+            "- dynamisches Nachladen oder Umschalten von Inhalten per JavaScript\n\n"
+            "Wichtig:\n"
+            "- Erzeuge direkt vollstaendigen funktionierenden Code.\n"
+            "- Die Website soll wie ein echtes kleines Produkt wirken und nicht wie ein leeres Template."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested bundle."},
+        ],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+    )
+    payload["entities"]["constraints"] = ["Nur Vanilla HTML, CSS und JavaScript verwenden."]
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert "Latest user request:" in prompt or "User request digest:" in prompt
+    assert "Request memory:" in prompt
+    assert "Formular mit einfacher Frontend-Validierung" in prompt
+    assert "dynamisches Nachladen oder Umschalten von Inhalten per JavaScript" in prompt
+
+
 def test_planner_extracts_user_literal_examples_into_file_scoped_focus(tmp_path):
     readme_path = tmp_path / "README.md"
     readme_path.write_text(
@@ -5189,6 +5613,210 @@ def test_generate_content_prompt_adds_copy_grounding_rule_for_web_repair_scripts
 
     assert "Ground any user-facing copy in the request and inspected context." in prompt
     assert "If the facts are not given, keep the wording generic" in prompt
+
+
+def test_generate_content_prompt_adds_shared_web_bundle_contract_for_explicit_html_bundle(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = empty_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["index.html"],
+            "important_files": ["index.html", "styles.css", "script.js"],
+            "focus_files": ["index.html", "styles.css", "script.js"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+            "repo_summary": "Small multi-file web workspace.",
+        }
+    )
+    session = SessionState(
+        task="Create index.html, styles.css, and script.js for a modern interactive landing page.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the explicit web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        mode="compact",
+    )
+
+    assert "Shared web bundle contract:" in prompt
+    assert "index.html" in prompt
+    assert "styles.css" in prompt
+    assert "script.js" in prompt
+    assert "include the requested companion asset references" in prompt
+
+
+def test_generate_content_prompt_keeps_shared_web_bundle_contract_in_compact_web_repair_prompt(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    html_path = tmp_path / "index.html"
+    html_path.write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"dialog-trigger\" type=\"button\">Mehr sehen</button>\n"
+            "      <dialog id=\"details-dialog\"></dialog>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    script_path = tmp_path / "script.js"
+    script_path.write_text("document.body.dataset.state = 'idle';\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text(".shell { display: grid; }\n", encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["index.html"],
+            "important_files": ["index.html", "script.js", "styles.css"],
+            "focus_files": ["script.js", "index.html", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+            "repo_summary": "Small multi-file web workspace.",
+        }
+    )
+    session = SessionState(
+        task="Repair the shared menu and dialog behavior across index.html, styles.css, and script.js.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="script.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="Verify the generated web artifact.")
+    repair_context = ValidationFailureEvidence(
+        command='internal:web_artifact:[{"path":"index.html","expected_features":["dialog"]}]',
+        verification_scope="semantic",
+        status="failed",
+        artifact_paths=["index.html", "styles.css", "script.js"],
+        summary="Structural web validation failed.",
+        excerpt="The shared dialog behavior is incomplete.",
+        failure_summary="Repair the shared HTML/CSS/JS contract so the dialog behavior is wired correctly.",
+        file_hints=["index.html", "styles.css", "script.js"],
+        repair_requirements=["Update script.js so the shared dialog contract can pass validation."],
+        repair_brief=RepairBrief(
+            failure_type="semantic_contract_mismatch",
+            failure_signature="semantic:web-contract:compact-repair-bundle-contract",
+            primary_target="script.js",
+            locked_target="script.js",
+            repair_constraints=["Keep the repair focused on the shared web contract."],
+            allowed_files=["script.js", "index.html", "styles.css"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=script_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Shared web bundle contract:" in prompt
+    assert "bind only to hooks that exist in the shared HTML" in prompt
+    assert "styles.css" in prompt
+
+
+def test_generate_content_retry_prompt_keeps_shared_web_bundle_contract_after_web_review_rejection(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    html_path = tmp_path / "index.html"
+    html_path.write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"dialog-trigger\" type=\"button\">Mehr sehen</button>\n"
+            "      <dialog id=\"details-dialog\"></dialog>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    script_path = tmp_path / "script.js"
+    script_path.write_text("document.body.dataset.state = 'idle';\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text(".shell { display: grid; }\n", encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["index.html"],
+            "important_files": ["index.html", "script.js", "styles.css"],
+            "focus_files": ["script.js", "index.html", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+            "repo_summary": "Small multi-file web workspace.",
+        }
+    )
+    session = SessionState(
+        task="Repair the shared menu and dialog behavior across index.html, styles.css, and script.js.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="script.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="Verify the generated web artifact.")
+    repair_context = ValidationFailureEvidence(
+        command='internal:web_artifact:[{"path":"index.html","expected_features":["dialog"]}]',
+        verification_scope="semantic",
+        status="failed",
+        artifact_paths=["index.html", "styles.css", "script.js"],
+        summary="Structural web validation failed.",
+        excerpt="The shared dialog behavior is incomplete.",
+        failure_summary="Repair the shared HTML/CSS/JS contract so the dialog behavior is wired correctly.",
+        file_hints=["index.html", "styles.css", "script.js"],
+        repair_requirements=["Update script.js so the shared dialog contract can pass validation."],
+        repair_brief=RepairBrief(
+            failure_type="semantic_contract_mismatch",
+            failure_signature="semantic:web-contract:retry-bundle-contract",
+            primary_target="script.js",
+            locked_target="script.js",
+            repair_constraints=["Keep the repair focused on the shared web contract."],
+            allowed_files=["script.js", "index.html", "styles.css"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The previous draft still drifted away from the shared HTML/CSS/JS contract.",
+        confidence=0.93,
+        blocking_issues=["The proposed script introduced UI state that is not represented in the shared HTML/CSS bundle."],
+        preservation_risks=[],
+        repair_hints=["Bind to the existing dialog hooks instead of inventing new ones."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=script_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Shared web bundle contract:" in prompt
+    assert "bind only to hooks that exist in the shared HTML" in prompt
+    assert "the companion targets index.html, styles.css" in prompt
 
 
 def test_artifact_scoped_focus_adds_test_contract_requirement_for_python_module(tmp_path):
@@ -13135,6 +13763,232 @@ def test_generate_content_prompt_keeps_callable_requirement_sentence_intact_for_
         in prompt
     )
     assert "wireMenuToggle(button; panel)" not in prompt
+
+
+def test_generate_content_prompt_compacts_large_request_context_only_when_needed(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    long_request = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Die Website soll nicht simpel oder leer wirken, sondern wie eine hochwertige Demo-Seite mit viel Inhalt, Interaktion und gutem UX. "
+        "Nutze nur Vanilla HTML, CSS und JavaScript, keine Frameworks, alles soll direkt lokal im Browser funktionieren. "
+        "Baue Hero, Feature-Sektion, interaktive Karten, Galerie, Statistikbereich, FAQ, Kontaktformular, Navigation und Footer. "
+        "Implementiere smooth scrolling, Filter oder Suche fuer Karten, anklickbare Detailanzeigen, Tabs oder Accordion, Modal, Scroll-Animationen, "
+        "Frontend-Validierung und dynamisches Umschalten von Inhalten. "
+        "Das UI soll hochwertig, responsive, stark typografisch und deutlich aufwendiger als ein einfaches Template wirken. "
+        "Gestalte mehrere klar getrennte Inhaltsbereiche mit starker Typografie, sauberen Abstaenden, Karten, Hover-Effekten, Micro-Animationen, "
+        "visuell markanten Buttons und einer glaubwuerdigen Produktpraesentation. "
+        "Die Seite soll mehrere Dinge gleichzeitig koennen: entdecken, filtern, anklicken, ausprobieren und Inhalte lebendig umschalten. "
+        "Baue ausserdem ein glaubwuerdiges Kontaktformular, dynamische Detailbereiche und eine Navigation mit sauberem Scroll-Verhalten und hochwertigen Uebergaengen."
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["index.html", "styles.css", "script.js"],
+            "focus_files": ["index.html", "styles.css", "script.js"],
+            "entrypoints": ["index.html", "script.js"],
+            "language_counts": {"html": 1, "css": 1, "javascript": 1},
+            "project_labels": ["frontend", "website"],
+            "repo_summary": "Small frontend workspace with a coordinated HTML, CSS, and JavaScript bundle.",
+        }
+    )
+    session = SessionState(
+        task=long_request,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Build the requested web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome=long_request,
+    )
+    payload["user_goal"] = long_request
+    commit_task_state_and_route(planner, session, payload, verification_target="Open index.html in a browser and verify the interactions.")
+    session.task_understanding = TaskUnderstanding(
+        original_request=long_request,
+        interpreted_goal="Build a high-end interactive demo website as a coordinated HTML/CSS/JS bundle.",
+        intent_category="build",
+        conversation_relation="new_task",
+        constraints=[
+            "Use only Vanilla HTML, CSS, and JavaScript.",
+            "Keep the bundle responsive for desktop and mobile.",
+            "Include rich content sections plus interactive UI elements.",
+        ],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.92,
+        recommended_mode="modify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Define the shared HTML structure and hooks", action_hint="modify"),
+            TaskPlanStep(step=2, summary="Style the coordinated sections and states", action_hint="modify"),
+            TaskPlanStep(step=3, summary="Wire the interactive behaviors in JavaScript", action_hint="modify"),
+        ],
+    )
+    (tmp_path / "index.html").write_text("<main>Old</main>\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: Arial; }\n", encoding="utf-8")
+    (tmp_path / "script.js").write_text("console.log('old');\n", encoding="utf-8")
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Read index.html.",
+                output_excerpt="<main>Old</main>\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Read styles.css.",
+                output_excerpt="body { font-family: Arial; }\n",
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "script.js"},
+                success=True,
+                summary="Read script.js.",
+                output_excerpt="console.log('old');\n",
+            ),
+        ]
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=(tmp_path / "index.html").read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "Generation brief:" in prompt
+    assert "Request memory:" in prompt
+    assert "User goal:" not in prompt
+    assert "Requested outcome:" not in prompt
+    assert "other_pending_requirements" not in prompt
+    assert "Kontaktformular" in prompt
+    assert estimate_context_pressure(prompt_chars=len(prompt)) == "low"
+
+
+def test_generate_content_retry_prompt_compacts_large_request_context_only_when_needed(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    long_request = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Die Seite soll wie ein kleines Produkt wirken, mit starkem Hero, mehreren Sektionen, Karten, Galerie, FAQ, Kontakt und echter Interaktivitaet. "
+        "Nutze nur Vanilla HTML, CSS und JavaScript, halte alles lokal lauffaehig und responsive, und baue Filter, Modal oder Tabs, Scroll-Verhalten und Formular-Validierung ein. "
+        "Das Layout soll hochwertig wirken, viele nutzbare Oberflaechenelemente zeigen und nicht wie ein leeres Template aussehen. "
+        "Baue mehrere Inhaltszonen, dynamische Karten, anklickbare Detailansichten, Animationen beim Scrollen und eine starke visuelle Hierarchie mit echter Demo-Produktwirkung. "
+        "Erzeuge ausserdem mehrere klar gegliederte Inhaltsbereiche mit Hero, Services, Galerie, Statistik, FAQ, Kontaktformular und Footer, "
+        "plus Hover-Effekte, hochwertige Buttons, starke Typografie und kleine Animationen, damit die Seite wirklich wie ein hochwertiges Produkt wirkt. "
+        "Achte zusaetzlich darauf, dass der Nutzer auf der Seite viel sehen, ausprobieren und entdecken kann, inklusive sinnvoller Dynamik, klarer Interaktionslogik, "
+        "sichtbaren Zustandswechseln und einem insgesamt glaubwuerdigen UX-Fluss ueber alle Bereiche hinweg. "
+        "Die Seite soll in Summe deutlich naeher an einer hochwertigen Produktdemo als an einem simplen Template oder einer leeren Standardseite liegen."
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["index.html", "styles.css", "script.js"],
+            "focus_files": ["index.html", "styles.css", "script.js"],
+            "entrypoints": ["index.html", "script.js"],
+            "language_counts": {"html": 1, "css": 1, "javascript": 1},
+            "project_labels": ["frontend", "website"],
+            "repo_summary": "Small frontend workspace with a coordinated HTML, CSS, and JavaScript bundle.",
+        }
+    )
+    session = SessionState(
+        task=long_request,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Build the requested web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome=long_request,
+    )
+    payload["user_goal"] = long_request
+    commit_task_state_and_route(planner, session, payload, verification_target="Open index.html in a browser and verify the interactions.")
+    session.task_understanding = TaskUnderstanding(
+        original_request=long_request,
+        interpreted_goal="Build a coordinated demo website bundle with strong visuals and interactive frontend behavior.",
+        intent_category="build",
+        conversation_relation="new_task",
+        constraints=[
+            "Use only Vanilla HTML, CSS, and JavaScript.",
+            "Keep the bundle responsive for desktop and mobile.",
+            "Include interactive discovery elements and form validation.",
+        ],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.91,
+        recommended_mode="modify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Keep the HTML, CSS, and JS contract aligned", action_hint="modify"),
+            TaskPlanStep(step=2, summary="Ship the interactive sections and behaviors", action_hint="modify"),
+        ],
+    )
+    (tmp_path / "index.html").write_text("<main>Old</main>\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: Arial; }\n", encoding="utf-8")
+    (tmp_path / "script.js").write_text("console.log('old');\n", encoding="utf-8")
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=(tmp_path / "index.html").read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "Generation brief:" in prompt
+    assert "User goal:" not in prompt
+    assert "Requested outcome:" not in prompt
+    assert "other_pending_requirements" not in prompt
+    assert estimate_context_pressure(prompt_chars=len(prompt)) == "low"
+
+
+def test_generate_content_prompt_keeps_standard_compact_prompt_for_small_request(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    task = "Ergaenze in app.js einen kompakten Status-Badge und lass tests/test_app.cjs weiter passen."
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["app.js", "tests/test_app.cjs"],
+                "focus_files": ["app.js"],
+                "test_files": ["tests/test_app.cjs"],
+                "language_counts": {"javascript": 2},
+                "project_labels": ["javascript"],
+                "repo_summary": "Small JavaScript module with one focused node test.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Apply the requested UI change."}],
+        target_paths=["app.js", "tests/test_app.cjs"],
+        target_name="app.js",
+        requested_outcome=task,
+    )
+    payload["user_goal"] = task
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_app.cjs")
+    (tmp_path / "app.js").write_text("export function render() {}\n", encoding="utf-8")
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=(tmp_path / "app.js").read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "Generation brief:" not in prompt
+    assert "Latest user request:" in prompt
+    assert "User goal:" in prompt
+    assert "Requested outcome:" in prompt
 
 
 def test_generate_content_prompt_derives_test_backed_toggle_contract_hints_without_repair_context(tmp_path):
@@ -27989,6 +28843,95 @@ def test_planner_uses_compact_prompt_for_fallback_model_after_primary_no_start(t
     assert attempts[0].strategy == "fallback_model"
 
 
+def test_planner_prefers_compact_fallback_model_after_primary_no_start_when_context_pressure_likely(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:14b",
+                router_model_name="qwen2.5-coder:7b",
+            )
+        ),
+        "",
+    )
+
+    attempts = planner._content_generation_recovery_attempts(
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:14b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=False,
+            raw_reason="startup_timeout",
+        )
+    )
+
+    assert attempts
+    assert attempts[0].model_name == "qwen2.5-coder:7b"
+    assert attempts[0].prompt_kind == "compact"
+    assert attempts[0].strategy == "compact_fallback_model"
+    assert any(
+        attempt.prompt_kind == "full"
+        and attempt.strategy == "fallback_model"
+        and attempt.model_name == "qwen2.5-coder:7b"
+        for attempt in attempts[1:]
+    )
+
+
+def test_planner_builds_compact_generation_retry_prompt_for_compact_attempt(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+    payload = route_payload(
+        intent="update",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "update_artifact",
+                "reason": "Refresh the interactive web bundle.",
+            }
+        ],
+        target_paths=["index.html", "styles.css", "script.js"],
+        requested_outcome="Refresh the website bundle.",
+    )
+    route = RouterOutput.model_validate(payload)
+    session = SessionState(
+        task="Refresh the website bundle with a stronger interactive UI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    current_content = "<!DOCTYPE html><html><body><main>Legacy demo</main></body></html>"
+    attempt = GenerationRecoveryAttempt(
+        strategy="compact_fallback_model",
+        prompt_kind="compact",
+        model_name="qwen3:8b",
+        capability_tier="tier_b",
+    )
+
+    prompt = planner._content_generation_prompt_for_attempt(
+        attempt,
+        route,
+        session,
+        path="index.html",
+        current_content=current_content,
+        prompt="",
+        partial_text="",
+        repair_context=None,
+        repair_strategy=None,
+    )
+
+    expected = generate_content_retry_prompt(
+        route,
+        session,
+        path="index.html",
+        current_content=current_content,
+        mode="compact",
+    )
+
+    assert prompt == expected
+
+
 def test_planner_uses_compact_same_model_retry_after_retryable_no_start(tmp_path):
     planner = Planner(
         ScriptedLLM(
@@ -28019,6 +28962,39 @@ def test_planner_uses_compact_same_model_retry_after_retryable_no_start(tmp_path
     assert attempts[0].strategy == "retry_same_model"
     assert attempts[0].prompt_kind == "full"
     assert attempts[0].model_name is None
+
+
+def test_planner_prefers_fallback_model_before_same_model_retry_for_retryable_primary_no_start(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:7b",
+                router_model_name="qwen3:8b",
+            )
+        ),
+        "",
+    )
+
+    attempts = planner._content_generation_recovery_attempts(
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="low",
+            retryable=True,
+            raw_reason="startup_timeout",
+        )
+    )
+
+    assert attempts
+    assert attempts[0].strategy == "fallback_model"
+    assert attempts[0].prompt_kind == "full"
+    assert attempts[0].model_name == "qwen3:8b"
+    assert any(attempt.strategy == "retry_same_model" and attempt.prompt_kind == "full" for attempt in attempts[1:])
 
 
 def test_planner_prefers_compact_same_model_retry_for_high_pressure_single_model_no_start(tmp_path):
@@ -28052,6 +29028,40 @@ def test_planner_prefers_compact_same_model_retry_for_high_pressure_single_model
     assert attempts[0].prompt_kind == "compact"
     assert attempts[0].model_name is None
     assert any(attempt.strategy == "retry_same_model" and attempt.prompt_kind == "full" for attempt in attempts[1:])
+
+
+def test_planner_prefers_resume_on_progress_model_after_fallback_timeout(tmp_path):
+    planner = Planner(
+        ScriptedLLM(
+            config=AppConfig(
+                workspace_root=str(tmp_path),
+                model_name="qwen2.5-coder:7b",
+                router_model_name="qwen3:8b",
+            )
+        ),
+        "",
+    )
+
+    attempts = planner._content_generation_recovery_attempts(
+        ExecutionFailure(
+            failure_class="total_timeout",
+            state="failed_total_timeout",
+            had_progress=True,
+            first_output_received=True,
+            model_identifier="qwen3:8b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=True,
+            raw_reason="total_timeout",
+            partial_text="<main>partial website",
+            characters=24,
+        )
+    )
+
+    assert attempts
+    assert attempts[0].strategy == "resume_fallback_model"
+    assert attempts[0].prompt_kind == "resume"
+    assert attempts[0].model_name == "qwen3:8b"
 
 
 def test_planner_recovers_from_retryable_no_start_with_same_model_retry(tmp_path):
@@ -28205,6 +29215,62 @@ def test_planner_extends_compact_resume_budget_after_timeout_progress(tmp_path):
     assert num_ctx == 3072
 
 
+def test_planner_extends_fallback_compact_budget_for_context_heavy_cold_start(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+
+    timeout_seconds, total_timeout_seconds, num_ctx = planner._content_generation_runtime_for_attempt(
+        GenerationRecoveryAttempt(
+            strategy="compact_fallback_model",
+            prompt_kind="compact",
+            model_name="qwen3:8b",
+            capability_tier="tier_b",
+        ),
+        ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=True,
+            raw_reason="startup_timeout",
+        ),
+    )
+
+    assert timeout_seconds == 60
+    assert total_timeout_seconds == 330
+    assert num_ctx == 2048
+
+
+def test_planner_extends_fallback_resume_budget_for_context_heavy_progress_timeout(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+
+    timeout_seconds, total_timeout_seconds, num_ctx = planner._content_generation_runtime_for_attempt(
+        GenerationRecoveryAttempt(
+            strategy="resume_fallback_model",
+            prompt_kind="resume",
+            model_name="qwen3:8b",
+            capability_tier="tier_b",
+        ),
+        ExecutionFailure(
+            failure_class="total_timeout",
+            state="failed_after_progress",
+            had_progress=True,
+            first_output_received=True,
+            model_identifier="qwen3:8b",
+            backend_identifier="ollama",
+            context_pressure_estimate="high",
+            retryable=True,
+            raw_reason="total_timeout",
+        ),
+    )
+
+    assert timeout_seconds == 60
+    assert total_timeout_seconds == 390
+    assert num_ctx == 2048
+
+
 def test_planner_retries_resume_once_after_no_start_during_partial_progress_recovery(tmp_path):
     llm = ScriptedLLM(
         json_payloads=[
@@ -28278,6 +29344,80 @@ def test_planner_retries_resume_once_after_no_start_during_partial_progress_reco
     assert "print('gui" in llm.generate_calls[2]["args"][0]
     assert llm.generate_calls[2]["kwargs"]["timeout"] >= 60
     assert llm.generate_calls[2]["kwargs"]["total_timeout"] >= 270
+
+
+def test_retry_content_generation_retries_resume_on_same_fallback_model_after_progress_timeout(tmp_path):
+    llm = ScriptedLLM(
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion after 240.0 seconds",
+                reason="total_timeout",
+                partial_text="<main>partial website",
+                characters=200,
+                model_name="qwen3:8b",
+                total_timeout_seconds=240,
+            ),
+            OllamaGenerationError(
+                "timed out waiting for model completion after 270.0 seconds",
+                reason="total_timeout",
+                partial_text="<main>partial website expanded",
+                characters=320,
+                model_name="qwen3:8b",
+                total_timeout_seconds=270,
+            ),
+            "<main>completed website</main>\n",
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen3:8b",
+        ),
+    )
+    planner = Planner(llm, "")
+    route = RouterOutput.model_validate(
+        route_payload(
+            intent="update",
+            action_plan=[
+                {
+                    "step": 1,
+                    "action": "update_artifact",
+                    "reason": "Refresh the interactive website bundle.",
+                }
+            ],
+            target_paths=["index.html", "styles.css", "script.js"],
+            requested_outcome="Refresh the interactive website bundle.",
+        )
+    )
+    session = SessionState(
+        task="Refresh the interactive website bundle with a stronger UI.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+
+    result = planner._retry_content_generation(
+        route,
+        session,
+        path="index.html",
+        current_content="<!DOCTYPE html><html><body><main>legacy</main></body></html>",
+        cause=ExecutionFailure(
+            failure_class="startup_timeout",
+            state="failed_startup",
+            had_progress=False,
+            first_output_received=False,
+            model_identifier="qwen2.5-coder:7b",
+            backend_identifier="ollama",
+            context_pressure_estimate="medium",
+            retryable=False,
+            raw_reason="startup_timeout",
+        ),
+        prompt="x" * 8000,
+    )
+
+    assert result.content == "<main>completed website</main>"
+    seen_models = [call["kwargs"]["model"] for call in llm.generate_calls]
+    assert seen_models == ["qwen3:8b", "qwen3:8b", "qwen3:8b"]
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[1]["args"][0]
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[2]["args"][0]
 
 
 def test_planner_preserves_progress_budget_for_compact_retry_after_resume_no_start(tmp_path):
@@ -29578,6 +30718,76 @@ def test_planner_uses_deterministic_final_response_when_final_llm_roundtrip_time
     assert len(llm.generate_calls) == 1
     assert llm.generate_calls[0]["kwargs"]["num_ctx"] <= 1536
     assert llm.generate_calls[0]["kwargs"]["total_timeout"] >= 60
+
+
+def test_planner_salvages_partial_final_response_after_timeout_with_progress(tmp_path):
+    payload = route_payload(
+        intent="explain",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "summarize_result",
+                "reason": "Return the final result to the user.",
+            }
+        ],
+        target_paths=["agent/planner.py", "agent/prompts.py"],
+        target_name="agent/planner.py",
+        requested_outcome="Fasse die Architektur belastbar zusammen.",
+    )
+    llm = ScriptedLLM(
+        json_payloads=[payload],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion after 120.0 seconds",
+                reason="total_timeout",
+                partial_text=(
+                    "Analyse:\n"
+                    "- planner.py steuert Routing, Plan- und Abschlussentscheidungen.\n"
+                    "- prompts.py verdichtet Request- und Workspace-Kontext fuer die Modellaufrufe.\n"
+                    "- layered_memory.py kombiniert Working, Episodic, Project und Conversation Memory.\n\n"
+                    "Offen bleibt vor allem die Qualitaet des finalen Antwortabschlusses."
+                ),
+                characters=320,
+                total_timeout_seconds=120,
+                model_name="qwen2.5-coder:7b",
+            )
+        ],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Fasse die Architektur belastbar zusammen",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "agent/planner.py"},
+                success=True,
+                summary="Read agent/planner.py.",
+                output_excerpt="def summarize_session(...):\n    ...\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "agent/prompts.py"},
+                success=True,
+                summary="Read agent/prompts.py.",
+                output_excerpt="def final_response_prompt(...):\n    ...\n",
+            ),
+        ]
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert decision.final_response is not None
+    assert decision.final_response.startswith("Analyse:")
+    assert "prompts.py" in decision.final_response
+    assert "untersucht" not in decision.final_response
 
 
 def test_planner_localizes_deterministic_final_response_to_english(tmp_path):

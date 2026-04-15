@@ -8,11 +8,13 @@ import re
 import shlex
 
 from agent.models import ProposedUpdateReview, SessionState, ValidationFailureEvidence, WorkspaceSnapshot
-from agent.semantic_defaults import classify_conversation_request
-from agent.task_state import TaskState
+from agent.semantic_guardrails import _extract_explicit_paths
+from agent.semantic_defaults import classify_conversation_request, normalize_text, prioritized_focus_terms
+from agent.task_state import RequestDigest, TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
+from llm.runtime_resilience import estimate_context_pressure
 
 
 REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
@@ -22,11 +24,108 @@ STANDARD_MEMORY_CONTEXT_CHAR_BUDGET = 1100
 SEMANTIC_START_MEMORY_CONTEXT_CHAR_BUDGET = 760
 ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET = 900
 DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET = 1280
+TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET = 760
+TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET = 520
+REQUEST_MEMORY_PACKET_CHAR_BUDGET = 760
+REQUEST_MEMORY_STATE_CHAR_BUDGET = 1600
+REQUEST_MEMORY_CHUNK_CHAR_BUDGET = 200
+GENERATION_BRIEF_CHAR_BUDGET = 760
+GENERATION_FILE_FOCUS_CHAR_BUDGET = 480
+GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 420
+GENERATION_REQUEST_DIGEST_CHAR_BUDGET = 520
 UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
     re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
     re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
     re.compile(r"['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]\s+as undefined"),
     re.compile(r"undefined symbol ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
+)
+REQUEST_DIGEST_HARD_MARKERS = (
+    "must",
+    "muss",
+    "soll",
+    "sollen",
+    "required",
+    "verpflichtend",
+    "exactly",
+    "genau",
+    "strict",
+    "zwingend",
+    "without",
+    "ohne",
+    "do not",
+    "don't",
+    "never",
+    "kein",
+    "keine",
+    "nicht",
+)
+REQUEST_DIGEST_SOFT_MARKERS = (
+    "prefer",
+    "preferred",
+    "ideally",
+    "optional",
+    "nice to have",
+    "waere gut",
+    "wäre gut",
+    "gern",
+    "bitte",
+)
+REQUEST_DIGEST_NON_GOAL_MARKERS = (
+    "do not",
+    "don't",
+    "never",
+    "without",
+    "avoid",
+    "kein",
+    "keine",
+    "nicht",
+    "ohne",
+    "verboten",
+)
+REQUEST_DIGEST_VALIDATION_MARKERS = (
+    "test",
+    "tests",
+    "pytest",
+    "unittest",
+    "validate",
+    "validation",
+    "verify",
+    "verification",
+    "lint",
+    "build",
+    "smoke",
+    "regression",
+    "run",
+    "check",
+)
+REQUEST_DIGEST_RISK_MARKERS = (
+    "risk",
+    "risiko",
+    "security",
+    "sicherheit",
+    "performance",
+    "memory",
+    "kontext",
+    "context",
+    "regression",
+    "fallback",
+    "halluz",
+    "hardcod",
+    "fragil",
+    "reliable",
+    "robust",
+)
+REQUEST_DIGEST_COMPLETION_MARKERS = (
+    "am ende",
+    "endbedingung",
+    "completion",
+    "done when",
+    "fertig",
+    "liefere",
+    "deliver",
+    "return",
+    "ausgabeformat",
+    "ergebnis",
 )
 
 
@@ -132,6 +231,14 @@ def task_state_update_prompt(
         "active_goal": "string",
         "goal_relation": "new_task | continue | refine | correct | report_problem | scope_change | validation_request | rollback_request | approval | rejection | update_constraints | clarify | unknown",
         "output_expectation": "string",
+        "remembered_facts": [
+            {
+                "subject": "user | assistant",
+                "attribute": "string",
+                "value": "string",
+                "summary": "string | null (optional)",
+            }
+        ],
         "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null (optional)",
         "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null (optional)",
         "open_problem": "string | null (optional)",
@@ -167,6 +274,14 @@ def task_state_update_prompt(
         "active_goal": "string",
         "goal_relation": "new_task | continue | refine | correct | report_problem | scope_change | clarify | unknown",
         "output_expectation": "string",
+        "remembered_facts": [
+            {
+                "subject": "user | assistant",
+                "attribute": "string",
+                "value": "string",
+                "summary": "string | null (optional)",
+            }
+        ],
         "current_user_intent": "repair | implement | refactor | harden | validate | inspect | explain | search | plan | correct | unknown | null (optional)",
         "execution_strategy": "debug_repair | feature_implementation | refactor | hardening | validation_inspection | rollback_correction | null (optional)",
         "verification_target": "string | null (optional)",
@@ -193,14 +308,38 @@ def task_state_update_prompt(
     previous_task_state = _compact_task_state(session.task_state if session is not None else None)
     workspace_detail = "router" if compact else "decision"
     workspace_context = _compact_workspace_snapshot(snapshot, detail=workspace_detail)
+    request_excerpt = _trim_balanced_text(
+        task,
+        TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET if compact else 1100,
+    )
+    request_digest = _compact_request_digest(
+        task,
+        snapshot=snapshot,
+        max_chars=TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET,
+    )
+    request_memory_packet = build_request_memory_packet(
+        task,
+        snapshot=snapshot,
+        max_chars=REQUEST_MEMORY_PACKET_CHAR_BUDGET if compact else 900,
+    )
+    include_request_memory_packet = (
+        bool(request_memory_packet.get("requirement_chunks"))
+        and len(str(task or "").strip()) > TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET
+    )
     if mode == "resume" and str(resume_partial or "").strip():
-        return "\n".join(
+        lines = [
+            "Finish the partially emitted task-state JSON object for this turn.",
+            "Return valid JSON only.",
+            "Preserve already-correct fields from the partial object, repair broken structure, and complete any missing required fields.",
+            "Do not restart analysis from scratch unless the partial object is clearly contradictory.",
+            f"Latest user request: {request_excerpt}",
+        ]
+        if request_digest:
+            lines.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+        if include_request_memory_packet:
+            lines.append(f"Request memory packet: {json.dumps(request_memory_packet, ensure_ascii=False)}")
+        lines.extend(
             [
-                "Finish the partially emitted task-state JSON object for this turn.",
-                "Return valid JSON only.",
-                "Preserve already-correct fields from the partial object, repair broken structure, and complete any missing required fields.",
-                "Do not restart analysis from scratch unless the partial object is clearly contradictory.",
-                f"Latest user request: {_trim_text(task, 500)}",
                 f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
                 f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}",
                 f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}",
@@ -210,19 +349,33 @@ def task_state_update_prompt(
                 f"Return JSON only with this structure: {json.dumps(compact_schema_shape, ensure_ascii=False)}",
             ]
         )
+        return "\n".join(lines)
     lines = [
         "Update the central task state for this turn.",
-        f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
+        f"Latest user request: {request_excerpt}",
         f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
         "State update rules:",
     ]
+    if request_digest:
+        lines.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+    if include_request_memory_packet:
+        lines.insert(3 if request_digest else 2, f"Request memory packet: {json.dumps(request_memory_packet, ensure_ascii=False)}")
     if follow_up_context:
-        lines.insert(2, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
+        follow_up_index = 4 if request_digest and include_request_memory_packet else 3 if request_digest or include_request_memory_packet else 2
+        lines.insert(follow_up_index, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
     if memory_context:
-        insert_at = 3 if follow_up_context else 2
+        insert_at = 2
+        if request_digest:
+            insert_at += 1
+        if include_request_memory_packet:
+            insert_at += 1
+        if follow_up_context:
+            insert_at += 1
         lines.insert(insert_at, f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}")
     if previous_task_state:
-        insert_at = 3
+        insert_at = 3 if not request_digest else 4
+        if include_request_memory_packet:
+            insert_at += 1
         if follow_up_context:
             insert_at += 1
         if memory_context:
@@ -250,6 +403,7 @@ def task_state_update_prompt(
                 "- For bugs or regressions, prefer inspect/debug/test before modify.",
                 "- For scope corrections or rollbacks, narrow or revert only the necessary part of the prior work.",
                 "- Update constraints and assumptions explicitly.",
+                "- remembered_facts is optional and only for stable cross-project facts explicitly stated about the user or assistant; never store secrets, transient task instructions, repo details, or guesses there.",
                 "- Keep root_goal stable across refinements unless the user clearly starts a new task.",
                 "- If a compatible active artifact already exists and the user is extending its behavior, prefer modify over create unless the user clearly asks for a distinct new artifact or file surface.",
                 "- next_action and next_best_action should be the single best next move, not a full route tree.",
@@ -505,11 +659,33 @@ def generate_content_prompt(
     review_feedback: ProposedUpdateReview | None = None,
     mode: str = "full",
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    request_text = session.task if session is not None else route.requested_outcome
     if mode != "full":
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        compact_large_request = _should_compact_generation_request(
+            route,
+            session,
+            path=path,
+            file_focus=file_focus,
+            current_content=current_content,
+        )
+        compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
+        generation_brief = _compact_generation_brief(route, session, path=path)
+        request_memory = _generation_request_memory(session)
+        request_digest = _compact_request_digest(
+            request_text,
+            snapshot=session.workspace_snapshot if session is not None else None,
+            max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
+        )
+        include_request_digest = bool(request_digest) and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET
         explicit_constraints = _explicit_generation_constraints(route, session)
         related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
-        related_context = _related_file_context(session, path)
+        related_context = _compact_related_file_context(
+            session,
+            path,
+            compact=compact_large_request,
+        )
         runtime_hints = _targeted_runtime_prompt_hints(
             path=path,
             current_content=current_content or "",
@@ -519,13 +695,37 @@ def generate_content_prompt(
         if current_content is None:
             sections = [
                 "Produce the full file content for exactly one file.",
-                f"Latest user request: {_trim_text(session.task, 360)}",
                 f"Target path: {path}",
                 f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
             ]
+            if compact_large_request:
+                sections.insert(
+                    1,
+                    f"User request excerpt: {_trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+                )
+                if include_request_digest:
+                    sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+                sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+                if request_memory:
+                    sections.insert(
+                        4 if include_request_digest else 3,
+                        f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}",
+                    )
+            else:
+                sections.insert(1, f"Latest user request: {_trim_balanced_text(request_text, 520)}")
+                if include_request_digest:
+                    sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+                if request_memory and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET:
+                    sections.insert(3 if include_request_digest else 2, f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}")
             if explicit_constraints != "none":
                 sections.append(f"Explicit constraints: {explicit_constraints}")
-            sections.append(f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
+            sections.append(
+                "File-scoped focus: "
+                + json.dumps(
+                    compact_file_focus if compact_large_request else file_focus,
+                    ensure_ascii=False,
+                )
+            )
             grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
             if grounding_instruction:
                 sections.append(grounding_instruction)
@@ -558,6 +758,8 @@ def generate_content_prompt(
                         + " ".join(_trim_text(item, 180) for item in fixture_hints[:4])
                     )
             sections.append(_single_file_boundary_instruction(path, route.entities.target_paths))
+            if web_bundle_contract:
+                sections.append(web_bundle_contract)
             sections.append("Create the file from scratch. Return the full new file content only.")
             sections.append("Do not add markdown fences or explanations.")
             return "\n\n".join(sections)
@@ -577,20 +779,41 @@ def generate_content_prompt(
 
         sections = [
             "Produce the full file content for exactly one file.",
-            f"Latest user request: {_trim_text(session.task, 420)}",
-            f"User goal: {_trim_text(route.user_goal, 240)}",
-            f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
             f"Explicit constraints: {explicit_constraints}",
-            f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}",
-            f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             f"Related file hints: {related_context}",
         ]
+        if compact_large_request:
+            sections.insert(
+                1,
+                f"User request excerpt: {_trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+            )
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            if request_memory:
+                sections.insert(
+                    4 if include_request_digest else 3,
+                    f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}",
+                )
+            sections.insert(6 if include_request_digest else 5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+        else:
+            sections.insert(1, f"Latest user request: {_trim_balanced_text(request_text, 520)}")
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            if request_memory and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET:
+                sections.insert(3 if include_request_digest else 2, f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"User goal: {_trim_text(route.user_goal, 240)}")
+            sections.insert(4 if include_request_digest else 3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
+            sections.insert(6 if include_request_digest else 5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
+            sections.insert(7 if include_request_digest else 6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
         grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
         if grounding_instruction:
             sections.append(grounding_instruction)
+        if web_bundle_contract:
+            sections.append(web_bundle_contract)
         if runtime_hints:
             sections.append(
                 "Targeted runtime hints: "
@@ -634,12 +857,11 @@ def generate_content_prompt(
                     "Current file content:",
                     current_content,
                     _single_file_boundary_instruction(path, route.entities.target_paths),
-                    "Update this file to satisfy the request. Return the full updated file content only.",
                 ]
             )
-        else:
-            sections.append(_single_file_boundary_instruction(path, route.entities.target_paths))
-            sections.append("Create the file from scratch. Return the full new file content only.")
+            if web_bundle_contract:
+                sections.append(web_bundle_contract)
+            sections.append("Update this file to satisfy the request. Return the full updated file content only.")
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
@@ -684,6 +906,8 @@ def generate_content_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
     if runtime_hints:
@@ -744,19 +968,9 @@ def generate_content_retry_prompt(
     review_feedback: ProposedUpdateReview | None = None,
     mode: str = "full",
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    request_text = session.task if session is not None else route.requested_outcome
     if mode != "full":
-        task_focus = (
-            _compact_generation_focus(route, session, path)
-            if session is not None
-            else {
-                "target_path": path,
-                "active_goal": _trim_text(route.requested_outcome, 180),
-                "output_expectation": _trim_text(route.requested_outcome, 180),
-                "verification_target": "",
-                "constraints": route.entities.constraints[:4],
-                "related_targets": [item for item in route.entities.target_paths if item and item != path][:6],
-            }
-        )
         if current_content is not None and repair_context is not None and session is not None:
             if review_feedback is not None:
                 return _compact_repair_retry_prompt(
@@ -780,7 +994,27 @@ def generate_content_retry_prompt(
                 review_feedback=review_feedback,
             )
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
-        related_context = _related_file_context(session, path) if session is not None else "none"
+        compact_large_request = _should_compact_generation_request(
+            route,
+            session,
+            path=path,
+            file_focus=file_focus,
+            current_content=current_content,
+        )
+        generation_brief = _compact_generation_brief(route, session, path=path)
+        request_memory = _generation_request_memory(session)
+        request_digest = _compact_request_digest(
+            request_text,
+            snapshot=session.workspace_snapshot if session is not None else None,
+            max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
+        )
+        include_request_digest = bool(request_digest) and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET
+        compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
+        related_context = (
+            _compact_related_file_context(session, path, compact=compact_large_request)
+            if session is not None
+            else "none"
+        )
         exact_output_contracts: list[str] = []
         supporting_runtime_argv_contract: dict[str, list[str]] = {}
         if session is not None and current_content is not None and review_feedback is not None:
@@ -811,21 +1045,47 @@ def generate_content_retry_prompt(
         )
         sections = [
             "Produce the full file content for exactly one file.",
-            f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
-            f"User goal: {_trim_text(route.user_goal, 240)}",
-            f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
             f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
             f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
-            f"Task focus: {json.dumps(task_focus, ensure_ascii=False)}",
-            f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             _single_file_boundary_instruction(path, route.entities.target_paths),
         ]
+        if compact_large_request:
+            sections.insert(
+                1,
+                "User request excerpt: "
+                + _trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET),
+            )
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            if request_memory:
+                sections.insert(
+                    4 if include_request_digest else 3,
+                    f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}",
+                )
+            sections.insert(6 if include_request_digest else 5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+        else:
+            sections.insert(
+                1,
+                f"Latest user request: {_trim_balanced_text(request_text, 520)}",
+            )
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            if request_memory and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET:
+                sections.insert(3 if include_request_digest else 2, f"Request memory: {json.dumps(request_memory, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"User goal: {_trim_text(route.user_goal, 240)}")
+            sections.insert(4 if include_request_digest else 3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
+            if session is not None:
+                sections.insert(6 if include_request_digest else 5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
+            sections.insert(7 if include_request_digest else 6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
         grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
         if grounding_instruction:
             sections.append(grounding_instruction)
+        if web_bundle_contract:
+            sections.append(web_bundle_contract)
         if session is not None:
             sections.append(f"Related file hints: {related_context}")
             if exact_output_contracts:
@@ -930,6 +1190,8 @@ def generate_content_retry_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
     if exact_output_contracts:
@@ -1069,6 +1331,106 @@ def _single_file_boundary_instruction(path: str, target_paths: list[str] | None)
     )
 
 
+def _explicit_web_bundle_contract_instruction(route: RouterOutput, path: str) -> str:
+    target = str(path or "").strip()
+    if not target:
+        return ""
+    explicit_targets = [
+        str(item or "").strip()
+        for item in getattr(getattr(route, "entities", None), "target_paths", []) or []
+        if str(item or "").strip()
+    ]
+    if not explicit_targets:
+        return ""
+
+    def is_html_target(candidate: str) -> bool:
+        return Path(candidate).suffix.lower() in {".html", ".htm", ".xhtml"}
+
+    def is_style_target(candidate: str) -> bool:
+        return Path(candidate).suffix.lower() in {".css", ".scss", ".sass", ".less"}
+
+    def is_script_target(candidate: str) -> bool:
+        return Path(candidate).suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+
+    bundle_targets: list[str] = []
+    html_targets: list[str] = []
+    style_targets: list[str] = []
+    script_targets: list[str] = []
+    for candidate in explicit_targets:
+        if is_html_target(candidate):
+            html_targets.append(candidate)
+            bundle_targets.append(candidate)
+        elif is_style_target(candidate):
+            style_targets.append(candidate)
+            bundle_targets.append(candidate)
+        elif is_script_target(candidate):
+            script_targets.append(candidate)
+            bundle_targets.append(candidate)
+
+    if len(bundle_targets) < 2 or not html_targets or (not style_targets and not script_targets):
+        return ""
+    if not any(_artifact_matches_path(target, candidate, candidate) for candidate in bundle_targets):
+        return ""
+
+    target_kind = "other"
+    if is_html_target(target):
+        target_kind = "html"
+    elif is_style_target(target):
+        target_kind = "style"
+    elif is_script_target(target):
+        target_kind = "script"
+
+    companion_targets = [
+        candidate
+        for candidate in bundle_targets
+        if not _artifact_matches_path(target, candidate, candidate)
+    ]
+    lines = [
+        "Shared web bundle contract:",
+        (
+            "- Treat the explicit web targets "
+            f"{_format_list(bundle_targets[:6])} as one companion UI bundle, not as independent deliverables."
+        ),
+        (
+            "- Keep responsibilities split by file: HTML owns semantic structure and stable hooks; "
+            "CSS owns presentation and stateful selectors; JS owns behavior and event wiring."
+        ),
+        (
+            "- Do not inline companion-file content or hide a missing companion implementation inside this file "
+            "just because the other files are handled separately."
+        ),
+        (
+            "- Only introduce ids, classes, data-* attributes, function names, or UI state tokens that the "
+            "shared bundle can consume consistently."
+        ),
+        (
+            "- If companion files are still pending, reserve the shared contract cleanly now so the remaining "
+            "explicit files can complete it without renaming hooks later."
+        ),
+    ]
+    if companion_targets:
+        lines.append(
+            "- Keep this file aligned with the companion targets "
+            f"{_format_list(companion_targets[:4])}; they are out of scope to write here, but in scope as a shared contract."
+        )
+    if target_kind == "html":
+        lines.append(
+            "- For this HTML file: define semantic structure, include the requested companion asset references, "
+            "and expose only stable hooks that the companion CSS/JS should consume."
+        )
+    elif target_kind == "style":
+        lines.append(
+            "- For this stylesheet: style only selectors and state tokens that exist in the shared HTML/JS "
+            "contract; do not invent orphan selectors or UI states."
+        )
+    elif target_kind == "script":
+        lines.append(
+            "- For this script: bind only to hooks that exist in the shared HTML and mutate only classes, "
+            "attributes, or states that the bundle defines intentionally."
+        )
+    return "\n".join(lines)
+
+
 def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
     language = _session_language(session)
     if (
@@ -1090,6 +1452,39 @@ def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
                 "Use general knowledge when needed.",
                 "Do not mention repository work, routing, validation, or internal execution unless the user asked about them.",
             ]
+        )
+    if _requires_structured_analysis_report(route, session):
+        analysis_context = _compact_structured_analysis_context(route, session)
+        return "\n".join(
+            _localized_prompt_lines(
+                language,
+                de=[
+                    "Schreibe eine belastbare Architektur-Zusammenfassung zur letzten Repository-Frage.",
+                    "Antworte auf Deutsch.",
+                    f"Kontext: {json.dumps(analysis_context, ensure_ascii=False)}",
+                    "Beantworte die Teilfragen des Nutzers in derselben Reihenfolge. Lasse keinen spaeteren Punkt stillschweigend weg.",
+                    "Nenne in jedem Abschnitt die relevanten Dateipfade und sichtbaren Funktionen, Klassen, Signale oder Datenfluesse, wenn sie im Kontext sichtbar sind.",
+                    "Trenne sauber zwischen direkt sichtbar, indirekt ableitbar und im gelesenen Kontext nicht bestaetigt.",
+                    "Wenn ein Punkt nach Repo-Mapping, Memory, Retrieval, Request-Digests oder kompakter Promptbildung fragt, erklaere auch, wo diese Informationen erzeugt, gespeichert oder wieder eingespeist werden, soweit das im Kontext sichtbar ist.",
+                    "Nenne 2 bis 4 groesste technische Risiken oder Restluecken nur dann, wenn sie an sichtbaren Code- oder Architekturhinweisen festzumachen sind.",
+                    "Schreibe natuerlich und kompakt, aber mit klaren Abschnitten statt generischem Fliesstext.",
+                    "Spekuliere nicht. Wenn etwas fehlt oder nur indirekt ableitbar ist, sag das knapp und klar.",
+                    "Gib kein JSON aus.",
+                ],
+                en=[
+                    "Write a reliable architecture summary for the latest repository question.",
+                    "Reply in English.",
+                    f"Context: {json.dumps(analysis_context, ensure_ascii=False)}",
+                    "Answer the user's sub-questions in the same order. Do not silently drop later requirements.",
+                    "For each section, cite the relevant file paths and any visible functions, classes, signals, or data flow when they are present in the context.",
+                    "Clearly separate what is directly visible, indirectly inferred, and not confirmed in the inspected context.",
+                    "When the user asks about repo mapping, memory, retrieval, request digests, or compact prompt building, explain where those pieces are produced, stored, or fed back into prompts/retrieval when that is visible in context.",
+                    "Name 2 to 4 biggest technical risks or remaining gaps only when they are grounded in visible code or architecture signals.",
+                    "Write naturally and concisely, but use clear sections instead of generic filler prose.",
+                    "Do not speculate. If something is missing or only indirectly inferable, say so briefly and clearly.",
+                    "Do not emit JSON.",
+                ],
+            )
         )
     inspection_evidence = _compact_read_evidence(session)
     if route.intent in {RouteIntent.EXPLAIN, RouteIntent.INSPECT} and not session.changed_files and inspection_evidence:
@@ -1569,6 +1964,10 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
         "current_subtask": _trim_text(working.current_subtask or "", 160),
         "primary_target": working.primary_target,
         "verification_target": _trim_text(working.verification_target or "", 180),
+        "request_excerpt": _trim_text(working.request_excerpt or "", 180),
+        "request_requirements": [_trim_text(item, 120) for item in working.request_requirements[:4]],
+        "request_chunks": [_trim_text(item, 140) for item in working.request_chunks[:3]],
+        "request_digest": _compact_request_digest_payload(getattr(working, "request_digest", None), max_chars=260),
         "active_constraints": [_trim_text(item, 120) for item in working.active_constraints[:6]],
         "active_failure_signature": _trim_text(working.active_failure_signature or "", 180),
         "relevant_files": working.relevant_files[:6],
@@ -1583,6 +1982,10 @@ def _compact_working_memory(session: SessionState | None) -> dict[str, object]:
             "current_goal",
             "primary_target",
             "verification_target",
+            "request_chunks",
+            "request_digest",
+            "request_requirements",
+            "request_excerpt",
             "current_subtask",
             "active_failure_signature",
             "active_constraints",
@@ -1833,6 +2236,102 @@ def _recent_diagnostics(session: SessionState | None):
     return diagnostics[-6:]
 
 
+def _requires_structured_analysis_report(route: RouterOutput, session: SessionState) -> bool:
+    if route.intent not in {RouteIntent.EXPLAIN, RouteIntent.INSPECT}:
+        return False
+    if session.changed_files:
+        return False
+    task_state = session.task_state
+    if task_state is None:
+        return False
+    request = str(task_state.latest_user_turn or session.task or "").strip()
+    if len(request) < 180:
+        return False
+    request_requirements = sum(1 for item in task_state.request_requirements if str(item or "").strip())
+    request_chunks = sum(1 for item in task_state.request_chunks if str(item or "").strip())
+    enumerated_sections = len(re.findall(r"(?:^|[\s(])(?:\d+[.)]|[-*])\s", request))
+    if request_chunks < 4 and request_requirements < 6 and enumerated_sections < 3:
+        return False
+    if len(route.entities.target_paths) == 1 and request_requirements <= 4 and enumerated_sections < 3:
+        return False
+    return True
+
+
+def _compact_structured_analysis_context(route: RouterOutput, session: SessionState) -> dict[str, object]:
+    snapshot = session.workspace_snapshot
+    task_state = session.task_state
+    relevant_paths = list(
+        dict.fromkeys(
+            [
+                *_read_paths(session)[-6:],
+                *(snapshot.important_files[:6] if snapshot is not None else []),
+                *(snapshot.focus_files[:4] if snapshot is not None else []),
+            ]
+        )
+    )
+    payload: dict[str, object] = {
+        "user_task": _trim_text(session.task, 420),
+        "requested_outcome": _trim_text(route.requested_outcome, 260),
+        "request_requirements": [_trim_text(item, 120) for item in (task_state.request_requirements if task_state else [])[:8]],
+        "request_chunks": [_trim_text(item, 160) for item in (task_state.request_chunks if task_state else [])[:5]],
+        "route": {
+            "intent": route.intent,
+            "target_paths": route.entities.target_paths[:8],
+            "search_terms": route.search_terms[:6],
+        },
+        "inspected_files": _read_paths(session)[-10:],
+        "inspection_evidence": _compact_read_evidence(session, limit=6, excerpt_chars=420),
+        "recent_tool_calls": _compact_recent_calls(session),
+        "workspace_summary": _trim_text(snapshot.repo_summary if snapshot is not None else "", 320),
+        "workspace_entrypoints": snapshot.entrypoints[:6] if snapshot is not None else [],
+        "workspace_important_files": snapshot.important_files[:10] if snapshot is not None else [],
+        "workspace_repo_map": [_trim_text(item, 120) for item in (snapshot.repo_map[:10] if snapshot is not None else [])],
+        "workspace_symbols": {
+            path: list(symbols[:4])
+            for path, symbols in list((snapshot.symbol_index if snapshot is not None else {}).items())[:6]
+        },
+        "workspace_module_summaries": {
+            path: _trim_text(str((snapshot.module_summaries if snapshot is not None else {}).get(path) or ""), 180)
+            for path in relevant_paths[:4]
+            if str((snapshot.module_summaries if snapshot is not None else {}).get(path) or "").strip()
+        },
+        "workspace_file_relationships": {
+            path: list(((snapshot.file_relationships if snapshot is not None else {}).get(path) or [])[:4])
+            for path in relevant_paths[:4]
+            if (snapshot.file_relationships if snapshot is not None else {}).get(path)
+        },
+        "workspace_subsystem_summaries": {
+            name: _trim_text(summary, 180)
+            for name, summary in list((snapshot.subsystem_summaries if snapshot is not None else {}).items())[:4]
+        },
+        "memory_context": _compact_memory_context(session),
+        "notes": [_trim_text(item, 140) for item in session.notes[-8:]],
+    }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "user_task",
+            "request_requirements",
+            "request_chunks",
+            "inspected_files",
+            "inspection_evidence",
+            "workspace_repo_map",
+            "workspace_summary",
+            "workspace_important_files",
+            "workspace_module_summaries",
+            "workspace_file_relationships",
+            "workspace_subsystem_summaries",
+            "workspace_entrypoints",
+            "workspace_symbols",
+            "route",
+            "memory_context",
+            "recent_tool_calls",
+            "notes",
+        ],
+        max_chars=2200,
+    )
+
+
 def _compact_workspace_snapshot(
     snapshot: WorkspaceSnapshot | None,
     *,
@@ -1865,12 +2364,27 @@ def _compact_workspace_snapshot(
             path: list(symbols[:4])
             for path, symbols in list(snapshot.symbol_index.items())[:4]
         }
+        payload["module_summaries"] = {
+            path: _trim_text(summary, 160)
+            for path, summary in list(snapshot.module_summaries.items())[:4]
+        }
+        payload["file_relationships"] = {
+            path: list(relations[:4])
+            for path, relations in list(snapshot.file_relationships.items())[:4]
+        }
+        payload["subsystem_summaries"] = {
+            name: _trim_text(summary, 160)
+            for name, summary in list(snapshot.subsystem_summaries.items())[:3]
+        }
     return _prioritized_compact_payload(
         payload,
         ordered_keys=[
             "repo_summary",
             "focus_files",
             "important_files",
+            "module_summaries",
+            "file_relationships",
+            "subsystem_summaries",
             "entrypoints",
             "manifests",
             "likely_commands",
@@ -1935,6 +2449,19 @@ def _compact_task_state(state: TaskState | None) -> dict[str, object]:
     return {
         "root_goal": _trim_text(state.root_goal, 220),
         "active_goal": _trim_text(state.active_goal, 220),
+        "request_excerpt": _trim_text(state.request_excerpt or "", 220),
+        "request_requirements": [_trim_text(item, 120) for item in state.request_requirements[:4]],
+        "request_chunks": [_trim_text(item, 140) for item in state.request_chunks[:3]],
+        "request_digest": _compact_request_digest_payload(state.request_digest, max_chars=300),
+        "remembered_facts": [
+            {
+                "subject": item.subject,
+                "attribute": _trim_text(item.attribute, 60),
+                "value": _trim_text(item.value, 120),
+                "summary": _trim_text(item.summary or "", 140),
+            }
+            for item in state.remembered_facts[:3]
+        ],
         "goal_relation": state.goal_relation,
         "output_expectation": _trim_text(state.output_expectation, 220),
         "current_user_intent": state.current_user_intent,
@@ -2216,6 +2743,258 @@ def _compact_generation_focus(
     }
 
 
+def _append_unique_compact_text(
+    items: list[str],
+    value: object,
+    *,
+    limit: int = 140,
+) -> None:
+    text = _trim_text(str(value or "").strip(), limit)
+    if not text:
+        return
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if not normalized:
+        return
+    for existing in items:
+        existing_normalized = re.sub(r"\s+", " ", str(existing or "")).strip().lower()
+        if not existing_normalized:
+            continue
+        if (
+            normalized == existing_normalized
+            or normalized in existing_normalized
+            or existing_normalized in normalized
+        ):
+            return
+    items.append(text)
+
+
+def _compact_generation_constraints(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    limit: int = 6,
+) -> list[str]:
+    items: list[str] = []
+    task_state = session.task_state if session is not None else None
+    understanding = session.task_understanding if session is not None else None
+    for source in (
+        list(getattr(understanding, "constraints", []) or []),
+        list(getattr(task_state, "constraints", []) or []),
+        list(route.entities.constraints or []),
+    ):
+        for candidate in source:
+            _append_unique_compact_text(items, candidate, limit=140)
+            if len(items) >= limit:
+                return items[:limit]
+    raw_request = (
+        session.task
+        if session is not None and str(session.task or "").strip()
+        else route.requested_outcome
+    )
+    for sentence in _requirement_sentences(str(raw_request or "").replace("*", "; ").replace("•", "; ")):
+        for clause in _split_requirement_clauses(sentence):
+            cleaned = _trim_text(clause, 140)
+            if not cleaned or _is_generation_metadata_constraint(cleaned):
+                continue
+            _append_unique_compact_text(items, cleaned, limit=140)
+            if len(items) >= limit:
+                return items[:limit]
+    return items[:limit]
+
+
+def _deterministic_generation_goal(
+    route: RouterOutput,
+    *,
+    path: str,
+) -> str:
+    target = str(path or "").strip() or "the target file"
+    companions = [
+        str(item or "").strip()
+        for item in route.entities.target_paths[:4]
+        if str(item or "").strip() and str(item or "").strip() != target
+    ]
+    intent = str(route.intent or "").strip().lower()
+    verb = "Create" if intent == "create" else "Update"
+    if companions:
+        return (
+            f"{verb} {target} as part of the requested multi-file bundle and keep it aligned with "
+            f"{_format_list(companions)}."
+        )
+    return f"{verb} {target} to satisfy the requested outcome while preserving unrelated behavior."
+
+
+def _compact_generation_brief(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+) -> dict[str, object]:
+    task_state = session.task_state if session is not None else None
+    understanding = session.task_understanding if session is not None else None
+    working = _compact_working_memory(session)
+    semantic_goal = str(getattr(understanding, "interpreted_goal", "") or "").strip()
+    goal = (
+        semantic_goal
+        if semantic_goal and len(semantic_goal) <= 180 and "\n" not in semantic_goal
+        else _deterministic_generation_goal(route, path=path)
+    )
+    expected_output = next(
+        (
+            str(candidate or "").strip()
+            for candidate in (
+                getattr(task_state, "output_expectation", None),
+                route.requested_outcome,
+                getattr(understanding, "interpreted_goal", None),
+            )
+            if str(candidate or "").strip()
+        ),
+        "",
+    )
+    if expected_output and expected_output == goal:
+        expected_output = ""
+
+    execution_outline: list[str] = []
+    for candidate in list(getattr(task_state, "execution_outline", []) or []):
+        _append_unique_compact_text(execution_outline, candidate, limit=120)
+    for step in list(getattr(understanding, "execution_plan", []) or []):
+        _append_unique_compact_text(execution_outline, getattr(step, "summary", ""), limit=120)
+    request_memory = _generation_request_memory(session)
+    payload: dict[str, object] = {
+        "target_path": path,
+        "goal": _trim_text(goal, 220),
+        "expected_output": _trim_text(expected_output, 180),
+        "constraints": _compact_generation_constraints(route, session, limit=6),
+        "requested_artifacts": [
+            str(item or "").strip()
+            for item in route.entities.target_paths[:4]
+            if str(item or "").strip()
+        ],
+        "execution_outline": execution_outline[:4],
+        "request_memory": request_memory[:3],
+    }
+    if working:
+        payload["working_summary"] = _trim_text(str(working.get("summary") or "").strip(), 180)
+        payload["relevant_files"] = list(working.get("relevant_files", []) or [])[:4]
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "target_path",
+            "goal",
+            "expected_output",
+            "constraints",
+            "request_memory",
+            "execution_outline",
+            "requested_artifacts",
+            "working_summary",
+            "relevant_files",
+        ],
+        max_chars=GENERATION_BRIEF_CHAR_BUDGET,
+    )
+
+
+def _should_compact_generation_request(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    file_focus: dict[str, object],
+    current_content: str | None = None,
+) -> bool:
+    signal_chars = sum(
+        len(str(value or "").strip())
+        for value in (
+            session.task if session is not None else None,
+            route.user_goal,
+            route.requested_outcome,
+            getattr(session.task_state, "active_goal", None) if session is not None else None,
+            getattr(session.task_state, "output_expectation", None) if session is not None else None,
+        )
+    )
+    if session is not None:
+        signal_chars += _json_char_cost(_compact_generation_focus(route, session, path))
+        signal_chars += _json_char_cost(_compact_memory_context(session))
+        signal_chars += len(_related_file_context(session, path))
+    signal_chars += _json_char_cost(file_focus)
+    pressure = estimate_context_pressure(
+        prompt_chars=signal_chars,
+        current_content_chars=len(str(current_content or "")),
+    )
+    return pressure != "low"
+
+
+def _generation_request_memory(session: SessionState | None) -> list[str]:
+    task_state = session.task_state if session is not None else None
+    request_memory = list(getattr(task_state, "request_chunks", []) or [])
+    if not request_memory:
+        request_memory = list(getattr(task_state, "request_requirements", []) or [])
+    if not request_memory and session is not None:
+        packet = build_request_memory_packet(
+            session.task,
+            snapshot=session.workspace_snapshot if session is not None else None,
+            max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
+            max_items=8,
+            max_chunks=3,
+        )
+        request_memory = list(packet.get("requirement_chunks", []) or packet.get("requirements", []) or [])
+    compacted: list[str] = []
+    for item in request_memory:
+        _append_unique_compact_text(compacted, item, limit=140)
+    return compacted[:4]
+
+
+def _compact_generation_file_focus(
+    file_focus: dict[str, object],
+    *,
+    target_path: str,
+) -> dict[str, object]:
+    current_requirements: list[str] = []
+    for item in file_focus.get("current_write_requirements", [])[:6]:
+        _append_unique_compact_text(current_requirements, item, limit=140)
+    general_constraints: list[str] = []
+    for item in file_focus.get("general_constraints", [])[:4]:
+        _append_unique_compact_text(general_constraints, item, limit=120)
+    payload = {
+        "target_path": file_focus.get("target_path") or target_path,
+        "artifact_kind": file_focus.get("artifact_kind"),
+        "artifact_role": file_focus.get("artifact_role"),
+        "literal_constraints": [
+            _trim_text(str(item or "").strip(), 100)
+            for item in file_focus.get("literal_constraints", [])[:4]
+            if str(item or "").strip()
+        ],
+        "current_write_requirements": current_requirements[:4],
+        "general_constraints": general_constraints[:2],
+    }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "target_path",
+            "artifact_kind",
+            "artifact_role",
+            "literal_constraints",
+            "current_write_requirements",
+            "general_constraints",
+        ],
+        max_chars=GENERATION_FILE_FOCUS_CHAR_BUDGET,
+    )
+
+
+def _compact_related_file_context(
+    session: SessionState,
+    target_path: str,
+    *,
+    compact: bool = False,
+) -> str:
+    if not compact:
+        return _related_file_context(session, target_path)
+    return _related_file_context(
+        session,
+        target_path,
+        excerpt_limit=220,
+        max_files=1,
+    )
+
+
 def _file_local_requirement_summary(file_focus: dict[str, object], *, limit: int = 3) -> str:
     items = [
         _trim_text(str(item or "").strip(), 180)
@@ -2329,6 +3108,7 @@ def _compact_repair_update_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview | None,
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
     failure_focus = [
         _trim_text(str(item or "").strip(), 160)
@@ -2388,6 +3168,8 @@ def _compact_repair_update_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -2554,6 +3336,7 @@ def _compact_repair_retry_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview,
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
@@ -2625,6 +3408,8 @@ def _compact_repair_retry_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -2746,6 +3531,7 @@ def _focused_full_repair_update_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview | None,
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
@@ -2890,6 +3676,8 @@ def _focused_full_repair_update_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -7109,6 +7897,381 @@ def _derived_requirement_sentences(
             if sentence not in sentences:
                 sentences.append(sentence)
     return sentences[:8]
+
+
+def build_request_memory_packet(
+    text: str,
+    *,
+    snapshot: WorkspaceSnapshot | None = None,
+    max_chars: int = REQUEST_MEMORY_PACKET_CHAR_BUDGET,
+    max_items: int = 10,
+    max_chunks: int = 4,
+) -> dict[str, object]:
+    effective_budget = max(int(max_chars or 0), 160)
+    digest_model = build_request_digest(
+        text,
+        snapshot=snapshot,
+        max_chars=min(max(effective_budget, REQUEST_MEMORY_PACKET_CHAR_BUDGET), REQUEST_MEMORY_STATE_CHAR_BUDGET),
+        max_items=max_items,
+    )
+    digest = _compact_request_digest_payload(
+        digest_model,
+        max_chars=min(max(effective_budget, REQUEST_MEMORY_PACKET_CHAR_BUDGET), REQUEST_MEMORY_STATE_CHAR_BUDGET),
+    )
+    requirements = [str(item).strip() for item in list(digest_model.requirements) if str(item).strip()]
+    compact_requirements = [
+        _trim_text(item, 96 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 140)
+        for item in requirements[:max_items]
+        if str(item).strip()
+    ]
+    requirement_chunks = list(digest_model.requirement_chunks[:max_chunks])
+    if not requirement_chunks:
+        requirement_chunks = _chunk_requirement_groups(
+            requirements,
+            max_chars=min(
+                REQUEST_MEMORY_CHUNK_CHAR_BUDGET,
+                160 if effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 220,
+            ),
+            max_chunks=max_chunks,
+        )
+    request_excerpt = _trim_text(
+        str(digest_model.request_excerpt or digest.get("request_excerpt") or "").strip(),
+        180 if requirement_chunks and effective_budget <= REQUEST_MEMORY_PACKET_CHAR_BUDGET else 260,
+    )
+    packet = _fit_prioritized_payload_fields(
+        [
+            ("requirements", compact_requirements),
+            ("requirement_chunks", requirement_chunks),
+            ("request_excerpt", request_excerpt),
+            ("request_digest", digest),
+        ],
+        max_chars=effective_budget,
+    )
+    if "requirements" not in packet and compact_requirements:
+        packet["requirements"] = compact_requirements[: min(len(compact_requirements), 3)]
+    return _fit_prioritized_payload_fields(
+        [
+            ("requirements", packet.get("requirements", [])),
+            ("requirement_chunks", packet.get("requirement_chunks", [])),
+            ("request_excerpt", packet.get("request_excerpt", "")),
+            ("request_digest", packet.get("request_digest", {})),
+        ],
+        max_chars=effective_budget,
+    )
+
+
+def _fit_prioritized_payload_fields(
+    fields: list[tuple[str, object]],
+    *,
+    max_chars: int,
+) -> dict[str, object]:
+    compacted: dict[str, object] = {}
+    remaining_budget = max(int(max_chars or 0), 0)
+    for key, value in fields:
+        if not _has_payload_signal(value) or remaining_budget <= 0:
+            continue
+        candidate = {**compacted, key: value}
+        if _json_char_cost(candidate) <= max_chars:
+            compacted[key] = value
+            remaining_budget = max_chars - _json_char_cost(compacted)
+            continue
+        trimmed = _trim_value_to_budget(
+            value,
+            max_chars=max(remaining_budget - len(str(key)) - 8, 12),
+        )
+        if not _has_payload_signal(trimmed):
+            continue
+        candidate = {**compacted, key: trimmed}
+        if _json_char_cost(candidate) <= max_chars:
+            compacted[key] = trimmed
+            remaining_budget = max_chars - _json_char_cost(compacted)
+    return compacted
+
+
+def _compact_request_digest(
+    text: str,
+    *,
+    snapshot: WorkspaceSnapshot | None = None,
+    max_chars: int,
+    max_items: int = 8,
+) -> dict[str, object]:
+    digest = build_request_digest(
+        text,
+        snapshot=snapshot,
+        max_chars=max_chars,
+        max_items=max_items,
+    )
+    return _compact_request_digest_payload(digest, max_chars=max_chars)
+
+
+def build_request_digest(
+    text: str,
+    *,
+    snapshot: WorkspaceSnapshot | None = None,
+    max_chars: int = REQUEST_MEMORY_STATE_CHAR_BUDGET,
+    max_items: int = 8,
+) -> RequestDigest:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return RequestDigest()
+    all_requirements: list[str] = []
+    line_requirements: list[str] = []
+    for raw_line in normalized.splitlines():
+        cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", str(raw_line or "")).strip(" .")
+        if len(cleaned_line) < 8 or _is_generation_metadata_constraint(cleaned_line):
+            continue
+        trimmed_line = _trim_balanced_text(cleaned_line, 180)
+        _append_unique_compact_text(line_requirements, trimmed_line, limit=180)
+        _append_unique_compact_text(all_requirements, trimmed_line, limit=180)
+    expanded = normalized.replace("*", "; ").replace("•", "; ")
+    for sentence in _requirement_sentences(expanded):
+        clauses = _split_requirement_clauses(sentence)
+        candidates = clauses if len(clauses) > 1 else [sentence]
+        for candidate in candidates:
+            cleaned = _trim_balanced_text(candidate, 180)
+            if not cleaned or _is_generation_metadata_constraint(cleaned):
+                continue
+            _append_unique_compact_text(all_requirements, cleaned, limit=180)
+    prioritized_requirements = list(line_requirements or all_requirements)
+    for candidate in all_requirements:
+        _append_unique_compact_text(prioritized_requirements, candidate, limit=180)
+    requirements = prioritized_requirements[:max_items]
+    balancing_source = line_requirements if len(line_requirements) >= max_items else prioritized_requirements
+    if len(balancing_source) > max_items:
+        head_count = max(1, max_items // 2)
+        tail_count = max(1, max_items - head_count)
+        balanced: list[str] = []
+        for candidate in [*balancing_source[:head_count], *balancing_source[-tail_count:]]:
+            _append_unique_compact_text(balanced, candidate, limit=180)
+            if len(balanced) >= max_items:
+                break
+        if balanced:
+            requirements = balanced[:max_items]
+    hard_constraints: list[str] = []
+    soft_preferences: list[str] = []
+    non_goals: list[str] = []
+    validation_needs: list[str] = []
+    risk_indicators: list[str] = []
+    completion_criteria: list[str] = []
+    for clause in prioritized_requirements[: max(max_items * 2, 12)]:
+        lowered = normalize_text(clause)
+        if any(marker in lowered for marker in REQUEST_DIGEST_HARD_MARKERS):
+            _append_unique_compact_text(hard_constraints, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_SOFT_MARKERS):
+            _append_unique_compact_text(soft_preferences, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_NON_GOAL_MARKERS):
+            _append_unique_compact_text(non_goals, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_VALIDATION_MARKERS):
+            _append_unique_compact_text(validation_needs, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_RISK_MARKERS):
+            _append_unique_compact_text(risk_indicators, clause, limit=180)
+        if any(marker in lowered for marker in REQUEST_DIGEST_COMPLETION_MARKERS):
+            _append_unique_compact_text(completion_criteria, clause, limit=180)
+    explicit_paths = [str(item).strip() for item in _extract_explicit_paths(normalized) if str(item).strip()][:8]
+    explicit_symbols = _request_digest_explicit_symbols(normalized, snapshot)
+    affected_areas = _request_digest_affected_areas(
+        normalized,
+        requirements,
+        snapshot=snapshot,
+        explicit_paths=explicit_paths,
+        explicit_symbols=explicit_symbols,
+    )
+    goal = next(
+        (
+            _trim_text(item, 180)
+            for item in [*requirements, _trim_balanced_text(normalized, 200)]
+            if str(item or "").strip()
+        ),
+        None,
+    )
+    return RequestDigest(
+        goal=goal,
+        requirements=requirements[:max_items],
+        hard_constraints=hard_constraints[:8],
+        soft_preferences=soft_preferences[:6],
+        non_goals=non_goals[:6],
+        affected_areas=affected_areas[:8],
+        explicit_paths=explicit_paths,
+        explicit_symbols=explicit_symbols[:8],
+        validation_needs=validation_needs[:6],
+        risk_indicators=risk_indicators[:6],
+        completion_criteria=completion_criteria[:6],
+        requirement_chunks=_chunk_requirement_groups(
+            prioritized_requirements,
+            max_chars=min(REQUEST_MEMORY_CHUNK_CHAR_BUDGET, max(140, max_chars // 5)),
+            max_chunks=5,
+        ),
+        request_excerpt=_trim_balanced_text(
+            normalized,
+            min(max(max_chars // 2, 220), 420),
+        ),
+    )
+
+
+def _compact_request_digest_payload(
+    digest: RequestDigest | dict[str, object] | None,
+    *,
+    max_chars: int,
+) -> dict[str, object]:
+    if digest is None:
+        return {}
+    if isinstance(digest, RequestDigest):
+        if not digest.has_signal():
+            return {}
+        payload = {
+            "goal": _trim_text(digest.goal or "", 180),
+            "requirements": [_trim_balanced_text(item, 160) for item in digest.requirements[:6]],
+            "hard_constraints": [_trim_text(item, 120) for item in digest.hard_constraints[:4]],
+            "soft_preferences": [_trim_text(item, 120) for item in digest.soft_preferences[:3]],
+            "non_goals": [_trim_text(item, 120) for item in digest.non_goals[:3]],
+            "affected_areas": [_trim_text(item, 120) for item in digest.affected_areas[:5]],
+            "explicit_paths": digest.explicit_paths[:5],
+            "explicit_symbols": digest.explicit_symbols[:5],
+            "validation_needs": [_trim_text(item, 120) for item in digest.validation_needs[:3]],
+            "risk_indicators": [_trim_text(item, 120) for item in digest.risk_indicators[:3]],
+            "completion_criteria": [_trim_text(item, 120) for item in digest.completion_criteria[:3]],
+            "request_excerpt": _trim_text(digest.request_excerpt or "", 260),
+        }
+    else:
+        payload = {key: value for key, value in dict(digest).items() if _has_payload_signal(value)}
+        if not payload:
+            return {}
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "requirements",
+            "goal",
+            "hard_constraints",
+            "validation_needs",
+            "completion_criteria",
+            "affected_areas",
+            "explicit_paths",
+            "explicit_symbols",
+            "risk_indicators",
+            "soft_preferences",
+            "non_goals",
+            "requirements",
+            "request_excerpt",
+        ],
+        max_chars=max_chars,
+    )
+
+
+def _request_digest_explicit_symbols(
+    text: str,
+    snapshot: WorkspaceSnapshot | None,
+) -> list[str]:
+    raw = str(text or "")
+    hints: list[str] = []
+    for candidate in re.findall(r"`([^`]+)`", raw):
+        cleaned = str(candidate or "").strip()
+        if cleaned and cleaned not in hints and "/" not in cleaned:
+            hints.append(cleaned)
+    if snapshot is None:
+        return hints[:8]
+    token_candidates = {
+        token
+        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", raw)
+        if len(token) >= 3
+    }
+    symbol_lookup = {
+        str(symbol or "").strip().lower(): str(symbol or "").strip()
+        for symbols in list(getattr(snapshot, "symbol_index", {}).values())
+        for symbol in list(symbols or [])
+        if str(symbol or "").strip()
+    }
+    for token in token_candidates:
+        resolved = symbol_lookup.get(token.lower())
+        if resolved and resolved not in hints:
+            hints.append(resolved)
+        elif (
+            token not in hints
+            and ("_" in token or any(char.isupper() for char in token[1:]))
+            and len(token) <= 48
+        ):
+            hints.append(token)
+    return hints[:8]
+
+
+def _request_digest_affected_areas(
+    text: str,
+    requirements: list[str],
+    *,
+    snapshot: WorkspaceSnapshot | None,
+    explicit_paths: list[str],
+    explicit_symbols: list[str],
+) -> list[str]:
+    affected: list[str] = []
+    for item in [*explicit_paths, *explicit_symbols]:
+        if item and item not in affected:
+            affected.append(item)
+    if snapshot is None:
+        for item in prioritized_focus_terms(text, *requirements, max_terms=8):
+            if item not in affected:
+                affected.append(item)
+        return affected[:8]
+    symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+    candidate_paths = [
+        *list(getattr(snapshot, "focus_files", []) or []),
+        *list(getattr(snapshot, "important_files", []) or []),
+        *list(getattr(snapshot, "entrypoints", []) or []),
+        *list(getattr(snapshot, "service_files", []) or []),
+        *list(symbol_index.keys()),
+    ]
+    reference_terms = {
+        token
+        for item in [*candidate_paths, *explicit_symbols]
+        for token in prioritized_focus_terms(str(item or ""), max_terms=6)
+    }
+    query_terms = set(prioritized_focus_terms(text, *requirements, reference_terms=reference_terms, max_terms=18))
+    ranked: list[tuple[float, str]] = []
+    for path in dict.fromkeys(path for path in candidate_paths if str(path or "").strip()):
+        path_terms = set(prioritized_focus_terms(path, max_terms=8))
+        symbol_terms = {
+            token
+            for symbol in list(symbol_index.get(path, []) or [])[:6]
+            for token in prioritized_focus_terms(str(symbol or ""), max_terms=4)
+        }
+        overlap = len(query_terms & (path_terms | symbol_terms))
+        if overlap <= 0:
+            continue
+        score = overlap
+        if path in explicit_paths:
+            score += 4
+        if any(symbol.lower() in {item.lower() for item in explicit_symbols} for symbol in list(symbol_index.get(path, []) or [])[:6]):
+            score += 2
+        ranked.append((score, path))
+    for _score, path in sorted(ranked, key=lambda item: (-item[0], item[1]))[:5]:
+        if path not in affected:
+            affected.append(path)
+    return affected[:8]
+
+
+def _chunk_requirement_groups(
+    requirements: list[str],
+    *,
+    max_chars: int,
+    max_chunks: int,
+) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    for requirement in requirements:
+        item = _trim_text(requirement, min(max_chars, 180))
+        extra_chars = len(item) + (2 if current else 0)
+        if current and (current_chars + extra_chars > max_chars or len(current) >= 3):
+            chunks.append("; ".join(current))
+            current = []
+            current_chars = 0
+            if len(chunks) >= max_chunks:
+                break
+        if len(chunks) >= max_chunks:
+            break
+        current.append(item)
+        current_chars += len(item) + (2 if len(current) > 1 else 0)
+    if current and len(chunks) < max_chunks:
+        chunks.append("; ".join(current))
+    return chunks[:max_chunks]
 
 
 def _requirement_sentences(text: str) -> list[str]:

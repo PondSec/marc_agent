@@ -56,6 +56,7 @@ FailureClass = Literal[
     "runtime_error",
 ]
 ContextPressureEstimate = Literal["low", "medium", "high"]
+MAX_PARTIAL_OUTPUT_BUFFER_CHARS = 50000
 
 
 @dataclass(slots=True)
@@ -148,6 +149,7 @@ class ExecutionAttemptRecord:
     first_output_received: bool = False
     output_characters: int = 0
     activity_count: int = 0
+    partial_text: str = ""
     failure: ExecutionFailure | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -183,6 +185,17 @@ class InvocationOutcome:
     attempt: ExecutionAttemptRecord
     value: Any | None = None
     exception: Exception | None = None
+
+
+def _append_partial_output(existing: str, fragment: str) -> str:
+    current = str(existing or "")
+    piece = str(fragment or "")
+    if not piece:
+        return current
+    if len(current) >= MAX_PARTIAL_OUTPUT_BUFFER_CHARS:
+        return current
+    remaining = MAX_PARTIAL_OUTPUT_BUFFER_CHARS - len(current)
+    return current + piece[:remaining]
 
 
 class InvocationLifecycleTimeoutError(RuntimeError):
@@ -524,6 +537,17 @@ class ExecutionAttemptStateMachine:
                     self.record.output_characters,
                     _coerce_int(payload.get("characters")) or self.record.output_characters,
                 )
+                chunk_text = str(payload.get("text") or payload.get("chunk") or "")
+                if chunk_text:
+                    self.record.partial_text = _append_partial_output(
+                        self.record.partial_text,
+                        chunk_text,
+                    )
+                elif payload.get("partial_text"):
+                    self.record.partial_text = _append_partial_output(
+                        self.record.partial_text,
+                        str(payload.get("partial_text") or ""),
+                    )
                 self.record.activity_count = max(self.record.activity_count + 1, 1)
                 if now - self._last_chunk_at < 2.0:
                     return
@@ -552,6 +576,8 @@ class ExecutionAttemptStateMachine:
                 self.record.output_characters,
                 measure_output_characters(value),
             )
+            if isinstance(value, str) and value:
+                self.record.partial_text = _append_partial_output("", value)
         return self.record
 
     def fail(
@@ -577,6 +603,8 @@ class ExecutionAttemptStateMachine:
             self.record.first_output_received = failure.first_output_received
             self.record.output_characters = max(self.record.output_characters, failure.characters)
             self.record.activity_count = max(self.record.activity_count, failure.activity_count)
+            if failure.partial_text:
+                self.record.partial_text = failure.partial_text
         return self.record
 
     def lifecycle_timeout_error(self, *, now: float | None = None) -> InvocationLifecycleTimeoutError | None:
@@ -601,6 +629,7 @@ class ExecutionAttemptStateMachine:
                     idle_for=round(idle_for, 1),
                     characters=self.record.output_characters,
                     activity_count=self.record.activity_count,
+                    partial_text=self.record.partial_text,
                     model_name=self.record.model_identifier,
                     backend_identifier=self.record.backend_identifier,
                     startup_timeout_seconds=startup_timeout,
@@ -620,6 +649,7 @@ class ExecutionAttemptStateMachine:
                     idle_for=round(idle_for, 1),
                     characters=self.record.output_characters,
                     activity_count=self.record.activity_count,
+                    partial_text=self.record.partial_text,
                     model_name=self.record.model_identifier,
                     backend_identifier=self.record.backend_identifier,
                     startup_timeout_seconds=startup_timeout,
@@ -635,6 +665,7 @@ class ExecutionAttemptStateMachine:
                     idle_for=round(idle_for, 1),
                     characters=self.record.output_characters,
                     activity_count=self.record.activity_count,
+                    partial_text=self.record.partial_text,
                     model_name=self.record.model_identifier,
                     backend_identifier=self.record.backend_identifier,
                     startup_timeout_seconds=startup_timeout,

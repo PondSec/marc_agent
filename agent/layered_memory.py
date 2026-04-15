@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -18,12 +19,14 @@ from agent.models import (
     MemoryRetrievalResult,
     MemorySummary,
     ProjectMemoryEntry,
+    RememberedFact,
     RetrievedMemoryItem,
     RetrievalRequest,
     SessionState,
     WorkingMemoryEntry,
     utc_now,
 )
+from agent.semantic_defaults import classify_conversation_request, normalize_text, prioritized_focus_terms
 from config.settings import AppConfig
 from runtime.workspace import WorkspaceManager
 
@@ -49,6 +52,105 @@ TYPE_USE_CASE_BONUS = {
     "project_context": {"project": 0.24, "episodic": 0.04, "failure": 0.02, "conversation": 0.02},
     "user_recall": {"episodic": 0.16, "conversation": 0.14, "project": 0.06, "failure": 0.02},
 }
+
+_QUESTION_WORD_TOKENS = {"how", "wann", "warum", "was", "what", "when", "wer", "where", "wie", "wieso", "wo", "who", "why"}
+_FIRST_PERSON_TOKENS = {"i", "ich", "me", "mein", "meine", "mich", "mir", "my"}
+_SECOND_PERSON_TOKENS = {"dein", "deine", "dich", "dir", "du", "you", "your"}
+_IDENTITY_QUERY_TOKENS = {"bin", "heisse", "heisst", "identity", "identitaet", "name", "person", "profil", "profile", "who", "wer"}
+_PROFILE_QUERY_PHRASES = ("about me", "ueber mich", "uber mich")
+_PERSONAL_QUERY_STOPWORDS = {
+    *_QUESTION_WORD_TOKENS,
+    *_FIRST_PERSON_TOKENS,
+    *_SECOND_PERSON_TOKENS,
+    "am",
+    "bin",
+    "bist",
+    "bist",
+    "das",
+    "denn",
+    "der",
+    "die",
+    "du",
+    "ein",
+    "eine",
+    "einem",
+    "einer",
+    "erinnern",
+    "erinnere",
+    "from",
+    "fuer",
+    "für",
+    "hab",
+    "habe",
+    "haben",
+    "heisse",
+    "heisst",
+    "identity",
+    "identitaet",
+    "ist",
+    "mein",
+    "meine",
+    "mich",
+    "mir",
+    "my",
+    "noch",
+    "profil",
+    "profile",
+    "remember",
+    "seid",
+    "sind",
+    "ueber",
+    "uber",
+    "von",
+    "weiss",
+    "weisst",
+    "weißt",
+    "werde",
+    "wirst",
+}
+_PERSONAL_RECALL_EXCLUDE_TOKENS = {
+    "api",
+    "app",
+    "auth",
+    "backend",
+    "bug",
+    "build",
+    "cli",
+    "code",
+    "config",
+    "css",
+    "datei",
+    "diff",
+    "feature",
+    "file",
+    "frontend",
+    "html",
+    "index",
+    "js",
+    "modul",
+    "module",
+    "projekt",
+    "python",
+    "repo",
+    "route",
+    "script",
+    "server",
+    "stacktrace",
+    "test",
+    "ui",
+    "workspace",
+}
+_HISTORY_TEMPORAL_TOKENS = {"already", "bereits", "bisher", "earlier", "frueher", "history", "last", "letzte", "letzten", "letzter", "mal", "previous", "schon", "status", "stand", "vorher"}
+_HISTORY_CONTINUITY_TOKENS = {"again", "gebaut", "did", "done", "gemacht", "have", "haben", "implemented", "schon", "we", "wir"}
+_MEMORY_DIRECTIVE_PATTERNS = (
+    re.compile(r"\b(?:merk(?:e)?\s+dir|speicher(?:e)?|behalte?)\b(?:\s+bitte|\s+mal)?(?:\s+dass)?\s*(?P<fact>.+)", flags=re.IGNORECASE),
+    re.compile(r"\bremember\b(?:\s+this|\s+that)?\s*(?P<fact>.+)", flags=re.IGNORECASE),
+)
+_USER_NAME_PATTERNS = (
+    re.compile(r"\b(?:ich\s+heisse|mein\s+name\s+ist|my\s+name\s+is)\s+(?P<value>[^,.!?;\n]+)", flags=re.IGNORECASE),
+    re.compile(r"\b(?:dass\s+)?ich\s+(?P<value>[^,.!?;\n]+?)\s+heisse\b", flags=re.IGNORECASE),
+    re.compile(r"\b(?:i\s+am|i'm)\s+(?P<value>[^,.!?;\n]+)", flags=re.IGNORECASE),
+)
 
 
 class AgentMemoryStore(RepoMemoryStore):
@@ -295,6 +397,10 @@ class AgentMemoryStore(RepoMemoryStore):
             current_subtask=current_subtask,
             primary_target=primary_target,
             verification_target=verification_target,
+            request_excerpt=str(getattr(task_state, "request_excerpt", "") or "").strip() or None,
+            request_requirements=list(getattr(task_state, "request_requirements", [])[:6] if task_state is not None else []),
+            request_chunks=list(getattr(task_state, "request_chunks", [])[:4] if task_state is not None else []),
+            request_digest=getattr(task_state, "request_digest", None),
             active_constraints=active_constraints,
             active_failure_signature=active_failure_signature,
             recent_attempts=[self._trim_text(item, 140) for item in recent_attempts],
@@ -310,6 +416,7 @@ class AgentMemoryStore(RepoMemoryStore):
     def build_retrieval_request(self, task: str, session: SessionState) -> RetrievalRequest:
         working = session.working_memory or self.build_working_memory(session)
         use_case = self._infer_use_case(task, session)
+        recall_subject, recall_attributes = self._personal_recall_focus(task)
         fresh_task_bootstrap = self._is_fresh_task_bootstrap(session)
         include_types = ["episodic", "project", "failure", "conversation"]
         if fresh_task_bootstrap and use_case != "user_recall":
@@ -319,9 +426,14 @@ class AgentMemoryStore(RepoMemoryStore):
         elif use_case == "project_context":
             include_types = ["project", "episodic", "failure", "conversation"]
         elif use_case == "user_recall":
-            include_types = ["episodic", "conversation", "project", "failure"]
+            include_types = ["conversation"] if recall_subject else ["episodic", "conversation", "project", "failure"]
         target_paths = self._unique_strings(
             [
+                *(
+                    list(getattr(getattr(working, "request_digest", None), "explicit_paths", []) or [])
+                    if working is not None
+                    else []
+                ),
                 *(working.relevant_files if working is not None else []),
                 *session.candidate_files[:8],
                 *[item.path for item in session.changed_files[-6:]],
@@ -333,17 +445,24 @@ class AgentMemoryStore(RepoMemoryStore):
             project_id=session.project_id or self.project_id,
             workspace_root=session.workspace_root,
             session_id=session.id,
+            recall_subject=recall_subject,
+            recall_attributes=list(recall_attributes),
             target_paths=target_paths,
-            symbol_names=list(working.relevant_symbols[:6] if working is not None else []),
+            symbol_names=self._unique_strings(
+                [
+                    *(list(getattr(getattr(working, "request_digest", None), "explicit_symbols", []) or []) if working is not None else []),
+                    *(working.relevant_symbols[:6] if working is not None else []),
+                ]
+            )[:6],
             error_terms=self._request_error_terms(session),
             failure_signature=working.active_failure_signature if working is not None else None,
             current_goal=working.current_goal if working is not None else None,
             current_subtask=working.current_subtask if working is not None else None,
             changed_files=[item.path for item in session.changed_files[-6:]],
             include_types=include_types,
-            max_hits=4 if fresh_task_bootstrap else 6,
-            max_per_type=1 if fresh_task_bootstrap else 2,
-            summary_budget_chars=520 if fresh_task_bootstrap else 900,
+            max_hits=3 if recall_subject else 4 if fresh_task_bootstrap else 6,
+            max_per_type=3 if recall_subject else 1 if fresh_task_bootstrap else 2,
+            summary_budget_chars=420 if recall_subject else 520 if fresh_task_bootstrap else 900,
             allow_cross_project=use_case in {"similar_task_lookup", "user_recall"},
         )
 
@@ -366,7 +485,7 @@ class AgentMemoryStore(RepoMemoryStore):
                 scored.append(item)
         scored.sort(key=lambda item: (item.score, item.exact_entity_relevance, item.project_relevance), reverse=True)
         selected = self._select_with_budgets(scored, request)
-        recall_brief = self._render_user_recall_brief(selected, request.summary_budget_chars) if request.use_case == "user_recall" else ""
+        recall_brief = self._render_user_recall_brief(selected, request) if request.use_case == "user_recall" else ""
         summary = recall_brief or self._render_result_summary(selected, request.summary_budget_chars)
         suggested_files = self._unique_strings(
             [path for item in selected for path in item.file_paths]
@@ -595,12 +714,20 @@ class AgentMemoryStore(RepoMemoryStore):
             common_file_relationships=common_file_relationships[:8],
             test_mappings=[f"{left} -> {right}" for left, right in self._infer_test_mappings(snapshot.test_files, snapshot.important_files)][:8],
             symbol_index={path: symbols[:6] for path, symbols in list(snapshot.symbol_index.items())[:10]},
+            file_relationships={path: relations[:6] for path, relations in list(snapshot.file_relationships.items())[:10]},
+            module_summaries={path: self._trim_text(summary, 180) for path, summary in list(snapshot.module_summaries.items())[:8]},
             architecture_notes=[self._trim_text(item, 180) for item in snapshot.repo_map[:8]],
             known_hotspots=list(snapshot.important_files[:8]),
             conventions=[self._trim_text(item, 120) for item in snapshot.project_labels[:6]],
             workflow_hints=workflow_hints,
             co_change_hints=self._project_co_change_hints(session.project_id or self.project_id),
-            subsystem_summaries={path: self._trim_text(brief, 160) for path, brief in file_briefs[:6]},
+            subsystem_summaries={
+                name: self._trim_text(summary, 180)
+                for name, summary in (
+                    list(getattr(snapshot, "subsystem_summaries", {}).items())[:6]
+                    or [(path, brief) for path, brief in file_briefs[:6]]
+                )
+            },
         )
 
     def _build_failure_entries(self, session: SessionState) -> list[FailureMemoryEntry]:
@@ -639,6 +766,7 @@ class AgentMemoryStore(RepoMemoryStore):
     def _build_conversation_entry(self, session: SessionState) -> ConversationMemoryEntry | None:
         if not session.messages and not str(session.task or "").strip():
             return None
+        remembered_facts = self._extract_remembered_facts(session)
         request_summary = self._trim_text(
             str(getattr(session.task_state, "root_goal", "") or "").strip() or session.task,
             180,
@@ -654,6 +782,24 @@ class AgentMemoryStore(RepoMemoryStore):
                 *(session.completion_criteria[:3] if session.status == "completed" else []),
             ]
         )[:4]
+        base_tags = self._unique_strings(
+            [
+                str(getattr(session.task_state, "goal_relation", "") or "").strip(),
+                str(getattr(session.task_state, "current_user_intent", "") or "").strip(),
+                session.status,
+                *[f"recall_subject:{item.subject}" for item in remembered_facts],
+                *[f"recall_attribute:{item.attribute}" for item in remembered_facts],
+            ]
+        )
+        dedupe_seed = " ".join(item.summary for item in remembered_facts) if remembered_facts else request_summary
+        dedupe_key = (
+            f"conversation:remembered:{self._hash_text(dedupe_seed)}"
+            if remembered_facts
+            else f"conversation:{session.project_id or self.project_id}:{self._hash_text(request_summary)}"
+        )
+        retention = "long" if remembered_facts else "short"
+        ttl_days = 365 if remembered_facts else RETENTION_DAYS["conversation"]
+        importance = 0.82 if remembered_facts else 0.58
         return ConversationMemoryEntry(
             project_id=session.project_id or self.project_id,
             workspace_root=session.workspace_root,
@@ -671,26 +817,21 @@ class AgentMemoryStore(RepoMemoryStore):
                 workspace_root=session.workspace_root,
                 detail="Derived from the user request, assistant outcome, and recent conversation context.",
             ),
-            tags=self._unique_strings(
-                [
-                    str(getattr(session.task_state, "goal_relation", "") or "").strip(),
-                    str(getattr(session.task_state, "current_user_intent", "") or "").strip(),
-                    session.status,
-                ]
-            ),
+            tags=base_tags,
             file_paths=[item.path for item in session.changed_files[-6:]],
             symbol_names=list(session.working_memory.relevant_symbols[:4] if session.working_memory else []),
-            retention="short",
-            ttl_days=RETENTION_DAYS["conversation"],
-            importance=0.58,
+            retention=retention,
+            ttl_days=ttl_days,
+            importance=importance,
             confidence=max(float(getattr(session.task_state, "confidence", 0.0) or 0.0), 0.42),
-            dedupe_key=f"conversation:{session.project_id or self.project_id}:{self._hash_text(request_summary)}",
+            dedupe_key=dedupe_key,
             request_summary=request_summary,
             delivered_summary=delivered_summary or None,
             projects_touched=[session.project_id or self.project_id],
             decision_notes=[self._trim_text(item, 160) for item in session.notes[-4:]],
             implemented_features=implemented_features,
             referenced_sessions=[session.id],
+            remembered_facts=remembered_facts,
         )
 
     def _build_failure_entry(
@@ -916,25 +1057,38 @@ class AgentMemoryStore(RepoMemoryStore):
         query_terms = self._query_terms(request)
         entry_terms = set(metadata.get("terms", []))
         similarity = self._jaccard_similarity(query_terms, entry_terms)
-        project_relevance = 1.0 if request.project_id and metadata.get("project_id") == request.project_id else 0.0
+        personal_recall = bool(request.recall_subject)
+        project_relevance = 0.0 if personal_recall else 1.0 if request.project_id and metadata.get("project_id") == request.project_id else 0.0
         exact_entity = self._exact_entity_relevance(request, metadata)
         failure_relevance = self._failure_relevance(request, metadata)
         recency, is_stale = self._recency_score(metadata)
         confidence = float(metadata.get("confidence", 0.0) or 0.0)
         importance = float(metadata.get("importance", 0.0) or 0.0)
         type_bonus = TYPE_USE_CASE_BONUS.get(request.use_case, {}).get(memory_type, 0.0)
-        score = (
-            0.28 * similarity
-            + 0.24 * project_relevance
-            + 0.19 * exact_entity
-            + 0.14 * recency
-            + 0.09 * failure_relevance
-            + 0.03 * confidence
-            + 0.03 * importance
-            + type_bonus
-        )
+        if personal_recall:
+            score = (
+                0.34 * similarity
+                + 0.3 * exact_entity
+                + 0.18 * recency
+                + 0.08 * confidence
+                + 0.06 * importance
+                + type_bonus
+            )
+        else:
+            score = (
+                0.28 * similarity
+                + 0.24 * project_relevance
+                + 0.19 * exact_entity
+                + 0.14 * recency
+                + 0.09 * failure_relevance
+                + 0.03 * confidence
+                + 0.03 * importance
+                + type_bonus
+            )
         if is_stale:
             score *= 0.58
+        if personal_recall and similarity < 0.08 and exact_entity < 0.22:
+            return None
         if score < 0.12 and not project_relevance and not exact_entity and not failure_relevance:
             return None
         entry = self._load_entry(entry_id)
@@ -998,12 +1152,15 @@ class AgentMemoryStore(RepoMemoryStore):
     def _render_user_recall_brief(
         self,
         selected: list[RetrievedMemoryItem],
-        budget_chars: int,
+        request: RetrievalRequest,
     ) -> str:
         if not selected:
             return ""
+        fact = self._best_remembered_fact(selected, request)
+        if fact is not None:
+            return self._render_remembered_fact_response(fact, request, request.summary_budget_chars)
         lines = ["Ich habe dazu relevante fruehere Arbeit gefunden:"]
-        remaining = max(int(budget_chars or 0), 240) - len(lines[0]) - 1
+        remaining = max(int(request.summary_budget_chars or 0), 240) - len(lines[0]) - 1
         for item in selected[:3]:
             session_ref = f"session={item.session_id}" if item.session_id else f"source={item.provenance.source_type}"
             line = self._trim_text(
@@ -1176,7 +1333,18 @@ class AgentMemoryStore(RepoMemoryStore):
         elif isinstance(entry, FailureMemoryEntry):
             chunks.extend([entry.failure_signature, *entry.tried_strategies, *entry.successful_repair_patterns, *entry.bad_retry_patterns, *entry.chosen_targets])
         elif isinstance(entry, ConversationMemoryEntry):
-            chunks.extend([entry.request_summary, entry.delivered_summary or "", *entry.implemented_features, *entry.decision_notes])
+            chunks.extend(
+                [
+                    entry.request_summary,
+                    entry.delivered_summary or "",
+                    *entry.implemented_features,
+                    *entry.decision_notes,
+                    *[fact.summary for fact in entry.remembered_facts],
+                    *[fact.value for fact in entry.remembered_facts],
+                    *[fact.attribute for fact in entry.remembered_facts],
+                    *[fact.subject for fact in entry.remembered_facts],
+                ]
+            )
         return self._terms_from_text(" ".join(chunk for chunk in chunks if chunk))
 
     def _load_entry(
@@ -1241,6 +1409,8 @@ class AgentMemoryStore(RepoMemoryStore):
             merged_roles.update(incoming.module_roles)
             merged_subsystems = dict(existing.subsystem_summaries)
             merged_subsystems.update(incoming.subsystem_summaries)
+            merged_module_summaries = dict(existing.module_summaries)
+            merged_module_summaries.update(incoming.module_summaries)
             return existing.model_copy(
                 update={
                     **common_update,
@@ -1253,6 +1423,8 @@ class AgentMemoryStore(RepoMemoryStore):
                     "common_file_relationships": self._unique_strings([*existing.common_file_relationships, *incoming.common_file_relationships])[:10],
                     "test_mappings": self._unique_strings([*existing.test_mappings, *incoming.test_mappings])[:10],
                     "symbol_index": self._merge_symbol_indexes(existing.symbol_index, incoming.symbol_index),
+                    "file_relationships": self._merge_symbol_indexes(existing.file_relationships, incoming.file_relationships),
+                    "module_summaries": merged_module_summaries,
                     "architecture_notes": self._unique_strings([*existing.architecture_notes, *incoming.architecture_notes])[:10],
                     "known_hotspots": self._unique_strings([*existing.known_hotspots, *incoming.known_hotspots])[:10],
                     "conventions": self._unique_strings([*existing.conventions, *incoming.conventions])[:10],
@@ -1285,31 +1457,236 @@ class AgentMemoryStore(RepoMemoryStore):
                     "decision_notes": self._unique_strings([*existing.decision_notes, *incoming.decision_notes])[:8],
                     "implemented_features": self._unique_strings([*existing.implemented_features, *incoming.implemented_features])[:8],
                     "referenced_sessions": self._unique_strings([*existing.referenced_sessions, *incoming.referenced_sessions])[:8],
+                    "remembered_facts": self._merge_remembered_facts(existing.remembered_facts, incoming.remembered_facts),
                 }
             )
         return incoming
 
     def _infer_use_case(self, task: str, session: SessionState) -> str:
-        lowered = str(task or "").strip().lower()
+        lowered = normalize_text(task)
         if session.validation_status in {"failed", "bootstrap_failed", "bootstrap_reset_required"} or session.active_repair_context is not None:
             return "repair_assistance"
-        recall_markers = (
-            "haben wir",
-            "hatten wir",
-            "letzter stand",
-            "last time",
-            "did we already",
-            "already built",
-            "schon mal",
-            "remember",
-        )
-        if any(marker in lowered for marker in recall_markers):
+        if self._personal_recall_focus(task)[0] is not None or self._looks_like_history_recall_query(lowered):
             return "user_recall"
         if str(getattr(session.task_state, "goal_relation", "") or "").strip() in {"continue", "refine"}:
             return "task_continuation"
         if any(token in lowered for token in ("architecture", "repo", "projekt", "module", "subsystem")):
             return "project_context"
         return "similar_task_lookup"
+
+    def _extract_remembered_facts(self, session: SessionState) -> list[RememberedFact]:
+        facts: list[RememberedFact] = []
+        task_state_facts = list(getattr(session.task_state, "remembered_facts", []) or [])
+        for item in task_state_facts:
+            attribute = self._clean_fact_value(str(getattr(item, "attribute", "") or ""))
+            value = self._clean_fact_value(str(getattr(item, "value", "") or ""))
+            if not attribute or not value:
+                continue
+            subject = str(getattr(item, "subject", "user") or "user").strip().lower()
+            if subject not in {"user", "assistant"}:
+                subject = "user"
+            summary = self._clean_fact_value(str(getattr(item, "summary", "") or ""))
+            facts.append(
+                RememberedFact(
+                    subject=subject,
+                    attribute=attribute,
+                    value=value,
+                    summary=summary or f"{subject}:{attribute}={value}",
+                )
+            )
+        for message in session.messages[-12:]:
+            if message.role != "user":
+                continue
+            facts.extend(self._facts_from_user_text(message.content))
+        return self._merge_remembered_facts([], facts)
+
+    def _facts_from_user_text(self, text: str) -> list[RememberedFact]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        normalized = self._fact_text(raw)
+        facts = self._named_facts_from_statement(normalized)
+        directive_payload = self._memory_directive_payload(normalized)
+        if directive_payload:
+            directive_facts = self._named_facts_from_statement(directive_payload)
+            if directive_facts:
+                facts.extend(directive_facts)
+            else:
+                note = self._clean_fact_value(directive_payload)
+                if note:
+                    facts.append(
+                        RememberedFact(
+                            subject="user",
+                            attribute="note",
+                            value=note,
+                            summary=f"User note: {note}.",
+                        )
+                    )
+        return self._merge_remembered_facts([], facts)
+
+    def _named_facts_from_statement(self, text: str) -> list[RememberedFact]:
+        facts: list[RememberedFact] = []
+        for pattern in _USER_NAME_PATTERNS:
+            for match in pattern.finditer(text):
+                value = self._clean_fact_value(str(match.group("value") or ""))
+                if not self._looks_like_person_name(value):
+                    continue
+                facts.append(
+                    RememberedFact(
+                        subject="user",
+                        attribute="name",
+                        value=value,
+                        summary=f"User name: {value}.",
+                    )
+                )
+        return facts
+
+    def _memory_directive_payload(self, text: str) -> str | None:
+        for pattern in _MEMORY_DIRECTIVE_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
+            candidate = self._clean_fact_value(str(match.group("fact") or ""))
+            if candidate:
+                return candidate
+        return None
+
+    def _fact_text(self, text: str) -> str:
+        normalized = str(text or "").replace("ß", "ss")
+        return " ".join(normalized.split())
+
+    def _clean_fact_value(self, value: str) -> str:
+        return str(value or "").strip().strip("\"'`").rstrip(" .,:;!?")
+
+    def _looks_like_person_name(self, value: str) -> bool:
+        words = [item for item in re.split(r"[^A-Za-z0-9_-]+", str(value or "").strip()) if item]
+        if not words or len(words) > 4:
+            return False
+        alpha_words = [item for item in words if any(ch.isalpha() for ch in item)]
+        if not alpha_words:
+            return False
+        if len(alpha_words) >= 2:
+            return all(item[0].isupper() for item in alpha_words if item)
+        token = alpha_words[0]
+        return len(token) >= 2 and token[0].isupper()
+
+    def _merge_remembered_facts(
+        self,
+        existing: list[RememberedFact],
+        incoming: list[RememberedFact],
+    ) -> list[RememberedFact]:
+        merged: list[RememberedFact] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in [*existing, *incoming]:
+            key = (
+                str(item.subject or "").strip().lower(),
+                str(item.attribute or "").strip().lower(),
+                str(item.value or "").strip().lower(),
+            )
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged[:8]
+
+    def _personal_recall_focus(self, task: str) -> tuple[str | None, tuple[str, ...]]:
+        text = str(task or "").strip()
+        if not text:
+            return None, ()
+        normalized = normalize_text(text)
+        tokens = self._memory_tokens(normalized)
+        question_like = normalized.endswith("?") or bool(tokens and tokens[0] in _QUESTION_WORD_TOKENS)
+        conversational = classify_conversation_request(text) is not None
+        if not question_like and not conversational:
+            return None, ()
+        first_person = bool(set(tokens) & _FIRST_PERSON_TOKENS) or any(phrase in normalized for phrase in _PROFILE_QUERY_PHRASES)
+        second_person = bool(set(tokens) & _SECOND_PERSON_TOKENS)
+        if not first_person and not second_person:
+            return None, ()
+        identity_like = bool(set(tokens) & _IDENTITY_QUERY_TOKENS) or any(phrase in normalized for phrase in _PROFILE_QUERY_PHRASES)
+        content_tokens = [
+            token
+            for token in tokens
+            if len(token) >= 4 and token not in _PERSONAL_QUERY_STOPWORDS
+        ]
+        if not identity_like and any(token in _PERSONAL_RECALL_EXCLUDE_TOKENS for token in content_tokens):
+            return None, ()
+        if not identity_like and not content_tokens:
+            return None, ()
+        subject = "user" if first_person else "assistant"
+        attributes: list[str] = []
+        if identity_like:
+            attributes.extend(["identity", "profile"])
+            if "name" in tokens or "heisse" in tokens or "heisst" in tokens:
+                attributes.insert(0, "name")
+            elif subject == "user":
+                attributes.append("name")
+        for token in content_tokens:
+            if token not in attributes:
+                attributes.append(token)
+        return subject, tuple(self._unique_strings(attributes))
+
+    def _looks_like_history_recall_query(self, normalized: str) -> bool:
+        tokens = self._memory_tokens(normalized)
+        if not tokens:
+            return False
+        question_like = normalized.endswith("?") or tokens[0] in _QUESTION_WORD_TOKENS
+        temporal = bool(set(tokens) & _HISTORY_TEMPORAL_TOKENS) or any(
+            phrase in normalized for phrase in ("last time", "letzter stand", "previous run")
+        )
+        continuity = bool(set(tokens) & _HISTORY_CONTINUITY_TOKENS)
+        return temporal and (question_like or continuity)
+
+    def _memory_tokens(self, normalized: str) -> list[str]:
+        return [token for token in re.split(r"[^a-z0-9_]+", normalized) if token]
+
+    def _best_remembered_fact(
+        self,
+        selected: list[RetrievedMemoryItem],
+        request: RetrievalRequest,
+    ) -> RememberedFact | None:
+        preferred_subject = str(request.recall_subject or "").strip().lower()
+        preferred_attributes = {str(item or "").strip().lower() for item in request.recall_attributes if str(item or "").strip()}
+        query_terms = self._query_terms(request)
+        best_fact: RememberedFact | None = None
+        best_score = -1.0
+        for item in selected:
+            entry = item.entry
+            if not isinstance(entry, ConversationMemoryEntry):
+                continue
+            for fact in entry.remembered_facts:
+                fact_subject = str(fact.subject or "").strip().lower()
+                fact_attribute = str(fact.attribute or "").strip().lower()
+                if preferred_subject and fact_subject != preferred_subject:
+                    continue
+                score = item.score
+                if fact_attribute in preferred_attributes:
+                    score += 0.6
+                if preferred_attributes & {"identity", "profile"} and fact_attribute == "name":
+                    score += 0.45
+                fact_terms = set(self._terms_from_text(" ".join([fact.attribute, fact.summary, fact.value])))
+                overlap = len(query_terms & fact_terms)
+                if overlap:
+                    score += min(0.45, 0.12 * overlap)
+                if score > best_score:
+                    best_fact = fact
+                    best_score = score
+        return best_fact
+
+    def _render_remembered_fact_response(
+        self,
+        fact: RememberedFact,
+        request: RetrievalRequest,
+        budget_chars: int,
+    ) -> str:
+        preferred_attributes = {str(item or "").strip().lower() for item in request.recall_attributes if str(item or "").strip()}
+        if fact.subject == "user" and (fact.attribute == "name" or preferred_attributes & {"identity", "name", "profile"}):
+            return self._trim_text(f"Du bist {fact.value}.", max(int(budget_chars or 0), 60))
+        if fact.subject == "assistant" and (fact.attribute == "name" or preferred_attributes & {"identity", "name", "profile"}):
+            return self._trim_text(f"Ich bin {fact.value}.", max(int(budget_chars or 0), 60))
+        if fact.subject == "user":
+            return self._trim_text(f"Ich habe mir ueber dich gemerkt: {fact.value}.", max(int(budget_chars or 0), 80))
+        return self._trim_text(f"Ich habe mir dazu gemerkt: {fact.value}.", max(int(budget_chars or 0), 80))
 
     def _is_fresh_task_bootstrap(self, session: SessionState) -> bool:
         if session.active_repair_context is not None:
@@ -1347,22 +1724,34 @@ class AgentMemoryStore(RepoMemoryStore):
             ]
         )
 
-    def _query_terms(self, request: RetrievalRequest) -> set[str]:
+    def _query_terms(
+        self,
+        request: RetrievalRequest,
+        *,
+        reference_terms: set[str] | None = None,
+    ) -> set[str]:
+        recall_chunks: list[str] = []
+        if request.recall_subject:
+            recall_chunks.append(request.recall_subject)
+        recall_chunks.extend(request.recall_attributes)
         return set(
-            self._terms_from_text(
+            prioritized_focus_terms(
                 " ".join(
                     part
                     for part in [
                         request.query,
                         request.current_goal or "",
                         request.current_subtask or "",
+                        " ".join(recall_chunks),
                         " ".join(request.target_paths),
                         " ".join(request.symbol_names),
                         " ".join(request.error_terms),
                         request.failure_signature or "",
                     ]
                     if part
-                )
+                ),
+                max_terms=32,
+                reference_terms=reference_terms,
             )
         )
 
@@ -1371,6 +1760,7 @@ class AgentMemoryStore(RepoMemoryStore):
         file_paths = set(metadata.get("file_paths", []))
         symbol_names = {str(item).strip().lower() for item in request.symbol_names if str(item).strip()}
         stored_symbols = {str(item).strip().lower() for item in metadata.get("symbol_names", []) if str(item).strip()}
+        stored_tags = {str(item).strip().lower() for item in metadata.get("tags", []) if str(item).strip()}
         matches = 0.0
         total = 0.0
         if target_paths:
@@ -1383,6 +1773,14 @@ class AgentMemoryStore(RepoMemoryStore):
             total += 1.0
             if symbol_names & stored_symbols:
                 matches += 1.0
+        if request.recall_subject:
+            total += 1.0
+            subject_tag = f"recall_subject:{request.recall_subject}".lower()
+            attribute_tags = {f"recall_attribute:{item}".lower() for item in request.recall_attributes if str(item).strip()}
+            if subject_tag in stored_tags:
+                matches += 0.7
+                if attribute_tags & stored_tags:
+                    matches += 0.3
         return matches / total if total else 0.0
 
     def _failure_relevance(self, request: RetrievalRequest, metadata: dict[str, Any]) -> float:
@@ -1418,9 +1816,6 @@ class AgentMemoryStore(RepoMemoryStore):
     ) -> tuple[list[str], list[str], list[str]]:
         if snapshot is None:
             return [], [], []
-        query_terms = self._query_terms(request)
-        if not query_terms and not request.target_paths and not request.symbol_names and not request.error_terms:
-            return [], [], []
         ranked: list[tuple[float, str]] = []
         exact_targets = {str(path or "").strip() for path in request.target_paths if str(path or "").strip()}
         exact_names = {Path(path).name.lower() for path in exact_targets}
@@ -1430,6 +1825,7 @@ class AgentMemoryStore(RepoMemoryStore):
             if str(symbol or "").strip()
         }
         symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        file_relationships = getattr(snapshot, "file_relationships", {}) or {}
         candidate_paths = self._unique_strings(
             [
                 *list(getattr(snapshot, "focus_files", []) or []),
@@ -1440,8 +1836,22 @@ class AgentMemoryStore(RepoMemoryStore):
                 *list(symbol_index.keys()),
             ]
         )
+        query_terms = self._query_terms(
+            request,
+            reference_terms=self._candidate_reference_terms(candidate_paths, symbol_index),
+        )
+        if not query_terms and not request.target_paths and not request.symbol_names and not request.error_terms:
+            return [], [], []
+        path_terms_by_candidate = {
+            path: set(self._terms_from_text(path))
+            for path in candidate_paths
+        }
+        query_term_frequency: dict[str, int] = defaultdict(int)
+        for terms in path_terms_by_candidate.values():
+            for term in query_terms & terms:
+                query_term_frequency[term] += 1
         for path in candidate_paths:
-            path_terms = set(self._terms_from_text(path))
+            path_terms = path_terms_by_candidate.get(path, set())
             score = 0.0
             if path in exact_targets:
                 score += 3.2
@@ -1449,7 +1859,11 @@ class AgentMemoryStore(RepoMemoryStore):
                 score += 1.6
             matched_terms = query_terms & path_terms
             if matched_terms:
-                score += min(2.0, 0.6 * len(matched_terms))
+                specificity = sum(
+                    1.0 / max(query_term_frequency.get(term, 1), 1)
+                    for term in matched_terms
+                )
+                score += min(2.2, 1.2 * specificity)
             path_symbols = [str(item or "").strip() for item in symbol_index.get(path, []) if str(item or "").strip()]
             lowered_symbols = {item.lower() for item in path_symbols}
             if requested_symbols & lowered_symbols:
@@ -1467,6 +1881,14 @@ class AgentMemoryStore(RepoMemoryStore):
                 ranked.append((score, path))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         suggested_files = [path for _, path in ranked[:8]]
+        related_files = self._unique_strings(
+            [
+                relation
+                for path in suggested_files[:3]
+                for relation in list(file_relationships.get(path, []) or [])[:4]
+            ]
+        )[:4]
+        suggested_files = self._unique_strings([*suggested_files, *related_files])[:8]
         suggested_symbols = self._unique_strings(
             [
                 symbol
@@ -1483,6 +1905,8 @@ class AgentMemoryStore(RepoMemoryStore):
         test_mappings = list(getattr(snapshot, "test_mappings", []) or [])
         import_hotspots = set(getattr(snapshot, "import_hotspots", []) or [])
         symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        file_relationships = getattr(snapshot, "file_relationships", {}) or {}
+        module_summaries = getattr(snapshot, "module_summaries", {}) or {}
         for path in suggested_files[:4]:
             for mapping in test_mappings:
                 if path in mapping and mapping not in hints:
@@ -1492,6 +1916,12 @@ class AgentMemoryStore(RepoMemoryStore):
             symbols = list(symbol_index.get(path, []) or [])[:4]
             if symbols:
                 hints.append(f"{path} symbols: {', '.join(symbols)}")
+            related = list(file_relationships.get(path, []) or [])[:3]
+            if related:
+                hints.append(f"{path} related: {', '.join(related)}")
+            summary = str(module_summaries.get(path) or "").strip()
+            if summary:
+                hints.append(f"{path} summary: {self._trim_text(summary, 160)}")
         return self._unique_strings(hints)[:6]
 
     def _render_repo_hint_summary(self, repo_hints: list[str], budget_chars: int) -> str:
@@ -1776,14 +2206,31 @@ class AgentMemoryStore(RepoMemoryStore):
         return intersection / union if union else 0.0
 
     def _terms_from_text(self, text: str) -> list[str]:
-        terms: list[str] = []
-        for raw in str(text or "").lower().replace("/", " ").replace("-", " ").split():
-            token = "".join(ch for ch in raw if ch.isalnum() or ch == "_").strip("_")
-            if len(token) < 3:
+        return prioritized_focus_terms(text, max_terms=32)
+
+    def _candidate_reference_terms(
+        self,
+        candidate_paths: list[str],
+        symbol_index: dict[str, list[str]],
+    ) -> set[str]:
+        reference_terms: set[str] = set()
+        for path in candidate_paths:
+            lowered = str(path or "").strip().lower()
+            if not lowered:
                 continue
-            if token not in terms:
-                terms.append(token)
-        return terms[:32]
+            stem = Path(lowered).stem
+            if len(stem) >= 3:
+                reference_terms.add(stem)
+            for raw in re.split(r"[^a-z0-9_]+", lowered):
+                token = raw.strip("_")
+                if len(token) >= 3:
+                    reference_terms.add(token)
+            for symbol in list(symbol_index.get(path, []) or [])[:8]:
+                for raw in re.split(r"[^a-z0-9_]+", str(symbol or "").strip().lower()):
+                    token = raw.strip("_")
+                    if len(token) >= 3:
+                        reference_terms.add(token)
+        return reference_terms
 
     def _index_list_add(self, bucket: dict[str, list[str]], key: str, value: str) -> None:
         if key not in bucket:

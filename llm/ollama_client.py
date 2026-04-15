@@ -523,6 +523,7 @@ class OllamaClient:
                                 "type": "chunk",
                                 "elapsed": round(last_activity_at - started_at, 1),
                                 "characters": total_characters,
+                                "text": piece,
                                 "model": model_name,
                             }
                         )

@@ -37,14 +37,17 @@ class DummyLLM:
         raise RuntimeError("generate is not used in this test")
 
 
-def build_store(tmp_path: Path) -> AgentMemoryStore:
+def build_store(tmp_path: Path, *, state_root_override: Path | None = None) -> AgentMemoryStore:
     (tmp_path / "app").mkdir(parents=True)
     (tmp_path / "tests").mkdir(parents=True)
     (tmp_path / "app" / "main.py").write_text("def login(user):\n    return user\n", encoding="utf-8")
     (tmp_path / "app" / "auth.py").write_text("def check_role(role):\n    return role == 'admin'\n", encoding="utf-8")
     (tmp_path / "tests" / "test_main.py").write_text("def test_login():\n    assert True\n", encoding="utf-8")
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
-    config = AppConfig(workspace_root=str(tmp_path))
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        state_root_override=str(state_root_override) if state_root_override is not None else None,
+    )
     config.ensure_state_dirs()
     return AgentMemoryStore(config, WorkspaceManager(tmp_path))
 
@@ -233,6 +236,77 @@ def make_failure_entry(
     return entry
 
 
+def test_refresh_session_memory_retains_late_module_terms_for_large_analysis_prompt(tmp_path):
+    (tmp_path / "agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "server").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "agent" / "planner.py").write_text("def plan():\n    return 'ok'\n", encoding="utf-8")
+    (tmp_path / "agent" / "prompts.py").write_text("def build_prompt():\n    return 'prompt'\n", encoding="utf-8")
+    (tmp_path / "agent" / "layered_memory.py").write_text("class LayeredMemory:\n    pass\n", encoding="utf-8")
+    (tmp_path / "agent" / "task_state.py").write_text("class TaskState:\n    pass\n", encoding="utf-8")
+    (tmp_path / "server" / "app.py").write_text("def create_app():\n    return object()\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    store = AgentMemoryStore(config, WorkspaceManager(tmp_path))
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Beantworte danach Systemtyp, Datenfluss, Repo-Mapping, grosse Prompts sowie die Rollen von "
+        "planner, prompts, layered_memory, task_state und server."
+    )
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(store.workspace.root),
+        project_id=store.project_id,
+        runtime_options={"agent_profile": "a2"},
+    )
+    session.workspace_snapshot = store.build_snapshot(prompt)
+    session.task_state = TaskState(
+        latest_user_turn=prompt,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="A grounded architecture summary with concrete file paths.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        confidence=0.82,
+        next_action="inspect",
+    )
+
+    store.refresh_session_memory(prompt, session)
+
+    assert session.memory_context is not None
+    top_suggestions = session.memory_context.suggested_files[:6]
+    assert top_suggestions
+    assert "agent/prompts.py" in top_suggestions
+    assert "agent/planner.py" in session.memory_context.suggested_files[:6]
+    assert "agent/layered_memory.py" in top_suggestions
+    assert "server/app.py" in session.memory_context.suggested_files
+
+
+def test_refresh_session_memory_reinjects_request_digest_targets_into_retrieval(tmp_path):
+    store = build_store(tmp_path)
+    session = build_session(store)
+    session.task_state = session.task_state.model_copy(
+        update={
+            "request_digest": {
+                "goal": "Inspect auth behavior before patching.",
+                "requirements": ["Explain the auth behavior with concrete evidence."],
+                "explicit_paths": ["app/auth.py"],
+                "explicit_symbols": ["check_role"],
+                "validation_needs": ["Name the relevant test coverage."],
+            }
+        }
+    )
+
+    store.refresh_session_memory(session.task, session)
+
+    assert session.working_memory is not None
+    assert session.working_memory.request_digest is not None
+    assert "app/auth.py" in session.memory_context.request.target_paths
+    assert "check_role" in session.memory_context.request.symbol_names
+
+
 def make_conversation_entry(store: AgentMemoryStore, *, session_id: str, summary: str) -> ConversationMemoryEntry:
     return ConversationMemoryEntry(
         project_id=store.project_id,
@@ -265,6 +339,20 @@ def make_conversation_entry(store: AgentMemoryStore, *, session_id: str, summary
 def test_working_memory_stays_relevant_and_compact_for_active_run(tmp_path):
     store = build_store(tmp_path)
     session = build_session(store)
+    session.task_state = session.task_state.model_copy(
+        update={
+            "request_excerpt": "Build the auth hardening flow and keep the validation contract intact.",
+            "request_requirements": [
+                "Keep the auth flow stable.",
+                "Preserve the runtime validation contract.",
+                "Avoid broad rewrites.",
+            ],
+            "request_chunks": [
+                "Keep the auth flow stable; preserve the runtime validation contract.",
+                "Avoid broad rewrites.",
+            ],
+        }
+    )
     session.candidate_files = [f"app/file_{index}.py" for index in range(20)] + ["app/auth.py"]
     session.changed_files = [FileChangeRecord(path="app/auth.py", operation="update")]
     session.active_repair_context = build_failure_context()
@@ -277,6 +365,8 @@ def test_working_memory_stays_relevant_and_compact_for_active_run(tmp_path):
     assert working.primary_target == "app/auth.py"
     assert len(working.relevant_files) <= 8
     assert len(working.active_constraints) <= 6
+    assert working.request_chunks
+    assert "runtime validation contract" in working.request_chunks[0]
     assert len(working.compact_state_summary) <= 340
     assert "app/auth.py" in working.relevant_files
 
@@ -611,6 +701,12 @@ def test_repo_map_signal_bundle_prefers_symbol_and_test_mappings(tmp_path):
             },
             "service_files": ["app/auth.py"],
             "import_hotspots": ["app/main.py"],
+            "file_relationships": {
+                "app/auth.py": ["tests/test_main.py"],
+            },
+            "module_summaries": {
+                "app/auth.py": "symbols: check_role; related: tests/test_main.py",
+            },
         }
     )
 
@@ -620,6 +716,7 @@ def test_repo_map_signal_bundle_prefers_symbol_and_test_mappings(tmp_path):
     assert "app/auth.py" in session.memory_context.suggested_files
     assert "check_role" in session.memory_context.suggested_symbols
     assert any("tests/test_main.py -> app/main.py" in item for item in session.memory_context.repo_map_hints)
+    assert any("app/auth.py related: tests/test_main.py" in item for item in session.memory_context.repo_map_hints)
 
 
 def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(tmp_path):
@@ -641,6 +738,9 @@ def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(
             "symbol_index": {"app/auth.py": ["check_role"]},
             "import_hotspots": ["app/main.py"],
             "service_files": ["app/auth.py"],
+            "file_relationships": {"app/auth.py": ["tests/test_main.py"]},
+            "module_summaries": {"app/auth.py": "symbols: check_role; related: tests/test_main.py"},
+            "subsystem_summaries": {"app": "auth and test surface"},
         }
     )
     store.persist_session_memory(session)
@@ -650,6 +750,9 @@ def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(
     assert project_entry.symbol_index["app/auth.py"] == ["check_role"]
     assert project_entry.import_hotspots == ["app/main.py"]
     assert project_entry.service_files == ["app/auth.py"]
+    assert project_entry.file_relationships["app/auth.py"] == ["tests/test_main.py"]
+    assert "check_role" in project_entry.module_summaries["app/auth.py"]
+    assert project_entry.subsystem_summaries["app"] == "auth and test surface"
     assert any("app/auth.py <-> tests/test_main.py" in item for item in project_entry.co_change_hints)
     assert "app/auth.py" in project_entry.known_hotspots
 
@@ -827,3 +930,194 @@ def test_planner_answers_user_recall_queries_from_memory(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert "relevante fruehere Arbeit" in str(decision.final_response or "")
+
+
+def test_cross_project_personal_name_recall_round_trips_from_shared_memory(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    remembered = SessionState(
+        task="Bitte merk dir, dass ich Joshua Pond heisse.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Ich merke mir das fuer spaetere Rueckfragen.",
+    )
+    remembered.append_message("user", remembered.task)
+    remembered.append_message("assistant", remembered.final_response or "")
+    remembered.workspace_snapshot = store_a.build_snapshot(remembered.task)
+    store_a.persist_session_memory(remembered)
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+
+    recall = SessionState(
+        task="Wer bin ich?",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    recall.workspace_snapshot = store_b.build_snapshot(recall.task)
+
+    request = store_b.build_retrieval_request(recall.task, recall)
+    result = store_b.retrieve(request)
+
+    assert request.use_case == "user_recall"
+    assert request.recall_subject == "user"
+    assert "name" in request.recall_attributes
+    assert "Joshua Pond" in result.recall_brief
+
+
+def test_repeated_personal_fact_deduplicates_across_projects(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    first = SessionState(
+        task="Mein Name ist Joshua Pond.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    first.append_message("user", first.task)
+    first.append_message("assistant", first.final_response or "")
+    first.workspace_snapshot = store_a.build_snapshot(first.task)
+    store_a.persist_session_memory(first)
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+    second = SessionState(
+        task="Mein Name ist Joshua Pond.",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    second.append_message("user", second.task)
+    second.append_message("assistant", second.final_response or "")
+    second.workspace_snapshot = store_b.build_snapshot(second.task)
+    store_b.persist_session_memory(second)
+
+    remembered_entries = [
+        item
+        for item in store_b.list_entries("conversation")
+        if any(fact.attribute == "name" and fact.value == "Joshua Pond" for fact in item.remembered_facts)
+    ]
+
+    assert len(remembered_entries) == 1
+    assert set(remembered_entries[0].projects_touched) == {store_a.project_id, store_b.project_id}
+
+
+def test_planner_answers_personal_identity_questions_from_memory(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    remembered = SessionState(
+        task="Ich heisse Joshua Pond.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    remembered.append_message("user", remembered.task)
+    remembered.append_message("assistant", remembered.final_response or "")
+    remembered.workspace_snapshot = store_a.build_snapshot(remembered.task)
+    store_a.persist_session_memory(remembered)
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+
+    session = SessionState(
+        task="Wer bin ich?",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    session.workspace_snapshot = store_b.build_snapshot(session.task)
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal=session.task,
+        active_goal="Answer the identity question from persistent memory.",
+        goal_relation="new_task",
+        output_expectation="Return the remembered identity directly and concisely.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        confidence=0.88,
+        next_action="explain",
+        next_best_action="explain",
+    )
+    session.router_result = RouterOutput(
+        user_goal="Recall the user's identity",
+        intent=RouteIntent.EXPLAIN,
+        entities=RouteEntities(
+            target_type=None,
+            target_name=None,
+            target_paths=[],
+            attributes=[],
+            constraints=[],
+        ),
+        requested_outcome="Answer the identity question from memory.",
+        action_plan=[
+            RouteActionStep(step=1, action=RouteActionName.RESPOND_DIRECTLY, reason="Answer from memory."),
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+        confidence=0.92,
+        safe_to_execute=True,
+        repo_context_needed=False,
+        search_terms=["identity"],
+        relevant_extensions=[],
+        direct_response=None,
+    )
+    store_b.refresh_session_memory(session.task, session)
+    planner = Planner(DummyLLM(AppConfig(workspace_root=str(tmp_path))), "tools", logger=AgentLogger(store_b.config.log_dir_path, "memory-personal-recall"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Joshua Pond" in str(decision.final_response or "")
+
+
+def test_model_extracted_personal_fact_recalls_across_projects_without_literal_trigger(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    remembered = SessionState(
+        task="Bitte behalte fuer spaetere Projekte, dass meine Lieblingsfarbe Petrol ist.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    remembered.task_state = TaskState(
+        latest_user_turn=remembered.task,
+        root_goal="Merke dir die persoenliche Praeferenz.",
+        active_goal="Speichere die stabile Nutzerpraeferenz.",
+        goal_relation="new_task",
+        output_expectation="Die Praeferenz soll fuer spaetere Rueckfragen gespeichert werden.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        confidence=0.88,
+        next_action="explain",
+        next_best_action="explain",
+        remembered_facts=[
+            {
+                "subject": "user",
+                "attribute": "lieblingsfarbe",
+                "value": "Petrol",
+                "summary": "User preference: Lieblingsfarbe Petrol.",
+            }
+        ],
+    )
+    remembered.append_message("user", remembered.task)
+    remembered.append_message("assistant", remembered.final_response or "")
+    remembered.workspace_snapshot = store_a.build_snapshot(remembered.task)
+    store_a.persist_session_memory(remembered)
+
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+    recall = SessionState(
+        task="Welche Lieblingsfarbe habe ich?",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    recall.workspace_snapshot = store_b.build_snapshot(recall.task)
+
+    request = store_b.build_retrieval_request(recall.task, recall)
+    result = store_b.retrieve(request)
+
+    assert request.use_case == "user_recall"
+    assert request.recall_subject == "user"
+    assert "lieblingsfarbe" in request.recall_attributes
+    assert "Petrol" in result.recall_brief

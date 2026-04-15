@@ -12,9 +12,17 @@ from agent.models import ChatMessage, FollowUpContext, SessionState, WorkspaceSn
 from agent.planner import Planner
 from agent.prompts import (
     _compact_follow_up_context,
+    _compact_request_digest,
     _compact_workspace_snapshot,
     _prioritized_compact_payload,
+    build_request_digest,
+    build_request_memory_packet,
     task_state_update_prompt,
+)
+from agent.semantic_defaults import (
+    extract_scope_constraints,
+    looks_like_problem_report,
+    looks_like_scope_narrowing_request,
 )
 from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
@@ -1690,6 +1698,65 @@ def test_task_state_timeout_fallback_preserves_clear_explain_request(tmp_path):
     assert task_state.semantic_resolution == "minimal_inference"
 
 
+def test_task_state_timeout_fallback_keeps_large_project_analysis_executable_and_compact(tmp_path):
+    updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Ich moechte trotz kleinem Modell eine wirklich brauchbare Architektur-Zusammenfassung. "
+        "Lies die relevanten Stellen und beantworte dann kompakt: "
+        "Welche Rollen haben planner, prompts, layered_memory, task_state, state_updater und server? "
+        "Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen? "
+        "Woher kommt das Repo-Mapping und welche Stellen sind fuer grosse Nutzerprompts, Request-Digests, Request-Memory "
+        "und kompakte Generationsprompts entscheidend? "
+        "Nenne zentrale Dateipfade, bleibe geerdet und antworte auf Deutsch."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=build_snapshot(tmp_path))
+
+    assert task_state.current_user_intent == "explain"
+    assert task_state.next_action == "inspect"
+    assert task_state.needs_clarification is False
+    assert task_state.request_chunks
+    assert task_state.target_artifacts == []
+    assert len(task_state.root_goal) <= 220
+    assert len(task_state.active_goal) <= 220
+
+
+def test_task_state_a2_uses_local_structured_bootstrap_for_large_analysis(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    prompt = (
+        "Analysiere dieses Projekt gruendlich und belastbar. "
+        "Ich moechte trotz kleinem Modell eine wirklich brauchbare Architektur-Zusammenfassung. "
+        "Beantworte in mehreren Punkten Systemtyp, Datenfluss, Memory, Repo-Mapping, grosse Prompts und Risiken. "
+        "Nenne dabei konkrete Dateipfade, verliere spaetere Anforderungen nicht und antworte auf Deutsch. "
+        "Welche Rollen haben planner, prompts, layered_memory, task_state, state_updater und server? "
+        "Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen? "
+        "Welche Stellen sind fuer grosse Nutzerprompts, Request-Digests, Request-Memory und kompakte Generationsprompts entscheidend?"
+    )
+    llm = ScriptedLLM(json_payloads=[])
+    llm.config = config
+    session = SessionState(
+        task=prompt,
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        prompt,
+        snapshot=build_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.next_action == "inspect"
+    assert llm.generate_json_calls == []
+
+
 def test_task_state_timeout_fallback_treats_agent_intro_follow_up_as_direct_chat_even_with_multiple_active_artifacts(tmp_path):
     updater = TaskStateUpdater(ScriptedLLM(fail=True, fail_message="timed out"))
     session = SessionState(
@@ -2194,6 +2261,43 @@ def test_minimal_task_state_extracts_named_config_file_path_in_german_request(tm
     assert state.target_artifacts
     assert state.target_artifacts[0].path == "smoke.ini"
     assert state.target_artifacts[0].name == "smoke.ini"
+
+
+def test_minimal_task_state_does_not_treat_vanilla_frontend_create_prompt_as_scope_change(tmp_path):
+    request = (
+        "Erstelle eine moderne Website mit index.html, styles.css und script.js. "
+        "Nutze nur Vanilla HTML, CSS und JavaScript. "
+        "Baue ausserdem ein Formular mit einfacher Frontend-Validierung. "
+        "Achte darauf, dass es keine kaputten Funktionen gibt."
+    )
+
+    assert looks_like_scope_narrowing_request(request) is False
+    assert extract_scope_constraints(request) == []
+
+    state = build_minimal_task_state(
+        request,
+        session=None,
+        snapshot=empty_snapshot(tmp_path),
+        semantic_resolution="minimal_inference",
+    )
+    route = ExecutionDecisionPolicy().build_route(state, snapshot=empty_snapshot(tmp_path))
+
+    assert state.goal_relation == "new_task"
+    assert state.current_user_intent == "implement"
+    assert state.execution_strategy == "feature_implementation"
+    assert state.next_action == "create"
+    assert state.constraints == []
+    assert route.intent == RouteIntent.CREATE
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+
+
+def test_looks_like_problem_report_ignores_negated_problem_constraints():
+    request = (
+        "Erstelle eine moderne Website mit index.html, styles.css und script.js. "
+        "Achte darauf, dass es keine kaputten Funktionen gibt und keine Fehler auftreten."
+    )
+
+    assert looks_like_problem_report(request) is False
 
 
 def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_request(tmp_path):
@@ -3624,6 +3728,181 @@ def test_task_state_update_prompt_compact_stays_smaller_than_full(tmp_path):
     assert '"file_briefs"' not in compact_prompt
     assert '"symbol_index"' in full_prompt
     assert '"file_briefs"' in full_prompt
+
+
+def test_task_state_update_prompt_compact_keeps_tail_requirements_for_large_requests(tmp_path):
+    prompt = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Die Seite soll hochwertig wirken und viele Bereiche haben. "
+        "Baue Hero, Features, Galerie und Statistikbereich. "
+        "Interaktivitaet: Navigation mit smooth scrolling, Tabs oder Modal, Formular mit einfacher Frontend-Validierung "
+        "und dynamisches Umschalten von Inhalten per JavaScript. "
+        "Ergaenze ausserdem Team-Sektion, Testimonials, Pricing, FAQ, Kontaktformular, Karten mit Hover-Zustaenden, "
+        "Filter fuer Inhalte, kleine Scroll-Animationen, Dark-Light-Umschalter und klare Loading-States. "
+        "Achte zusaetzlich auf Mobile-Navigation, Suchfunktion, Tabellen mit Statusanzeigen, Export-Hinweise und "
+        "eine hochwertige, nicht-templatehafte Gesamtwirkung. "
+        "Wichtig: Die Website soll wie ein echtes kleines Produkt wirken und nicht wie ein leeres Template."
+    )
+
+    compact_prompt = task_state_update_prompt(prompt, snapshot=build_snapshot(tmp_path), mode="compact")
+
+    assert "User request digest:" in compact_prompt
+    assert "Request memory packet:" in compact_prompt
+    assert "smooth scrolling" in compact_prompt
+    assert "Export-Hinweise" in compact_prompt
+
+
+def test_task_state_updater_preserves_full_latest_user_turn_after_semantic_compaction():
+    prompt = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Baue mehrere Sektionen und Interaktionen. "
+        "Am Ende soll auch ein Kontaktformular und ein FAQ-Bereich enthalten sein."
+    )
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": "Erstelle eine moderne Website mit drei Dateien.",
+                "root_goal": "Erstelle eine moderne Website.",
+                "active_goal": "Implementierung von index.html, styles.css und script.js.",
+                "goal_relation": "new_task",
+                "output_expectation": "Eine moderne Website mit drei Dateien.",
+                "current_user_intent": "implement",
+                "execution_strategy": "feature_implementation",
+                "target_artifacts": [
+                    {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                    {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                    {"path": "script.js", "name": "script.js", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                ],
+                "constraints": ["Nur Vanilla HTML, CSS und JavaScript verwenden."],
+                "ambiguity_level": "low",
+                "risk_level": "low",
+                "confidence": 0.9,
+                "next_action": "create",
+                "execution_outline": ["Lege die drei Dateien an und implementiere die Website."],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(prompt)
+
+    assert task_state.latest_user_turn == prompt
+    assert any("Kontaktformular" in item for item in task_state.request_requirements)
+    assert any("FAQ-Bereich" in item for item in task_state.request_requirements)
+    assert task_state.request_chunks
+
+
+def test_task_state_updater_keeps_model_extracted_remembered_facts():
+    prompt = "Bitte behalte fuer spaetere Projekte, dass meine Lieblingsfarbe Petrol ist."
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": prompt,
+                "root_goal": "Merke dir die persoenliche Praeferenz.",
+                "active_goal": "Speichere die stabile Nutzerpraeferenz.",
+                "goal_relation": "new_task",
+                "output_expectation": "Die Praeferenz soll fuer spaetere Rueckfragen gespeichert werden.",
+                "remembered_facts": [
+                    {
+                        "subject": "user",
+                        "attribute": "lieblingsfarbe",
+                        "value": "Petrol",
+                        "summary": "User preference: Lieblingsfarbe Petrol.",
+                    }
+                ],
+                "current_user_intent": "explain",
+                "execution_strategy": "validation_inspection",
+                "ambiguity_level": "low",
+                "risk_level": "low",
+                "confidence": 0.91,
+                "next_action": "explain",
+                "execution_outline": ["Speichere die Praeferenz fuer spaetere Rueckfragen."],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(prompt)
+
+    assert task_state.remembered_facts
+    assert task_state.remembered_facts[0].attribute == "lieblingsfarbe"
+    assert task_state.remembered_facts[0].value == "Petrol"
+
+
+def test_compact_request_digest_captures_late_requirements():
+    digest = _compact_request_digest(
+        (
+            "Erstelle eine moderne Demo-Seite. "
+            "Nutze nur Vanilla HTML, CSS und JavaScript. "
+            "Implementiere spaeter im Prompt auch smooth scrolling, ein Kontaktformular "
+            "und dynamisches Umschalten von Inhalten per JavaScript."
+        ),
+        max_chars=420,
+    )
+
+    assert "requirements" in digest
+    assert any("smooth scrolling" in item for item in digest["requirements"])
+    assert any("Kontaktformular" in item for item in digest["requirements"])
+
+
+def test_request_digest_structures_targets_constraints_and_validation(tmp_path):
+    digest = build_request_digest(
+        (
+            "Analysiere app/auth.py gruendlich, erklaere check_role und login_user, "
+            "nenne relevante Tests, verliere spaetere Anforderungen nicht und fuehre keine Aenderungen aus."
+        ),
+        snapshot=build_snapshot(tmp_path),
+        max_chars=900,
+    )
+
+    assert "app/auth.py" in digest.explicit_paths
+    assert any(item in {"check_role", "login_user"} for item in digest.explicit_symbols)
+    assert any("verliere spaetere anforderungen nicht" in item.lower() for item in digest.hard_constraints)
+    assert any("keine aenderungen" in item.lower() for item in digest.non_goals)
+    assert any("Tests" in item or "tests" in item for item in digest.validation_needs)
+
+
+def test_request_memory_packet_chunks_large_prompt_into_compact_groups():
+    packet = build_request_memory_packet(
+        (
+            "Erstelle eine grosse Webapp mit vielen Bereichen. "
+            "Baue Dashboard, Detailansichten, Filter, Suche, Formulare, Validierung, Tabellen, Diagramme und ein Settings-Modul. "
+            "Achte spaeter im Prompt auch auf Audit-Log, Rollenrechte, Exportfunktion, Undo-Hinweise und klare Loading-States. "
+            "Wichtig ist ausserdem, dass Desktop und Mobile sauber funktionieren und die App nicht wie ein Template wirkt."
+        )
+    )
+
+    assert packet["requirements"]
+    assert packet["requirement_chunks"]
+    assert len(packet["requirement_chunks"]) <= 4
+    assert any("Audit-Log" in chunk for chunk in packet["requirement_chunks"])
+
+
+def test_task_state_prefers_chunked_request_memory_in_relevant_context():
+    task_state = TaskState(
+        latest_user_turn="Baue ein grosses Dashboard mit Audit-Log und Export.",
+        root_goal="Baue ein grosses Dashboard.",
+        active_goal="Implementiere das Dashboard.",
+        output_expectation="Ein funktionierendes Dashboard.",
+        request_requirements=[
+            "Baue das Dashboard.",
+            "Beruecksichtige Audit-Log.",
+            "Füge Export hinzu.",
+        ],
+        request_chunks=[
+            "Baue das Dashboard; beruecksichtige Audit-Log.",
+            "Fuege Export hinzu.",
+        ],
+        next_action="modify",
+    )
+
+    understanding = task_state.to_task_understanding()
+
+    assert understanding.relevant_context
+    assert understanding.relevant_context[0].startswith("Request memory:")
+    assert "Audit-Log" in understanding.relevant_context[0]
 
 
 def test_prioritized_compact_payload_keeps_high_value_keys_under_budget():

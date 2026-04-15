@@ -9,7 +9,7 @@ from bootstrap_runtime import ensure_ollama_runtime, ensure_runtime_dependencies
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Optional CLI for the M.A.R.C A1 coding runtime."
+        description="Optional CLI for the MARC A2 coding runtime."
     )
     parser.add_argument(
         "--config",

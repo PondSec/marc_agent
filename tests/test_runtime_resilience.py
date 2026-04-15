@@ -375,3 +375,49 @@ def test_invoke_model_watchdog_tracks_terminal_outcomes_across_multiple_attempts
     assert third.attempt.state == "failed_inactivity"
     assert third.attempt.failure is not None
     assert third.attempt.failure.failure_class == "inactivity_timeout"
+
+
+def test_invoke_model_watchdog_preserves_partial_text_from_streamed_chunks(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(runtime_resilience.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runtime_resilience.time, "sleep", clock.sleep)
+    blocker = threading.Event()
+
+    def stall_after_progress(progress):
+        progress(
+            {
+                "type": "status",
+                "stage": "request_started",
+                "model": "qwen3:8b",
+                "startup_timeout": 2,
+                "inactivity_timeout": 2,
+                "total_timeout": 5,
+            }
+        )
+        progress({"type": "chunk", "characters": 7, "text": "<main>", "model": "qwen3:8b"})
+        runtime_resilience.time.sleep(1.0)
+        progress({"type": "chunk", "characters": 13, "text": "demo", "model": "qwen3:8b"})
+        blocker.wait(timeout=60)
+        return "never"
+
+    outcome = runtime_resilience.invoke_model(
+        stall_after_progress,
+        operation_name="content_generation",
+        task_class="content_generation",
+        attempt_number=1,
+        capability_tier="tier_b",
+        recovery_strategy="resume_fallback_model",
+        prompt_variant="resume",
+        model_identifier="qwen3:8b",
+        backend_identifier="ollama",
+        startup_timeout_seconds=2,
+        inactivity_timeout_seconds=2,
+        total_timeout_seconds=5,
+    )
+
+    assert outcome.value is None
+    assert outcome.exception is not None
+    assert outcome.attempt.failure is not None
+    assert outcome.attempt.failure.failure_class == "inactivity_timeout"
+    assert outcome.attempt.failure.partial_text == "<main>demo"
+    assert outcome.attempt.partial_text == "<main>demo"
