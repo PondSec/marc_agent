@@ -25,7 +25,7 @@ ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET = 900
 DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET = 1280
 GENERATION_BRIEF_CHAR_BUDGET = 760
 GENERATION_FILE_FOCUS_CHAR_BUDGET = 480
-GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 260
+GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 200
 UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
     re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
     re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -523,7 +523,11 @@ def generate_content_prompt(
         generation_brief = _compact_generation_brief(route, session, path=path)
         explicit_constraints = _explicit_generation_constraints(route, session)
         related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
-        related_context = _related_file_context(session, path)
+        related_context = _compact_related_file_context(
+            session,
+            path,
+            compact=compact_large_request,
+        )
         runtime_hints = _targeted_runtime_prompt_hints(
             path=path,
             current_content=current_content or "",
@@ -818,7 +822,11 @@ def generate_content_retry_prompt(
         )
         generation_brief = _compact_generation_brief(route, session, path=path)
         compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
-        related_context = _related_file_context(session, path) if session is not None else "none"
+        related_context = (
+            _compact_related_file_context(session, path, compact=compact_large_request)
+            if session is not None
+            else "none"
+        )
         exact_output_contracts: list[str] = []
         supporting_runtime_argv_contract: dict[str, list[str]] = {}
         if session is not None and current_content is not None and review_feedback is not None:
@@ -2417,10 +2425,13 @@ def _compact_generation_constraints(
             _append_unique_compact_text(items, candidate, limit=140)
             if len(items) >= limit:
                 return items[:limit]
-    for sentence in _derived_requirement_sentences(route, session):
-        for clause in _split_requirement_clauses(
-            str(sentence or "").replace("*", "; ").replace("•", "; ")
-        ):
+    raw_request = (
+        session.task
+        if session is not None and str(session.task or "").strip()
+        else route.requested_outcome
+    )
+    for sentence in _requirement_sentences(str(raw_request or "").replace("*", "; ").replace("•", "; ")):
+        for clause in _split_requirement_clauses(sentence):
             cleaned = _trim_text(clause, 140)
             if not cleaned or _is_generation_metadata_constraint(cleaned):
                 continue
@@ -2428,6 +2439,27 @@ def _compact_generation_constraints(
             if len(items) >= limit:
                 return items[:limit]
     return items[:limit]
+
+
+def _deterministic_generation_goal(
+    route: RouterOutput,
+    *,
+    path: str,
+) -> str:
+    target = str(path or "").strip() or "the target file"
+    companions = [
+        str(item or "").strip()
+        for item in route.entities.target_paths[:4]
+        if str(item or "").strip() and str(item or "").strip() != target
+    ]
+    intent = str(route.intent or "").strip().lower()
+    verb = "Create" if intent == "create" else "Update"
+    if companions:
+        return (
+            f"{verb} {target} as part of the requested multi-file bundle and keep it aligned with "
+            f"{_format_list(companions)}."
+        )
+    return f"{verb} {target} to satisfy the requested outcome while preserving unrelated behavior."
 
 
 def _compact_generation_brief(
@@ -2439,20 +2471,11 @@ def _compact_generation_brief(
     task_state = session.task_state if session is not None else None
     understanding = session.task_understanding if session is not None else None
     working = _compact_working_memory(session)
-    goal = next(
-        (
-            str(candidate or "").strip()
-            for candidate in (
-                getattr(understanding, "interpreted_goal", None),
-                getattr(task_state, "active_goal", None),
-                working.get("current_goal") if working else None,
-                route.requested_outcome,
-                route.user_goal,
-                session.task if session is not None else None,
-            )
-            if str(candidate or "").strip()
-        ),
-        "",
+    semantic_goal = str(getattr(understanding, "interpreted_goal", "") or "").strip()
+    goal = (
+        semantic_goal
+        if semantic_goal and len(semantic_goal) <= 180 and "\n" not in semantic_goal
+        else _deterministic_generation_goal(route, path=path)
     )
     expected_output = next(
         (
@@ -2569,6 +2592,22 @@ def _compact_generation_file_focus(
             "general_constraints",
         ],
         max_chars=GENERATION_FILE_FOCUS_CHAR_BUDGET,
+    )
+
+
+def _compact_related_file_context(
+    session: SessionState,
+    target_path: str,
+    *,
+    compact: bool = False,
+) -> str:
+    if not compact:
+        return _related_file_context(session, target_path)
+    return _related_file_context(
+        session,
+        target_path,
+        excerpt_limit=220,
+        max_files=1,
     )
 
 
