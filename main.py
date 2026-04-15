@@ -8,7 +8,7 @@ from bootstrap_runtime import ensure_ollama_runtime, ensure_runtime_dependencies
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Start the M.A.R.C A1 local web console."
+        description="Start the MARC A2 local web console."
     )
     parser.add_argument(
         "--config",

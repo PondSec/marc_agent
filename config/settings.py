@@ -9,8 +9,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 
-AGENT_NAME = "M.A.R.C A1"
-AGENT_FULL_NAME = "Modular Autonomous Runtime Core - Agent 1"
+AGENT_NAME = "MARC A2"
+AGENT_FULL_NAME = "Modular Autonomous Runtime Core - Agent 2"
 AGENT_TAGLINE = "Local autonomous coding runtime for real implementation work"
 
 
