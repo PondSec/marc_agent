@@ -6672,6 +6672,7 @@ def _rebalance_web_bundle_requirements(
     promoted = list(current_requirements)
     remaining_other: list[str] = []
     remaining_general: list[str] = []
+    html_visible_markers = {"anzeigen", "display", "show", "modell", "karte", "card", "filter", "such", "preis", "daten"}
     script_markers = {
         "javascript",
         "js",
@@ -6704,6 +6705,10 @@ def _rebalance_web_bundle_requirements(
                     promoted.append(item)
                 continue
             if target_role == "html":
+                if any(marker in normalized for marker in html_visible_markers):
+                    if item not in promoted:
+                        promoted.append(item)
+                    continue
                 if any(marker in normalized for marker in script_markers | style_markers):
                     target_bucket.append(item)
                     continue
@@ -6749,6 +6754,7 @@ def _sort_web_bundle_requirements(
     target_role: str,
     explicit_targets: list[str],
 ) -> list[str]:
+    html_visible_markers = {"anzeigen", "display", "show", "modell", "karte", "card", "filter", "such", "preis", "daten"}
     style_markers = {"css", "style", "ui", "ux", "responsive", "layout", "visual", "theme", "modern", "animation"}
     script_markers = {
         "javascript",
@@ -6784,7 +6790,7 @@ def _sort_web_bundle_requirements(
         else:
             if style_hits == 0 and script_hits == 0:
                 priority += 3
-            if any(marker in normalized for marker in ("anzeigen", "display", "show", "modell", "section", "karte", "card")):
+            if any(marker in normalized for marker in html_visible_markers | {"section"}):
                 priority += 3
             else:
                 priority -= (style_hits + script_hits)
