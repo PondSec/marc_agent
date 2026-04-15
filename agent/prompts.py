@@ -2260,6 +2260,15 @@ def _requires_structured_analysis_report(route: RouterOutput, session: SessionSt
 def _compact_structured_analysis_context(route: RouterOutput, session: SessionState) -> dict[str, object]:
     snapshot = session.workspace_snapshot
     task_state = session.task_state
+    relevant_paths = list(
+        dict.fromkeys(
+            [
+                *_read_paths(session)[-6:],
+                *(snapshot.important_files[:6] if snapshot is not None else []),
+                *(snapshot.focus_files[:4] if snapshot is not None else []),
+            ]
+        )
+    )
     payload: dict[str, object] = {
         "user_task": _trim_text(session.task, 420),
         "requested_outcome": _trim_text(route.requested_outcome, 260),
@@ -2281,6 +2290,20 @@ def _compact_structured_analysis_context(route: RouterOutput, session: SessionSt
             path: list(symbols[:4])
             for path, symbols in list((snapshot.symbol_index if snapshot is not None else {}).items())[:6]
         },
+        "workspace_module_summaries": {
+            path: _trim_text(str((snapshot.module_summaries if snapshot is not None else {}).get(path) or ""), 180)
+            for path in relevant_paths[:4]
+            if str((snapshot.module_summaries if snapshot is not None else {}).get(path) or "").strip()
+        },
+        "workspace_file_relationships": {
+            path: list(((snapshot.file_relationships if snapshot is not None else {}).get(path) or [])[:4])
+            for path in relevant_paths[:4]
+            if (snapshot.file_relationships if snapshot is not None else {}).get(path)
+        },
+        "workspace_subsystem_summaries": {
+            name: _trim_text(summary, 180)
+            for name, summary in list((snapshot.subsystem_summaries if snapshot is not None else {}).items())[:4]
+        },
         "memory_context": _compact_memory_context(session),
         "notes": [_trim_text(item, 140) for item in session.notes[-8:]],
     }
@@ -2295,6 +2318,9 @@ def _compact_structured_analysis_context(route: RouterOutput, session: SessionSt
             "workspace_repo_map",
             "workspace_summary",
             "workspace_important_files",
+            "workspace_module_summaries",
+            "workspace_file_relationships",
+            "workspace_subsystem_summaries",
             "workspace_entrypoints",
             "workspace_symbols",
             "route",
@@ -2338,12 +2364,27 @@ def _compact_workspace_snapshot(
             path: list(symbols[:4])
             for path, symbols in list(snapshot.symbol_index.items())[:4]
         }
+        payload["module_summaries"] = {
+            path: _trim_text(summary, 160)
+            for path, summary in list(snapshot.module_summaries.items())[:4]
+        }
+        payload["file_relationships"] = {
+            path: list(relations[:4])
+            for path, relations in list(snapshot.file_relationships.items())[:4]
+        }
+        payload["subsystem_summaries"] = {
+            name: _trim_text(summary, 160)
+            for name, summary in list(snapshot.subsystem_summaries.items())[:3]
+        }
     return _prioritized_compact_payload(
         payload,
         ordered_keys=[
             "repo_summary",
             "focus_files",
             "important_files",
+            "module_summaries",
+            "file_relationships",
+            "subsystem_summaries",
             "entrypoints",
             "manifests",
             "likely_commands",

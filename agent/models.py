@@ -477,6 +477,7 @@ class WorkspaceSnapshot(StrictModel):
     symbol_index: dict[str, list[str]] = Field(default_factory=dict)
     file_relationships: dict[str, list[str]] = Field(default_factory=dict)
     module_summaries: dict[str, str] = Field(default_factory=dict)
+    subsystem_summaries: dict[str, str] = Field(default_factory=dict)
     project_labels: list[str] = Field(default_factory=list)
     likely_commands: list[str] = Field(default_factory=list)
     validation_commands: list[ValidationCommand] = Field(default_factory=list)

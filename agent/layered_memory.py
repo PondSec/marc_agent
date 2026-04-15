@@ -714,12 +714,20 @@ class AgentMemoryStore(RepoMemoryStore):
             common_file_relationships=common_file_relationships[:8],
             test_mappings=[f"{left} -> {right}" for left, right in self._infer_test_mappings(snapshot.test_files, snapshot.important_files)][:8],
             symbol_index={path: symbols[:6] for path, symbols in list(snapshot.symbol_index.items())[:10]},
+            file_relationships={path: relations[:6] for path, relations in list(snapshot.file_relationships.items())[:10]},
+            module_summaries={path: self._trim_text(summary, 180) for path, summary in list(snapshot.module_summaries.items())[:8]},
             architecture_notes=[self._trim_text(item, 180) for item in snapshot.repo_map[:8]],
             known_hotspots=list(snapshot.important_files[:8]),
             conventions=[self._trim_text(item, 120) for item in snapshot.project_labels[:6]],
             workflow_hints=workflow_hints,
             co_change_hints=self._project_co_change_hints(session.project_id or self.project_id),
-            subsystem_summaries={path: self._trim_text(brief, 160) for path, brief in file_briefs[:6]},
+            subsystem_summaries={
+                name: self._trim_text(summary, 180)
+                for name, summary in (
+                    list(getattr(snapshot, "subsystem_summaries", {}).items())[:6]
+                    or [(path, brief) for path, brief in file_briefs[:6]]
+                )
+            },
         )
 
     def _build_failure_entries(self, session: SessionState) -> list[FailureMemoryEntry]:
@@ -1401,6 +1409,8 @@ class AgentMemoryStore(RepoMemoryStore):
             merged_roles.update(incoming.module_roles)
             merged_subsystems = dict(existing.subsystem_summaries)
             merged_subsystems.update(incoming.subsystem_summaries)
+            merged_module_summaries = dict(existing.module_summaries)
+            merged_module_summaries.update(incoming.module_summaries)
             return existing.model_copy(
                 update={
                     **common_update,
@@ -1413,6 +1423,8 @@ class AgentMemoryStore(RepoMemoryStore):
                     "common_file_relationships": self._unique_strings([*existing.common_file_relationships, *incoming.common_file_relationships])[:10],
                     "test_mappings": self._unique_strings([*existing.test_mappings, *incoming.test_mappings])[:10],
                     "symbol_index": self._merge_symbol_indexes(existing.symbol_index, incoming.symbol_index),
+                    "file_relationships": self._merge_symbol_indexes(existing.file_relationships, incoming.file_relationships),
+                    "module_summaries": merged_module_summaries,
                     "architecture_notes": self._unique_strings([*existing.architecture_notes, *incoming.architecture_notes])[:10],
                     "known_hotspots": self._unique_strings([*existing.known_hotspots, *incoming.known_hotspots])[:10],
                     "conventions": self._unique_strings([*existing.conventions, *incoming.conventions])[:10],
@@ -1813,6 +1825,7 @@ class AgentMemoryStore(RepoMemoryStore):
             if str(symbol or "").strip()
         }
         symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        file_relationships = getattr(snapshot, "file_relationships", {}) or {}
         candidate_paths = self._unique_strings(
             [
                 *list(getattr(snapshot, "focus_files", []) or []),
@@ -1868,6 +1881,14 @@ class AgentMemoryStore(RepoMemoryStore):
                 ranked.append((score, path))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         suggested_files = [path for _, path in ranked[:8]]
+        related_files = self._unique_strings(
+            [
+                relation
+                for path in suggested_files[:3]
+                for relation in list(file_relationships.get(path, []) or [])[:4]
+            ]
+        )[:4]
+        suggested_files = self._unique_strings([*suggested_files, *related_files])[:8]
         suggested_symbols = self._unique_strings(
             [
                 symbol
@@ -1884,6 +1905,8 @@ class AgentMemoryStore(RepoMemoryStore):
         test_mappings = list(getattr(snapshot, "test_mappings", []) or [])
         import_hotspots = set(getattr(snapshot, "import_hotspots", []) or [])
         symbol_index = getattr(snapshot, "symbol_index", {}) or {}
+        file_relationships = getattr(snapshot, "file_relationships", {}) or {}
+        module_summaries = getattr(snapshot, "module_summaries", {}) or {}
         for path in suggested_files[:4]:
             for mapping in test_mappings:
                 if path in mapping and mapping not in hints:
@@ -1893,6 +1916,12 @@ class AgentMemoryStore(RepoMemoryStore):
             symbols = list(symbol_index.get(path, []) or [])[:4]
             if symbols:
                 hints.append(f"{path} symbols: {', '.join(symbols)}")
+            related = list(file_relationships.get(path, []) or [])[:3]
+            if related:
+                hints.append(f"{path} related: {', '.join(related)}")
+            summary = str(module_summaries.get(path) or "").strip()
+            if summary:
+                hints.append(f"{path} summary: {self._trim_text(summary, 160)}")
         return self._unique_strings(hints)[:6]
 
     def _render_repo_hint_summary(self, repo_hints: list[str], budget_chars: int) -> str:

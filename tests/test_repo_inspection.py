@@ -167,6 +167,9 @@ def test_repo_snapshot_collects_service_files_and_symbols_for_repo_map(tmp_path)
     assert "app/router.py" in snapshot.service_files
     assert "app/service.py" in snapshot.service_files
     assert snapshot.symbol_index["app/service.py"][:2] == ["AuthService", "fetch_user"]
+    assert "app/service.py" in snapshot.file_relationships["app/router.py"]
+    assert "AuthService" in snapshot.module_summaries["app/service.py"]
+    assert "app" in snapshot.subsystem_summaries
 
 
 def test_repo_snapshot_focus_matches_late_repo_specific_terms_from_large_prompt(tmp_path):

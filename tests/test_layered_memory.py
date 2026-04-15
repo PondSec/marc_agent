@@ -701,6 +701,12 @@ def test_repo_map_signal_bundle_prefers_symbol_and_test_mappings(tmp_path):
             },
             "service_files": ["app/auth.py"],
             "import_hotspots": ["app/main.py"],
+            "file_relationships": {
+                "app/auth.py": ["tests/test_main.py"],
+            },
+            "module_summaries": {
+                "app/auth.py": "symbols: check_role; related: tests/test_main.py",
+            },
         }
     )
 
@@ -710,6 +716,7 @@ def test_repo_map_signal_bundle_prefers_symbol_and_test_mappings(tmp_path):
     assert "app/auth.py" in session.memory_context.suggested_files
     assert "check_role" in session.memory_context.suggested_symbols
     assert any("tests/test_main.py -> app/main.py" in item for item in session.memory_context.repo_map_hints)
+    assert any("app/auth.py related: tests/test_main.py" in item for item in session.memory_context.repo_map_hints)
 
 
 def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(tmp_path):
@@ -731,6 +738,9 @@ def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(
             "symbol_index": {"app/auth.py": ["check_role"]},
             "import_hotspots": ["app/main.py"],
             "service_files": ["app/auth.py"],
+            "file_relationships": {"app/auth.py": ["tests/test_main.py"]},
+            "module_summaries": {"app/auth.py": "symbols: check_role; related: tests/test_main.py"},
+            "subsystem_summaries": {"app": "auth and test surface"},
         }
     )
     store.persist_session_memory(session)
@@ -740,6 +750,9 @@ def test_project_memory_tracks_symbol_index_import_hotspots_and_co_change_hints(
     assert project_entry.symbol_index["app/auth.py"] == ["check_role"]
     assert project_entry.import_hotspots == ["app/main.py"]
     assert project_entry.service_files == ["app/auth.py"]
+    assert project_entry.file_relationships["app/auth.py"] == ["tests/test_main.py"]
+    assert "check_role" in project_entry.module_summaries["app/auth.py"]
+    assert project_entry.subsystem_summaries["app"] == "auth and test surface"
     assert any("app/auth.py <-> tests/test_main.py" in item for item in project_entry.co_change_hints)
     assert "app/auth.py" in project_entry.known_hotspots
 

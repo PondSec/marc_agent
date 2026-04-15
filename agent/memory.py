@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import tomllib
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from agent.models import FileInsight, ValidationCommand, WorkspaceSnapshot
@@ -129,6 +129,7 @@ class RepoMemoryStore:
 
     def build_snapshot(self, focus: str | None = None) -> WorkspaceSnapshot:
         files = self.workspace.iter_files(max_results=20_000)
+        all_relative_paths: list[str] = []
         language_counts: Counter[str] = Counter()
         directory_counts: Counter[str] = Counter()
         insights: list[FileInsight] = []
@@ -145,6 +146,7 @@ class RepoMemoryStore:
                 rel = path.relative_to(self.workspace.root).as_posix()
             except ValueError:
                 continue
+            all_relative_paths.append(rel)
             language = LANGUAGE_MAP.get(path.suffix.lower(), "other")
             language_counts[language] += 1
             top_dir = rel.split("/", 1)[0] if "/" in rel else "."
@@ -177,9 +179,10 @@ class RepoMemoryStore:
         }
         for item in insights[: min(16, len(insights))]:
             item.summary = file_briefs.get(item.path)
+        inferred_test_mappings = self._infer_test_mappings(test_files, important_files)
         test_mappings = [
             f"{test_path} -> {source_path}"
-            for test_path, source_path in self._infer_test_mappings(test_files, important_files)
+            for test_path, source_path in inferred_test_mappings
         ]
         deep_repo_paths = self._deep_repo_analysis_candidates(
             important_files=important_files,
@@ -187,7 +190,22 @@ class RepoMemoryStore:
             entrypoints=entrypoints,
             test_files=test_files,
         )
-        symbol_index, import_hotspots, service_files = self._deep_repo_signals(deep_repo_paths)
+        symbol_index, import_hotspots, service_files, file_relationships = self._deep_repo_signals(
+            deep_repo_paths,
+            all_paths=all_relative_paths,
+            test_mappings=inferred_test_mappings,
+        )
+        module_summaries = self._build_module_summaries(
+            important_files=important_files,
+            file_briefs=file_briefs,
+            symbol_index=symbol_index,
+            file_relationships=file_relationships,
+            test_mappings=inferred_test_mappings,
+        )
+        subsystem_summaries = self._build_subsystem_summaries(
+            important_files=important_files,
+            module_summaries=module_summaries,
+        )
         entrypoints = self._augment_entrypoints_from_symbols(entrypoints, symbol_index)
 
         validation_commands, workflow_commands = self._detect_commands(
@@ -243,6 +261,9 @@ class RepoMemoryStore:
             service_files=service_files[:12],
             import_hotspots=import_hotspots[:12],
             symbol_index={path: symbols[:8] for path, symbols in list(symbol_index.items())[:16]},
+            file_relationships={path: relations[:8] for path, relations in list(file_relationships.items())[:16]},
+            module_summaries={path: summary for path, summary in list(module_summaries.items())[:12]},
+            subsystem_summaries={name: summary for name, summary in list(subsystem_summaries.items())[:8]},
             project_labels=project_labels,
             likely_commands=likely_commands,
             validation_commands=validation_commands,
@@ -322,6 +343,10 @@ class RepoMemoryStore:
             lines.extend(["", "Import hotspots:"])
             for path in snapshot.import_hotspots[:6]:
                 lines.append(f"- {path}")
+        if snapshot.module_summaries:
+            lines.extend(["", "Module summaries:"])
+            for path, summary in list(snapshot.module_summaries.items())[:4]:
+                lines.append(f"- {path}: {summary}")
         lines.extend(["", "Summary:", snapshot.repo_summary])
         return "\n".join(lines)
 
@@ -766,10 +791,15 @@ class RepoMemoryStore:
     def _deep_repo_signals(
         self,
         relative_paths: list[str],
-    ) -> tuple[dict[str, list[str]], list[str], list[str]]:
+        *,
+        all_paths: list[str],
+        test_mappings: list[tuple[str, str]] | None = None,
+    ) -> tuple[dict[str, list[str]], list[str], list[str], dict[str, list[str]]]:
         symbol_index: dict[str, list[str]] = {}
         import_scores: list[tuple[str, int]] = []
         service_files: list[str] = []
+        imported_relationships: dict[str, list[str]] = {}
+        reference_index = self._build_reference_index(all_paths)
         for relative_path in relative_paths:
             content = self._read_text_excerpt(relative_path, limit=6_000)
             if not content:
@@ -780,14 +810,246 @@ class RepoMemoryStore:
             import_score = self._import_signal_count(relative_path, content)
             if import_score > 0:
                 import_scores.append((relative_path, import_score))
+            references = self._extract_repo_references(
+                relative_path,
+                content,
+                reference_index=reference_index,
+            )
+            if references:
+                imported_relationships[relative_path] = references[:8]
             if self._looks_like_service_file(relative_path, content):
                 service_files.append(relative_path)
         import_scores.sort(key=lambda item: (-item[1], item[0]))
+        file_relationships = self._build_file_relationships(
+            imported_relationships,
+            test_mappings or [],
+        )
         return (
             symbol_index,
             [path for path, _ in import_scores[:12]],
             list(dict.fromkeys(service_files))[:12],
+            file_relationships,
         )
+
+    def _build_reference_index(self, all_paths: list[str]) -> dict[str, list[str]]:
+        reference_index: dict[str, list[str]] = defaultdict(list)
+        for path in all_paths:
+            normalized = str(path or "").strip()
+            if not normalized:
+                continue
+            for variant in self._reference_variants_for_path(normalized):
+                if normalized not in reference_index[variant]:
+                    reference_index[variant].append(normalized)
+        return dict(reference_index)
+
+    def _reference_variants_for_path(self, relative_path: str) -> list[str]:
+        normalized = str(relative_path or "").replace("\\", "/").lstrip("./")
+        if not normalized:
+            return []
+        path_obj = Path(normalized)
+        suffix = path_obj.suffix.lower()
+        without_suffix = normalized[: -len(suffix)] if suffix else normalized
+        variants = [normalized, without_suffix, without_suffix.replace("/", "."), path_obj.stem]
+        if path_obj.name == "__init__.py":
+            parent = path_obj.parent.as_posix()
+            if parent and parent != ".":
+                variants.extend([parent, parent.replace("/", "."), path_obj.parent.name])
+        if path_obj.stem == "index":
+            parent = path_obj.parent.as_posix()
+            if parent and parent != ".":
+                variants.extend([parent, parent.replace("/", "."), path_obj.parent.name])
+        return [item for item in dict.fromkeys(str(item or "").strip() for item in variants) if item]
+
+    def _extract_repo_references(
+        self,
+        relative_path: str,
+        content: str,
+        *,
+        reference_index: dict[str, list[str]],
+    ) -> list[str]:
+        suffix = Path(relative_path).suffix.lower()
+        references: list[str] = []
+        if suffix in {".py", ".pyi"}:
+            for raw_line in content.splitlines()[:220]:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("import "):
+                    for part in line[len("import ") :].split(","):
+                        module = part.split(" as ", 1)[0].strip()
+                        references.extend(
+                            self._resolve_repo_reference(
+                                relative_path,
+                                module,
+                                language="python",
+                                reference_index=reference_index,
+                            )
+                        )
+                elif line.startswith("from "):
+                    module = line[len("from ") :].split(" import ", 1)[0].strip()
+                    references.extend(
+                        self._resolve_repo_reference(
+                            relative_path,
+                            module,
+                            language="python",
+                            reference_index=reference_index,
+                        )
+                    )
+        elif suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            for raw_line in content.splitlines()[:240]:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                for match in re.finditer(r"(?:from\s+|require\()\s*[\"']([^\"']+)[\"']", line):
+                    references.extend(
+                        self._resolve_repo_reference(
+                            relative_path,
+                            str(match.group(1) or "").strip(),
+                            language="script",
+                            reference_index=reference_index,
+                        )
+                    )
+        resolved: list[str] = []
+        for reference in references:
+            item = str(reference or "").strip()
+            if item and item != relative_path and item not in resolved:
+                resolved.append(item)
+        return resolved[:8]
+
+    def _resolve_repo_reference(
+        self,
+        relative_path: str,
+        reference: str,
+        *,
+        language: str,
+        reference_index: dict[str, list[str]],
+    ) -> list[str]:
+        cleaned = str(reference or "").strip()
+        if not cleaned or cleaned.startswith(("http://", "https://", "@")):
+            return []
+        keys: list[str] = []
+        if language == "script" and cleaned.startswith("."):
+            base = (Path(relative_path).parent / cleaned).as_posix().lstrip("./")
+            if Path(base).suffix:
+                keys.append(base)
+            else:
+                keys.extend(
+                    [
+                        base,
+                        f"{base}.js",
+                        f"{base}.jsx",
+                        f"{base}.ts",
+                        f"{base}.tsx",
+                        f"{base}/index.js",
+                        f"{base}/index.ts",
+                        f"{base}/index.tsx",
+                    ]
+                )
+        elif language == "python" and cleaned.startswith("."):
+            depth = len(cleaned) - len(cleaned.lstrip("."))
+            bare = cleaned.lstrip(".")
+            current_module = Path(relative_path).with_suffix("")
+            base_parts = list(current_module.parts[:-1])
+            if Path(relative_path).name == "__init__.py":
+                base_parts = list(Path(relative_path).parent.parts)
+            if depth > 1:
+                base_parts = base_parts[: max(len(base_parts) - (depth - 1), 0)]
+            module_parts = [*base_parts, *[part for part in bare.split(".") if part]]
+            if module_parts:
+                dotted = ".".join(module_parts)
+                slashed = "/".join(module_parts)
+                keys.extend([dotted, slashed])
+        else:
+            keys.extend([cleaned, cleaned.replace(".", "/"), cleaned.replace("/", ".")])
+        resolved: list[str] = []
+        for key in keys:
+            for candidate in reference_index.get(key, []):
+                if candidate not in resolved:
+                    resolved.append(candidate)
+        return resolved[:8]
+
+    def _build_file_relationships(
+        self,
+        imported_relationships: dict[str, list[str]],
+        test_mappings: list[tuple[str, str]],
+    ) -> dict[str, list[str]]:
+        related: dict[str, list[str]] = defaultdict(list)
+        for path, references in imported_relationships.items():
+            for target in references[:8]:
+                if target == path:
+                    continue
+                if target not in related[path]:
+                    related[path].append(target)
+                if path not in related[target]:
+                    related[target].append(path)
+        for test_path, source_path in test_mappings[:12]:
+            if source_path not in related[test_path]:
+                related[test_path].append(source_path)
+            if test_path not in related[source_path]:
+                related[source_path].append(test_path)
+        return {
+            path: relations[:8]
+            for path, relations in related.items()
+            if relations
+        }
+
+    def _build_module_summaries(
+        self,
+        *,
+        important_files: list[str],
+        file_briefs: dict[str, str],
+        symbol_index: dict[str, list[str]],
+        file_relationships: dict[str, list[str]],
+        test_mappings: list[tuple[str, str]],
+    ) -> dict[str, str]:
+        tests_by_source: dict[str, list[str]] = defaultdict(list)
+        for test_path, source_path in test_mappings[:12]:
+            tests_by_source[source_path].append(test_path)
+        summaries: dict[str, str] = {}
+        candidate_paths = list(
+            dict.fromkeys(
+                [
+                    *important_files[:12],
+                    *file_relationships.keys(),
+                    *symbol_index.keys(),
+                ]
+            )
+        )
+        for path in candidate_paths[:16]:
+            parts: list[str] = []
+            brief = str(file_briefs.get(path) or "").strip() or self._brief_for_file(path)
+            if brief:
+                parts.append(brief[:140])
+            symbols = list(symbol_index.get(path, []) or [])[:4]
+            if symbols:
+                parts.append("symbols: " + ", ".join(symbols))
+            related = list(file_relationships.get(path, []) or [])[:3]
+            if related:
+                parts.append("related: " + ", ".join(related))
+            tests = tests_by_source.get(path, [])[:2]
+            if tests:
+                parts.append("tests: " + ", ".join(tests))
+            if parts:
+                summaries[path] = "; ".join(parts)[:280]
+        return summaries
+
+    def _build_subsystem_summaries(
+        self,
+        *,
+        important_files: list[str],
+        module_summaries: dict[str, str],
+    ) -> dict[str, str]:
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for path in important_files[:16]:
+            top_dir = path.split("/", 1)[0] if "/" in path else "."
+            summary = str(module_summaries.get(path) or "").strip()
+            if summary:
+                grouped[top_dir].append(summary)
+        return {
+            name: " | ".join(items[:2])[:280]
+            for name, items in grouped.items()
+            if items
+        }
 
     def _read_text_excerpt(self, relative_path: str, *, limit: int = 4_000) -> str:
         target = self.workspace.resolve_path(relative_path)
