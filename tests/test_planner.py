@@ -30364,6 +30364,76 @@ def test_planner_uses_deterministic_final_response_when_final_llm_roundtrip_time
     assert llm.generate_calls[0]["kwargs"]["total_timeout"] >= 60
 
 
+def test_planner_salvages_partial_final_response_after_timeout_with_progress(tmp_path):
+    payload = route_payload(
+        intent="explain",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "summarize_result",
+                "reason": "Return the final result to the user.",
+            }
+        ],
+        target_paths=["agent/planner.py", "agent/prompts.py"],
+        target_name="agent/planner.py",
+        requested_outcome="Fasse die Architektur belastbar zusammen.",
+    )
+    llm = ScriptedLLM(
+        json_payloads=[payload],
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for model completion after 120.0 seconds",
+                reason="total_timeout",
+                partial_text=(
+                    "Analyse:\n"
+                    "- planner.py steuert Routing, Plan- und Abschlussentscheidungen.\n"
+                    "- prompts.py verdichtet Request- und Workspace-Kontext fuer die Modellaufrufe.\n"
+                    "- layered_memory.py kombiniert Working, Episodic, Project und Conversation Memory.\n\n"
+                    "Offen bleibt vor allem die Qualitaet des finalen Antwortabschlusses."
+                ),
+                characters=320,
+                total_timeout_seconds=120,
+                model_name="qwen2.5-coder:7b",
+            )
+        ],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task="Fasse die Architektur belastbar zusammen",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "agent/planner.py"},
+                success=True,
+                summary="Read agent/planner.py.",
+                output_excerpt="def summarize_session(...):\n    ...\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "agent/prompts.py"},
+                success=True,
+                summary="Read agent/prompts.py.",
+                output_excerpt="def final_response_prompt(...):\n    ...\n",
+            ),
+        ]
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert decision.final_response is not None
+    assert decision.final_response.startswith("Analyse:")
+    assert "prompts.py" in decision.final_response
+    assert "untersucht" not in decision.final_response
+
+
 def test_planner_localizes_deterministic_final_response_to_english(tmp_path):
     payload = route_payload(
         intent="update",

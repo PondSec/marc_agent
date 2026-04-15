@@ -7169,6 +7169,30 @@ class Planner:
                 had_progress=issue.had_progress if issue is not None else False,
                 partial_characters=issue.characters if issue is not None else 0,
             )
+            partial_response = self._salvage_partial_final_response(issue)
+            if partial_response:
+                self._log(
+                    "final_response_generation_finished",
+                    characters=len(partial_response),
+                    source="partial_salvage",
+                )
+                self._append_runtime_execution(
+                    session,
+                    build_execution_run_record(
+                        operation_name="final_response_generation",
+                        task_class="final_response_generation",
+                        final_state="degraded_success",
+                        capability_tier="tier_c",
+                        recovery_strategy="partial_response_salvage",
+                        degraded=True,
+                        honest_blocked=False,
+                        artifact_bytes_generated=len(partial_response),
+                        validation_possible=False,
+                        summary="Final user response was salvaged from partial model output after the runtime timed out.",
+                        attempts=[outcome.attempt],
+                    ),
+                )
+                return partial_response
         deterministic = self._deterministic_final_response(route, session)
         self._log(
             "final_response_generation_finished",
@@ -7192,6 +7216,28 @@ class Planner:
             ),
         )
         return deterministic
+
+    def _salvage_partial_final_response(self, issue) -> str:
+        if issue is None or not issue.failed_after_progress:
+            return ""
+        partial = self._strip_code_fences(str(issue.partial_text or "")).strip()
+        if len(partial) < 120:
+            return ""
+        candidates = [
+            partial.rfind("\n\n"),
+            partial.rfind(". "),
+            partial.rfind("! "),
+            partial.rfind("? "),
+            partial.rfind("\n"),
+        ]
+        cutoff = max(candidates)
+        minimum_safe_cutoff = max(80, len(partial) // 2)
+        if cutoff >= minimum_safe_cutoff:
+            if partial[cutoff:cutoff + 2] in {". ", "! ", "? "}:
+                partial = partial[: cutoff + 1].rstrip()
+            else:
+                partial = partial[:cutoff].rstrip()
+        return partial if len(partial) >= 120 else ""
 
     def _final_decision(
         self,
