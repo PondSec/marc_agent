@@ -343,12 +343,23 @@ _BACKEND_SCOPE_TOKENS = (
 
 _FRONTEND_SCOPE_TOKENS = (
     "client only",
-    "frontend",
     "frontend only",
     "nur frontend",
     "nur im frontend",
     "only frontend",
     "ui only",
+)
+
+_BACKEND_SCOPE_PATTERNS = (
+    re.compile(r"\b(?:backend|server|api)\s+only\b"),
+    re.compile(r"\bonly\s+(?:the\s+)?(?:backend|server|api)\b"),
+    re.compile(r"\b(?:nur|just|lediglich|ausschliesslich|ausschließlich)\s+(?:im\s+|den\s+|das\s+)?(?:backend|server)\b"),
+)
+
+_FRONTEND_SCOPE_PATTERNS = (
+    re.compile(r"\b(?:frontend|client|ui)\s+only\b"),
+    re.compile(r"\bonly\s+(?:the\s+)?(?:frontend|client|ui)\b"),
+    re.compile(r"\b(?:nur|just|lediglich|ausschliesslich|ausschließlich)\s+(?:im\s+|das\s+|die\s+)?(?:frontend|client|ui)\b"),
 )
 
 _QUESTION_WORD_TOKENS = (
@@ -837,22 +848,24 @@ def looks_like_scope_narrowing_request(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
-    narrowing_markers = ("nur", "only", "just", "lediglich", "ausschliesslich", "ausschließlich")
-    has_narrowing = any(marker in normalized for marker in narrowing_markers)
-    return has_narrowing and (
-        any(token in normalized for token in _BACKEND_SCOPE_TOKENS)
-        or any(token in normalized for token in _FRONTEND_SCOPE_TOKENS)
+    return _has_explicit_scope_constraint(normalized, _BACKEND_SCOPE_PATTERNS) or _has_explicit_scope_constraint(
+        normalized,
+        _FRONTEND_SCOPE_PATTERNS,
     )
 
 
 def extract_scope_constraints(text: str) -> list[str]:
     normalized = normalize_text(text)
     constraints: list[str] = []
-    if any(token in normalized for token in _BACKEND_SCOPE_TOKENS):
+    if _has_explicit_scope_constraint(normalized, _BACKEND_SCOPE_PATTERNS):
         constraints.append("Backend only.")
-    if any(token in normalized for token in _FRONTEND_SCOPE_TOKENS):
+    if _has_explicit_scope_constraint(normalized, _FRONTEND_SCOPE_PATTERNS):
         constraints.append("Frontend only.")
     return constraints[:2]
+
+
+def _has_explicit_scope_constraint(normalized: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return any(pattern.search(normalized) for pattern in patterns)
 
 
 def is_structural_follow_up_request(

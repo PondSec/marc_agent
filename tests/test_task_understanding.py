@@ -16,6 +16,7 @@ from agent.prompts import (
     _prioritized_compact_payload,
     task_state_update_prompt,
 )
+from agent.semantic_defaults import extract_scope_constraints, looks_like_scope_narrowing_request
 from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
@@ -2194,6 +2195,33 @@ def test_minimal_task_state_extracts_named_config_file_path_in_german_request(tm
     assert state.target_artifacts
     assert state.target_artifacts[0].path == "smoke.ini"
     assert state.target_artifacts[0].name == "smoke.ini"
+
+
+def test_minimal_task_state_does_not_treat_vanilla_frontend_create_prompt_as_scope_change(tmp_path):
+    request = (
+        "Erstelle eine moderne Website mit index.html, styles.css und script.js. "
+        "Nutze nur Vanilla HTML, CSS und JavaScript. "
+        "Baue ausserdem ein Formular mit einfacher Frontend-Validierung."
+    )
+
+    assert looks_like_scope_narrowing_request(request) is False
+    assert extract_scope_constraints(request) == []
+
+    state = build_minimal_task_state(
+        request,
+        session=None,
+        snapshot=empty_snapshot(tmp_path),
+        semantic_resolution="minimal_inference",
+    )
+    route = ExecutionDecisionPolicy().build_route(state, snapshot=empty_snapshot(tmp_path))
+
+    assert state.goal_relation == "new_task"
+    assert state.current_user_intent == "implement"
+    assert state.execution_strategy == "feature_implementation"
+    assert state.next_action == "create"
+    assert state.constraints == []
+    assert route.intent == RouteIntent.CREATE
+    assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
 
 
 def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_request(tmp_path):
