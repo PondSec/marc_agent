@@ -190,6 +190,7 @@ class TaskStateUpdater:
             payload = outcome.value
             try:
                 state = TaskState.model_validate(payload)
+                state.latest_user_turn = str(user_input or "").strip() or state.latest_user_turn
                 reconcile_reason = self._local_reconciliation_reason(state, local_state)
                 if reconcile_reason is not None:
                     self._reconcile_with_local_state(
@@ -344,6 +345,7 @@ class TaskStateUpdater:
                 )
                 try:
                     state = TaskState.model_validate(payload)
+                    state.latest_user_turn = str(user_input or "").strip() or state.latest_user_turn
                     reconcile_reason = self._local_reconciliation_reason(state, local_state)
                     if reconcile_reason is not None:
                         self._reconcile_with_local_state(

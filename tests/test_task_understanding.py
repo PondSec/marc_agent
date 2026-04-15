@@ -12,6 +12,7 @@ from agent.models import ChatMessage, FollowUpContext, SessionState, WorkspaceSn
 from agent.planner import Planner
 from agent.prompts import (
     _compact_follow_up_context,
+    _compact_request_digest,
     _compact_workspace_snapshot,
     _prioritized_compact_payload,
     task_state_update_prompt,
@@ -3652,6 +3653,77 @@ def test_task_state_update_prompt_compact_stays_smaller_than_full(tmp_path):
     assert '"file_briefs"' not in compact_prompt
     assert '"symbol_index"' in full_prompt
     assert '"file_briefs"' in full_prompt
+
+
+def test_task_state_update_prompt_compact_keeps_tail_requirements_for_large_requests(tmp_path):
+    prompt = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Die Seite soll hochwertig wirken und viele Bereiche haben. "
+        "Baue Hero, Features, Galerie und Statistikbereich. "
+        "Interaktivitaet: Navigation mit smooth scrolling, Tabs oder Modal, Formular mit einfacher Frontend-Validierung "
+        "und dynamisches Umschalten von Inhalten per JavaScript. "
+        "Wichtig: Die Website soll wie ein echtes kleines Produkt wirken und nicht wie ein leeres Template."
+    )
+
+    compact_prompt = task_state_update_prompt(prompt, snapshot=build_snapshot(tmp_path), mode="compact")
+
+    assert "User request digest:" in compact_prompt
+    assert "smooth scrolling" in compact_prompt
+    assert "Formular mit einfacher Frontend-Validierung" in compact_prompt
+
+
+def test_task_state_updater_preserves_full_latest_user_turn_after_semantic_compaction():
+    prompt = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Baue mehrere Sektionen und Interaktionen. "
+        "Am Ende soll auch ein Kontaktformular und ein FAQ-Bereich enthalten sein."
+    )
+    llm = ScriptedLLM(
+        [
+            {
+                "latest_user_turn": "Erstelle eine moderne Website mit drei Dateien.",
+                "root_goal": "Erstelle eine moderne Website.",
+                "active_goal": "Implementierung von index.html, styles.css und script.js.",
+                "goal_relation": "new_task",
+                "output_expectation": "Eine moderne Website mit drei Dateien.",
+                "current_user_intent": "implement",
+                "execution_strategy": "feature_implementation",
+                "target_artifacts": [
+                    {"path": "index.html", "name": "index.html", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                    {"path": "styles.css", "name": "styles.css", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                    {"path": "script.js", "name": "script.js", "kind": "file", "role": "primary_target", "confidence": 0.9},
+                ],
+                "constraints": ["Nur Vanilla HTML, CSS und JavaScript verwenden."],
+                "ambiguity_level": "low",
+                "risk_level": "low",
+                "confidence": 0.9,
+                "next_action": "create",
+                "execution_outline": ["Lege die drei Dateien an und implementiere die Website."],
+                "needs_clarification": False,
+                "clarification_questions": [],
+            }
+        ]
+    )
+
+    task_state = TaskStateUpdater(llm).update_task_state(prompt)
+
+    assert task_state.latest_user_turn == prompt
+
+
+def test_compact_request_digest_captures_late_requirements():
+    digest = _compact_request_digest(
+        (
+            "Erstelle eine moderne Demo-Seite. "
+            "Nutze nur Vanilla HTML, CSS und JavaScript. "
+            "Implementiere spaeter im Prompt auch smooth scrolling, ein Kontaktformular "
+            "und dynamisches Umschalten von Inhalten per JavaScript."
+        ),
+        max_chars=420,
+    )
+
+    assert "requirements" in digest
+    assert any("smooth scrolling" in item for item in digest["requirements"])
+    assert any("Kontaktformular" in item for item in digest["requirements"])
 
 
 def test_prioritized_compact_payload_keeps_high_value_keys_under_budget():

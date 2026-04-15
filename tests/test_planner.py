@@ -3730,6 +3730,73 @@ def test_planner_surfaces_explicit_constraints_in_compact_generation_prompt(tmp_
     assert "New unit test for parser.parse_args(['--state-root', '/tmp/state']) is required." in prompt
 
 
+def test_compact_generation_prompt_keeps_late_large_request_requirements(tmp_path):
+    planner = Planner(ScriptedLLM(text_payloads=["<html></html>"]), "")
+    session = SessionState(
+        task=(
+            "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js.\n\n"
+            "Ziel:\n"
+            "Die Website soll nicht simpel oder leer wirken, sondern wie eine hochwertige moderne Demo-Seite mit viel Inhalt, Interaktion und gutem UX.\n\n"
+            "Anforderungen:\n"
+            "- Lege genau diese Dateien an: index.html, styles.css, script.js.\n"
+            "- Nutze nur Vanilla HTML, CSS und JavaScript.\n"
+            "- Keine Frameworks.\n"
+            "- Alles soll direkt lokal im Browser funktionieren.\n\n"
+            "Design:\n"
+            "- modernes, professionelles, hochwertiges UI\n"
+            "- umfangreiches Styling\n"
+            "- sauberes Layout mit mehreren klaren Sektionen\n"
+            "- starke Typografie, Karten, Hover-Effekte, Uebergaenge und kleine Animationen\n"
+            "- responsive fuer Desktop und Mobile\n\n"
+            "Inhalt / Aufbau:\n"
+            "- Hero-Bereich mit starkem Einstieg\n"
+            "- Feature- oder Service-Sektion\n"
+            "- interaktive Karten oder Elemente\n"
+            "- Galerie / Vorschau-Bereich\n"
+            "- Statistik- oder Fortschrittsbereich\n"
+            "- FAQ oder Info-Bereich\n"
+            "- Kontakt-/Formularbereich\n"
+            "- Navigation mit sauberem Scroll-Verhalten\n"
+            "- Footer\n\n"
+            "Interaktivitaet:\n"
+            "- Navigation mit smooth scrolling\n"
+            "- Filter- oder Suchfunktion fuer Inhalte/Karten\n"
+            "- anklickbare Elemente mit dynamischen Detailanzeigen\n"
+            "- Tabs, Accordion oder Modal\n"
+            "- kleine Animationen beim Scrollen\n"
+            "- Formular mit einfacher Frontend-Validierung\n"
+            "- dynamisches Nachladen oder Umschalten von Inhalten per JavaScript\n\n"
+            "Wichtig:\n"
+            "- Erzeuge direkt vollstaendigen funktionierenden Code.\n"
+            "- Die Website soll wie ein echtes kleines Produkt wirken und nicht wie ein leeres Template."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {"step": 1, "action": "create_artifact", "reason": "Create the requested bundle."},
+        ],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+    )
+    payload["entities"]["constraints"] = ["Nur Vanilla HTML, CSS und JavaScript verwenden."]
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert "Latest user request:" in prompt or "User request digest:" in prompt
+    assert "Formular mit einfacher Frontend-Validierung" in prompt
+    assert "dynamisches Nachladen oder Umschalten von Inhalten per JavaScript" in prompt
+
+
 def test_planner_extracts_user_literal_examples_into_file_scoped_focus(tmp_path):
     readme_path = tmp_path / "README.md"
     readme_path.write_text(

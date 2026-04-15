@@ -23,9 +23,12 @@ STANDARD_MEMORY_CONTEXT_CHAR_BUDGET = 1100
 SEMANTIC_START_MEMORY_CONTEXT_CHAR_BUDGET = 760
 ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET = 900
 DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET = 1280
+TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET = 760
+TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET = 520
 GENERATION_BRIEF_CHAR_BUDGET = 760
 GENERATION_FILE_FOCUS_CHAR_BUDGET = 480
-GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 200
+GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 420
+GENERATION_REQUEST_DIGEST_CHAR_BUDGET = 520
 UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
     re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
     re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -197,14 +200,26 @@ def task_state_update_prompt(
     previous_task_state = _compact_task_state(session.task_state if session is not None else None)
     workspace_detail = "router" if compact else "decision"
     workspace_context = _compact_workspace_snapshot(snapshot, detail=workspace_detail)
+    request_excerpt = _trim_balanced_text(
+        task,
+        TASK_STATE_REQUEST_EXCERPT_CHAR_BUDGET if compact else 1100,
+    )
+    request_digest = _compact_request_digest(
+        task,
+        max_chars=TASK_STATE_REQUEST_DIGEST_CHAR_BUDGET,
+    )
     if mode == "resume" and str(resume_partial or "").strip():
-        return "\n".join(
+        lines = [
+            "Finish the partially emitted task-state JSON object for this turn.",
+            "Return valid JSON only.",
+            "Preserve already-correct fields from the partial object, repair broken structure, and complete any missing required fields.",
+            "Do not restart analysis from scratch unless the partial object is clearly contradictory.",
+            f"Latest user request: {request_excerpt}",
+        ]
+        if request_digest:
+            lines.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+        lines.extend(
             [
-                "Finish the partially emitted task-state JSON object for this turn.",
-                "Return valid JSON only.",
-                "Preserve already-correct fields from the partial object, repair broken structure, and complete any missing required fields.",
-                "Do not restart analysis from scratch unless the partial object is clearly contradictory.",
-                f"Latest user request: {_trim_text(task, 500)}",
                 f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
                 f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}",
                 f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}",
@@ -214,19 +229,22 @@ def task_state_update_prompt(
                 f"Return JSON only with this structure: {json.dumps(compact_schema_shape, ensure_ascii=False)}",
             ]
         )
+        return "\n".join(lines)
     lines = [
         "Update the central task state for this turn.",
-        f"Latest user request: {_trim_text(task, 900 if not compact else 500)}",
+        f"Latest user request: {request_excerpt}",
         f"Workspace context: {json.dumps(workspace_context, ensure_ascii=False)}",
         "State update rules:",
     ]
+    if request_digest:
+        lines.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
     if follow_up_context:
-        lines.insert(2, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
+        lines.insert(3 if request_digest else 2, f"Follow-up context: {json.dumps(follow_up_context, ensure_ascii=False)}")
     if memory_context:
-        insert_at = 3 if follow_up_context else 2
+        insert_at = 4 if request_digest and follow_up_context else 3 if request_digest or follow_up_context else 2
         lines.insert(insert_at, f"Memory context: {json.dumps(memory_context, ensure_ascii=False)}")
     if previous_task_state:
-        insert_at = 3
+        insert_at = 3 if not request_digest else 4
         if follow_up_context:
             insert_at += 1
         if memory_context:
@@ -510,6 +528,7 @@ def generate_content_prompt(
     mode: str = "full",
 ) -> str:
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    request_text = session.task if session is not None else route.requested_outcome
     if mode != "full":
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
         compact_large_request = _should_compact_generation_request(
@@ -521,6 +540,11 @@ def generate_content_prompt(
         )
         compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
         generation_brief = _compact_generation_brief(route, session, path=path)
+        request_digest = _compact_request_digest(
+            request_text,
+            max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
+        )
+        include_request_digest = bool(request_digest) and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET
         explicit_constraints = _explicit_generation_constraints(route, session)
         related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
         related_context = _compact_related_file_context(
@@ -543,11 +567,15 @@ def generate_content_prompt(
             if compact_large_request:
                 sections.insert(
                     1,
-                    f"User request excerpt: {_trim_text(session.task, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+                    f"User request excerpt: {_trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
                 )
-                sections.insert(3, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+                if include_request_digest:
+                    sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+                sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
             else:
-                sections.insert(1, f"Latest user request: {_trim_text(session.task, 360)}")
+                sections.insert(1, f"Latest user request: {_trim_balanced_text(request_text, 520)}")
+                if include_request_digest:
+                    sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
             if explicit_constraints != "none":
                 sections.append(f"Explicit constraints: {explicit_constraints}")
             sections.append(
@@ -616,16 +644,20 @@ def generate_content_prompt(
         if compact_large_request:
             sections.insert(
                 1,
-                f"User request excerpt: {_trim_text(session.task, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+                f"User request excerpt: {_trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
             )
-            sections.insert(2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
-            sections.insert(4, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            sections.insert(5 if include_request_digest else 4, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
         else:
-            sections.insert(1, f"Latest user request: {_trim_text(session.task, 420)}")
-            sections.insert(2, f"User goal: {_trim_text(route.user_goal, 240)}")
-            sections.insert(3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
-            sections.insert(5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
-            sections.insert(6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
+            sections.insert(1, f"Latest user request: {_trim_balanced_text(request_text, 520)}")
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"User goal: {_trim_text(route.user_goal, 240)}")
+            sections.insert(4 if include_request_digest else 3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
+            sections.insert(6 if include_request_digest else 5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
+            sections.insert(7 if include_request_digest else 6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
@@ -789,6 +821,7 @@ def generate_content_retry_prompt(
     mode: str = "full",
 ) -> str:
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    request_text = session.task if session is not None else route.requested_outcome
     if mode != "full":
         if current_content is not None and repair_context is not None and session is not None:
             if review_feedback is not None:
@@ -821,6 +854,11 @@ def generate_content_retry_prompt(
             current_content=current_content,
         )
         generation_brief = _compact_generation_brief(route, session, path=path)
+        request_digest = _compact_request_digest(
+            request_text,
+            max_chars=GENERATION_REQUEST_DIGEST_CHAR_BUDGET,
+        )
+        include_request_digest = bool(request_digest) and len(str(request_text or "").strip()) > GENERATION_REQUEST_EXCERPT_CHAR_BUDGET
         compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
         related_context = (
             _compact_related_file_context(session, path, compact=compact_large_request)
@@ -865,23 +903,24 @@ def generate_content_retry_prompt(
             sections.insert(
                 1,
                 "User request excerpt: "
-                + _trim_text(
-                    session.task if session is not None else route.requested_outcome,
-                    GENERATION_REQUEST_EXCERPT_CHAR_BUDGET,
-                ),
+                + _trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET),
             )
-            sections.insert(2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
-            sections.insert(5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            sections.insert(6 if include_request_digest else 5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
         else:
             sections.insert(
                 1,
-                f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
+                f"Latest user request: {_trim_balanced_text(request_text, 520)}",
             )
-            sections.insert(2, f"User goal: {_trim_text(route.user_goal, 240)}")
-            sections.insert(3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
+            if include_request_digest:
+                sections.insert(2, f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+            sections.insert(3 if include_request_digest else 2, f"User goal: {_trim_text(route.user_goal, 240)}")
+            sections.insert(4 if include_request_digest else 3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
             if session is not None:
-                sections.insert(5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
-            sections.insert(6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
+                sections.insert(6 if include_request_digest else 5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
+            sections.insert(7 if include_request_digest else 6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
@@ -7513,6 +7552,63 @@ def _derived_requirement_sentences(
             if sentence not in sentences:
                 sentences.append(sentence)
     return sentences[:8]
+
+
+def _compact_request_digest(
+    text: str,
+    *,
+    max_chars: int,
+    max_items: int = 8,
+) -> dict[str, object]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return {}
+    all_requirements: list[str] = []
+    line_requirements: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", str(raw_line or "")).strip(" .")
+        if len(cleaned_line) < 8 or _is_generation_metadata_constraint(cleaned_line):
+            continue
+        trimmed_line = _trim_text(cleaned_line, 180)
+        _append_unique_compact_text(line_requirements, trimmed_line, limit=180)
+        _append_unique_compact_text(all_requirements, trimmed_line, limit=180)
+    expanded = normalized.replace("*", "; ").replace("•", "; ")
+    for sentence in _requirement_sentences(expanded):
+        clauses = _split_requirement_clauses(sentence)
+        candidates = clauses if len(clauses) > 1 else [sentence]
+        for candidate in candidates:
+            cleaned = _trim_text(candidate, 180)
+            if not cleaned or _is_generation_metadata_constraint(cleaned):
+                continue
+            _append_unique_compact_text(all_requirements, cleaned, limit=180)
+    prioritized_requirements = list(line_requirements or all_requirements)
+    for candidate in all_requirements:
+        _append_unique_compact_text(prioritized_requirements, candidate, limit=180)
+
+    requirements = prioritized_requirements[:max_items]
+    balancing_source = line_requirements if len(line_requirements) >= max_items else prioritized_requirements
+    if len(balancing_source) > max_items:
+        head_count = max(1, max_items // 2)
+        tail_count = max(1, max_items - head_count)
+        balanced: list[str] = []
+        for candidate in [*balancing_source[:head_count], *balancing_source[-tail_count:]]:
+            _append_unique_compact_text(balanced, candidate, limit=180)
+            if len(balanced) >= max_items:
+                break
+        if balanced:
+            requirements = balanced[:max_items]
+    payload = {
+        "requirements": requirements[:max_items],
+        "request_excerpt": _trim_balanced_text(
+            normalized,
+            min(max(max_chars // 2, 220), 420),
+        ),
+    }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=["requirements", "request_excerpt"],
+        max_chars=max_chars,
+    )
 
 
 def _requirement_sentences(text: str) -> list[str]:
