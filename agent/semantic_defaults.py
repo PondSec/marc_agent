@@ -916,14 +916,10 @@ def classify_obvious_request(text: str) -> ObviousRequestClassification | None:
         return None
     requested_extension = infer_requested_extension(text)
     artifact_name_hint = infer_artifact_name_hint(text)
-    if looks_like_explanation_request(text):
-        return ObviousRequestClassification(
-            intent="explain",
-            confidence=0.78,
-            requested_extension=requested_extension,
-            artifact_name_hint=artifact_name_hint,
-        )
-    if looks_like_debug_request(text):
+    explanation_like = looks_like_explanation_request(text)
+    problem_report_like = looks_like_problem_report(text)
+    debug_like = looks_like_debug_request(text) and (not explanation_like or not problem_report_like)
+    if debug_like:
         return ObviousRequestClassification(
             intent="debug",
             confidence=0.8,
@@ -949,6 +945,13 @@ def classify_obvious_request(text: str) -> ObviousRequestClassification | None:
         return ObviousRequestClassification(
             intent="create",
             confidence=0.84 if requested_extension is not None else 0.78,
+            requested_extension=requested_extension,
+            artifact_name_hint=artifact_name_hint,
+        )
+    if explanation_like:
+        return ObviousRequestClassification(
+            intent="explain",
+            confidence=0.78,
             requested_extension=requested_extension,
             artifact_name_hint=artifact_name_hint,
         )

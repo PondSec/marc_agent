@@ -1367,6 +1367,162 @@ def test_task_state_local_short_circuit_preserves_explicit_multi_file_website_ta
     assert llm.generate_json_calls == []
 
 
+def test_task_state_local_short_circuit_keeps_large_create_prompt_with_reporting_tail_as_implementation(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    prompt = (
+        "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+        "- index.html\n"
+        "- styles.css\n"
+        "- script.js\n\n"
+        "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+        "Anforderungen:\n"
+        "- mehrere Automodelle anzeigen\n"
+        "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+        "- funktionierende Suchfunktion nach Marke und Modell\n"
+        "- modernes, sauberes UI\n"
+        "- gutes UX\n"
+        "- responsive Layout\n"
+        "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+        "- keine Frameworks, nur HTML, CSS und JavaScript\n\n"
+        "Arbeite sinnvoll:\n"
+        "1. baue erst eine klare Struktur\n"
+        "2. halte die Autodaten sauber in JavaScript\n"
+        "3. implementiere dann Darstellung und Suche\n"
+        "4. prüfe am Ende, ob alles zusammen funktioniert\n\n"
+        "Am Ende kurz angeben:\n"
+        "- welche Dateien erstellt wurden\n"
+        "- wie die Suchfunktion funktioniert\n"
+        "- was geprüft wurde"
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=empty_snapshot(tmp_path))
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=empty_snapshot(tmp_path))
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "create"
+    assert [artifact.path for artifact in task_state.target_artifacts] == [
+        "index.html",
+        "styles.css",
+        "script.js",
+    ]
+    assert route.intent == RouteIntent.CREATE
+    assert route.entities.target_paths == ["index.html", "styles.css", "script.js"]
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_local_short_circuit_keeps_update_prompt_with_reporting_tail_as_modification(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=3,
+        language_counts={"html": 1, "css": 1, "javascript": 1},
+        top_directories=[],
+        important_files=["index.html", "styles.css", "script.js"],
+        focus_files=["index.html", "styles.css", "script.js"],
+        file_briefs={},
+        manifests=[],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["index.html"],
+        repo_map=[],
+        project_labels=["website"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small static site.",
+    )
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    prompt = (
+        "Überarbeite im bestehenden Projekt index.html, styles.css und script.js so, dass die Auto-Website jetzt "
+        "zusätzlich einen Filter nach Kraftstoff und Preisbereich hat. Lass das Design konsistent, ändere sonst "
+        "nichts unnötig und prüfe am Ende, ob Suche und Filter zusammen funktionieren. Am Ende kurz angeben, "
+        "was geändert wurde und was geprüft wurde."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "modify"
+    assert {artifact.path for artifact in task_state.target_artifacts} >= {
+        "index.html",
+        "styles.css",
+        "script.js",
+    }
+    assert route.intent == RouteIntent.UPDATE
+    assert {path for path in route.entities.target_paths} >= {"index.html", "styles.css", "script.js"}
+    assert llm.generate_json_calls == []
+
+
+def test_task_state_local_short_circuit_keeps_analyze_then_modify_prompt_on_update_path(tmp_path):
+    snapshot = WorkspaceSnapshot(
+        root=str(tmp_path),
+        file_count=4,
+        language_counts={"html": 1, "css": 1, "javascript": 1, "markdown": 1},
+        top_directories=[],
+        important_files=["README.md", "index.html", "script.js", "styles.css"],
+        focus_files=["index.html", "script.js", "styles.css"],
+        file_briefs={},
+        manifests=["README.md"],
+        configs=[],
+        test_files=[],
+        build_files=[],
+        deploy_files=[],
+        entrypoints=["index.html"],
+        repo_map=[],
+        project_labels=["website"],
+        likely_commands=[],
+        validation_commands=[],
+        workflow_commands=[],
+        repo_summary="Small static site.",
+    )
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM()
+    llm.config = config
+    updater = TaskStateUpdater(llm)
+
+    prompt = (
+        "Analysiere zuerst die bestehende Auto-Website im Repo und ändere dann gezielt index.html, styles.css und "
+        "script.js, damit ein Filter nach Kraftstoff und Preisbereich hinzukommt. Lies die relevanten Stellen erst, "
+        "halte das UI konsistent und gib am Ende kurz an, was du geändert und geprüft hast."
+    )
+
+    task_state = updater.update_task_state(prompt, snapshot=snapshot)
+    route = ExecutionDecisionPolicy().build_route(task_state, snapshot=snapshot)
+
+    assert task_state.current_user_intent == "implement"
+    assert task_state.execution_strategy == "feature_implementation"
+    assert task_state.next_action == "modify"
+    assert route.intent == RouteIntent.UPDATE
+    assert route.action_plan[0].action == RouteActionName.READ_RELEVANT_FILES
+    assert route.action_plan[1].action == RouteActionName.UPDATE_ARTIFACT
+    assert {path for path in route.entities.target_paths} >= {"index.html", "styles.css", "script.js"}
+    assert llm.generate_json_calls == []
+
+
 def test_task_state_local_short_circuit_prioritizes_debug_for_bugfix_prompts_with_search_words(tmp_path):
     snapshot = WorkspaceSnapshot(
         root=str(tmp_path),

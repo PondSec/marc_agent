@@ -581,6 +581,9 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
     multiple_anchors = len(anchor_paths) > 1
 
     create_like = is_clear_low_risk_build_request(request)
+    explanation_like = looks_like_explanation_request(request)
+    problem_report_like = looks_like_problem_report(request)
+    debug_like = looks_like_debug_request(request) and (not explanation_like or not problem_report_like)
     update_like = (
         looks_like_update_request(request)
         or looks_like_hardening_request(request)
@@ -592,20 +595,20 @@ def _minimal_semantic_signal(request: str, *, context: dict[str, Any]) -> Minima
     validate_like = looks_like_validation_request(request) and not looks_like_debug_request(request)
 
     intent: GuardrailPrimaryIntent
-    if looks_like_explanation_request(request):
-        intent = "explain"
-    elif _looks_like_plan_request(normalized):
-        intent = "plan"
-    elif looks_like_debug_request(request):
-        intent = "debug"
-    elif _looks_like_search_request(normalized):
-        intent = "search"
-    elif create_like:
+    if create_like:
         intent = "create"
+    elif debug_like:
+        intent = "debug"
     elif update_like:
         intent = "update"
     elif validate_like:
         intent = "validate"
+    elif _looks_like_plan_request(normalized):
+        intent = "plan"
+    elif _looks_like_search_request(normalized):
+        intent = "search"
+    elif explanation_like:
+        intent = "explain"
     else:
         intent = "unknown"
 
