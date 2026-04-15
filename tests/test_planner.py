@@ -769,6 +769,7 @@ def test_final_response_prompt_uses_structured_architecture_report_for_large_ana
 
     assert "Beantworte die Teilfragen des Nutzers in derselben Reihenfolge." in prompt
     assert "insgesamt moeglichst unter 450 Woertern" in prompt
+    assert "Belegstatus:" in prompt
     assert '"request_requirements": ["Systemtyp", "Rollen", "Memory", "Repo-Mapping"' in prompt
     assert '"workspace_repo_map":' in prompt
     assert '"inspection_evidence": [{"path": "app/main.py"' in prompt
@@ -31052,10 +31053,206 @@ def test_planner_uses_structured_deterministic_fallback_for_large_analysis_timeo
 
     assert decision.action_type == AgentActionType.FINAL
     assert "1. Was fuer ein System ist das insgesamt?" in (decision.final_response or "")
+    assert "Belegstatus:" in (decision.final_response or "")
+    assert "Dateien:" in (decision.final_response or "")
+    assert "Sichtbare Symbole/Felder:" in (decision.final_response or "")
     assert "agent/planner.py" in (decision.final_response or "")
     assert "agent/prompts.py" in (decision.final_response or "")
     assert "agent/layered_memory.py" in (decision.final_response or "")
     assert "Ich habe vor allem" not in (decision.final_response or "")
+
+
+def test_planner_rejects_generic_completed_large_analysis_response_and_falls_back_to_structured_report(tmp_path):
+    payload = route_payload(
+        intent="inspect",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "summarize_result",
+                "reason": "Return the grounded architecture summary.",
+            }
+        ],
+        requested_outcome="Analysiere Systemtyp, Rollen, Memory, Repo-Mapping, grosse Prompts und Risiken.",
+    )
+    llm = ScriptedLLM(
+        json_payloads=[payload],
+        text_payloads=[
+            (
+                "1. Das ist ein Agentensystem.\n"
+                "2. Planner plant, Prompts erzeugen Prompts und der Server hostet die Anwendung.\n"
+                "3. Memory speichert Dinge.\n"
+                "4. Repo-Mapping wird wahrscheinlich irgendwo verwendet.\n"
+                "5. Request-Digests helfen bei grossen Prompts.\n"
+                "6. Risiken gibt es ebenfalls.\n"
+            )
+        ],
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Was fuer ein System ist das insgesamt? "
+            "2. Welche Rollen haben planner, prompts und layered_memory? "
+            "3. Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen? "
+            "4. Woher kommt das Repo-Mapping und wie wird es wieder eingespeist? "
+            "5. Welche Stellen sind fuer grosse Nutzerprompts und Request-Digests entscheidend? "
+            "6. Welche technischen Risiken siehst du noch?"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=WorkspaceSnapshot(
+            root=str(tmp_path),
+            file_count=20,
+            language_counts={"python": 18},
+            top_directories=["agent", "server", "tests"],
+            important_files=[
+                "agent/layered_memory.py",
+                "agent/memory.py",
+                "agent/planner.py",
+                "agent/prompts.py",
+                "agent/state_updater.py",
+                "agent/task_state.py",
+                "server/app.py",
+            ],
+            focus_files=[
+                "agent/layered_memory.py",
+                "agent/memory.py",
+                "agent/planner.py",
+                "agent/prompts.py",
+                "agent/state_updater.py",
+                "agent/task_state.py",
+                "server/app.py",
+            ],
+            file_briefs={},
+            manifests=["README.md"],
+            configs=[],
+            test_files=["tests/test_layered_memory.py", "tests/test_planner.py"],
+            build_files=[],
+            deploy_files=[],
+            entrypoints=["server/app.py"],
+            repo_map=["agent/", "server/", "tests/"],
+            project_labels=["python", "python-runtime"],
+            likely_commands=[],
+            validation_commands=[],
+            workflow_commands=[],
+            repo_summary="Lokaler Coding-Agent mit Planner-, Prompt-, Memory- und Server-Schicht.",
+            symbol_index={
+                "agent/planner.py": ["Planner", "decide_next_action", "_compose_user_response"],
+                "agent/prompts.py": ["final_response_prompt", "build_request_digest", "build_request_memory_packet"],
+                "agent/layered_memory.py": ["AgentMemoryStore", "build_working_memory", "build_retrieval_request"],
+                "agent/memory.py": ["RepoMemoryStore", "build_snapshot"],
+                "agent/state_updater.py": ["TaskStateUpdater", "update_task_state"],
+                "agent/task_state.py": ["TaskState", "RequestDigest"],
+                "server/app.py": ["create_app", "require_auth"],
+            },
+            file_relationships={
+                "agent/planner.py": ["agent/prompts.py", "agent/task_state.py", "tests/test_planner.py"],
+                "agent/prompts.py": ["agent/planner.py", "agent/state_updater.py"],
+                "agent/layered_memory.py": ["agent/memory.py", "agent/task_state.py", "tests/test_layered_memory.py"],
+                "agent/memory.py": ["agent/layered_memory.py"],
+                "agent/state_updater.py": ["agent/prompts.py", "agent/task_state.py"],
+            },
+            module_summaries={
+                "agent/planner.py": "Planner orchestrates routing, read candidates, validation passes and final response generation.",
+                "agent/prompts.py": "Prompt layer compacts request context and builds request digest, request memory and final response prompts.",
+                "agent/layered_memory.py": "Layered memory store combines working, episodic, project, failure and conversation memory retrieval.",
+                "agent/memory.py": "Repo memory builds workspace snapshots, repo maps, relationships and module summaries.",
+                "agent/state_updater.py": "Task state updater structures latest user intent, request chunks and request memory state.",
+                "agent/task_state.py": "Task state schema persists active goal, constraints, evidence and structured request digest.",
+                "server/app.py": "FastAPI server exposes auth, session and runtime endpoints.",
+            },
+            subsystem_summaries={
+                "agent": "Planner, prompts, memory and task state cooperate for repository work.",
+                "server": "FastAPI runtime and auth/API surface.",
+            },
+        ),
+    )
+    session.router_result = planner.validate_router_output(payload)
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="Return a grounded architecture summary with concrete file paths.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        target_artifacts=[],
+        active_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.87,
+        next_action="inspect",
+        next_best_action="inspect",
+        request_requirements=[
+            "Was fuer ein System ist das insgesamt?",
+            "Welche Rollen haben planner, prompts und layered_memory?",
+            "Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen?",
+            "Woher kommt das Repo-Mapping und wie wird es wieder eingespeist?",
+            "Welche Stellen sind fuer grosse Nutzerprompts und Request-Digests entscheidend?",
+            "Welche technischen Risiken siehst du noch?",
+        ],
+        request_chunks=[
+            "Systemtyp; Rollen von planner, prompts, layered_memory",
+            "Memory-Zusammenspiel; Repo-Mapping",
+            "grosse Nutzerprompts; Request-Digests; Risiken",
+        ],
+        execution_outline=[],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "agent/planner.py"},
+                success=True,
+                summary="Read agent/planner.py.",
+                phase="exploring",
+                output_excerpt="class Planner:\n    def decide_next_action(self, task, session):\n        ...\n",
+            ),
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "agent/prompts.py"},
+                success=True,
+                summary="Read agent/prompts.py.",
+                phase="exploring",
+                output_excerpt="def final_response_prompt(...):\n    ...\ndef build_request_digest(...):\n    ...\n",
+            ),
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "agent/layered_memory.py"},
+                success=True,
+                summary="Read agent/layered_memory.py.",
+                phase="exploring",
+                output_excerpt="class AgentMemoryStore:\n    def build_working_memory(...):\n        ...\n",
+            ),
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "agent/memory.py"},
+                success=True,
+                summary="Read agent/memory.py.",
+                phase="exploring",
+                output_excerpt="class RepoMemoryStore:\n    def build_snapshot(...):\n        ...\n",
+            ),
+        ]
+    )
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Belegstatus:" in (decision.final_response or "")
+    assert "Dateien:" in (decision.final_response or "")
+    assert "Sichtbare Symbole/Felder:" in (decision.final_response or "")
+    assert "agent/memory.py" in (decision.final_response or "")
+    assert "build_snapshot" in (decision.final_response or "")
 
 
 def test_planner_localizes_deterministic_final_response_to_english(tmp_path):

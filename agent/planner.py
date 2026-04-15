@@ -1133,27 +1133,94 @@ class Planner:
         if candidates:
             direct = [item for item in candidates if item["direct"]]
             indirect = [item for item in candidates if not item["direct"]]
-            chosen = direct[:2] or indirect[:2]
-            label = self._localized_text(
+            chosen = direct[:4] or indirect[:3]
+            status = self._localized_text(
                 language,
                 de="Direkt sichtbar" if direct else "Indirekt ableitbar",
                 en="Directly visible" if direct else "Indirectly inferred",
             )
-            paths = ", ".join(item["path"] for item in chosen)
-            details = " ".join(
-                detail
-                for detail in [*(item["detail"] for item in chosen[:2])]
-                if detail
-            ).strip()
-            sentence = f"{index}. {section}: {label} in {paths}."
-            if details:
-                sentence += f" {details}"
-            return sentence
+            paths = ", ".join(str(item["path"]) for item in chosen[:3])
+            visible_signals = self._unique_strings(
+                [
+                    *(
+                        field
+                        for item in chosen
+                        for field in list(item["fields"])
+                    ),
+                    *(
+                        signal
+                        for item in chosen
+                        for signal in list(item["signals"])
+                    ),
+                ],
+                limit=6,
+            )
+            claims = self._unique_strings(
+                [str(item["claim"]) for item in chosen if str(item["claim"]).strip()],
+                limit=3,
+            )
+            relationships = self._unique_strings(
+                [
+                    relation
+                    for item in chosen
+                    for relation in list(item["relationships"])
+                ],
+                limit=4,
+            )
+            answer_parts: list[str] = []
+            if claims:
+                answer_parts.append(" ".join(claims))
+            if visible_signals:
+                answer_parts.append(
+                    self._localized_text(
+                        language,
+                        de=f"Sichtbare Strukturanker: {', '.join(visible_signals[:4])}.",
+                        en=f"Visible structural anchors: {', '.join(visible_signals[:4])}.",
+                    )
+                )
+            if relationships:
+                answer_parts.append(
+                    self._localized_text(
+                        language,
+                        de=f"Nahe Beziehungen: {', '.join(relationships)}.",
+                        en=f"Nearby relationships: {', '.join(relationships)}.",
+                    )
+                )
+            answer = " ".join(part for part in answer_parts if part).strip()
+            return "\n".join(
+                [
+                    f"{index}. {section}",
+                    self._localized_text(language, de=f"Belegstatus: {status}.", en=f"Evidence status: {status}."),
+                    self._localized_text(language, de=f"Dateien: {paths}.", en=f"Files: {paths}."),
+                    self._localized_text(
+                        language,
+                        de=f"Sichtbare Symbole/Felder: {', '.join(visible_signals) if visible_signals else 'keine belastbaren Symbole im kompakten Kontext'}.",
+                        en=f"Visible symbols/fields: {', '.join(visible_signals) if visible_signals else 'no reliable symbols in the compact context'}.",
+                    ),
+                    self._localized_text(
+                        language,
+                        de=f"Antwort: {answer or 'Im gelesenen Kontext ist hier nur die Dateinaehe sichtbar, aber noch keine belastbare tiefere Aussage.'}",
+                        en=f"Answer: {answer or 'The inspected context currently shows file proximity here, but not a deeper reliable conclusion yet.'}",
+                    ),
+                ]
+            )
         inspected = ", ".join(_read_paths(session)[-4:])
         return self._localized_text(
             language,
-            de=f"{index}. {section}: Im gelesenen Kontext noch nicht belastbar bestaetigt. Bisher direkt gelesen: {inspected}.",
-            en=f"{index}. {section}: Not reliably confirmed in the inspected context yet. Files read so far: {inspected}.",
+            de=(
+                f"{index}. {section}\n"
+                "Belegstatus: Im gelesenen Kontext nicht bestaetigt.\n"
+                f"Dateien: {inspected}.\n"
+                "Sichtbare Symbole/Felder: keine belastbaren Treffer.\n"
+                "Antwort: Fuer diesen Punkt fehlt im bisher gelesenen Kontext noch ein belastbarer direkter Beleg."
+            ),
+            en=(
+                f"{index}. {section}\n"
+                "Evidence status: Not confirmed in the inspected context.\n"
+                f"Files: {inspected}.\n"
+                "Visible symbols/fields: no reliable matches.\n"
+                "Answer: The files read so far do not yet contain a strong direct signal for this point."
+            ),
         )
 
     def _structured_analysis_section_candidates(
@@ -1198,31 +1265,129 @@ class Planner:
                 score += 1
             if score <= 0:
                 continue
-            detail_parts: list[str] = []
-            if module_summary:
-                detail_parts.append(_trim_text(module_summary, 180))
-            elif symbols:
-                detail_parts.append(
-                    self._localized_text(
-                        self._session_language(session),
-                        de=f"Sichtbare Symbole: {', '.join(symbols)}.",
-                        en=f"Visible symbols: {', '.join(symbols)}.",
-                    )
-                )
-            elif excerpt:
-                detail_parts.append(_trim_text(excerpt.replace("\n", " "), 180))
+            fields = self._structured_analysis_visible_fields(
+                path,
+                session=session,
+                section_terms=section_terms,
+            )
+            claim = self._structured_analysis_claim_for_path(
+                path,
+                session=session,
+                snapshot=snapshot,
+                signals=symbols,
+                fields=fields,
+            )
             candidates.append(
                 {
                     "path": path,
                     "score": score,
                     "direct": path in inspected,
-                    "detail": " ".join(detail_parts).strip(),
+                    "claim": claim,
+                    "signals": symbols,
+                    "fields": fields,
+                    "relationships": list((snapshot.file_relationships or {}).get(path) or [])[:3],
                 }
             )
         candidates.sort(key=lambda item: (-int(item["score"]), str(item["path"])))
         return candidates[:4]
 
-    def _structured_analysis_partial_is_grounded(
+    def _structured_analysis_claim_for_path(
+        self,
+        path: str,
+        *,
+        session: SessionState,
+        snapshot: WorkspaceSnapshot,
+        signals: list[str],
+        fields: list[str],
+    ) -> str:
+        module_summary = str((snapshot.module_summaries or {}).get(path) or "").strip()
+        language = self._session_language(session)
+        if signals:
+            sentence = self._localized_text(
+                language,
+                de=f"In {path} sind {', '.join(signals[:3])} sichtbar.",
+                en=f"In {path}, {', '.join(signals[:3])} are visible.",
+            )
+            if fields:
+                sentence += " " + self._localized_text(
+                    language,
+                    de=f"Dazu kommen die Strukturfelder {', '.join(fields[:3])}.",
+                    en=f"Relevant structural fields include {', '.join(fields[:3])}.",
+                )
+            return sentence
+        if module_summary and not module_summary.lower().startswith(("from __future__", "import ", "from ")):
+            parts = [part.strip() for part in module_summary.split(";") if part.strip()]
+            if parts:
+                return _trim_text(parts[0], 220)
+        excerpt = self._current_or_last_read_excerpt(session, path=path)
+        excerpt_line = next(
+            (
+                line.strip()
+                for line in excerpt.splitlines()
+                if line.strip() and not line.strip().startswith(("from __future__", "import ", "#"))
+            ),
+            "",
+        )
+        return _trim_text(excerpt_line.replace("\n", " "), 220)
+
+    def _structured_analysis_visible_fields(
+        self,
+        path: str,
+        *,
+        session: SessionState,
+        section_terms: list[str],
+    ) -> list[str]:
+        content = self._current_or_last_read_excerpt(session, path=path)[:6000]
+        if not content:
+            return []
+        fields: list[str] = []
+        filtered: list[str] = []
+        normalized_terms = {
+            token.lower()
+            for term in section_terms
+            for token in re.split(r"[^a-z0-9_]+", str(term or "").lower())
+            if len(token) >= 3
+        }
+        constructor_matches = list(re.finditer(r"\b([A-Z][A-Za-z0-9_]{2,})\(", content))
+        for match in constructor_matches[:3]:
+            start = match.end()
+            depth = 1
+            index = start
+            while index < len(content) and depth > 0 and index - start < 1800:
+                char = content[index]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                index += 1
+            block = content[start:index]
+            for field in re.findall(r"\b([a-z_][A-Za-z0-9_]*)\s*=", block):
+                cleaned = str(field or "").strip()
+                if cleaned and cleaned not in fields and len(cleaned) >= 4:
+                    fields.append(cleaned)
+        for field in re.findall(r"\b(?:state|session|entry|snapshot)\.([a-z_][A-Za-z0-9_]*)\s*=", content):
+            cleaned = str(field or "").strip()
+            if cleaned and cleaned not in fields and len(cleaned) >= 4:
+                fields.append(cleaned)
+        for field in fields:
+            lowered = field.lower()
+            field_tokens = {
+                token
+                for token in re.split(r"[^a-z0-9_]+", lowered)
+                if len(token) >= 3
+            } | {
+                token
+                for token in lowered.split("_")
+                if len(token) >= 3
+            }
+            if normalized_terms and (
+                any(term in lowered for term in normalized_terms)
+                or any(token in normalized_terms for token in field_tokens)
+            ):
+                filtered.append(field)
+        return filtered[:6] if normalized_terms else fields[:4]
+
+    def _structured_analysis_response_is_grounded(
         self,
         response: str,
         session: SessionState,
@@ -1231,8 +1396,9 @@ class Planner:
         if len(text) < 160:
             return False
         inspected = _read_paths(session)[-6:]
-        if any(path in text for path in inspected):
-            return True
+        path_hits = sum(1 for path in inspected if path in text)
+        status_markers = len(re.findall(r"(?:^|\n)\s*(?:Belegstatus|Evidence status):", text))
+        file_markers = len(re.findall(r"(?:^|\n)\s*(?:Dateien|Files):", text))
         request_count = len(
             [
                 item
@@ -1241,7 +1407,12 @@ class Planner:
             ]
         )
         numbered_sections = len(re.findall(r"(?:^|\n)\s*\d+[.)]\s", text))
-        return numbered_sections >= max(3, min(5, request_count))
+        return (
+            path_hits >= min(2, max(1, min(4, len(inspected))))
+            and numbered_sections >= max(3, min(5, request_count))
+            and status_markers >= max(3, min(5, request_count))
+            and file_markers >= max(3, min(5, request_count))
+        )
 
     def _is_conversation_request(self, session: SessionState) -> bool:
         return (
@@ -7575,6 +7746,12 @@ class Planner:
         )
         if outcome.exception is None:
             response = self._strip_code_fences(str(outcome.value or "")).strip()
+            if (
+                response
+                and _requires_structured_analysis_report(route, session)
+                and not self._structured_analysis_response_is_grounded(response, session)
+            ):
+                response = ""
             if response:
                 self._log("final_response_generation_finished", characters=len(response))
                 self._append_runtime_execution(
@@ -7607,7 +7784,7 @@ class Planner:
             if (
                 partial_response
                 and _requires_structured_analysis_report(route, session)
-                and not self._structured_analysis_partial_is_grounded(partial_response, session)
+                and not self._structured_analysis_response_is_grounded(partial_response, session)
             ):
                 partial_response = ""
             if partial_response:
@@ -16020,6 +16197,22 @@ class Planner:
         if not diff.strip():
             return "(no diff)"
         return self._review_excerpt(diff, limit=limit)
+
+    def _unique_strings(
+        self,
+        values: list[str | None],
+        *,
+        limit: int | None = None,
+    ) -> list[str]:
+        unique: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if not text or text in unique:
+                continue
+            unique.append(text)
+            if limit is not None and len(unique) >= limit:
+                break
+        return unique
 
     def _deterministic_exact_text_create_review(
         self,
