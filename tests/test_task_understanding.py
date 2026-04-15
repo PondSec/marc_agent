@@ -17,7 +17,11 @@ from agent.prompts import (
     _prioritized_compact_payload,
     task_state_update_prompt,
 )
-from agent.semantic_defaults import extract_scope_constraints, looks_like_scope_narrowing_request
+from agent.semantic_defaults import (
+    extract_scope_constraints,
+    looks_like_problem_report,
+    looks_like_scope_narrowing_request,
+)
 from agent.semantic_guardrails import build_minimal_task_state
 from agent.state_updater import TaskStateUpdater
 from agent.task_state import EvidenceItem, TaskState
@@ -2202,7 +2206,8 @@ def test_minimal_task_state_does_not_treat_vanilla_frontend_create_prompt_as_sco
     request = (
         "Erstelle eine moderne Website mit index.html, styles.css und script.js. "
         "Nutze nur Vanilla HTML, CSS und JavaScript. "
-        "Baue ausserdem ein Formular mit einfacher Frontend-Validierung."
+        "Baue ausserdem ein Formular mit einfacher Frontend-Validierung. "
+        "Achte darauf, dass es keine kaputten Funktionen gibt."
     )
 
     assert looks_like_scope_narrowing_request(request) is False
@@ -2223,6 +2228,15 @@ def test_minimal_task_state_does_not_treat_vanilla_frontend_create_prompt_as_sco
     assert state.constraints == []
     assert route.intent == RouteIntent.CREATE
     assert route.action_plan[0].action == RouteActionName.CREATE_ARTIFACT
+
+
+def test_looks_like_problem_report_ignores_negated_problem_constraints():
+    request = (
+        "Erstelle eine moderne Website mit index.html, styles.css und script.js. "
+        "Achte darauf, dass es keine kaputten Funktionen gibt und keine Fehler auftreten."
+    )
+
+    assert looks_like_problem_report(request) is False
 
 
 def test_task_state_updater_reanchors_model_prefixed_workspace_path_to_explicit_request(tmp_path):

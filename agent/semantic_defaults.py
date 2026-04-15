@@ -254,6 +254,14 @@ _PROBLEM_REPORT_TOKENS = (
     "warning",
 )
 
+_NEGATED_PROBLEM_CONSTRAINT_PATTERNS = (
+    re.compile(
+        r"\b(?:kein|keine|keinen|keinem|keiner|ohne|no|not)\s+"
+        r"(?:[a-z0-9_äöüß-]+\s+){0,3}"
+        r"(?:bug|bugs|broken|crash(?:es)?|error(?:s)?|exception(?:s)?|fail(?:ed|ing|s)?|fehler|kaputt[a-z0-9_äöüß-]*|problem(?:e|s)?)\b"
+    ),
+)
+
 _DEBUG_REQUEST_TOKENS = (
     "beheb",
     "debug",
@@ -701,7 +709,12 @@ def looks_like_additive_request(text: str) -> bool:
 
 def looks_like_problem_report(text: str) -> bool:
     normalized = normalize_text(text)
-    return bool(normalized) and any(token in normalized for token in _PROBLEM_REPORT_TOKENS)
+    if not normalized:
+        return False
+    scrubbed = normalized
+    for pattern in _NEGATED_PROBLEM_CONSTRAINT_PATTERNS:
+        scrubbed = pattern.sub(" ", scrubbed)
+    return any(token in scrubbed for token in _PROBLEM_REPORT_TOKENS)
 
 
 def looks_like_debug_request(text: str) -> bool:
