@@ -42,6 +42,7 @@ class SessionReporter:
         self._require_task_state(session)
         language = self._session_language(session)
         report = session.report or self.build_report(session)
+        used_draft_response = self._uses_draft_response(session, draft_response)
         lead = self._lead_message(session, draft_response)
         details: list[str] = []
         inspected_files: list[str] = []
@@ -60,7 +61,7 @@ class SessionReporter:
                 details.append(degraded_note)
         else:
             inspected_files = self._inspected_files(session)
-            if inspected_files:
+            if inspected_files and not used_draft_response:
                 details.append(
                     self._localized_text(
                         language,
@@ -159,7 +160,7 @@ class SessionReporter:
 
     def _lead_message(self, session: SessionState, draft_response: str | None) -> str:
         cleaned = self._clean_text(draft_response)
-        if cleaned and not self._looks_like_machine_summary(cleaned) and not self._conflicts_with_session(cleaned, session):
+        if self._uses_draft_response(session, draft_response):
             return cleaned
         language = self._session_language(session)
 
@@ -232,6 +233,14 @@ class SessionReporter:
             language,
             de="Ich habe den Workspace untersucht, aber noch kein sauberes Abschlussergebnis erreicht.",
             en="I inspected the workspace, but I have not reached a clean final outcome yet.",
+        )
+
+    def _uses_draft_response(self, session: SessionState, draft_response: str | None) -> bool:
+        cleaned = self._clean_text(draft_response)
+        return bool(
+            cleaned
+            and not self._looks_like_machine_summary(cleaned)
+            and not self._conflicts_with_session(cleaned, session)
         )
 
     def _degraded_execution_note(self, session: SessionState) -> str | None:
