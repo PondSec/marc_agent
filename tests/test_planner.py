@@ -44,14 +44,14 @@ from agent.prompts import (
     generate_content_retry_prompt,
     proposed_update_review_prompt,
 )
-from agent.task_schema import TaskArtifact
+from agent.task_schema import TaskArtifact, TaskPlanStep, TaskUnderstanding
 from agent.task_state import TaskState
 from agent.verification import ValidationPlanner
 from agent.memory import RepoMemoryStore
 from agent.decision import ExecutionDecisionPolicy
 from config.settings import AppConfig
 from llm.ollama_client import OllamaGenerationError
-from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure
+from llm.runtime_resilience import ExecutionAttemptRecord, ExecutionFailure, estimate_context_pressure
 from llm.schemas import AgentActionType, AgentDecision, RouteIntent, RouterOutput
 from runtime.logger import AgentLogger
 from runtime.workspace import WorkspaceManager
@@ -13339,6 +13339,230 @@ def test_generate_content_prompt_keeps_callable_requirement_sentence_intact_for_
         in prompt
     )
     assert "wireMenuToggle(button; panel)" not in prompt
+
+
+def test_generate_content_prompt_compacts_large_request_context_only_when_needed(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    long_request = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Die Website soll nicht simpel oder leer wirken, sondern wie eine hochwertige Demo-Seite mit viel Inhalt, Interaktion und gutem UX. "
+        "Nutze nur Vanilla HTML, CSS und JavaScript, keine Frameworks, alles soll direkt lokal im Browser funktionieren. "
+        "Baue Hero, Feature-Sektion, interaktive Karten, Galerie, Statistikbereich, FAQ, Kontaktformular, Navigation und Footer. "
+        "Implementiere smooth scrolling, Filter oder Suche fuer Karten, anklickbare Detailanzeigen, Tabs oder Accordion, Modal, Scroll-Animationen, "
+        "Frontend-Validierung und dynamisches Umschalten von Inhalten. "
+        "Das UI soll hochwertig, responsive, stark typografisch und deutlich aufwendiger als ein einfaches Template wirken. "
+        "Gestalte mehrere klar getrennte Inhaltsbereiche mit starker Typografie, sauberen Abstaenden, Karten, Hover-Effekten, Micro-Animationen, "
+        "visuell markanten Buttons und einer glaubwuerdigen Produktpraesentation. "
+        "Die Seite soll mehrere Dinge gleichzeitig koennen: entdecken, filtern, anklicken, ausprobieren und Inhalte lebendig umschalten. "
+        "Baue ausserdem ein glaubwuerdiges Kontaktformular, dynamische Detailbereiche und eine Navigation mit sauberem Scroll-Verhalten und hochwertigen Uebergaengen."
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["index.html", "styles.css", "script.js"],
+            "focus_files": ["index.html", "styles.css", "script.js"],
+            "entrypoints": ["index.html", "script.js"],
+            "language_counts": {"html": 1, "css": 1, "javascript": 1},
+            "project_labels": ["frontend", "website"],
+            "repo_summary": "Small frontend workspace with a coordinated HTML, CSS, and JavaScript bundle.",
+        }
+    )
+    session = SessionState(
+        task=long_request,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Build the requested web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome=long_request,
+    )
+    payload["user_goal"] = long_request
+    commit_task_state_and_route(planner, session, payload, verification_target="Open index.html in a browser and verify the interactions.")
+    session.task_understanding = TaskUnderstanding(
+        original_request=long_request,
+        interpreted_goal="Build a high-end interactive demo website as a coordinated HTML/CSS/JS bundle.",
+        intent_category="build",
+        conversation_relation="new_task",
+        constraints=[
+            "Use only Vanilla HTML, CSS, and JavaScript.",
+            "Keep the bundle responsive for desktop and mobile.",
+            "Include rich content sections plus interactive UI elements.",
+        ],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.92,
+        recommended_mode="modify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Define the shared HTML structure and hooks", action_hint="modify"),
+            TaskPlanStep(step=2, summary="Style the coordinated sections and states", action_hint="modify"),
+            TaskPlanStep(step=3, summary="Wire the interactive behaviors in JavaScript", action_hint="modify"),
+        ],
+    )
+    (tmp_path / "index.html").write_text("<main>Old</main>\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: Arial; }\n", encoding="utf-8")
+    (tmp_path / "script.js").write_text("console.log('old');\n", encoding="utf-8")
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="read_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Read index.html.",
+                output_excerpt="<main>Old</main>\n",
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="read_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Read styles.css.",
+                output_excerpt="body { font-family: Arial; }\n",
+            ),
+            ToolCallRecord(
+                iteration=3,
+                tool_name="read_file",
+                tool_args={"path": "script.js"},
+                success=True,
+                summary="Read script.js.",
+                output_excerpt="console.log('old');\n",
+            ),
+        ]
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=(tmp_path / "index.html").read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "Generation brief:" in prompt
+    assert "User goal:" not in prompt
+    assert "Requested outcome:" not in prompt
+    assert "other_pending_requirements" not in prompt
+    assert estimate_context_pressure(prompt_chars=len(prompt)) == "low"
+
+
+def test_generate_content_retry_prompt_compacts_large_request_context_only_when_needed(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    long_request = (
+        "Erstelle eine moderne, visuell starke und interaktive Website mit index.html, styles.css und script.js. "
+        "Die Seite soll wie ein kleines Produkt wirken, mit starkem Hero, mehreren Sektionen, Karten, Galerie, FAQ, Kontakt und echter Interaktivitaet. "
+        "Nutze nur Vanilla HTML, CSS und JavaScript, halte alles lokal lauffaehig und responsive, und baue Filter, Modal oder Tabs, Scroll-Verhalten und Formular-Validierung ein. "
+        "Das Layout soll hochwertig wirken, viele nutzbare Oberflaechenelemente zeigen und nicht wie ein leeres Template aussehen. "
+        "Baue mehrere Inhaltszonen, dynamische Karten, anklickbare Detailansichten, Animationen beim Scrollen und eine starke visuelle Hierarchie mit echter Demo-Produktwirkung. "
+        "Erzeuge ausserdem mehrere klar gegliederte Inhaltsbereiche mit Hero, Services, Galerie, Statistik, FAQ, Kontaktformular und Footer, "
+        "plus Hover-Effekte, hochwertige Buttons, starke Typografie und kleine Animationen, damit die Seite wirklich wie ein hochwertiges Produkt wirkt. "
+        "Achte zusaetzlich darauf, dass der Nutzer auf der Seite viel sehen, ausprobieren und entdecken kann, inklusive sinnvoller Dynamik, klarer Interaktionslogik, "
+        "sichtbaren Zustandswechseln und einem insgesamt glaubwuerdigen UX-Fluss ueber alle Bereiche hinweg. "
+        "Die Seite soll in Summe deutlich naeher an einer hochwertigen Produktdemo als an einem simplen Template oder einer leeren Standardseite liegen."
+    )
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "important_files": ["index.html", "styles.css", "script.js"],
+            "focus_files": ["index.html", "styles.css", "script.js"],
+            "entrypoints": ["index.html", "script.js"],
+            "language_counts": {"html": 1, "css": 1, "javascript": 1},
+            "project_labels": ["frontend", "website"],
+            "repo_summary": "Small frontend workspace with a coordinated HTML, CSS, and JavaScript bundle.",
+        }
+    )
+    session = SessionState(
+        task=long_request,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Build the requested web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome=long_request,
+    )
+    payload["user_goal"] = long_request
+    commit_task_state_and_route(planner, session, payload, verification_target="Open index.html in a browser and verify the interactions.")
+    session.task_understanding = TaskUnderstanding(
+        original_request=long_request,
+        interpreted_goal="Build a coordinated demo website bundle with strong visuals and interactive frontend behavior.",
+        intent_category="build",
+        conversation_relation="new_task",
+        constraints=[
+            "Use only Vanilla HTML, CSS, and JavaScript.",
+            "Keep the bundle responsive for desktop and mobile.",
+            "Include interactive discovery elements and form validation.",
+        ],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.91,
+        recommended_mode="modify",
+        execution_plan=[
+            TaskPlanStep(step=1, summary="Keep the HTML, CSS, and JS contract aligned", action_hint="modify"),
+            TaskPlanStep(step=2, summary="Ship the interactive sections and behaviors", action_hint="modify"),
+        ],
+    )
+    (tmp_path / "index.html").write_text("<main>Old</main>\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text("body { font-family: Arial; }\n", encoding="utf-8")
+    (tmp_path / "script.js").write_text("console.log('old');\n", encoding="utf-8")
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=(tmp_path / "index.html").read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "Generation brief:" in prompt
+    assert "User goal:" not in prompt
+    assert "Requested outcome:" not in prompt
+    assert "other_pending_requirements" not in prompt
+    assert estimate_context_pressure(prompt_chars=len(prompt)) == "low"
+
+
+def test_generate_content_prompt_keeps_standard_compact_prompt_for_small_request(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    task = "Ergaenze in app.js einen kompakten Status-Badge und lass tests/test_app.cjs weiter passen."
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["app.js", "tests/test_app.cjs"],
+                "focus_files": ["app.js"],
+                "test_files": ["tests/test_app.cjs"],
+                "language_counts": {"javascript": 2},
+                "project_labels": ["javascript"],
+                "repo_summary": "Small JavaScript module with one focused node test.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Apply the requested UI change."}],
+        target_paths=["app.js", "tests/test_app.cjs"],
+        target_name="app.js",
+        requested_outcome=task,
+    )
+    payload["user_goal"] = task
+    commit_task_state_and_route(planner, session, payload, verification_target="node --test tests/test_app.cjs")
+    (tmp_path / "app.js").write_text("export function render() {}\n", encoding="utf-8")
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="app.js",
+        current_content=(tmp_path / "app.js").read_text(encoding="utf-8"),
+        mode="compact",
+    )
+
+    assert "Generation brief:" not in prompt
+    assert "Latest user request:" in prompt
+    assert "User goal:" in prompt
+    assert "Requested outcome:" in prompt
 
 
 def test_generate_content_prompt_derives_test_backed_toggle_contract_hints_without_repair_context(tmp_path):

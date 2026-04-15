@@ -13,6 +13,7 @@ from agent.task_state import TaskState
 from agent.task_schema import TaskUnderstanding
 from config.settings import AGENT_FULL_NAME, AGENT_NAME
 from llm.schemas import RouteActionName, RouteIntent, RouterOutput
+from llm.runtime_resilience import estimate_context_pressure
 
 
 REPAIR_BLOCKED_SENTINEL = "__REPAIR_BLOCKED__"
@@ -22,6 +23,9 @@ STANDARD_MEMORY_CONTEXT_CHAR_BUDGET = 1100
 SEMANTIC_START_MEMORY_CONTEXT_CHAR_BUDGET = 760
 ROUTER_WORKSPACE_CONTEXT_CHAR_BUDGET = 900
 DECISION_WORKSPACE_CONTEXT_CHAR_BUDGET = 1280
+GENERATION_BRIEF_CHAR_BUDGET = 760
+GENERATION_FILE_FOCUS_CHAR_BUDGET = 480
+GENERATION_REQUEST_EXCERPT_CHAR_BUDGET = 260
 UNDEFINED_RUNTIME_SYMBOL_PATTERNS = (
     re.compile(r"NameError:\s+name ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"] is not defined"),
     re.compile(r"UnboundLocalError:\s+cannot access local variable ['\"](?P<name>[A-Za-z_][A-Za-z0-9_]*)['\"]"),
@@ -508,6 +512,15 @@ def generate_content_prompt(
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     if mode != "full":
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        compact_large_request = _should_compact_generation_request(
+            route,
+            session,
+            path=path,
+            file_focus=file_focus,
+            current_content=current_content,
+        )
+        compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
+        generation_brief = _compact_generation_brief(route, session, path=path)
         explicit_constraints = _explicit_generation_constraints(route, session)
         related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
         related_context = _related_file_context(session, path)
@@ -520,13 +533,26 @@ def generate_content_prompt(
         if current_content is None:
             sections = [
                 "Produce the full file content for exactly one file.",
-                f"Latest user request: {_trim_text(session.task, 360)}",
                 f"Target path: {path}",
                 f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
             ]
+            if compact_large_request:
+                sections.insert(
+                    1,
+                    f"User request excerpt: {_trim_text(session.task, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+                )
+                sections.insert(3, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            else:
+                sections.insert(1, f"Latest user request: {_trim_text(session.task, 360)}")
             if explicit_constraints != "none":
                 sections.append(f"Explicit constraints: {explicit_constraints}")
-            sections.append(f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
+            sections.append(
+                "File-scoped focus: "
+                + json.dumps(
+                    compact_file_focus if compact_large_request else file_focus,
+                    ensure_ascii=False,
+                )
+            )
             grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
             if grounding_instruction:
                 sections.append(grounding_instruction)
@@ -580,14 +606,22 @@ def generate_content_prompt(
 
         sections = [
             "Produce the full file content for exactly one file.",
-            f"Latest user request: {_trim_text(session.task, 420)}",
-            f"User goal: {_trim_text(route.user_goal, 240)}",
-            f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
             f"Explicit constraints: {explicit_constraints}",
-            f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}",
-            f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             f"Related file hints: {related_context}",
         ]
+        if compact_large_request:
+            sections.insert(
+                1,
+                f"User request excerpt: {_trim_text(session.task, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+            )
+            sections.insert(2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            sections.insert(4, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+        else:
+            sections.insert(1, f"Latest user request: {_trim_text(session.task, 420)}")
+            sections.insert(2, f"User goal: {_trim_text(route.user_goal, 240)}")
+            sections.insert(3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
+            sections.insert(5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
+            sections.insert(6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
@@ -752,18 +786,6 @@ def generate_content_retry_prompt(
 ) -> str:
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     if mode != "full":
-        task_focus = (
-            _compact_generation_focus(route, session, path)
-            if session is not None
-            else {
-                "target_path": path,
-                "active_goal": _trim_text(route.requested_outcome, 180),
-                "output_expectation": _trim_text(route.requested_outcome, 180),
-                "verification_target": "",
-                "constraints": route.entities.constraints[:4],
-                "related_targets": [item for item in route.entities.target_paths if item and item != path][:6],
-            }
-        )
         if current_content is not None and repair_context is not None and session is not None:
             if review_feedback is not None:
                 return _compact_repair_retry_prompt(
@@ -787,6 +809,15 @@ def generate_content_retry_prompt(
                 review_feedback=review_feedback,
             )
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
+        compact_large_request = _should_compact_generation_request(
+            route,
+            session,
+            path=path,
+            file_focus=file_focus,
+            current_content=current_content,
+        )
+        generation_brief = _compact_generation_brief(route, session, path=path)
+        compact_file_focus = _compact_generation_file_focus(file_focus, target_path=path)
         related_context = _related_file_context(session, path) if session is not None else "none"
         exact_output_contracts: list[str] = []
         supporting_runtime_argv_contract: dict[str, list[str]] = {}
@@ -818,15 +849,31 @@ def generate_content_retry_prompt(
         )
         sections = [
             "Produce the full file content for exactly one file.",
-            f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
-            f"User goal: {_trim_text(route.user_goal, 240)}",
-            f"Requested outcome: {_trim_text(route.requested_outcome, 240)}",
             f"Explicit constraints: {_explicit_generation_constraints(route, session)}",
             f"Memory context: {json.dumps(_compact_memory_context(session), ensure_ascii=False)}",
-            f"Task focus: {json.dumps(task_focus, ensure_ascii=False)}",
-            f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}",
             _single_file_boundary_instruction(path, route.entities.target_paths),
         ]
+        if compact_large_request:
+            sections.insert(
+                1,
+                "User request excerpt: "
+                + _trim_text(
+                    session.task if session is not None else route.requested_outcome,
+                    GENERATION_REQUEST_EXCERPT_CHAR_BUDGET,
+                ),
+            )
+            sections.insert(2, f"Generation brief: {json.dumps(generation_brief, ensure_ascii=False)}")
+            sections.insert(5, f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}")
+        else:
+            sections.insert(
+                1,
+                f"Latest user request: {_trim_text(session.task if session is not None else route.requested_outcome, 420)}",
+            )
+            sections.insert(2, f"User goal: {_trim_text(route.user_goal, 240)}")
+            sections.insert(3, f"Requested outcome: {_trim_text(route.requested_outcome, 240)}")
+            if session is not None:
+                sections.insert(5, f"Task focus: {json.dumps(_compact_generation_focus(route, session, path), ensure_ascii=False)}")
+            sections.insert(6, f"File-scoped focus: {json.dumps(file_focus, ensure_ascii=False)}")
         file_requirement_summary = _file_local_requirement_summary(file_focus)
         if file_requirement_summary:
             sections.append(file_requirement_summary)
@@ -2325,6 +2372,204 @@ def _compact_generation_focus(
         "constraints": (task_state.constraints[:4] if task_state is not None else []) or route.entities.constraints[:4],
         "related_targets": related_targets,
     }
+
+
+def _append_unique_compact_text(
+    items: list[str],
+    value: object,
+    *,
+    limit: int = 140,
+) -> None:
+    text = _trim_text(str(value or "").strip(), limit)
+    if not text:
+        return
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if not normalized:
+        return
+    for existing in items:
+        existing_normalized = re.sub(r"\s+", " ", str(existing or "")).strip().lower()
+        if not existing_normalized:
+            continue
+        if (
+            normalized == existing_normalized
+            or normalized in existing_normalized
+            or existing_normalized in normalized
+        ):
+            return
+    items.append(text)
+
+
+def _compact_generation_constraints(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    limit: int = 6,
+) -> list[str]:
+    items: list[str] = []
+    task_state = session.task_state if session is not None else None
+    understanding = session.task_understanding if session is not None else None
+    for source in (
+        list(getattr(understanding, "constraints", []) or []),
+        list(getattr(task_state, "constraints", []) or []),
+        list(route.entities.constraints or []),
+    ):
+        for candidate in source:
+            _append_unique_compact_text(items, candidate, limit=140)
+            if len(items) >= limit:
+                return items[:limit]
+    for sentence in _derived_requirement_sentences(route, session):
+        for clause in _split_requirement_clauses(
+            str(sentence or "").replace("*", "; ").replace("•", "; ")
+        ):
+            cleaned = _trim_text(clause, 140)
+            if not cleaned or _is_generation_metadata_constraint(cleaned):
+                continue
+            _append_unique_compact_text(items, cleaned, limit=140)
+            if len(items) >= limit:
+                return items[:limit]
+    return items[:limit]
+
+
+def _compact_generation_brief(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+) -> dict[str, object]:
+    task_state = session.task_state if session is not None else None
+    understanding = session.task_understanding if session is not None else None
+    working = _compact_working_memory(session)
+    goal = next(
+        (
+            str(candidate or "").strip()
+            for candidate in (
+                getattr(understanding, "interpreted_goal", None),
+                getattr(task_state, "active_goal", None),
+                working.get("current_goal") if working else None,
+                route.requested_outcome,
+                route.user_goal,
+                session.task if session is not None else None,
+            )
+            if str(candidate or "").strip()
+        ),
+        "",
+    )
+    expected_output = next(
+        (
+            str(candidate or "").strip()
+            for candidate in (
+                getattr(task_state, "output_expectation", None),
+                route.requested_outcome,
+                getattr(understanding, "interpreted_goal", None),
+            )
+            if str(candidate or "").strip()
+        ),
+        "",
+    )
+    if expected_output and expected_output == goal:
+        expected_output = ""
+
+    execution_outline: list[str] = []
+    for candidate in list(getattr(task_state, "execution_outline", []) or []):
+        _append_unique_compact_text(execution_outline, candidate, limit=120)
+    for step in list(getattr(understanding, "execution_plan", []) or []):
+        _append_unique_compact_text(execution_outline, getattr(step, "summary", ""), limit=120)
+    payload: dict[str, object] = {
+        "target_path": path,
+        "goal": _trim_text(goal, 220),
+        "expected_output": _trim_text(expected_output, 180),
+        "constraints": _compact_generation_constraints(route, session, limit=6),
+        "requested_artifacts": [
+            str(item or "").strip()
+            for item in route.entities.target_paths[:4]
+            if str(item or "").strip()
+        ],
+        "execution_outline": execution_outline[:4],
+    }
+    if working:
+        payload["working_summary"] = _trim_text(str(working.get("summary") or "").strip(), 180)
+        payload["relevant_files"] = list(working.get("relevant_files", []) or [])[:4]
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "target_path",
+            "goal",
+            "expected_output",
+            "constraints",
+            "execution_outline",
+            "requested_artifacts",
+            "working_summary",
+            "relevant_files",
+        ],
+        max_chars=GENERATION_BRIEF_CHAR_BUDGET,
+    )
+
+
+def _should_compact_generation_request(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+    file_focus: dict[str, object],
+    current_content: str | None = None,
+) -> bool:
+    signal_chars = sum(
+        len(str(value or "").strip())
+        for value in (
+            session.task if session is not None else None,
+            route.user_goal,
+            route.requested_outcome,
+            getattr(session.task_state, "active_goal", None) if session is not None else None,
+            getattr(session.task_state, "output_expectation", None) if session is not None else None,
+        )
+    )
+    if session is not None:
+        signal_chars += _json_char_cost(_compact_generation_focus(route, session, path))
+        signal_chars += _json_char_cost(_compact_memory_context(session))
+        signal_chars += len(_related_file_context(session, path))
+    signal_chars += _json_char_cost(file_focus)
+    pressure = estimate_context_pressure(
+        prompt_chars=signal_chars,
+        current_content_chars=len(str(current_content or "")),
+    )
+    return pressure != "low"
+
+
+def _compact_generation_file_focus(
+    file_focus: dict[str, object],
+    *,
+    target_path: str,
+) -> dict[str, object]:
+    current_requirements: list[str] = []
+    for item in file_focus.get("current_write_requirements", [])[:6]:
+        _append_unique_compact_text(current_requirements, item, limit=140)
+    general_constraints: list[str] = []
+    for item in file_focus.get("general_constraints", [])[:4]:
+        _append_unique_compact_text(general_constraints, item, limit=120)
+    payload = {
+        "target_path": file_focus.get("target_path") or target_path,
+        "artifact_kind": file_focus.get("artifact_kind"),
+        "artifact_role": file_focus.get("artifact_role"),
+        "literal_constraints": [
+            _trim_text(str(item or "").strip(), 100)
+            for item in file_focus.get("literal_constraints", [])[:4]
+            if str(item or "").strip()
+        ],
+        "current_write_requirements": current_requirements[:4],
+        "general_constraints": general_constraints[:2],
+    }
+    return _prioritized_compact_payload(
+        payload,
+        ordered_keys=[
+            "target_path",
+            "artifact_kind",
+            "artifact_role",
+            "literal_constraints",
+            "current_write_requirements",
+            "general_constraints",
+        ],
+        max_chars=GENERATION_FILE_FOCUS_CHAR_BUDGET,
+    )
 
 
 def _file_local_requirement_summary(file_focus: dict[str, object], *, limit: int = 3) -> str:
