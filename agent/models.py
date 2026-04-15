@@ -339,6 +339,13 @@ class FailureMemoryEntry(MemoryEntryBase):
     last_result: str | None = None
 
 
+class RememberedFact(StrictModel):
+    subject: Literal["user", "assistant"]
+    attribute: str
+    value: str
+    summary: str
+
+
 class ConversationMemoryEntry(MemoryEntryBase):
     memory_type: Literal["conversation"] = "conversation"
     request_summary: str
@@ -347,6 +354,7 @@ class ConversationMemoryEntry(MemoryEntryBase):
     decision_notes: list[str] = Field(default_factory=list)
     implemented_features: list[str] = Field(default_factory=list)
     referenced_sessions: list[str] = Field(default_factory=list)
+    remembered_facts: list[RememberedFact] = Field(default_factory=list)
 
 
 class RetrievedMemoryItem(StrictModel):
@@ -385,6 +393,8 @@ class RetrievalRequest(StrictModel):
     project_id: str | None = None
     workspace_root: str | None = None
     session_id: str | None = None
+    recall_subject: Literal["user", "assistant"] | None = None
+    recall_attributes: list[str] = Field(default_factory=list)
     target_paths: list[str] = Field(default_factory=list)
     symbol_names: list[str] = Field(default_factory=list)
     error_terms: list[str] = Field(default_factory=list)

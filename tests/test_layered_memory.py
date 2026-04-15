@@ -37,14 +37,17 @@ class DummyLLM:
         raise RuntimeError("generate is not used in this test")
 
 
-def build_store(tmp_path: Path) -> AgentMemoryStore:
+def build_store(tmp_path: Path, *, state_root_override: Path | None = None) -> AgentMemoryStore:
     (tmp_path / "app").mkdir(parents=True)
     (tmp_path / "tests").mkdir(parents=True)
     (tmp_path / "app" / "main.py").write_text("def login(user):\n    return user\n", encoding="utf-8")
     (tmp_path / "app" / "auth.py").write_text("def check_role(role):\n    return role == 'admin'\n", encoding="utf-8")
     (tmp_path / "tests" / "test_main.py").write_text("def test_login():\n    assert True\n", encoding="utf-8")
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
-    config = AppConfig(workspace_root=str(tmp_path))
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        state_root_override=str(state_root_override) if state_root_override is not None else None,
+    )
     config.ensure_state_dirs()
     return AgentMemoryStore(config, WorkspaceManager(tmp_path))
 
@@ -827,3 +830,141 @@ def test_planner_answers_user_recall_queries_from_memory(tmp_path):
 
     assert decision.action_type == AgentActionType.FINAL
     assert "relevante fruehere Arbeit" in str(decision.final_response or "")
+
+
+def test_cross_project_personal_name_recall_round_trips_from_shared_memory(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    remembered = SessionState(
+        task="Bitte merk dir, dass ich Joshua Pond heisse.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Ich merke mir das fuer spaetere Rueckfragen.",
+    )
+    remembered.append_message("user", remembered.task)
+    remembered.append_message("assistant", remembered.final_response or "")
+    remembered.workspace_snapshot = store_a.build_snapshot(remembered.task)
+    store_a.persist_session_memory(remembered)
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+
+    recall = SessionState(
+        task="Wer bin ich?",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    recall.workspace_snapshot = store_b.build_snapshot(recall.task)
+
+    request = store_b.build_retrieval_request(recall.task, recall)
+    result = store_b.retrieve(request)
+
+    assert request.use_case == "user_recall"
+    assert request.recall_subject == "user"
+    assert "name" in request.recall_attributes
+    assert "Joshua Pond" in result.recall_brief
+
+
+def test_repeated_personal_fact_deduplicates_across_projects(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    first = SessionState(
+        task="Mein Name ist Joshua Pond.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    first.append_message("user", first.task)
+    first.append_message("assistant", first.final_response or "")
+    first.workspace_snapshot = store_a.build_snapshot(first.task)
+    store_a.persist_session_memory(first)
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+    second = SessionState(
+        task="Mein Name ist Joshua Pond.",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    second.append_message("user", second.task)
+    second.append_message("assistant", second.final_response or "")
+    second.workspace_snapshot = store_b.build_snapshot(second.task)
+    store_b.persist_session_memory(second)
+
+    remembered_entries = [
+        item
+        for item in store_b.list_entries("conversation")
+        if any(fact.attribute == "name" and fact.value == "Joshua Pond" for fact in item.remembered_facts)
+    ]
+
+    assert len(remembered_entries) == 1
+    assert set(remembered_entries[0].projects_touched) == {store_a.project_id, store_b.project_id}
+
+
+def test_planner_answers_personal_identity_questions_from_memory(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_store(tmp_path / "workspace_a", state_root_override=shared_state)
+
+    remembered = SessionState(
+        task="Ich heisse Joshua Pond.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+        status="completed",
+        final_response="Verstanden.",
+    )
+    remembered.append_message("user", remembered.task)
+    remembered.append_message("assistant", remembered.final_response or "")
+    remembered.workspace_snapshot = store_a.build_snapshot(remembered.task)
+    store_a.persist_session_memory(remembered)
+    store_b = build_store(tmp_path / "workspace_b", state_root_override=shared_state)
+
+    session = SessionState(
+        task="Wer bin ich?",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    session.workspace_snapshot = store_b.build_snapshot(session.task)
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal=session.task,
+        active_goal="Answer the identity question from persistent memory.",
+        goal_relation="new_task",
+        output_expectation="Return the remembered identity directly and concisely.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        confidence=0.88,
+        next_action="explain",
+        next_best_action="explain",
+    )
+    session.router_result = RouterOutput(
+        user_goal="Recall the user's identity",
+        intent=RouteIntent.EXPLAIN,
+        entities=RouteEntities(
+            target_type=None,
+            target_name=None,
+            target_paths=[],
+            attributes=[],
+            constraints=[],
+        ),
+        requested_outcome="Answer the identity question from memory.",
+        action_plan=[
+            RouteActionStep(step=1, action=RouteActionName.RESPOND_DIRECTLY, reason="Answer from memory."),
+        ],
+        needs_clarification=False,
+        clarification_questions=[],
+        confidence=0.92,
+        safe_to_execute=True,
+        repo_context_needed=False,
+        search_terms=["identity"],
+        relevant_extensions=[],
+        direct_response=None,
+    )
+    store_b.refresh_session_memory(session.task, session)
+    planner = Planner(DummyLLM(AppConfig(workspace_root=str(tmp_path))), "tools", logger=AgentLogger(store_b.config.log_dir_path, "memory-personal-recall"))
+
+    decision = planner.decide_next_action(session.task, session)
+
+    assert decision.action_type == AgentActionType.FINAL
+    assert "Joshua Pond" in str(decision.final_response or "")
