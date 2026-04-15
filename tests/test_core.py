@@ -108,6 +108,34 @@ def test_core_runtime_options_default_agent_profile_to_a2(tmp_path):
     assert options["agent_profile"] == "a2"
 
 
+def test_core_read_excerpt_keeps_structural_signals_for_python_files(tmp_path):
+    config = AppConfig(workspace_root=str(tmp_path))
+    config.ensure_state_dirs()
+    core = AgentCore(config)
+
+    excerpt = core._build_output_excerpt(
+        {
+            "path": "agent/planner.py",
+            "content": (
+                "from pydantic import ValidationError\n\n"
+                "ROUTE_LIMIT = 8\n\n"
+                "class Planner:\n"
+                "    def __init__(self):\n"
+                "        pass\n\n"
+                "    async def decide_next_action(self, task, session):\n"
+                "        return None\n"
+            ),
+        }
+    )
+
+    assert excerpt is not None
+    assert "from pydantic import ValidationError" in excerpt
+    assert "Top-level signals:" in excerpt
+    assert "class Planner:" in excerpt
+    assert "async def decide_next_action" in excerpt
+    assert "ROUTE_LIMIT = 8" in excerpt
+
+
 def test_core_requires_semantic_review_before_marking_changed_run_complete(tmp_path):
     config = AppConfig(workspace_root=str(tmp_path))
     config.ensure_state_dirs()

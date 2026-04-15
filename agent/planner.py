@@ -4145,6 +4145,9 @@ class Planner:
             )
             for index, path in enumerate(candidates)
         ]
+        strong_scored = [item for item in scored if item[0] > 0]
+        if len(strong_scored) >= 6:
+            scored = strong_scored
         ranked = [path for _score, _index, path in sorted(scored, key=lambda item: (-item[0], item[1]))]
         primary_ranked = [
             path
@@ -4191,8 +4194,8 @@ class Planner:
             for item in (getattr(task_state, "request_requirements", []) if task_state is not None else [])
             if str(item or "").strip()
         )
-        target = max(6, requirement_count + 2, min(len(focus_terms), 8))
-        return min(10, target)
+        target = max(6, min(requirement_count + 1, 8), min(len(focus_terms), 7))
+        return min(8, target)
 
     def _structured_analysis_candidate_score(
         self,

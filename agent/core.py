@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import Callable, Iterable
 
 from agent.diagnostics import FailureAnalyzer
@@ -574,7 +575,10 @@ class AgentCore:
             return None
         excerpt: str | None = None
         if data.get("content"):
-            excerpt = str(data["content"])
+            excerpt = self._compact_read_content_excerpt(
+                str(data.get("path") or data.get("file_path") or ""),
+                str(data["content"]),
+            )
         elif data.get("matches"):
             excerpt = json.dumps(data["matches"][:10], ensure_ascii=False, indent=2)
         elif data.get("files"):
@@ -593,6 +597,49 @@ class AgentCore:
         if excerpt is None:
             excerpt = json.dumps(data, ensure_ascii=False, indent=2)
         return excerpt[: self.config.max_read_chars]
+
+    def _compact_read_content_excerpt(self, path: str, content: str) -> str:
+        text = str(content or "")
+        if not text.strip():
+            return ""
+        head_budget = min(700, max(260, self.config.max_read_chars // 6))
+        parts = [text[:head_budget].rstrip()]
+        signal_lines = self._read_content_signal_lines(path, text)
+        if signal_lines:
+            parts.append("Top-level signals:\n" + "\n".join(signal_lines))
+        return "\n\n".join(part for part in parts if part).strip()
+
+    def _read_content_signal_lines(self, path: str, content: str) -> list[str]:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        patterns: list[re.Pattern[str]] = []
+        if suffix == ".py":
+            patterns = [
+                re.compile(r"^\s*@[\w.]+"),
+                re.compile(r"^\s*class\s+[A-Za-z_][A-Za-z0-9_]*"),
+                re.compile(r"^\s*(?:async\s+def|def)\s+[A-Za-z_][A-Za-z0-9_]*\s*\("),
+                re.compile(r"^\s*[A-Z][A-Z0-9_]{2,}\s*="),
+            ]
+        elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs"}:
+            patterns = [
+                re.compile(r"^\s*(?:export\s+)?class\s+[A-Za-z_][A-Za-z0-9_]*"),
+                re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\("),
+                re.compile(r"^\s*(?:export\s+)?const\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:async\s*)?\("),
+                re.compile(r"^\s*(?:export\s+)?const\s+[A-Za-z_][A-Za-z0-9_]*\s*="),
+            ]
+        else:
+            return []
+
+        lines: list[str] = []
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith(("#", "//", "/*", "*")):
+                continue
+            if any(pattern.search(stripped) for pattern in patterns):
+                if stripped not in lines:
+                    lines.append(stripped[:140])
+            if len(lines) >= 10:
+                break
+        return lines
 
     def _determine_phase(self, session: SessionState) -> str:
         if session.validation_status == "bootstrap_reset_required":

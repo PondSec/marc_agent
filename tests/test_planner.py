@@ -880,7 +880,7 @@ def test_large_structured_analysis_read_candidates_prioritize_requested_implemen
     assert {"server/app.py", "agent/memory.py"} <= set(candidates[:7])
     assert "README.md" not in candidates[:7]
     assert "tests/test_layered_memory.py" not in candidates[:7]
-    assert len(candidates) <= 10
+    assert len(candidates) <= 8
 
 
 def test_large_structured_analysis_reaches_summary_once_focused_candidates_are_read(tmp_path):
