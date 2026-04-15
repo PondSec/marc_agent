@@ -505,6 +505,7 @@ def generate_content_prompt(
     review_feedback: ProposedUpdateReview | None = None,
     mode: str = "full",
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     if mode != "full":
         file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
         explicit_constraints = _explicit_generation_constraints(route, session)
@@ -558,6 +559,8 @@ def generate_content_prompt(
                         + " ".join(_trim_text(item, 180) for item in fixture_hints[:4])
                     )
             sections.append(_single_file_boundary_instruction(path, route.entities.target_paths))
+            if web_bundle_contract:
+                sections.append(web_bundle_contract)
             sections.append("Create the file from scratch. Return the full new file content only.")
             sections.append("Do not add markdown fences or explanations.")
             return "\n\n".join(sections)
@@ -591,6 +594,8 @@ def generate_content_prompt(
         grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
         if grounding_instruction:
             sections.append(grounding_instruction)
+        if web_bundle_contract:
+            sections.append(web_bundle_contract)
         if runtime_hints:
             sections.append(
                 "Targeted runtime hints: "
@@ -634,12 +639,11 @@ def generate_content_prompt(
                     "Current file content:",
                     current_content,
                     _single_file_boundary_instruction(path, route.entities.target_paths),
-                    "Update this file to satisfy the request. Return the full updated file content only.",
                 ]
             )
-        else:
-            sections.append(_single_file_boundary_instruction(path, route.entities.target_paths))
-            sections.append("Create the file from scratch. Return the full new file content only.")
+            if web_bundle_contract:
+                sections.append(web_bundle_contract)
+            sections.append("Update this file to satisfy the request. Return the full updated file content only.")
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
@@ -684,6 +688,8 @@ def generate_content_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
     if runtime_hints:
@@ -744,6 +750,7 @@ def generate_content_retry_prompt(
     review_feedback: ProposedUpdateReview | None = None,
     mode: str = "full",
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     if mode != "full":
         task_focus = (
             _compact_generation_focus(route, session, path)
@@ -826,6 +833,8 @@ def generate_content_retry_prompt(
         grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
         if grounding_instruction:
             sections.append(grounding_instruction)
+        if web_bundle_contract:
+            sections.append(web_bundle_contract)
         if session is not None:
             sections.append(f"Related file hints: {related_context}")
             if exact_output_contracts:
@@ -930,6 +939,8 @@ def generate_content_retry_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     if related_context != "none":
         sections.append(f"Related file hints: {related_context}")
     if exact_output_contracts:
@@ -1067,6 +1078,106 @@ def _single_file_boundary_instruction(path: str, target_paths: list[str] | None)
     return (
         f"Only write {target}. Do not include content for any second file, extra headings, or multi-file output."
     )
+
+
+def _explicit_web_bundle_contract_instruction(route: RouterOutput, path: str) -> str:
+    target = str(path or "").strip()
+    if not target:
+        return ""
+    explicit_targets = [
+        str(item or "").strip()
+        for item in getattr(getattr(route, "entities", None), "target_paths", []) or []
+        if str(item or "").strip()
+    ]
+    if not explicit_targets:
+        return ""
+
+    def is_html_target(candidate: str) -> bool:
+        return Path(candidate).suffix.lower() in {".html", ".htm", ".xhtml"}
+
+    def is_style_target(candidate: str) -> bool:
+        return Path(candidate).suffix.lower() in {".css", ".scss", ".sass", ".less"}
+
+    def is_script_target(candidate: str) -> bool:
+        return Path(candidate).suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+
+    bundle_targets: list[str] = []
+    html_targets: list[str] = []
+    style_targets: list[str] = []
+    script_targets: list[str] = []
+    for candidate in explicit_targets:
+        if is_html_target(candidate):
+            html_targets.append(candidate)
+            bundle_targets.append(candidate)
+        elif is_style_target(candidate):
+            style_targets.append(candidate)
+            bundle_targets.append(candidate)
+        elif is_script_target(candidate):
+            script_targets.append(candidate)
+            bundle_targets.append(candidate)
+
+    if len(bundle_targets) < 2 or not html_targets or (not style_targets and not script_targets):
+        return ""
+    if not any(_artifact_matches_path(target, candidate, candidate) for candidate in bundle_targets):
+        return ""
+
+    target_kind = "other"
+    if is_html_target(target):
+        target_kind = "html"
+    elif is_style_target(target):
+        target_kind = "style"
+    elif is_script_target(target):
+        target_kind = "script"
+
+    companion_targets = [
+        candidate
+        for candidate in bundle_targets
+        if not _artifact_matches_path(target, candidate, candidate)
+    ]
+    lines = [
+        "Shared web bundle contract:",
+        (
+            "- Treat the explicit web targets "
+            f"{_format_list(bundle_targets[:6])} as one companion UI bundle, not as independent deliverables."
+        ),
+        (
+            "- Keep responsibilities split by file: HTML owns semantic structure and stable hooks; "
+            "CSS owns presentation and stateful selectors; JS owns behavior and event wiring."
+        ),
+        (
+            "- Do not inline companion-file content or hide a missing companion implementation inside this file "
+            "just because the other files are handled separately."
+        ),
+        (
+            "- Only introduce ids, classes, data-* attributes, function names, or UI state tokens that the "
+            "shared bundle can consume consistently."
+        ),
+        (
+            "- If companion files are still pending, reserve the shared contract cleanly now so the remaining "
+            "explicit files can complete it without renaming hooks later."
+        ),
+    ]
+    if companion_targets:
+        lines.append(
+            "- Keep this file aligned with the companion targets "
+            f"{_format_list(companion_targets[:4])}; they are out of scope to write here, but in scope as a shared contract."
+        )
+    if target_kind == "html":
+        lines.append(
+            "- For this HTML file: define semantic structure, include the requested companion asset references, "
+            "and expose only stable hooks that the companion CSS/JS should consume."
+        )
+    elif target_kind == "style":
+        lines.append(
+            "- For this stylesheet: style only selectors and state tokens that exist in the shared HTML/JS "
+            "contract; do not invent orphan selectors or UI states."
+        )
+    elif target_kind == "script":
+        lines.append(
+            "- For this script: bind only to hooks that exist in the shared HTML and mutate only classes, "
+            "attributes, or states that the bundle defines intentionally."
+        )
+    return "\n".join(lines)
 
 
 def final_response_prompt(route: RouterOutput, session: SessionState) -> str:
@@ -2329,6 +2440,7 @@ def _compact_repair_update_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview | None,
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
     failure_focus = [
         _trim_text(str(item or "").strip(), 160)
@@ -2388,6 +2500,8 @@ def _compact_repair_update_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -2554,6 +2668,7 @@ def _compact_repair_retry_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview,
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     support_max_files = 2 if repair_context.verification_scope == "runtime" else 1
@@ -2625,6 +2740,8 @@ def _compact_repair_retry_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)
@@ -2746,6 +2863,7 @@ def _focused_full_repair_update_prompt(
     repair_strategy: str | None,
     review_feedback: ProposedUpdateReview | None,
 ) -> str:
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     file_focus = _artifact_scoped_focus(route, session, path, current_content=current_content)
     compact_focus = _compact_repair_file_focus(file_focus, target_path=path)
     targeted_context = _targeted_compact_repair_context(repair_context, target_path=path)
@@ -2890,6 +3008,8 @@ def _focused_full_repair_update_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
     literal_provenance = _repair_literal_provenance_guidance(file_focus)
     if literal_provenance:
         sections.append(literal_provenance)

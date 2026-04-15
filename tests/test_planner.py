@@ -5191,6 +5191,210 @@ def test_generate_content_prompt_adds_copy_grounding_rule_for_web_repair_scripts
     assert "If the facts are not given, keep the wording generic" in prompt
 
 
+def test_generate_content_prompt_adds_shared_web_bundle_contract_for_explicit_html_bundle(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    snapshot = empty_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["index.html"],
+            "important_files": ["index.html", "styles.css", "script.js"],
+            "focus_files": ["index.html", "styles.css", "script.js"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+            "repo_summary": "Small multi-file web workspace.",
+        }
+    )
+    session = SessionState(
+        task="Create index.html, styles.css, and script.js for a modern interactive landing page.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the explicit web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        mode="compact",
+    )
+
+    assert "Shared web bundle contract:" in prompt
+    assert "index.html" in prompt
+    assert "styles.css" in prompt
+    assert "script.js" in prompt
+    assert "include the requested companion asset references" in prompt
+
+
+def test_generate_content_prompt_keeps_shared_web_bundle_contract_in_compact_web_repair_prompt(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    html_path = tmp_path / "index.html"
+    html_path.write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"dialog-trigger\" type=\"button\">Mehr sehen</button>\n"
+            "      <dialog id=\"details-dialog\"></dialog>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    script_path = tmp_path / "script.js"
+    script_path.write_text("document.body.dataset.state = 'idle';\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text(".shell { display: grid; }\n", encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["index.html"],
+            "important_files": ["index.html", "script.js", "styles.css"],
+            "focus_files": ["script.js", "index.html", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+            "repo_summary": "Small multi-file web workspace.",
+        }
+    )
+    session = SessionState(
+        task="Repair the shared menu and dialog behavior across index.html, styles.css, and script.js.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="script.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="Verify the generated web artifact.")
+    repair_context = ValidationFailureEvidence(
+        command='internal:web_artifact:[{"path":"index.html","expected_features":["dialog"]}]',
+        verification_scope="semantic",
+        status="failed",
+        artifact_paths=["index.html", "styles.css", "script.js"],
+        summary="Structural web validation failed.",
+        excerpt="The shared dialog behavior is incomplete.",
+        failure_summary="Repair the shared HTML/CSS/JS contract so the dialog behavior is wired correctly.",
+        file_hints=["index.html", "styles.css", "script.js"],
+        repair_requirements=["Update script.js so the shared dialog contract can pass validation."],
+        repair_brief=RepairBrief(
+            failure_type="semantic_contract_mismatch",
+            failure_signature="semantic:web-contract:compact-repair-bundle-contract",
+            primary_target="script.js",
+            locked_target="script.js",
+            repair_constraints=["Keep the repair focused on the shared web contract."],
+            allowed_files=["script.js", "index.html", "styles.css"],
+        ),
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=script_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        mode="compact",
+    )
+
+    assert "Shared web bundle contract:" in prompt
+    assert "bind only to hooks that exist in the shared HTML" in prompt
+    assert "styles.css" in prompt
+
+
+def test_generate_content_retry_prompt_keeps_shared_web_bundle_contract_after_web_review_rejection(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    html_path = tmp_path / "index.html"
+    html_path.write_text(
+        (
+            "<!doctype html>\n"
+            "<html lang=\"de\">\n"
+            "  <body>\n"
+            "    <main class=\"shell\">\n"
+            "      <button id=\"dialog-trigger\" type=\"button\">Mehr sehen</button>\n"
+            "      <dialog id=\"details-dialog\"></dialog>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "  </body>\n"
+            "</html>\n"
+        ),
+        encoding="utf-8",
+    )
+    script_path = tmp_path / "script.js"
+    script_path.write_text("document.body.dataset.state = 'idle';\n", encoding="utf-8")
+    (tmp_path / "styles.css").write_text(".shell { display: grid; }\n", encoding="utf-8")
+    snapshot = build_snapshot(tmp_path).model_copy(
+        update={
+            "entrypoints": ["index.html"],
+            "important_files": ["index.html", "script.js", "styles.css"],
+            "focus_files": ["script.js", "index.html", "styles.css"],
+            "language_counts": {"html": 1, "javascript": 1, "css": 1},
+            "project_labels": ["website"],
+            "repo_summary": "Small multi-file web workspace.",
+        }
+    )
+    session = SessionState(
+        task="Repair the shared menu and dialog behavior across index.html, styles.css, and script.js.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=snapshot,
+    )
+    payload = route_payload(
+        intent="update",
+        action_plan=[{"step": 1, "action": "update_artifact", "reason": "Repair the shared web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="script.js",
+    )
+    commit_task_state_and_route(planner, session, payload, verification_target="Verify the generated web artifact.")
+    repair_context = ValidationFailureEvidence(
+        command='internal:web_artifact:[{"path":"index.html","expected_features":["dialog"]}]',
+        verification_scope="semantic",
+        status="failed",
+        artifact_paths=["index.html", "styles.css", "script.js"],
+        summary="Structural web validation failed.",
+        excerpt="The shared dialog behavior is incomplete.",
+        failure_summary="Repair the shared HTML/CSS/JS contract so the dialog behavior is wired correctly.",
+        file_hints=["index.html", "styles.css", "script.js"],
+        repair_requirements=["Update script.js so the shared dialog contract can pass validation."],
+        repair_brief=RepairBrief(
+            failure_type="semantic_contract_mismatch",
+            failure_signature="semantic:web-contract:retry-bundle-contract",
+            primary_target="script.js",
+            locked_target="script.js",
+            repair_constraints=["Keep the repair focused on the shared web contract."],
+            allowed_files=["script.js", "index.html", "styles.css"],
+        ),
+    )
+    review_feedback = ProposedUpdateReview(
+        safe_to_write=False,
+        summary="The previous draft still drifted away from the shared HTML/CSS/JS contract.",
+        confidence=0.93,
+        blocking_issues=["The proposed script introduced UI state that is not represented in the shared HTML/CSS bundle."],
+        preservation_risks=[],
+        repair_hints=["Bind to the existing dialog hooks instead of inventing new ones."],
+    )
+
+    prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=script_path.read_text(encoding="utf-8"),
+        repair_context=repair_context,
+        repair_strategy="validation_targeted",
+        review_feedback=review_feedback,
+        mode="compact",
+    )
+
+    assert "Shared web bundle contract:" in prompt
+    assert "bind only to hooks that exist in the shared HTML" in prompt
+    assert "the companion targets index.html, styles.css" in prompt
+
+
 def test_artifact_scoped_focus_adds_test_contract_requirement_for_python_module(tmp_path):
     pkg = tmp_path / "texttools"
     pkg.mkdir()
