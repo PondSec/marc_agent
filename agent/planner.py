@@ -9540,8 +9540,14 @@ class Planner:
         timeout_seconds = max(self._llm_timeout(20), 20)
         total_timeout_seconds = max(self._llm_timeout(60), 60)
         if _requires_structured_analysis_report(route, session):
-            timeout_seconds = max(timeout_seconds, 45 if prompt_chars < 4_800 else 60)
-            total_timeout_seconds = max(total_timeout_seconds, 150 if prompt_chars < 4_800 else 180)
+            requirement_count = sum(
+                1
+                for item in list(getattr(session.task_state, "request_requirements", []) or [])
+                if str(item or "").strip()
+            )
+            large_structured_report = requirement_count >= 5 or prompt_chars >= 4_800
+            timeout_seconds = max(timeout_seconds, 60 if large_structured_report else 45)
+            total_timeout_seconds = max(total_timeout_seconds, 210 if large_structured_report else 150)
             return timeout_seconds, total_timeout_seconds
         if prompt_chars >= 5_500:
             timeout_seconds = max(timeout_seconds, 35)

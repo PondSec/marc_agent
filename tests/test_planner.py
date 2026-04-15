@@ -31454,6 +31454,85 @@ def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tm
     assert "agent/prompts.py" in (decision.final_response or "")
 
 
+def test_planner_expands_final_response_budget_for_large_structured_analysis(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    payload = route_payload(
+        intent="inspect",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "summarize_result",
+                "reason": "Return the grounded architecture summary.",
+            }
+        ],
+        requested_outcome=(
+            "Analysiere Systemtyp, Modulrollen, Memory, Repo-Mapping, grosse Nutzerprompts, "
+            "Request-Digests und Risiken belastbar."
+        ),
+    )
+    session = SessionState(
+        task=(
+            "Analysiere dieses Projekt gruendlich und belastbar. "
+            "1. Was fuer ein System ist das insgesamt? "
+            "2. Welche Rollen haben planner, prompts, layered_memory, task_state, state_updater und server? "
+            "3. Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen? "
+            "4. Woher kommt das Repo-Mapping und wie wird es spaeter wieder in Prompts oder Retrieval eingespeist? "
+            "5. Welche Stellen sind fuer grosse Nutzerprompts, Request-Digests, Request-Memory und kompakte Generationsprompts entscheidend? "
+            "6. Welche Risiken siehst du noch?"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    session.router_result = planner.validate_router_output(payload)
+    session.task_state = TaskState(
+        latest_user_turn=session.task,
+        root_goal="Analysiere das Projekt belastbar.",
+        active_goal="Inspect the repository architecture and answer the requested analysis points with grounded evidence.",
+        goal_relation="new_task",
+        output_expectation="Return a grounded architecture summary with concrete file paths.",
+        current_user_intent="explain",
+        execution_strategy="validation_inspection",
+        target_artifacts=[],
+        active_artifacts=[],
+        evidence=[],
+        relevant_context=[],
+        constraints=[],
+        assumptions=[],
+        missing_info=[],
+        ambiguity_level="low",
+        risk_level="low",
+        confidence=0.87,
+        next_action="inspect",
+        next_best_action="inspect",
+        request_requirements=[
+            "Was fuer ein System ist das insgesamt?",
+            "Welche Rollen haben planner, prompts, layered_memory, task_state, state_updater und server?",
+            "Wie funktionieren Working, Episodic, Project, Failure und Conversation Memory zusammen?",
+            "Woher kommt das Repo-Mapping?",
+            "Welche Stellen sind fuer grosse Prompts wichtig?",
+            "Welche Risiken siehst du noch?",
+        ],
+        request_chunks=[
+            "Systemtyp; Rollen der zentralen Module",
+            "Memory-Zusammenspiel; Repo-Mapping",
+            "grosse Nutzerprompts; Request-Digests; Risiken",
+        ],
+        execution_outline=[],
+        needs_clarification=False,
+        clarification_questions=[],
+    )
+
+    prompt = final_response_prompt(session.router_result, session)
+    timeout_seconds, total_timeout_seconds = planner._final_response_runtime_budget(
+        session.router_result,
+        session,
+        prompt=prompt,
+    )
+
+    assert timeout_seconds >= 60
+    assert total_timeout_seconds >= 210
+
+
 def test_planner_localizes_deterministic_final_response_to_english(tmp_path):
     payload = route_payload(
         intent="update",
