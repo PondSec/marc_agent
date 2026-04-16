@@ -1356,6 +1356,16 @@ def _focused_create_retry_prompt(
     file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
     compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
     related_context = _compact_related_file_context(session, path, compact=True)
+    working_draft = str(prior_proposed_content or "").strip()
+    working_draft_budget = 1800 if mode == "full" else 1400
+    working_draft_complete = bool(working_draft) and len(working_draft) <= working_draft_budget
+    working_draft_snippet = (
+        working_draft
+        if working_draft_complete
+        else _trim_balanced_text(working_draft, working_draft_budget)
+        if working_draft
+        else ""
+    )
     request_digest = _compact_request_digest(
         request_text,
         snapshot=session.workspace_snapshot if session is not None else None,
@@ -1380,17 +1390,17 @@ def _focused_create_retry_prompt(
     explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 260 if mode == "full" else 180)
     if explicit_constraints:
         sections.append(f"Explicit constraints: {explicit_constraints}")
-    if str(prior_proposed_content or "").strip():
-        prior_excerpt = _trim_balanced_text(
-            str(prior_proposed_content or "").strip(),
-            900 if mode == "full" else 650,
+    if working_draft_snippet:
+        draft_label = (
+            "Current working draft to revise:"
+            if working_draft_complete
+            else "Current working draft excerpt to revise:"
         )
         sections.append(
-            "Rejected previous draft excerpt (expand this materially instead of repeating it unchanged):\n"
-            + prior_excerpt
+            draft_label + "\n" + working_draft_snippet
         )
         sections.append(
-            "Treat the rejected draft as the current working draft. Preserve correct sections, repair the missing review findings directly, and avoid restarting from a brand-new scaffold."
+            "Treat this as the current working draft. Preserve correct sections, repair the missing review findings directly, and finish the missing parts instead of restarting from a brand-new scaffold."
         )
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
@@ -1406,8 +1416,8 @@ def _focused_create_retry_prompt(
     file_creation_instruction = _file_creation_completeness_instruction(file_focus)
     if file_creation_instruction:
         sections.append(file_creation_instruction)
-    if str(prior_proposed_content or "").strip():
-        sections.append("Revise that draft into the complete final file. Return the full updated file content only.")
+    if working_draft_snippet:
+        sections.append("Revise this working draft into the complete final file. Return the full updated file content only.")
     else:
         sections.append("Create the file from scratch. Return the full new file content only.")
     sections.append("Do not add markdown fences or explanations.")

@@ -32227,9 +32227,66 @@ def test_compact_create_retry_prompt_revises_rejected_draft_instead_of_restartin
         mode="compact",
     )
 
-    assert "Treat the rejected draft as the current working draft." in retry_prompt
-    assert "Revise that draft into the complete final file." in retry_prompt
+    assert "Current working draft to revise:" in retry_prompt
+    assert "Treat this as the current working draft." in retry_prompt
+    assert "Revise this working draft into the complete final file." in retry_prompt
     assert "Create the file from scratch." not in retry_prompt
+
+
+def test_compact_create_retry_prompt_keeps_full_rejected_draft_when_budget_allows(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen und eine Suche enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    draft_lines = [f"<section class='card'>{index:02d}</section>" for index in range(30)]
+    prior_draft = "<main>\n" + "\n".join(draft_lines) + "\n</main>\n"
+    retry_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        prior_proposed_content=prior_draft,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file for index.html is still too thin for the current large-scope create request.",
+            confidence=0.84,
+            blocking_issues=[
+                "index.html still misses key interaction structure for the requested inventory experience.",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Expand the draft while preserving the structural work that is already correct.",
+            ],
+        ),
+        mode="compact",
+    )
+
+    assert "Current working draft to revise:" in retry_prompt
+    assert prior_draft.strip() in retry_prompt
+    assert "Current working draft excerpt to revise:" not in retry_prompt
 
 
 def test_generate_content_prompt_uses_focused_compact_create_prompt_for_large_multi_file_create(tmp_path):
