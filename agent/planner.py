@@ -7822,12 +7822,12 @@ class Planner:
         ]
         if len(scoped_requirements) < 2:
             return False
-        output_expectation = str(getattr(session.task_state, "output_expectation", "") or "").strip().lower()
+        _, forbids_starter_scope = self._starter_scope_signals(route, session, path=normalized_path)
         return (
             len(explicit_paths) >= 3
             or complexity_signals >= 10
             or len(scoped_requirements) >= 3
-            or "not as a minimal scaffold" in output_expectation
+            or forbids_starter_scope
         )
 
     def _startup_failure_exhausted(
@@ -8219,8 +8219,24 @@ class Planner:
         *,
         path: str,
     ) -> bool:
+        positive_starter_scope, forbids_starter_scope = self._starter_scope_signals(route, session, path=path)
+        if forbids_starter_scope:
+            return False
+        if positive_starter_scope:
+            return True
+        normalized = self._starter_scope_signal_text(route, session, path=path)
+        conventional_names = {"index.html", "main.py", "script.js", "app.py", "app.js"}
+        return len(normalized) <= 120 and Path(path).name.lower() in conventional_names
+
+    def _starter_scope_signal_text(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> str:
         task_state = session.task_state
-        normalized = " ".join(
+        return " ".join(
             part.strip().lower()
             for part in [
                 route.user_goal,
@@ -8233,23 +8249,71 @@ class Planner:
             ]
             if str(part or "").strip()
         )
-        starter_markers = (
-            "starter",
-            "scaffold",
-            "skeleton",
-            "template",
-            "boilerplate",
-            "grundgeruest",
-            "grundgerüst",
-            "geruest",
-            "gerüst",
-            "stub",
-            "hello world",
-        )
-        if any(marker in normalized for marker in starter_markers):
-            return True
-        conventional_names = {"index.html", "main.py", "script.js", "app.py", "app.js"}
-        return len(normalized) <= 120 and Path(path).name.lower() in conventional_names
+
+    def _starter_scope_signals(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> tuple[bool, bool]:
+        normalized = self._starter_scope_signal_text(route, session, path=path)
+        tokens = re.findall(r"[0-9A-Za-zÄÖÜäöüß_-]+", normalized)
+        if not tokens:
+            return False, False
+
+        negation_tokens = {
+            "no",
+            "not",
+            "without",
+            "avoid",
+            "avoids",
+            "avoiding",
+            "kein",
+            "keine",
+            "keinen",
+            "keinem",
+            "keiner",
+            "keines",
+            "nicht",
+            "ohne",
+        }
+        template_context_tokens = {"starter", "project", "app", "application", "basic", "simple", "minimal"}
+        starter_head_tokens = {"scaffold", "scaffolds", "scaffolding", "skeleton", "skeletons", "template", "templates", "boilerplate", "stub", "stubs"}
+        positive_match = False
+        negative_match = False
+        index = 0
+
+        while index < len(tokens):
+            token = tokens[index]
+            next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+            occurrence_end: int | None = None
+
+            if token == "hello" and next_token == "world":
+                occurrence_end = index + 2
+            elif token == "starter" and next_token in starter_head_tokens:
+                occurrence_end = index + 2
+            elif token.startswith("scaffold") or token.startswith("skeleton") or token.startswith("boilerplate") or token.startswith("stub"):
+                occurrence_end = index + 1
+            elif token.startswith("grundger") or token.startswith("geruest") or token.startswith("gerüst"):
+                occurrence_end = index + 1
+            elif token.startswith("template"):
+                nearby_tokens = tokens[max(0, index - 2) : min(len(tokens), index + 3)]
+                if any(candidate in template_context_tokens for candidate in nearby_tokens if candidate != token):
+                    occurrence_end = index + 1
+
+            if occurrence_end is None:
+                index += 1
+                continue
+
+            negation_window = tokens[max(0, index - 4) : index]
+            if any(candidate in negation_tokens for candidate in negation_window):
+                negative_match = True
+            else:
+                positive_match = True
+            index = occurrence_end
+
+        return positive_match, negative_match
 
     def _starter_title(
         self,

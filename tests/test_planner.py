@@ -32750,6 +32750,128 @@ def test_pre_write_create_review_rejects_placeholder_html_bundle_scaffold_even_w
     assert any("placeholder" in issue.lower() or "repeat the above" in issue.lower() for issue in review.blocking_issues)
 
 
+def test_starter_scope_requested_ignores_negative_scaffold_language(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle genau drei Dateien fuer eine Web-App. Keine Platzhalter-Kommentare, keine halben Scaffolds, "
+            "kein Boilerplate-Muell. Das Ergebnis darf nicht als minimal scaffold enden."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested inventory web app, not as a minimal scaffold.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    assert planner._starter_scope_requested(session.router_result, session, path="index.html") is False
+
+
+def test_starter_scope_requested_preserves_explicit_positive_scaffold_request(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Erstelle ein kleines starter scaffold fuer index.html und styles.css als bewusst minimalistischen Einstiegspunkt.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested starter bundle."}],
+        target_paths=["index.html", "styles.css"],
+        target_name="index.html",
+        requested_outcome="Create a deliberate starter scaffold for the first pass.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    assert planner._starter_scope_requested(session.router_result, session, path="index.html") is True
+
+
+def test_pre_write_create_review_still_rejects_placeholder_bundle_when_request_forbids_scaffolds(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine hochwertige kleine Web-App fuer ein Auto-Inventar mit genau drei Dateien: "
+            "index.html, styles.css und script.js. Verwende nur HTML, CSS und Vanilla JavaScript. "
+            "Keine Platzhalter-Kommentare, keine halben Scaffolds und keine TODOs."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested inventory web app, not as a minimal scaffold.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"en\">\n"
+            "<head>\n"
+            "  <meta charset=\"UTF-8\">\n"
+            "  <title>Auto Inventory</title>\n"
+            "  <link rel=\"stylesheet\" href=\"styles.css\">\n"
+            "</head>\n"
+            "<body>\n"
+            "  <header><h1>Auto Inventory</h1></header>\n"
+            "  <main>\n"
+            "    <input id=\"searchInput\" placeholder=\"Search...\">\n"
+            "    <select id=\"typeFilter\"></select>\n"
+            "    <select id=\"sortOrder\"></select>\n"
+            "    <section id=\"inventoryGrid\">\n"
+            "      <!-- Auto Card Template -->\n"
+            "    </section>\n"
+            "  </main>\n"
+            "  <aside id=\"detailPanel\">\n"
+            "      <!-- Auto Detail Template -->\n"
+            "  </aside>\n"
+            "  <script src=\"script.js\"></script>\n"
+            "</body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "placeholder" in review.summary.lower() or "scaffold" in review.summary.lower()
+
+
+def test_large_create_scope_requested_treats_general_no_scaffold_language_as_strict_scope(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    long_request = (
+        "Erstelle in diesem leeren Workspace eine hochwertige kleine Web-App fuer ein Auto-Inventar mit genau drei Dateien: "
+        "index.html, styles.css und script.js. Verwende nur HTML, CSS und Vanilla JavaScript. "
+        "Die Seite soll Suchfeld, Sortierung, Detailansicht, Filter, Kartendarstellung, responsives Layout, klare Typografie, "
+        "zustandsbehaftete Interaktionen, Dummy-Daten fuer mehrere Fahrzeuge und saubere semantische Struktur enthalten. "
+        "Keine Platzhalter-Kommentare, keine halben Scaffolds, kein Boilerplate-Muell und keine TODOs."
+    )
+    session = SessionState(
+        task=long_request,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested inventory web app without collapsing into a starter scaffold.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    assert planner._large_create_scope_requested(session.router_result, session, path="index.html") is True
+
+
 def test_pre_write_create_review_rejects_css_without_responsive_rules_when_requested(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
