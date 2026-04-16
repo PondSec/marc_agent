@@ -32619,6 +32619,45 @@ def test_artifact_scoped_focus_extracts_inline_id_requirements_without_colon_lis
     assert "detailPanel" in index_focus["literal_constraints"]
 
 
+def test_generate_content_prompt_discourages_placeholder_markers_in_html_bundle(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle eine hochwertige kleine Web-App mit index.html, styles.css und script.js. "
+            "Keine Platzhalter-Kommentare, keine TODOs und keine halben Scaffolds."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert "placeholder comments" in prompt.lower()
+    assert "visible field labels or placeholders" not in prompt.lower()
+
+
 def test_web_bundle_script_focus_keeps_detail_interaction_requirements(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

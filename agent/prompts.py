@@ -1654,7 +1654,7 @@ def _explicit_web_bundle_contract_instruction(route: RouterOutput, path: str) ->
             "- HTML must already contain visible UI structure, not just a header plus an empty placeholder container."
         )
         lines.append(
-            "- For collection/detail requests, include repeated item/card structure or template hooks plus visible field labels or placeholders."
+            "- For collection/detail requests, include repeated item/card structure or stable data hooks plus visible field labels and concrete copy, not placeholder comments, TODO notes, or repeat-later markers."
         )
     elif target_kind == "style":
         lines.append(
