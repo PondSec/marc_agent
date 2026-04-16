@@ -1727,7 +1727,7 @@ def _prefer_create_in_empty_workspace(
         return False
     if context.get("artifact_paths"):
         return False
-    if signal.goal_relation != "new_task" or signal.needs_clarification:
+    if signal.needs_clarification:
         return False
     if signal.intent in {"debug", "validate", "search", "plan", "explain"}:
         return False

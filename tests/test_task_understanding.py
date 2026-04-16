@@ -1952,6 +1952,46 @@ def test_task_state_a2_uses_local_mutation_bootstrap_for_large_create_prompt(tmp
     assert llm.generate_json_calls == []
 
 
+def test_task_state_a2_keeps_empty_workspace_create_bootstrap_when_request_contains_negative_constraints(tmp_path):
+    config = AppConfig(
+        workspace_root=str(tmp_path),
+        model_name="qwen2.5-coder:7b",
+        router_model_name="qwen2.5-coder:7b",
+    )
+    llm = ScriptedLLM(json_payloads=[])
+    llm.config = config
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine vollstaendige kleine responsive Web-App fuer einen "
+            "Autohaus-Inventar-Katalog. Lege genau index.html, styles.css und script.js an. "
+            "Keine Platzhalterbilder, kein Lorem Ipsum, kein repeat the above, keine TODOs und kein "
+            "Starter-Scaffold. Mobile-first responsive, deutsche UI-Texte, Filter, Sortierung und "
+            "klickbare Detailansicht."
+        ),
+        workspace_root=str(tmp_path),
+        runtime_options={"agent_profile": "a2"},
+    )
+    updater = TaskStateUpdater(llm)
+
+    task_state = updater.update_task_state(
+        session.task,
+        snapshot=empty_snapshot(tmp_path),
+        session=session,
+    )
+
+    assert task_state.semantic_resolution == "minimal_inference"
+    assert task_state.goal_relation == "new_task"
+    assert task_state.current_user_intent == "implement"
+    assert task_state.next_action == "create"
+    assert [artifact.path for artifact in task_state.target_artifacts] == [
+        "index.html",
+        "styles.css",
+        "script.js",
+    ]
+    assert any("kein Lorem Ipsum" in item or "keine Platzhalterbilder" in item for item in task_state.constraints)
+    assert llm.generate_json_calls == []
+
+
 def test_task_state_a2_uses_local_mutation_bootstrap_for_large_analyze_then_modify_prompt(tmp_path):
     config = AppConfig(
         workspace_root=str(tmp_path),
