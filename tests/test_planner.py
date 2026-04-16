@@ -31369,6 +31369,65 @@ def test_artifact_scoped_focus_distributes_web_bundle_requirements_by_file_role(
     assert any("Suchfunktion" in item or "such" in item.lower() for item in script_focus["current_write_requirements"])
 
 
+def test_generate_content_prompt_compact_create_surfaces_file_requirements_as_hard_outcomes(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+            "Anforderungen:\n"
+            "- mehrere Automodelle anzeigen\n"
+            "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+            "- funktionierende Suchfunktion nach Marke und Modell\n"
+            "- modernes, sauberes UI\n"
+            "- gutes UX\n"
+            "- responsive Layout\n"
+            "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+            "- keine Frameworks, nur HTML, CSS und JavaScript\n\n"
+            "Arbeite sinnvoll:\n"
+            "1. baue erst eine klare Struktur\n"
+            "2. halte die Autodaten sauber in JavaScript\n"
+            "3. implementiere dann Darstellung und Suche\n"
+            "4. prüfe am Ende, ob alles zusammen funktioniert\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "entrypoints": ["index.html", "script.js"],
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert "File-local requirements:" in prompt
+    assert "mehrere Automodelle anzeigen" in prompt
+    assert "Treat these as required outcomes for this file" in prompt
+    assert "Do not stop at a starter scaffold, placeholder shell, or empty structure" in prompt
+
+
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):
     payload = route_payload(
         intent="inspect",

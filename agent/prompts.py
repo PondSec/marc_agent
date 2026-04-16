@@ -736,6 +736,12 @@ def generate_content_prompt(
                     ensure_ascii=False,
                 )
             )
+            file_requirement_summary = _file_local_requirement_summary(file_focus)
+            if file_requirement_summary:
+                sections.append(file_requirement_summary)
+            file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+            if file_creation_instruction:
+                sections.append(file_creation_instruction)
             grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
             if grounding_instruction:
                 sections.append(grounding_instruction)
@@ -872,6 +878,10 @@ def generate_content_prompt(
             if web_bundle_contract:
                 sections.append(web_bundle_contract)
             sections.append("Update this file to satisfy the request. Return the full updated file content only.")
+        else:
+            file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+            if file_creation_instruction:
+                sections.append(file_creation_instruction)
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
 
@@ -1135,6 +1145,9 @@ def generate_content_retry_prompt(
                 ]
             )
         else:
+            file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+            if file_creation_instruction:
+                sections.append(file_creation_instruction)
             sections.append("Create the file from scratch. Return the full new file content only.")
         sections.append("Do not add markdown fences or explanations.")
         return "\n\n".join(sections)
@@ -1249,6 +1262,9 @@ def generate_content_retry_prompt(
             ]
         )
     else:
+        file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+        if file_creation_instruction:
+            sections.append(file_creation_instruction)
         sections.append("Create the file from scratch. Return the full new file content only.")
     sections.append("Do not add markdown fences or explanations.")
     return "\n\n".join(sections)
@@ -3017,7 +3033,25 @@ def _file_local_requirement_summary(file_focus: dict[str, object], *, limit: int
     ]
     if not items:
         return ""
-    return "File-local requirements: " + "; ".join(items)
+    return (
+        "File-local requirements: "
+        + "; ".join(items)
+        + ". Treat these as required outcomes for this file, not optional ideas."
+    )
+
+
+def _file_creation_completeness_instruction(file_focus: dict[str, object]) -> str:
+    requirements = [
+        str(item or "").strip()
+        for item in file_focus.get("current_write_requirements", [])[:3]
+        if str(item or "").strip()
+    ]
+    if not requirements:
+        return ""
+    return (
+        "For create mode, implement the concrete first-pass file content needed to satisfy those requirements now. "
+        "Do not stop at a starter scaffold, placeholder shell, or empty structure when the request expects a complete artifact."
+    )
 
 
 def _user_facing_copy_grounding_instruction(
