@@ -715,6 +715,7 @@ def generate_content_prompt(
                     request_digest=request_digest if include_request_digest else None,
                     explicit_constraints=explicit_constraints,
                     web_bundle_contract=web_bundle_contract,
+                    related_context=related_context,
                 )
             sections = [
                 "Produce the full file content for exactly one file.",
@@ -1001,6 +1002,7 @@ def _focused_create_prompt(
     request_digest: dict[str, object] | None,
     explicit_constraints: str,
     web_bundle_contract: str,
+    related_context: str = "none",
 ) -> str:
     sections = [
         "Produce the full file content for exactly one file.",
@@ -1026,6 +1028,8 @@ def _focused_create_prompt(
             f"Out-of-scope companion files for this step: {_format_list(related_targets)}. "
             "Keep shared hooks stable, but do not include their content or rely on future placeholder cleanup."
         )
+    if related_context != "none":
+        sections.append(f"Related file hints: {related_context}")
     if web_bundle_contract:
         sections.append(web_bundle_contract)
     file_creation_instruction = _file_creation_completeness_instruction(file_focus)
@@ -1351,6 +1355,7 @@ def _focused_create_retry_prompt(
     request_text = session.task or route.requested_outcome
     file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
     compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
+    related_context = _compact_related_file_context(session, path, compact=True)
     request_digest = _compact_request_digest(
         request_text,
         snapshot=session.workspace_snapshot if session is not None else None,
@@ -1390,6 +1395,8 @@ def _focused_create_retry_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if related_context != "none":
+        sections.append(f"Related file hints: {related_context}")
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     if web_bundle_contract:
         sections.append(web_bundle_contract)
@@ -1412,6 +1419,7 @@ def _focused_create_continuation_prompt(
     request_text = session.task or route.requested_outcome
     file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
     compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
+    related_context = _compact_related_file_context(session, path, compact=True)
     request_digest = _compact_request_digest(
         request_text,
         snapshot=session.workspace_snapshot if session is not None else None,
@@ -1441,6 +1449,8 @@ def _focused_create_continuation_prompt(
     grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
     if grounding_instruction:
         sections.append(grounding_instruction)
+    if related_context != "none":
+        sections.append(f"Related file hints: {related_context}")
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     if web_bundle_contract:
         sections.append(web_bundle_contract)
@@ -1643,6 +1653,9 @@ def _explicit_web_bundle_contract_instruction(route: RouterOutput, path: str) ->
         )
         lines.append(
             "- The script should already contain the data flow, rendering pipeline, and input wiring needed by the request; do not leave filtering disconnected from rendering."
+        )
+        lines.append(
+            "- Keep concrete state, rendering, and event wiring readable: use separate blocks for data, derived filtering/sorting, detail selection, and initial render instead of compressed token fragments."
         )
     return "\n".join(lines)
 
@@ -6902,11 +6915,23 @@ def _rebalance_web_bundle_requirements(
         "js",
         "search",
         "filter",
+        "sort",
+        "sortier",
         "state",
         "event",
         "logic",
         "data",
         "daten",
+        "detail",
+        "details",
+        "detailansicht",
+        "modal",
+        "dialog",
+        "overlay",
+        "click",
+        "klick",
+        "select",
+        "auswahl",
         "render",
         "suche",
         "such",
@@ -6985,11 +7010,23 @@ def _sort_web_bundle_requirements(
         "js",
         "search",
         "filter",
+        "sort",
+        "sortier",
         "state",
         "event",
         "logic",
         "data",
         "daten",
+        "detail",
+        "details",
+        "detailansicht",
+        "modal",
+        "dialog",
+        "overlay",
+        "click",
+        "klick",
+        "select",
+        "auswahl",
         "render",
         "suche",
         "such",
@@ -9324,6 +9361,7 @@ def _related_file_context(
             excerpt,
             session=session,
             target_path=target_path,
+            source_path=path,
         )
         if focused_line_hints:
             focused_limit = excerpt_limit if is_test_like else max(excerpt_limit, 560)
@@ -9397,11 +9435,18 @@ def _related_context_task_line_hints(
     *,
     session: SessionState,
     target_path: str,
+    source_path: str | None = None,
     limit: int = 6,
 ) -> list[int]:
     file_lines = [str(line or "").strip() for line in str(text or "").splitlines()]
     if not file_lines:
         return []
+
+    target_suffix = Path(str(target_path or "").strip()).suffix.lower()
+    source_suffix = Path(str(source_path or "").strip()).suffix.lower()
+    runtime_suffixes = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".gd"}
+    html_suffixes = {".html", ".htm", ".xhtml"}
+    css_suffixes = {".css", ".scss", ".sass", ".less"}
 
     token_sources = [
         str(getattr(session, "task", "") or "").strip(),
@@ -9450,27 +9495,75 @@ def _related_context_task_line_hints(
         if lowered not in query_tokens:
             query_tokens.append(lowered)
 
-    if not query_tokens:
-        return []
-
     matches: list[int] = []
-    for index, line in enumerate(file_lines, start=1):
-        lowered_line = line.lower()
-        if not lowered_line:
-            continue
-        if not any(token in lowered_line for token in query_tokens):
-            continue
-        previous_index = index - 1
-        if previous_index >= 1 and file_lines[previous_index - 1]:
-            if previous_index not in matches:
-                matches.append(previous_index)
+    if target_suffix in runtime_suffixes:
+        scored_indexes: list[tuple[int, int]] = []
+        for index, line in enumerate(file_lines, start=1):
+            lowered_line = line.lower()
+            if not lowered_line:
+                continue
+
+            score = 0
+            if source_suffix in html_suffixes:
+                if re.search(r"<(?:input|select|button|textarea|form|main|section|article|aside|dialog|template)\b", lowered_line):
+                    score += 8
+                if re.search(r"\bid\s*=", lowered_line):
+                    score += 9
+                if re.search(r"\bdata-[a-z0-9_-]+\s*=", lowered_line):
+                    score += 7
+                if re.search(r"\b(?:aria-controls|aria-labelledby|for|name|role)\s*=", lowered_line):
+                    score += 4
+                if re.search(r"\bclass\s*=", lowered_line):
+                    score += 2
+                if re.search(r"<(?:meta|title|link|style|script)\b", lowered_line):
+                    score -= 3
+            elif source_suffix in css_suffixes:
+                if re.search(r"(?:[#.][a-z_-][a-z0-9_-]*|\[data-[^]]+\])", lowered_line):
+                    score += 7
+                if re.search(r"\.(?:is|has|state|active|selected|open|visible|hidden|detail|panel|grid|card|filter|search|sort)[a-z0-9_-]*", lowered_line):
+                    score += 4
+                if re.search(r"\b(?:display|grid|flex|opacity|transform|transition|position|overflow|pointer-events)\b", lowered_line):
+                    score += 2
+            elif source_suffix in runtime_suffixes and re.search(
+                r"\b(?:getelementbyid|queryselector|queryselectorall|addeventlistener|classlist|dataset|innerhtml|textcontent|appendchild|closest|filter|sort|render)\b",
+                lowered_line,
+            ):
+                score += 8
+                if re.search(r"\b(?:const|let|function|class|export)\b", lowered_line):
+                    score += 2
+
+            if query_tokens:
+                token_hits = sum(1 for token in query_tokens if token in lowered_line)
+                if token_hits:
+                    score += min(token_hits, 3) * 3
+
+            if score > 0:
+                scored_indexes.append((score, index))
+
+        if scored_indexes:
+            for _, index in sorted(scored_indexes, key=lambda item: (-item[0], item[1]))[:limit]:
+                if index not in matches:
+                    matches.append(index)
+            return sorted(matches[:limit])
+
+    if query_tokens:
+        for index, line in enumerate(file_lines, start=1):
+            lowered_line = line.lower()
+            if not lowered_line:
+                continue
+            if not any(token in lowered_line for token in query_tokens):
+                continue
+            previous_index = index - 1
+            if previous_index >= 1 and file_lines[previous_index - 1]:
+                if previous_index not in matches:
+                    matches.append(previous_index)
+                if len(matches) >= limit:
+                    return matches[:limit]
+            if index not in matches:
+                matches.append(index)
             if len(matches) >= limit:
-                return matches
-        if index not in matches:
-            matches.append(index)
-        if len(matches) >= limit:
-            return matches
-    return matches
+                return matches[:limit]
+    return matches[:limit]
 
 
 def _repair_related_file_context(

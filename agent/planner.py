@@ -8,6 +8,9 @@ import io
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import tomllib
 import tokenize
@@ -14823,6 +14826,21 @@ class Planner:
         suffix = Path(path).suffix.lower()
         parsed_python_module: ast.AST | None = None
 
+        if suffix in {".js", ".mjs", ".cjs"}:
+            javascript_syntax_issue = self._javascript_syntax_issue(normalized, suffix=suffix)
+            if javascript_syntax_issue is not None:
+                return ProposedUpdateReview(
+                    safe_to_write=False,
+                    summary="The proposed update is structurally incomplete and cannot be written safely.",
+                    confidence=0.99,
+                    blocking_issues=[javascript_syntax_issue],
+                    preservation_risks=[],
+                    repair_hints=[
+                        "Return plain JavaScript file content with valid syntax and complete statements.",
+                        "Avoid markdown fences, token soup, or truncated fragments; emit the finished script only.",
+                    ],
+                )
+
         if suffix in {".py", ".pyi"}:
             try:
                 parsed_python_module = ast.parse(normalized)
@@ -14917,6 +14935,39 @@ class Planner:
                 )
 
         return None
+
+    def _javascript_syntax_issue(self, content: str, *, suffix: str) -> str | None:
+        normalized = str(content or "")
+        if not normalized.strip():
+            return "The proposed JavaScript file is empty."
+        node_path = shutil.which("node")
+        if not node_path:
+            return None
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as handle:
+                handle.write(normalized)
+                temp_path = Path(handle.name)
+            result = subprocess.run(
+                [node_path, "--check", str(temp_path)],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        if result.returncode == 0:
+            return None
+        stderr = str(result.stderr or result.stdout or "").strip()
+        lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        detail = lines[-1] if lines else "The proposed JavaScript does not parse cleanly."
+        if len(detail) > 220:
+            detail = f"{detail[:217]}..."
+        return f"The proposed JavaScript for {suffix} failed a syntax check: {detail}"
 
     def _is_python_test_path(self, path: str) -> bool:
         normalized = str(path or "").strip().lower()

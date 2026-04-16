@@ -32026,6 +32026,228 @@ def test_generate_content_prompt_uses_focused_compact_create_prompt_for_large_mu
     assert "Out-of-scope companion files for this step:" in prompt
 
 
+def test_focused_create_prompt_surfaces_companion_context_for_later_bundle_files(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen, filtern, sortieren und eine klickbare Detailansicht haben."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "index.html").write_text(
+        "<main><input id='searchInput'><select id='typeFilter'></select><select id='sortOrder'></select>"
+        "<section id='inventoryGrid'></section><aside id='detailPanel'></aside></main>",
+        encoding="utf-8",
+    )
+    (tmp_path / "styles.css").write_text(
+        ".inventory-card{display:grid}.detail-panel.is-open{opacity:1}.stats-strip{display:flex}",
+        encoding="utf-8",
+    )
+    session.tool_calls.extend(
+        [
+            ToolCallRecord(
+                iteration=1,
+                tool_name="create_file",
+                tool_args={"path": "index.html"},
+                success=True,
+                summary="Created index.html.",
+                phase="editing",
+                thought_summary="create",
+                expected_outcome="create",
+                output_excerpt=(tmp_path / "index.html").read_text(encoding="utf-8"),
+                risk_level="low",
+                tool_meta={},
+            ),
+            ToolCallRecord(
+                iteration=2,
+                tool_name="create_file",
+                tool_args={"path": "styles.css"},
+                success=True,
+                summary="Created styles.css.",
+                phase="editing",
+                thought_summary="create",
+                expected_outcome="create",
+                output_excerpt=(tmp_path / "styles.css").read_text(encoding="utf-8"),
+                risk_level="low",
+                tool_meta={},
+            ),
+        ]
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert "Related file hints:" in prompt
+    assert "searchInput" in prompt
+    assert "inventoryGrid" in prompt
+    assert "detail-panel.is-open" in prompt
+
+
+def test_focused_create_prompt_prefers_dom_hooks_over_html_head_boilerplate(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen, filtern, sortieren und eine klickbare Detailansicht haben."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    (tmp_path / "index.html").write_text(
+        "\n".join(
+            [
+                "<!DOCTYPE html>",
+                "<html lang='de'>",
+                "<head>",
+                "  <meta charset='utf-8'>",
+                "  <meta name='viewport' content='width=device-width, initial-scale=1'>",
+                "  <title>Luxusgarage</title>",
+                "</head>",
+                "<body>",
+                "  <main class='inventory-shell'>",
+                "    <input id='searchInput' name='search' />",
+                "    <select id='typeFilter'></select>",
+                "    <select id='sortOrder'></select>",
+                "    <section id='inventoryGrid' data-role='grid'></section>",
+                "    <aside id='detailPanel' aria-labelledby='detailTitle'></aside>",
+                "  </main>",
+                "</body>",
+                "</html>",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    session.tool_calls.append(
+        ToolCallRecord(
+            iteration=1,
+            tool_name="create_file",
+            tool_args={"path": "index.html"},
+            success=True,
+            summary="Created index.html.",
+            phase="editing",
+            thought_summary="create",
+            expected_outcome="create",
+            output_excerpt=(tmp_path / "index.html").read_text(encoding="utf-8"),
+            risk_level="low",
+            tool_meta={},
+        )
+    )
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=None,
+        mode="compact",
+    )
+
+    related_section = prompt.split("Related file hints:", 1)[1]
+    assert "searchInput" in related_section
+    assert "inventoryGrid" in related_section
+    assert "detailPanel" in related_section
+    assert "<meta charset" not in related_section
+    assert "<title>" not in related_section
+
+
+def test_web_bundle_script_focus_keeps_detail_interaction_requirements(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Anforderungen:\n"
+            "- Suchfeld, Filter nach Fahrzeugtyp oder Marke, Sortierung und klickbare Detailansicht\n"
+            "- in script.js realistische Beispiel-Fahrzeuge als Datenbasis\n"
+            "- klare deutsche UI-Texte\n"
+            "- styles.css und script.js muessen wirklich die inhaltliche Seite tragen, nicht nur Minimaldateien sein\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    script_focus = _artifact_scoped_focus(session.router_result, session, "script.js", current_content="")
+
+    assert any("detail" in item.lower() or "klickbar" in item.lower() for item in script_focus["current_write_requirements"])
+
+
+def test_pre_write_create_review_rejects_invalid_javascript_token_soup(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    review = planner._pre_write_create_review(
+        route_payload(
+            intent="create",
+            action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested script."}],
+            target_paths=["script.js"],
+            target_name="script.js",
+            requested_outcome="Create script.js.",
+        ),
+        SessionState(task="Create script.js", workspace_root=str(tmp_path), workspace_snapshot=empty_snapshot(tmp_path)),
+        path="script.js",
+        proposed_content="Cor type: ',: ', id:,   ',0]; const const const sort inventory functioninventory filtered.make car );",
+    )
+
+    assert review.safe_to_write is False
+    assert "syntax check" in review.blocking_issues[0].lower()
+
+
 def test_pre_write_create_review_rejects_placeholder_html_bundle_scaffold_even_when_length_passes(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
