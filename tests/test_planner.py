@@ -20752,6 +20752,7 @@ def test_compact_repair_retry_prompt_keeps_runtime_cli_literal_example_nonbindin
     assert "Literal provenance: treat only hard file-local source obligations as exact source-text requirements." in prompt
     assert "--keep-case hello world [runtime_evidence/illustrative_runtime_cli_example]" in prompt
     assert "Previous proposal was rejected because: The exact requested literal is missing from normalize_cli.py: --keep-case hello world" in prompt
+    assert "Add the exact literal `--keep-case hello world` verbatim in the next draft." in prompt
 
 
 def test_pre_write_update_review_allows_evidence_backed_local_behavior_adjustment_after_scope_rejection(

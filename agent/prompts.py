@@ -4249,6 +4249,19 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
         lines.append(
             f"- Either import or otherwise bind '{undefined_symbol}' before its current use, or remove that failing use if it is unnecessary."
         )
+    for issue in review.blocking_issues[:2]:
+        literal_match = re.match(
+            r"^The exact requested literal is missing from (?P<path>[^:]+): (?P<literal>.+)$",
+            str(issue or "").strip(),
+        )
+        if not literal_match:
+            continue
+        literal = str(literal_match.group("literal") or "").strip()
+        if not literal:
+            continue
+        lines.append(
+            f"- Add the exact literal `{literal}` verbatim in the next draft. Do not rename it, translate it, or replace it with a near match."
+        )
     unchanged_anchors = _unchanged_identifier_anchor_list(review)
     if unchanged_anchors:
         lines.append(
