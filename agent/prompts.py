@@ -1342,6 +1342,65 @@ def _focused_create_retry_prompt(
     return "\n\n".join(sections)
 
 
+def _focused_create_continuation_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    partial_content: str,
+    review_feedback: ProposedUpdateReview,
+) -> str:
+    request_text = session.task or route.requested_outcome
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
+    compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
+    request_digest = _compact_request_digest(
+        request_text,
+        snapshot=session.workspace_snapshot if session is not None else None,
+        max_chars=160,
+    )
+    sections = [
+        "Finish the full file content for exactly one file.",
+        f"Target path: {path}",
+        f"Latest user request: {_trim_text(request_text, 220)}",
+        f"File-scoped focus: {json.dumps(compact_focus, ensure_ascii=False)}",
+        _single_file_boundary_instruction(path, route.entities.target_paths),
+        (
+            "A slower retry already produced a partial draft after the previous thin scaffold was rejected. "
+            "Continue that stronger in-progress draft instead of restarting from scratch."
+        ),
+        f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+        _direct_review_corrections(review_feedback),
+    ]
+    if request_digest:
+        sections.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+    explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 180)
+    if explicit_constraints:
+        sections.append(f"Explicit constraints: {explicit_constraints}")
+    file_requirement_summary = _file_local_requirement_summary(file_focus)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
+    file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+    if file_creation_instruction:
+        sections.append(file_creation_instruction)
+    sections.extend(
+        [
+            "Partial draft from the previous attempt:",
+            _trim_balanced_text(str(partial_content or "").strip(), 2200),
+            (
+                "Return the complete final file content only. Preserve correct parts of the partial draft, "
+                "finish the missing sections, and do not add markdown fences or explanations."
+            ),
+        ]
+    )
+    return "\n\n".join(sections)
+
+
 def generate_content_continuation_prompt(
     route: RouterOutput,
     session: SessionState | None = None,
@@ -1353,6 +1412,14 @@ def generate_content_continuation_prompt(
     repair_strategy: str | None = None,
     review_feedback: ProposedUpdateReview | None = None,
 ) -> str:
+    if current_content is None and review_feedback is not None and session is not None:
+        return _focused_create_continuation_prompt(
+            route,
+            session,
+            path=path,
+            partial_content=partial_content,
+            review_feedback=review_feedback,
+        )
     sections = [
         "Finish the full file content for exactly one file.",
         "A previous slow generation already produced a partial draft. Use that progress instead of starting over blindly.",

@@ -36,6 +36,7 @@ from agent.prompts import (
     _artifact_scoped_focus,
     build_request_digest,
     final_response_prompt,
+    generate_content_continuation_prompt,
     _repair_target_line_hints,
     _repair_required_literal_anchors,
     _split_requirement_clauses,
@@ -26480,6 +26481,135 @@ def test_review_guided_retry_stays_compact_for_small_focused_updates(tmp_path, m
     assert "Handle argv=None inside main() instead of hard-coding a fixed return value." in llm.generate_calls[1]["args"][0]
 
 
+def test_review_guided_create_retry_resumes_partial_progress_before_falling_back(tmp_path, monkeypatch):
+    partial_html = (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"de\">\n"
+        "<head>\n"
+        "  <meta charset=\"UTF-8\">\n"
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+        "  <title>Autowelt</title>\n"
+        "  <link rel=\"stylesheet\" href=\"styles.css\">\n"
+        "</head>\n"
+        "<body>\n"
+        "  <main class=\"catalog-page\">\n"
+        "    <header class=\"hero\">\n"
+        "      <p class=\"eyebrow\">Premium Auswahl</p>\n"
+        "      <h1>Finde das passende Auto fuer deinen Alltag.</h1>\n"
+        "      <p class=\"hero-copy\">Vergleiche Modelle, Leistungsdaten und Preise in einer modernen Uebersicht.</p>\n"
+        "    </header>\n"
+        "    <section class=\"search-panel\">\n"
+        "      <label for=\"searchInput\">Suche nach Marke oder Modell</label>\n"
+        "      <input id=\"searchInput\" type=\"search\" placeholder=\"z. B. Audi A4\">\n"
+        "    </section>\n"
+        "    <section class=\"results\" id=\"carGrid\">\n"
+        "      <article class=\"car-card\">\n"
+        "        <h2>BMW 330e</h2>\n"
+        "        <p>Baujahr 2023</p>\n"
+        "        <p>292 PS</p>\n"
+        "      </article>\n"
+    )
+    completed_html = (
+        partial_html
+        + "      <article class=\"car-card\"><h2>Audi A5 Sportback</h2><p>Baujahr 2024</p><p>265 PS</p></article>\n"
+        + "    </section>\n"
+        + "  </main>\n"
+        + "  <script src=\"script.js\"></script>\n"
+        + "</body>\n"
+        + "</html>\n"
+    )
+    llm = ScriptedLLM(
+        generate_side_effects=[
+            OllamaGenerationError(
+                "timed out waiting for completion after 120.0 seconds",
+                reason="total_timeout",
+                partial_text=partial_html,
+                characters=len(partial_html),
+                model_name="qwen2.5-coder:7b",
+                total_timeout_seconds=120,
+            ),
+            completed_html,
+        ],
+        config=AppConfig(
+            workspace_root=str(tmp_path),
+            model_name="qwen2.5-coder:7b",
+            router_model_name="qwen2.5-coder:7b",
+        ),
+    )
+    planner = Planner(llm, "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen und eine Suche enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    monkeypatch.setattr(
+        planner,
+        "_pre_write_update_review",
+        lambda *_args, **_kwargs: ProposedUpdateReview(
+            safe_to_write=True,
+            summary="ok",
+            confidence=0.9,
+            blocking_issues=[],
+            preservation_risks=[],
+            repair_hints=[],
+        ),
+    )
+
+    result = planner._retry_update_after_review_failure(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        rejected_content="<!DOCTYPE html><html><body><main><ul id='carList'></ul></main></body></html>",
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file for index.html is still too thin for the current large-scope create request.",
+            confidence=0.84,
+            blocking_issues=[
+                "index.html only contains 19 non-empty lines / 488 characters, which is too small to credibly satisfy the active scoped requirements.",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
+            ],
+        ),
+        repair_context=None,
+        repair_strategy=None,
+        prior_attempts=[],
+    )
+
+    assert result.content == completed_html.strip()
+    assert result.recovery_strategy == "review_guided_retry_resume"
+    assert len(llm.generate_calls) == 2
+    assert llm.generate_calls[1]["kwargs"]["model"] == "qwen2.5-coder:7b"
+    assert llm.generate_calls[1]["kwargs"]["strict_timeouts"] is True
+    assert llm.generate_calls[1]["kwargs"]["total_timeout"] >= 270
+    assert llm.generate_calls[1]["kwargs"]["num_ctx"] == 2048
+    assert "Partial draft from the previous attempt:" in llm.generate_calls[1]["args"][0]
+    assert "Continue that stronger in-progress draft instead of restarting from scratch." in llm.generate_calls[1]["args"][0]
+    assert "Memory context:" not in llm.generate_calls[1]["args"][0]
+
+
 def test_review_guided_retry_followup_hang_returns_terminal_timeout(tmp_path, monkeypatch):
     class FakeClock:
         def __init__(self) -> None:
@@ -31789,6 +31919,67 @@ def test_compact_create_retry_prompt_stays_file_focused_for_large_scope_retries(
     assert "File-local requirements:" in retry_prompt
     assert "Memory context:" not in retry_prompt
     assert "Diagnostic context:" not in retry_prompt
+
+
+def test_compact_create_continuation_prompt_stays_file_focused_for_partial_retries(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen und eine Suche enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    continuation_prompt = generate_content_continuation_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        partial_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Autowelt</title></head>\n"
+            "<body><main class=\"catalog-page\"><section class=\"results\"><article class=\"car-card\"><h2>BMW 330e</h2></article>"
+        ),
+        current_content=None,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file for index.html is still too thin for the current large-scope create request.",
+            confidence=0.84,
+            blocking_issues=[
+                "index.html only contains 19 non-empty lines / 488 characters, which is too small to credibly satisfy the active scoped requirements.",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
+            ],
+        ),
+    )
+
+    assert len(continuation_prompt) < 5_200
+    assert "Partial draft from the previous attempt:" in continuation_prompt
+    assert "Continue that stronger in-progress draft instead of restarting from scratch." in continuation_prompt
+    assert "File-local requirements:" in continuation_prompt
+    assert "Memory context:" not in continuation_prompt
+    assert "Diagnostic context:" not in continuation_prompt
 
 
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):

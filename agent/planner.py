@@ -13717,7 +13717,7 @@ class Planner:
         *,
         path: str,
         current_content: str | None,
-        rejected_content: str | None,
+        rejected_content: str | None = None,
         review_feedback: ProposedUpdateReview,
         repair_context: ValidationFailureEvidence | None,
         repair_strategy: str | None,
@@ -14007,6 +14007,146 @@ class Planner:
 
         seen_retry_variants: set[tuple[str, str, str]] = set()
         seen_retry_prompts: set[tuple[str, str]] = set()
+
+        def run_review_guided_resume(
+            *,
+            model_name: str | None,
+            capability_tier: str,
+            base_strategy: str,
+            effective_repair_strategy: str | None,
+            partial_content: str,
+            timeout_seconds: int,
+            total_timeout_seconds: int,
+            num_ctx: int,
+        ) -> tuple[str | None, str | None]:
+            resume_strategy = f"{base_strategy}_resume"
+            continuation_prompt = generate_content_continuation_prompt(
+                route,
+                session,
+                path=path,
+                partial_content=partial_content,
+                current_content=current_content,
+                repair_context=repair_context,
+                repair_strategy=effective_repair_strategy,
+                review_feedback=last_review,
+            )
+            continuation_sha = self._prompt_sha256(continuation_prompt)
+            prompt_key = (str(model_name or primary_model or "__default__").strip() or "__default__", continuation_sha)
+            if prompt_key in seen_retry_prompts:
+                self._log(
+                    "content_generation_retry_skipped",
+                    path=path,
+                    strategy=resume_strategy,
+                    reason="duplicate_prompt",
+                    model=model_name or primary_model,
+                    capability_tier=capability_tier,
+                    prompt_variant="resume",
+                    prompt_sha256=continuation_sha,
+                )
+                return None, None
+            seen_retry_prompts.add(prompt_key)
+            resume_timeout_seconds = max(timeout_seconds, 60)
+            resume_total_timeout_seconds = max(total_timeout_seconds, 270)
+            resume_num_ctx = min(max(num_ctx, 2048), 3072)
+            prompt_trace_path = self._write_prompt_trace(
+                session,
+                operation_name=f"content_generation_{resume_strategy}",
+                path=path,
+                prompt=continuation_prompt,
+                model=model_name or primary_model,
+                prompt_variant="resume",
+                num_ctx=resume_num_ctx,
+                timeout_seconds=resume_timeout_seconds,
+                total_timeout_seconds=resume_total_timeout_seconds,
+            )
+            self._log(
+                "content_generation_retry_started",
+                path=path,
+                strategy=resume_strategy,
+                model=model_name or primary_model,
+                reason="proposed_update_review_rejected",
+                capability_tier=capability_tier,
+                prompt_variant="resume",
+                repair_strategy=effective_repair_strategy,
+                prompt_chars=len(continuation_prompt),
+                prompt_lines=continuation_prompt.count("\n") + 1,
+                prompt_sha256=continuation_sha,
+                prompt_artifact=prompt_trace_path,
+            )
+            continuation_outcome = invoke_model(
+                lambda progress, retry_model=model_name: self.llm.generate(
+                    continuation_prompt,
+                    model=retry_model,
+                    timeout=resume_timeout_seconds,
+                    total_timeout=resume_total_timeout_seconds,
+                    strict_timeouts=True,
+                    num_ctx=resume_num_ctx,
+                    retries=0,
+                    progress_callback=progress,
+                ),
+                operation_name="content_generation",
+                task_class="content_generation",
+                attempt_number=len(prior_attempts) + len(retry_attempts) + 1,
+                capability_tier=capability_tier,
+                recovery_strategy=resume_strategy,
+                prompt_variant="resume",
+                model_identifier=model_name or primary_model,
+                backend_identifier=self._backend_identifier(),
+                inactivity_timeout_seconds=resume_timeout_seconds,
+                total_timeout_seconds=resume_total_timeout_seconds,
+                context_pressure_estimate=self._context_pressure_estimate(
+                    prompt=continuation_prompt,
+                    current_content=current_content,
+                    exc=None,
+                ),
+                event_callback=self._progress_logger(
+                    "content_generation_progress",
+                    path=path,
+                    update=current_content is not None,
+                    strategy=resume_strategy,
+                ),
+            )
+            retry_attempts.append(continuation_outcome.attempt)
+            if continuation_outcome.exception is not None:
+                continuation_issue = continuation_outcome.attempt.failure
+                self._log(
+                    "content_generation_retry_error",
+                    path=path,
+                    strategy=resume_strategy,
+                    error=str(continuation_outcome.exception),
+                    reason=continuation_issue.reason if continuation_issue is not None else "runtime_error",
+                    had_progress=continuation_issue.had_progress if continuation_issue is not None else False,
+                    partial_characters=continuation_issue.characters if continuation_issue is not None else 0,
+                    failure_class=continuation_issue.classification if continuation_issue is not None else "generation_failed",
+                    capability_tier=capability_tier,
+                )
+                return None, resume_strategy
+
+            cleaned = self._strip_code_fences(str(continuation_outcome.value or "")).strip()
+            if not cleaned:
+                retry_attempts[-1] = self._empty_response_attempt(
+                    base_attempt=continuation_outcome.attempt,
+                    context_pressure=self._context_pressure_estimate(
+                        prompt=continuation_prompt,
+                        current_content=current_content,
+                        exc=None,
+                    ),
+                )
+                self._log(
+                    "content_generation_retry_error",
+                    path=path,
+                    strategy=resume_strategy,
+                    error="empty model response",
+                    reason="empty_response",
+                    had_progress=False,
+                    partial_characters=0,
+                    failure_class="empty_response",
+                    capability_tier=capability_tier,
+                )
+                return None, resume_strategy
+
+            return cleaned, resume_strategy
+
         for (
             model_name,
             capability_tier,
@@ -14125,30 +14265,53 @@ class Planner:
                     failure_class=retry_issue.classification if retry_issue is not None else "generation_failed",
                     capability_tier=capability_tier,
                 )
-                continue
+                if (
+                    retry_issue is not None
+                    and retry_issue.failed_after_progress
+                    and retry_issue.timeout_like
+                    and retry_issue.partial_text
+                ):
+                    resumed_content, resumed_strategy = run_review_guided_resume(
+                        model_name=model_name,
+                        capability_tier=capability_tier,
+                        base_strategy=strategy,
+                        effective_repair_strategy=effective_repair_strategy,
+                        partial_content=retry_issue.partial_text,
+                        timeout_seconds=timeout_seconds,
+                        total_timeout_seconds=total_timeout_seconds,
+                        num_ctx=num_ctx,
+                    )
+                    if resumed_content:
+                        cleaned = resumed_content
+                        strategy = resumed_strategy or strategy
+                    else:
+                        continue
+                else:
+                    continue
 
-            cleaned = self._strip_code_fences(str(outcome.value or "")).strip()
-            if not cleaned:
-                retry_attempts[-1] = self._empty_response_attempt(
-                    base_attempt=outcome.attempt,
-                    context_pressure=self._context_pressure_estimate(
-                        prompt=prompt,
-                        current_content=current_content,
-                        exc=None,
-                    ),
-                )
-                self._log(
-                    "content_generation_retry_error",
-                    path=path,
-                    strategy=strategy,
-                    error="empty model response",
-                    reason="empty_response",
-                    had_progress=False,
-                    partial_characters=0,
-                    failure_class="empty_response",
-                    capability_tier=capability_tier,
-                )
-                continue
+            else:
+                cleaned = self._strip_code_fences(str(outcome.value or "")).strip()
+                if not cleaned:
+                    retry_attempts[-1] = self._empty_response_attempt(
+                        base_attempt=outcome.attempt,
+                        context_pressure=self._context_pressure_estimate(
+                            prompt=prompt,
+                            current_content=current_content,
+                            exc=None,
+                        ),
+                    )
+                    self._log(
+                        "content_generation_retry_error",
+                        path=path,
+                        strategy=strategy,
+                        error="empty model response",
+                        reason="empty_response",
+                        had_progress=False,
+                        partial_characters=0,
+                        failure_class="empty_response",
+                        capability_tier=capability_tier,
+                    )
+                    continue
 
             self._log(
                 "content_generation_retry_finished",
