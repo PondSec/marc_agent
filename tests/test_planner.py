@@ -31759,6 +31759,13 @@ def test_compact_create_retry_prompt_stays_file_focused_for_large_scope_retries(
         session,
         path="index.html",
         current_content=None,
+        prior_proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Autoverleih</title></head>\n"
+            "<body><header><h1>Autoverleih</h1></header><main><ul id=\"carList\"></ul></main></body>\n"
+            "</html>\n"
+        ),
         review_feedback=ProposedUpdateReview(
             safe_to_write=False,
             summary="The proposed new file for index.html is still too thin for the current large-scope create request.",
@@ -31774,8 +31781,9 @@ def test_compact_create_retry_prompt_stays_file_focused_for_large_scope_retries(
         mode="compact",
     )
 
-    assert len(retry_prompt) < len(initial_prompt)
+    assert len(retry_prompt) < 5_200
     assert "Self-review feedback on the previous proposal" in retry_prompt
+    assert "Rejected previous draft excerpt" in retry_prompt
     assert "File-local requirements:" in retry_prompt
     assert "Memory context:" not in retry_prompt
     assert "Diagnostic context:" not in retry_prompt

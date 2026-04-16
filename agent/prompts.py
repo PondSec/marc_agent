@@ -983,6 +983,7 @@ def generate_content_retry_prompt(
     *,
     path: str,
     current_content: str | None = None,
+    prior_proposed_content: str | None = None,
     repair_context: ValidationFailureEvidence | None = None,
     repair_strategy: str | None = None,
     review_feedback: ProposedUpdateReview | None = None,
@@ -995,6 +996,7 @@ def generate_content_retry_prompt(
             route,
             session,
             path=path,
+            prior_proposed_content=prior_proposed_content,
             review_feedback=review_feedback,
             mode=mode,
         )
@@ -1283,6 +1285,7 @@ def _focused_create_retry_prompt(
     session: SessionState,
     *,
     path: str,
+    prior_proposed_content: str | None,
     review_feedback: ProposedUpdateReview,
     mode: str,
 ) -> str:
@@ -1313,6 +1316,15 @@ def _focused_create_retry_prompt(
     explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 260 if mode == "full" else 180)
     if explicit_constraints:
         sections.append(f"Explicit constraints: {explicit_constraints}")
+    if str(prior_proposed_content or "").strip():
+        prior_excerpt = _trim_balanced_text(
+            str(prior_proposed_content or "").strip(),
+            900 if mode == "full" else 650,
+        )
+        sections.append(
+            "Rejected previous draft excerpt (expand this materially instead of repeating it unchanged):\n"
+            + prior_excerpt
+        )
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
