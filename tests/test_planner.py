@@ -31428,6 +31428,105 @@ def test_generate_content_prompt_compact_create_surfaces_file_requirements_as_ha
     assert "Do not stop at a starter scaffold, placeholder shell, or empty structure" in prompt
 
 
+def test_pre_write_create_review_rejects_thin_large_scope_web_bundle_draft(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+            "Anforderungen:\n"
+            "- mehrere Automodelle anzeigen\n"
+            "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+            "- funktionierende Suchfunktion nach Marke und Modell\n"
+            "- modernes, sauberes UI\n"
+            "- gutes UX\n"
+            "- responsive Layout\n"
+            "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+            "- keine Frameworks, nur HTML, CSS und JavaScript\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Autoverleih</title></head>\n"
+            "<body><header><h1>Autoverleih</h1><input id=\"searchInput\"></header><main><ul id=\"carList\"></ul></main></body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "too thin" in review.summary.lower()
+    assert any("starter scaffold" in hint.lower() or "scoped requirements" in hint.lower() for hint in review.repair_hints)
+
+
+def test_pre_write_create_review_does_not_block_small_single_file_create(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    task = "Erstelle eine kleine index.html mit einer Ueberschrift und einem kurzen Begruessungstext."
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html"],
+                "focus_files": ["index.html"],
+                "entrypoints": ["index.html"],
+                "language_counts": {"html": 1},
+                "project_labels": ["website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested file."}],
+        target_paths=["index.html"],
+        target_name="index.html",
+        requested_outcome=task,
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Hallo</title></head>\n"
+            "<body><main><h1>Willkommen</h1><p>Hallo zusammen.</p></main></body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review.safe_to_write is True
+
+
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):
     payload = route_payload(
         intent="inspect",

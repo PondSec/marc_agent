@@ -13477,6 +13477,13 @@ class Planner:
                 path=path,
                 proposed_content=proposed_content,
             )
+        if review is None:
+            review = self._large_create_scope_completeness_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
         if review is not None:
             return review
         return ProposedUpdateReview(
@@ -13487,6 +13494,85 @@ class Planner:
             preservation_risks=[],
             repair_hints=[
                 "Keep the new file concrete and complete.",
+            ],
+        )
+
+    def _large_create_scope_completeness_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        normalized_path = str(path or "").strip()
+        suffix = Path(normalized_path).suffix.lower()
+        if suffix not in {".html", ".htm", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx", ".py"}:
+            return None
+
+        latest_user_turn = str(getattr(session.task_state, "latest_user_turn", "") or session.task or "").strip()
+        request_digest = getattr(session.task_state, "request_digest", None)
+
+        def _digest_items(key: str) -> list[object]:
+            if isinstance(request_digest, dict):
+                value = request_digest.get(key, [])
+            else:
+                value = getattr(request_digest, key, [])
+            return list(value or [])
+
+        requirement_count = len(getattr(session.task_state, "request_requirements", []) or [])
+        explicit_paths = list(getattr(route.entities, "target_paths", []) or [])
+        complexity_signals = len(explicit_paths)
+        complexity_signals += len(_digest_items("requirements"))
+        complexity_signals += len(_digest_items("completion_criteria"))
+        if len(latest_user_turn) < 280 and complexity_signals < 7 and requirement_count < 6:
+            return None
+
+        scope = _artifact_scoped_focus(route, session, normalized_path, current_content="")
+        scoped_requirements = [
+            str(item or "").strip()
+            for item in scope.get("current_write_requirements", [])[:4]
+            if str(item or "").strip()
+        ]
+        if len(scoped_requirements) < 2:
+            return None
+
+        line_count = len([line for line in str(proposed_content or "").splitlines() if line.strip()])
+        char_count = len(str(proposed_content or "").strip())
+        thresholds = {
+            ".html": (22, 650),
+            ".htm": (22, 650),
+            ".css": (28, 850),
+            ".scss": (28, 850),
+            ".sass": (28, 850),
+            ".less": (28, 850),
+            ".js": (28, 850),
+            ".jsx": (28, 850),
+            ".ts": (28, 850),
+            ".tsx": (28, 850),
+            ".py": (24, 700),
+        }
+        min_lines, min_chars = thresholds.get(suffix, (0, 0))
+        if line_count >= min_lines or char_count >= min_chars:
+            return None
+
+        requirement_preview = "; ".join(scoped_requirements[:3])
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary=(
+                f"The proposed new file for {normalized_path} is still too thin for the current large-scope create request."
+            ),
+            confidence=0.84,
+            blocking_issues=[
+                (
+                    f"{normalized_path} only contains {line_count} non-empty lines / {char_count} characters, "
+                    f"which is too small to credibly satisfy the active scoped requirements: {requirement_preview}."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
+                "Use the file-local requirements as deliverables that must already be visible in this file, not just implied by sibling files.",
             ],
         )
 
