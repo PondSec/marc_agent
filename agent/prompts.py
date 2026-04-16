@@ -7849,13 +7849,40 @@ def _structured_identifier_literal_candidates(text: str, *, limit: int = 8) -> l
 def _structured_identifier_body(text: str, lines: list[str], *, index: int) -> str:
     cleaned_text = str(text or "").strip()
     if ":" in cleaned_text:
-        after = cleaned_text.split(":", 1)[1].strip()
+        colon_indexes = [match.start() for match in re.finditer(":", cleaned_text)]
+        for colon_index in reversed(colon_indexes):
+            prefix_window = cleaned_text[max(0, colon_index - 140) : colon_index].strip()
+            if prefix_window and not _looks_like_structured_identifier_request(prefix_window):
+                continue
+            after = _truncate_structured_identifier_body(cleaned_text[colon_index + 1 :])
+            if after:
+                return after
+        after = _truncate_structured_identifier_body(cleaned_text.split(":", 1)[1])
         if after:
             return after
     if index + 1 >= len(lines):
         return ""
     next_line = re.sub(r"^\s*[-*•]+\s*", "", str(lines[index + 1] or "")).strip()
-    return next_line
+    return _truncate_structured_identifier_body(next_line)
+
+
+def _truncate_structured_identifier_body(text: str) -> str:
+    candidate = str(text or "").strip()
+    if not candidate:
+        return ""
+    for index, char in enumerate(candidate):
+        if char not in ".!?":
+            continue
+        if index <= 0 or index >= len(candidate) - 1:
+            continue
+        if candidate[index - 1].isspace() or candidate[index + 1].isspace() is False:
+            continue
+        remainder = candidate[index + 1 :].lstrip()
+        if remainder and remainder[0].isupper():
+            trimmed = candidate[:index].strip()
+            if trimmed:
+                return trimmed
+    return candidate
 
 
 def _looks_like_structured_identifier_request(text: str) -> bool:
