@@ -1485,46 +1485,38 @@ def _explicit_web_bundle_contract_instruction(route: RouterOutput, path: str) ->
     ]
     lines = [
         "Shared web bundle contract:",
-        (
-            "- Treat the explicit web targets "
-            f"{_format_list(bundle_targets[:6])} as one companion UI bundle, not as independent deliverables."
-        ),
-        (
-            "- Keep responsibilities split by file: HTML owns semantic structure and stable hooks; "
-            "CSS owns presentation and stateful selectors; JS owns behavior and event wiring."
-        ),
-        (
-            "- Do not inline companion-file content or hide a missing companion implementation inside this file "
-            "just because the other files are handled separately."
-        ),
-        (
-            "- Only introduce ids, classes, data-* attributes, function names, or UI state tokens that the "
-            "shared bundle can consume consistently."
-        ),
-        (
-            "- If companion files are still pending, reserve the shared contract cleanly now so the remaining "
-            "explicit files can complete it without renaming hooks later."
-        ),
+        f"- Treat {_format_list(bundle_targets[:6])} as one shared UI bundle with stable cross-file hooks.",
+        "- Split responsibilities cleanly: HTML owns structure; CSS owns layout and states; JS owns behavior and wiring.",
+        "- Do not hide missing companion work inside this file and do not invent orphan hooks or UI states.",
     ]
     if companion_targets:
         lines.append(
-            "- Keep this file aligned with the companion targets "
-            f"{_format_list(companion_targets[:4])}; they are out of scope to write here, but in scope as a shared contract."
+            "- Keep this file aligned with companion targets "
+            f"{_format_list(companion_targets[:4])} without renaming shared hooks later."
         )
     if target_kind == "html":
         lines.append(
-            "- For this HTML file: define semantic structure, include the requested companion asset references, "
-            "and expose only stable hooks that the companion CSS/JS should consume."
+            "- For HTML: include semantic structure, companion asset references, and only stable hooks for CSS/JS."
+        )
+        lines.append(
+            "- HTML must already contain visible UI structure, not just a header plus an empty placeholder container."
+        )
+        lines.append(
+            "- For collection/detail requests, include repeated item/card structure or template hooks plus visible field labels or placeholders."
         )
     elif target_kind == "style":
         lines.append(
-            "- For this stylesheet: style only selectors and state tokens that exist in the shared HTML/JS "
-            "contract; do not invent orphan selectors or UI states."
+            "- For CSS: style only selectors and state tokens that exist in the shared HTML/JS contract."
+        )
+        lines.append(
+            "- The stylesheet should already define layout, component states, and responsive adjustments when the request asks for modern or responsive UI."
         )
     elif target_kind == "script":
         lines.append(
-            "- For this script: bind only to hooks that exist in the shared HTML and mutate only classes, "
-            "attributes, or states that the bundle defines intentionally."
+            "- For JS: bind only to hooks that exist in the shared HTML and mutate only intentional bundle states."
+        )
+        lines.append(
+            "- The script should already contain the data flow, rendering pipeline, and input wiring needed by the request; do not leave filtering disconnected from rendering."
         )
     return "\n".join(lines)
 

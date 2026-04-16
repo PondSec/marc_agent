@@ -31426,6 +31426,7 @@ def test_generate_content_prompt_compact_create_surfaces_file_requirements_as_ha
     assert "mehrere Automodelle anzeigen" in prompt
     assert "Treat these as required outcomes for this file" in prompt
     assert "Do not stop at a starter scaffold, placeholder shell, or empty structure" in prompt
+    assert "HTML must already contain visible UI structure" in prompt
 
 
 def test_pre_write_create_review_rejects_thin_large_scope_web_bundle_draft(tmp_path):
@@ -31484,6 +31485,7 @@ def test_pre_write_create_review_rejects_thin_large_scope_web_bundle_draft(tmp_p
     assert review.safe_to_write is False
     assert "too thin" in review.summary.lower()
     assert any("starter scaffold" in hint.lower() or "scoped requirements" in hint.lower() for hint in review.repair_hints)
+    assert any("collection/card structure" in hint.lower() for hint in review.repair_hints)
 
 
 def test_pre_write_create_review_does_not_block_small_single_file_create(tmp_path):

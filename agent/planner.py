@@ -13581,6 +13581,22 @@ class Planner:
             return None
 
         requirement_preview = "; ".join(scoped_requirements[:3])
+        repair_hints = [
+            "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
+            "Use the file-local requirements as deliverables that must already be visible in this file, not just implied by sibling files.",
+        ]
+        if suffix in {".html", ".htm"}:
+            repair_hints.append(
+                "Add visible collection/card structure or templating hooks plus representative labels/placeholders for the requested user-facing data instead of leaving only an empty container."
+            )
+        elif suffix in {".css", ".scss", ".sass", ".less"}:
+            repair_hints.append(
+                "Add real layout, component, and responsive rules for the requested UI instead of only page chrome and base typography."
+            )
+        elif suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            repair_hints.append(
+                "Wire rendering, filtering, and state flow together so the requested behavior is already connected, not left as disconnected helpers."
+            )
         return ProposedUpdateReview(
             safe_to_write=False,
             summary=(
@@ -13594,10 +13610,7 @@ class Planner:
                 )
             ],
             preservation_risks=[],
-            repair_hints=[
-                "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
-                "Use the file-local requirements as deliverables that must already be visible in this file, not just implied by sibling files.",
-            ],
+            repair_hints=repair_hints,
         )
 
     def _local_pre_write_update_review(
