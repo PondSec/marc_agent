@@ -29455,6 +29455,106 @@ def test_planner_keeps_small_initial_compact_budget_for_simple_new_file(tmp_path
     assert total_timeout_seconds == 150
 
 
+def test_planner_extends_review_guided_create_retry_budget_for_large_new_scope(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+    task = (
+        "Erstelle eine vollständige Inventory-Weboberfläche im aktuellen Workspace mit genau drei Dateien: "
+        "index.html, styles.css und script.js. Nutze kein Framework und keine externen Libraries. "
+        "In index.html muss es eine Toolbar mit Suche und Filtern geben. Verwende exakt diese DOM-IDs: "
+        "searchInput, typeFilter, countryFilter, sortOrder, inventoryGrid, detailPanel. "
+        "Jedes Fahrzeug braucht mindestens die Felder id, brand, model, type, country, price, stock. "
+        "In script.js soll die Suche, Filterung, Sortierung und Detailansicht funktionieren. "
+        "In styles.css soll ein sauberes responsives Layout mit Karten und Detailpanel entstehen. "
+        "Das Ergebnis darf kein Minimal-Scaffold sein, sondern muss direkt benutzbar sein."
+    )
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "create_artifact",
+                "reason": "Create the requested multi-file web app.",
+            }
+        ],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested inventory web app, not as a minimal scaffold.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.request_requirements = [
+        "Create exactly index.html, styles.css, and script.js.",
+        "Use the exact DOM IDs searchInput, typeFilter, countryFilter, sortOrder, inventoryGrid, detailPanel.",
+        "Implement search and filtering in script.js.",
+        "Implement sorting and detail panel behavior in script.js.",
+        "Render a responsive inventory grid in index.html and styles.css.",
+        "Avoid minimal scaffolding and make it directly usable.",
+    ]
+
+    compact_timeout, compact_total_timeout = planner._review_guided_create_retry_time_budget(
+        route=session.router_result,
+        session=session,
+        path="index.html",
+        prompt_variant="compact",
+    )
+    full_timeout, full_total_timeout = planner._review_guided_create_retry_time_budget(
+        route=session.router_result,
+        session=session,
+        path="index.html",
+        prompt_variant="full",
+    )
+
+    assert compact_timeout == 60
+    assert compact_total_timeout == 180
+    assert full_timeout == 75
+    assert full_total_timeout == 240
+
+
+def test_planner_keeps_small_review_guided_create_retry_budget_for_simple_new_file(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+    session = SessionState(
+        task="Erstelle app.py mit einer kleinen greet(name)-Funktion.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "create_artifact",
+                "reason": "Create the requested helper module.",
+            }
+        ],
+        target_paths=["app.py"],
+        target_name="app.py",
+        requested_outcome="Create app.py with a tiny greeting helper.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    compact_timeout, compact_total_timeout = planner._review_guided_create_retry_time_budget(
+        route=session.router_result,
+        session=session,
+        path="app.py",
+        prompt_variant="compact",
+    )
+    full_timeout, full_total_timeout = planner._review_guided_create_retry_time_budget(
+        route=session.router_result,
+        session=session,
+        path="app.py",
+        prompt_variant="full",
+    )
+
+    assert compact_timeout == 45
+    assert compact_total_timeout == 120
+    assert full_timeout == 60
+    assert full_total_timeout == 180
+
+
 def test_planner_extends_generation_retry_budget_after_no_start_failure(tmp_path):
     planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
 
@@ -32069,6 +32169,66 @@ def test_compact_create_continuation_prompt_stays_file_focused_for_partial_retri
     assert "File-local requirements:" in continuation_prompt
     assert "Memory context:" not in continuation_prompt
     assert "Diagnostic context:" not in continuation_prompt
+
+
+def test_compact_create_retry_prompt_revises_rejected_draft_instead_of_restarting(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen und eine Suche enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    retry_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        prior_proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Autoverleih</title></head>\n"
+            "<body><header><h1>Autoverleih</h1></header><main><ul id=\"carList\"></ul></main></body>\n"
+            "</html>\n"
+        ),
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file for index.html is still too thin for the current large-scope create request.",
+            confidence=0.84,
+            blocking_issues=[
+                "index.html only contains 19 non-empty lines / 488 characters, which is too small to credibly satisfy the active scoped requirements.",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
+            ],
+        ),
+        mode="compact",
+    )
+
+    assert "Treat the rejected draft as the current working draft." in retry_prompt
+    assert "Revise that draft into the complete final file." in retry_prompt
+    assert "Create the file from scratch." not in retry_prompt
 
 
 def test_generate_content_prompt_uses_focused_compact_create_prompt_for_large_multi_file_create(tmp_path):

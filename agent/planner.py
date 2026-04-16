@@ -7763,6 +7763,27 @@ class Planner:
                 total_timeout = 300 if large_create_scope else 210
         return timeout_seconds, max(self._llm_timeout(total_timeout), total_timeout)
 
+    def _review_guided_create_retry_time_budget(
+        self,
+        *,
+        route: RouterOutput,
+        session: SessionState,
+        path: str,
+        prompt_variant: str,
+    ) -> tuple[int, int]:
+        large_create_scope = self._large_create_scope_requested(route, session, path=path)
+        compact_prompt = str(prompt_variant or "").strip() == "compact"
+        if compact_prompt:
+            base_timeout = 60 if large_create_scope else 45
+            total_timeout = 180 if large_create_scope else 120
+        else:
+            base_timeout = 75 if large_create_scope else 60
+            total_timeout = 240 if large_create_scope else 180
+        return (
+            max(self._llm_timeout(base_timeout), base_timeout),
+            max(self._llm_timeout(total_timeout), total_timeout),
+        )
+
     def _large_create_scope_requested(
         self,
         route: RouterOutput,
@@ -14012,13 +14033,25 @@ class Planner:
 
         retry_models: list[tuple[str | None, str, str, int, int, int, str]] = []
         if prefer_compact_create_retry:
+            compact_retry_timeout, compact_retry_total_timeout = self._review_guided_create_retry_time_budget(
+                route=route,
+                session=session,
+                path=path,
+                prompt_variant="compact",
+            )
+            full_retry_timeout, full_retry_total_timeout = self._review_guided_create_retry_time_budget(
+                route=route,
+                session=session,
+                path=path,
+                prompt_variant="full",
+            )
             retry_models.append(
                 (
                     primary_model,
                     "tier_a",
                     "review_guided_retry",
-                    max(self._llm_timeout(45), 45),
-                    max(self._llm_timeout(120), 120),
+                    compact_retry_timeout,
+                    compact_retry_total_timeout,
                     min(self._llm_num_ctx(2048), 2048),
                     "compact",
                 )
@@ -14029,8 +14062,8 @@ class Planner:
                         primary_model,
                         "tier_a",
                         "review_guided_primary_fallback",
-                        max(self._llm_timeout(60), 60),
-                        max(self._llm_timeout(180), 180),
+                        full_retry_timeout,
+                        full_retry_total_timeout,
                         min(self._llm_num_ctx(3072), 3072),
                         "full",
                     )
@@ -14041,8 +14074,8 @@ class Planner:
                         reserve_model,
                         "tier_b",
                         "review_guided_fallback_model",
-                        max(self._llm_timeout(45), 45),
-                        max(self._llm_timeout(120), 120),
+                        compact_retry_timeout,
+                        compact_retry_total_timeout,
                         min(self._llm_num_ctx(2048), 2048),
                         "compact",
                     )

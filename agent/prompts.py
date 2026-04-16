@@ -1389,6 +1389,9 @@ def _focused_create_retry_prompt(
             "Rejected previous draft excerpt (expand this materially instead of repeating it unchanged):\n"
             + prior_excerpt
         )
+        sections.append(
+            "Treat the rejected draft as the current working draft. Preserve correct sections, repair the missing review findings directly, and avoid restarting from a brand-new scaffold."
+        )
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
@@ -1403,7 +1406,10 @@ def _focused_create_retry_prompt(
     file_creation_instruction = _file_creation_completeness_instruction(file_focus)
     if file_creation_instruction:
         sections.append(file_creation_instruction)
-    sections.append("Create the file from scratch. Return the full new file content only.")
+    if str(prior_proposed_content or "").strip():
+        sections.append("Revise that draft into the complete final file. Return the full updated file content only.")
+    else:
+        sections.append("Create the file from scratch. Return the full new file content only.")
     sections.append("Do not add markdown fences or explanations.")
     return "\n\n".join(sections)
 
