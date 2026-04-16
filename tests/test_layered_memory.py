@@ -420,6 +420,16 @@ def test_fresh_semantic_start_limits_persistent_retrieval_to_project_memory(tmp_
     assert all(item.memory_type == "project" for item in fresh.memory_context.selected)
 
 
+def test_fresh_semantic_start_disables_cross_project_lookup_for_non_recall_tasks(tmp_path):
+    store = build_store(tmp_path)
+    fresh = build_fresh_start_session(store, "Add audit logging to the auth flow")
+
+    request = store.build_retrieval_request(fresh.task, fresh)
+
+    assert request.use_case == "similar_task_lookup"
+    assert request.allow_cross_project is False
+
+
 def test_fresh_semantic_start_prompt_excludes_prior_conversation_recall(tmp_path):
     store = build_store(tmp_path)
     seeded = build_session(store, "Fix auth bug")
@@ -831,6 +841,47 @@ def test_generic_single_file_workspaces_do_not_share_project_identity(tmp_path):
     assert store_a.project_id != store_b.project_id
     assert session_a.project_id == store_a.project_id
     assert session_b.project_id == store_b.project_id
+
+
+def test_generic_root_file_overlap_does_not_pull_cross_project_memory_without_semantic_overlap(tmp_path):
+    shared_state = tmp_path / ".shared_state"
+    store_a = build_empty_store(tmp_path / "web_a", state_root_override=shared_state)
+    store_b = build_empty_store(tmp_path / "web_b", state_root_override=shared_state)
+
+    (store_a.workspace.root / "index.html").write_text("<!DOCTYPE html><title>Auto-Inventar</title>", encoding="utf-8")
+    (store_a.workspace.root / "styles.css").write_text("body { color: #111; }", encoding="utf-8")
+    (store_a.workspace.root / "script.js").write_text("const inventoryGrid = document.getElementById('inventoryGrid');", encoding="utf-8")
+
+    seeded = SessionState(
+        task="Erstelle eine Auto-Inventar-Webapp mit Kartenansicht und Fahrzeugsuche.",
+        workspace_root=str(store_a.workspace.root),
+        project_id=store_a.project_id,
+    )
+    seeded.workspace_snapshot = store_a.build_snapshot(seeded.task)
+    seeded.status = "completed"
+    seeded.final_response = "Ich habe die Auto-Inventar-Webapp erstellt."
+    store_a.refresh_session_memory(seeded.task, seeded)
+    store_a.persist_session_memory(seeded)
+
+    fresh = SessionState(
+        task="Erstelle ein ruhiges Foto-Portfolio mit index.html, styles.css und script.js.",
+        workspace_root=str(store_b.workspace.root),
+        project_id=store_b.project_id,
+    )
+    fresh.workspace_snapshot = store_b.build_snapshot(fresh.task)
+    request = store_b.build_retrieval_request(fresh.task, fresh).model_copy(
+        update={
+            "use_case": "similar_task_lookup",
+            "allow_cross_project": True,
+            "include_types": ["project", "episodic"],
+            "target_paths": ["index.html", "styles.css", "script.js"],
+            "symbol_names": [],
+        }
+    )
+
+    result = store_b.retrieve(request)
+
+    assert result.selected == []
 
 
 def test_failure_memory_persists_multiple_failure_signatures_from_same_session(tmp_path):

@@ -463,7 +463,7 @@ class AgentMemoryStore(RepoMemoryStore):
             max_hits=3 if recall_subject else 4 if fresh_task_bootstrap else 6,
             max_per_type=3 if recall_subject else 1 if fresh_task_bootstrap else 2,
             summary_budget_chars=420 if recall_subject else 520 if fresh_task_bootstrap else 900,
-            allow_cross_project=use_case in {"similar_task_lookup", "user_recall"},
+            allow_cross_project=use_case == "user_recall" or (use_case == "similar_task_lookup" and not fresh_task_bootstrap),
         )
 
     def retrieve(self, request: RetrievalRequest) -> MemoryRetrievalResult:
@@ -1059,7 +1059,7 @@ class AgentMemoryStore(RepoMemoryStore):
         similarity = self._jaccard_similarity(query_terms, entry_terms)
         personal_recall = bool(request.recall_subject)
         project_relevance = 0.0 if personal_recall else 1.0 if request.project_id and metadata.get("project_id") == request.project_id else 0.0
-        exact_entity = self._exact_entity_relevance(request, metadata)
+        exact_entity, entity_breakdown = self._exact_entity_relevance(request, metadata)
         failure_relevance = self._failure_relevance(request, metadata)
         recency, is_stale = self._recency_score(metadata)
         confidence = float(metadata.get("confidence", 0.0) or 0.0)
@@ -1085,6 +1085,17 @@ class AgentMemoryStore(RepoMemoryStore):
                 + 0.03 * importance
                 + type_bonus
             )
+        weak_cross_project_path_match = (
+            not personal_recall
+            and project_relevance <= 0.0
+            and failure_relevance <= 0.0
+            and similarity < 0.16
+            and entity_breakdown.get("path", 0.0) > 0.0
+            and entity_breakdown.get("symbol", 0.0) <= 0.0
+            and entity_breakdown.get("generic_cross_project_path_only", False)
+        )
+        if weak_cross_project_path_match:
+            score *= 0.3
         if is_stale:
             score *= 0.58
         if personal_recall and similarity < 0.08 and exact_entity < 0.22:
@@ -1755,33 +1766,65 @@ class AgentMemoryStore(RepoMemoryStore):
             )
         )
 
-    def _exact_entity_relevance(self, request: RetrievalRequest, metadata: dict[str, Any]) -> float:
+    def _exact_entity_relevance(self, request: RetrievalRequest, metadata: dict[str, Any]) -> tuple[float, dict[str, float | bool]]:
         target_paths = {item for item in request.target_paths if item}
         file_paths = set(metadata.get("file_paths", []))
         symbol_names = {str(item).strip().lower() for item in request.symbol_names if str(item).strip()}
         stored_symbols = {str(item).strip().lower() for item in metadata.get("symbol_names", []) if str(item).strip()}
         stored_tags = {str(item).strip().lower() for item in metadata.get("tags", []) if str(item).strip()}
+        same_project = bool(request.project_id and metadata.get("project_id") == request.project_id)
         matches = 0.0
         total = 0.0
+        path_match = 0.0
+        symbol_match = 0.0
+        recall_match = 0.0
+        generic_cross_project_path_only = False
         if target_paths:
             total += 1.0
-            if target_paths & file_paths:
-                matches += 1.0
-            elif {Path(item).name for item in target_paths} & {Path(item).name for item in file_paths}:
-                matches += 0.65
+            matched_paths = target_paths & file_paths
+            if matched_paths:
+                if same_project:
+                    path_match = 1.0
+                else:
+                    max_depth = max(len(Path(item).parts) for item in matched_paths)
+                    if max_depth > 1:
+                        path_match = 0.72
+                    elif len(matched_paths) >= 3:
+                        path_match = 0.38
+                    elif len(matched_paths) >= 2:
+                        path_match = 0.32
+                    else:
+                        path_match = 0.24
+                    generic_cross_project_path_only = all(len(Path(item).parts) == 1 for item in matched_paths)
+            else:
+                matched_names = {Path(item).name for item in target_paths} & {Path(item).name for item in file_paths}
+                if matched_names:
+                    path_match = 0.65 if same_project else 0.18
+                    generic_cross_project_path_only = not same_project
+            matches += path_match
         if symbol_names:
             total += 1.0
             if symbol_names & stored_symbols:
-                matches += 1.0
+                symbol_match = 1.0
+                matches += symbol_match
         if request.recall_subject:
             total += 1.0
             subject_tag = f"recall_subject:{request.recall_subject}".lower()
             attribute_tags = {f"recall_attribute:{item}".lower() for item in request.recall_attributes if str(item).strip()}
             if subject_tag in stored_tags:
-                matches += 0.7
+                recall_match += 0.7
                 if attribute_tags & stored_tags:
-                    matches += 0.3
-        return matches / total if total else 0.0
+                    recall_match += 0.3
+                matches += recall_match
+        return (
+            matches / total if total else 0.0,
+            {
+                "path": path_match,
+                "symbol": symbol_match,
+                "recall": recall_match,
+                "generic_cross_project_path_only": generic_cross_project_path_only,
+            },
+        )
 
     def _failure_relevance(self, request: RetrievalRequest, metadata: dict[str, Any]) -> float:
         failure_signature = str(request.failure_signature or "").strip()
