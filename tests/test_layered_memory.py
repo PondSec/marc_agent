@@ -430,6 +430,16 @@ def test_fresh_semantic_start_disables_cross_project_lookup_for_non_recall_tasks
     assert request.allow_cross_project is False
 
 
+def test_execution_task_retrieval_keeps_cross_project_lookup_disabled(tmp_path):
+    store = build_store(tmp_path)
+    session = build_session(store, "Update the auth flow and keep tests stable")
+
+    request = store.build_retrieval_request(session.task, session)
+
+    assert request.use_case == "task_continuation"
+    assert request.allow_cross_project is False
+
+
 def test_fresh_semantic_start_prompt_excludes_prior_conversation_recall(tmp_path):
     store = build_store(tmp_path)
     seeded = build_session(store, "Fix auth bug")

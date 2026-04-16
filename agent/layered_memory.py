@@ -463,7 +463,7 @@ class AgentMemoryStore(RepoMemoryStore):
             max_hits=3 if recall_subject else 4 if fresh_task_bootstrap else 6,
             max_per_type=3 if recall_subject else 1 if fresh_task_bootstrap else 2,
             summary_budget_chars=420 if recall_subject else 520 if fresh_task_bootstrap else 900,
-            allow_cross_project=use_case == "user_recall" or (use_case == "similar_task_lookup" and not fresh_task_bootstrap),
+            allow_cross_project=use_case == "user_recall",
         )
 
     def retrieve(self, request: RetrievalRequest) -> MemoryRetrievalResult:
