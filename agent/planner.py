@@ -13537,6 +13537,13 @@ class Planner:
         if len(scoped_requirements) < 2:
             return None
 
+        output_expectation = str(getattr(session.task_state, "output_expectation", "") or "").strip().lower()
+        strict_scope = (
+            len(explicit_paths) >= 3
+            or complexity_signals >= 10
+            or len(scoped_requirements) >= 3
+            or "not as a minimal scaffold" in output_expectation
+        )
         line_count = len([line for line in str(proposed_content or "").splitlines() if line.strip()])
         char_count = len(str(proposed_content or "").strip())
         thresholds = {
@@ -13552,8 +13559,23 @@ class Planner:
             ".tsx": (28, 850),
             ".py": (24, 700),
         }
+        strict_thresholds = {
+            ".html": (28, 850),
+            ".htm": (28, 850),
+            ".css": (36, 1_050),
+            ".scss": (36, 1_050),
+            ".sass": (36, 1_050),
+            ".less": (36, 1_050),
+            ".js": (32, 1_100),
+            ".jsx": (32, 1_100),
+            ".ts": (32, 1_100),
+            ".tsx": (32, 1_100),
+            ".py": (28, 850),
+        }
+        if strict_scope:
+            thresholds = strict_thresholds
         min_lines, min_chars = thresholds.get(suffix, (0, 0))
-        if line_count >= min_lines or char_count >= min_chars:
+        if line_count >= min_lines and char_count >= min_chars:
             return None
 
         requirement_preview = "; ".join(scoped_requirements[:3])

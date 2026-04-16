@@ -31527,6 +31527,185 @@ def test_pre_write_create_review_does_not_block_small_single_file_create(tmp_pat
     assert review.safe_to_write is True
 
 
+def test_pre_write_create_review_rejects_high_line_low_substance_css_bundle_draft(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+            "Anforderungen:\n"
+            "- mehrere Automodelle anzeigen\n"
+            "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+            "- funktionierende Suchfunktion nach Marke und Modell\n"
+            "- modernes, sauberes UI\n"
+            "- gutes UX\n"
+            "- responsive Layout\n"
+            "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+            "- keine Frameworks, nur HTML, CSS und JavaScript\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="styles.css",
+        proposed_content=(
+            "/* styles.css */\n\n"
+            "body {\n"
+            "    font-family: Arial, sans-serif;\n"
+            "    background-color: #f4f4f9;\n"
+            "    margin: 0;\n"
+            "    padding: 0;\n"
+            "}\n\n"
+            "header {\n"
+            "    background-color: #333;\n"
+            "    color: #fff;\n"
+            "    padding: 1rem 2rem;\n"
+            "    text-align: center;\n"
+            "}\n\n"
+            "nav input[type=\"text\"] {\n"
+            "    padding: 0.5rem;\n"
+            "    font-size: 1rem;\n"
+            "    border: none;\n"
+            "    border-radius: 4px 0 0 4px;\n"
+            "}\n\n"
+            "nav button {\n"
+            "    padding: 0.5rem 1rem;\n"
+            "    font-size: 1rem;\n"
+            "    border: none;\n"
+            "    background-color: #007BFF;\n"
+            "    color: #fff;\n"
+            "    border-radius: 0 4px 4px 0;\n"
+            "    cursor: pointer;\n"
+            "}\n\n"
+            "nav button:hover {\n"
+            "    background-color: #0056b3;\n"
+            "}\n\n"
+            "main {\n"
+            "    padding: 2rem;\n"
+            "}\n\n"
+            "ul#carList {\n"
+            "    list-style-type: none;\n"
+            "    padding: 0;\n"
+            "}\n\n"
+            "li.car-item {\n"
+            "    background-color: #fff;\n"
+            "    border-radius: 4px;\n"
+            "    margin-bottom: 1rem;\n"
+            "    padding: 1rem;\n"
+            "    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);\n"
+            "}\n\n"
+            "li.car-item h3 {\n"
+            "    margin-top: 0;\n"
+            "}\n\n"
+            "li.car-item p {\n"
+            "    color: #666;\n"
+            "}\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "too thin" in review.summary.lower()
+
+
+def test_pre_write_create_review_rejects_low_line_large_scope_script_draft(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+            "- index.html\n"
+            "- styles.css\n"
+            "- script.js\n\n"
+            "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+            "Anforderungen:\n"
+            "- mehrere Automodelle anzeigen\n"
+            "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+            "- funktionierende Suchfunktion nach Marke und Modell\n"
+            "- modernes, sauberes UI\n"
+            "- gutes UX\n"
+            "- responsive Layout\n"
+            "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+            "- keine Frameworks, nur HTML, CSS und JavaScript\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="script.js",
+        proposed_content=(
+            "// script.js\n\n"
+            "const cars = [\n"
+            "    { brand: \"BMW\", model: \"3 Series\", year: 2021, power: \"150 hp\", engine: \"1.5L\", fuelType: \"Petrol\", price: 45000, description: \"Efficient and powerful\" },\n"
+            "    { brand: \"Audi\", model: \"A4\", year: 2020, power: \"180 hp\", engine: \"2.0L\", fuelType: \"Diesel\", price: 50000, description: \"Luxurious and reliable\" },\n"
+            "    { brand: \"Mercedes-Benz\", model: \"C-Class\", year: 2019, power: \"200 hp\", engine: \"2.0L\", fuelType: \"Petrol\", price: 60000, description: \"Premium quality\" }\n"
+            "];\n\n"
+            "function renderCars() {\n"
+            "    const carList = document.getElementById('carList');\n"
+            "    carList.innerHTML = '';\n"
+            "    cars.forEach(car => {\n"
+            "        const li = document.createElement('li');\n"
+            "        li.textContent = `${car.brand} ${car.model}, ${car.year}, ${car.power}, ${car.engine}, ${car.fuelType}, $${car.price}`;\n"
+            "        carList.appendChild(li);\n"
+            "    });\n"
+            "}\n\n"
+            "function searchCars() {\n"
+            "    const searchInput = document.getElementById('searchInput').value.toLowerCase();\n"
+            "    const filteredCars = cars.filter(car => \n"
+            "        car.brand.toLowerCase().includes(searchInput) || \n"
+            "        car.model.toLowerCase().includes(searchInput)\n"
+            "    );\n"
+            "    renderCars(filteredCars);\n"
+            "}\n\n"
+            "renderCars();\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "too thin" in review.summary.lower()
+
+
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):
     payload = route_payload(
         intent="inspect",
