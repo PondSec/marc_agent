@@ -32827,6 +32827,43 @@ def test_pre_write_create_review_rejects_placeholder_html_bundle_scaffold_even_w
     assert any("placeholder" in issue.lower() or "repeat the above" in issue.lower() for issue in review.blocking_issues)
 
 
+def test_create_placeholder_review_allows_legitimate_html_placeholder_attribute(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine hochwertige kleine Web-App mit index.html, styles.css und script.js. "
+            "Keine Platzhalter-Kommentare, keine TODOs und keine halben Scaffolds."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._create_placeholder_scaffold_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<body>\n"
+            "  <label for=\"searchInput\">Suche</label>\n"
+            "  <input id=\"searchInput\" type=\"search\" placeholder=\"Suche nach Marke oder Modell\">\n"
+            "</body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review is None
+
+
 def test_starter_scope_requested_ignores_negative_scaffold_language(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

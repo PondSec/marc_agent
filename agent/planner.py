@@ -13796,18 +13796,18 @@ class Planner:
         if suffix not in {".html", ".htm", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx"}:
             return None
         lowered = str(proposed_content or "").lower()
-        scaffold_markers = (
-            "placeholder",
-            "repeat the above",
-            "todo",
-            "lorem ipsum",
-            "sample text",
-            "your text here",
-            "replace this",
-            "template -->",
-            "starter scaffold",
+        scaffold_patterns = (
+            (r"<!--[^>]*(?:placeholder|template|todo|repeat the above|replace this)[^>]*-->", "placeholder comment"),
+            (r"\bplaceholder\.(?:jpg|jpeg|png|gif|webp|svg)\b", "placeholder asset"),
+            (r"\brepeat the above\b", "repeat the above"),
+            (r"\btodo\b", "todo"),
+            (r"\blorem ipsum\b", "lorem ipsum"),
+            (r"\bsample text\b", "sample text"),
+            (r"\byour text here\b", "your text here"),
+            (r"\breplace this\b", "replace this"),
+            (r"\bstarter scaffold\b", "starter scaffold"),
         )
-        hits = [marker for marker in scaffold_markers if marker in lowered]
+        hits = [label for pattern, label in scaffold_patterns if re.search(pattern, lowered)]
         if not hits:
             return None
         return ProposedUpdateReview(
