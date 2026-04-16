@@ -32588,7 +32588,8 @@ def test_artifact_scoped_focus_extracts_inline_id_requirements_without_colon_lis
             "Erstelle in diesem leeren Workspace eine hochwertige kleine deutsche Auto-Inventar-Webapp mit genau drei Dateien: "
             "index.html, styles.css und script.js. Verwende nur HTML, CSS und Vanilla JavaScript. "
             "Die Oberfläche muss ein Suchfeld mit id searchInput, ein Select mit id typeFilter, ein Select mit id sortOrder, "
-            "ein Grid mit id inventoryGrid und einen Detailbereich mit id detailPanel enthalten."
+            "ein Grid mit id inventoryGrid und einen Detailbereich mit id detailPanel enthalten. "
+            "Keine Platzhalter-Kommentare, keine TODOs, keine halben Scaffolds und keine englischen UI-Beschriftungen."
         ),
         workspace_root=str(tmp_path),
         workspace_snapshot=empty_snapshot(tmp_path).model_copy(
@@ -32617,6 +32618,9 @@ def test_artifact_scoped_focus_extracts_inline_id_requirements_without_colon_lis
     assert "sortOrder" in index_focus["literal_constraints"]
     assert "inventoryGrid" in index_focus["literal_constraints"]
     assert "detailPanel" in index_focus["literal_constraints"]
+    assert "index.html" not in index_focus["literal_constraints"]
+    assert "styles.css" not in index_focus["literal_constraints"]
+    assert "script.js" not in index_focus["literal_constraints"]
 
 
 def test_generate_content_prompt_discourages_placeholder_markers_in_html_bundle(tmp_path):

@@ -7980,11 +7980,52 @@ def _identifier_list_candidates_from_text(text: str, *, limit: int = 8) -> list[
                 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{1,80}", candidate):
                     continue
                 token = candidate
+            if _structured_identifier_candidate_is_artifact_reference(token):
+                continue
             if token not in candidates:
                 candidates.append(token)
             if len(candidates) >= limit:
                 return candidates[:limit]
     return candidates[:limit]
+
+
+def _structured_identifier_candidate_is_artifact_reference(candidate: str) -> bool:
+    normalized = str(candidate or "").strip()
+    if not normalized:
+        return False
+    if "/" in normalized or "\\" in normalized:
+        return True
+    lowered = normalized.lower()
+    suffix = Path(lowered).suffix.lower()
+    return suffix in {
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".py",
+        ".pyi",
+        ".json",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".rst",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".xml",
+        ".svg",
+    }
 
 
 def _python_call_literal_contains_example_payload(candidate: str) -> bool:
