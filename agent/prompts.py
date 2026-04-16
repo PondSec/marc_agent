@@ -990,6 +990,14 @@ def generate_content_retry_prompt(
 ) -> str:
     web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
     request_text = session.task if session is not None else route.requested_outcome
+    if current_content is None and review_feedback is not None and session is not None:
+        return _focused_create_retry_prompt(
+            route,
+            session,
+            path=path,
+            review_feedback=review_feedback,
+            mode=mode,
+        )
     if mode != "full":
         if current_content is not None and repair_context is not None and session is not None:
             if review_feedback is not None:
@@ -1266,6 +1274,58 @@ def generate_content_retry_prompt(
         if file_creation_instruction:
             sections.append(file_creation_instruction)
         sections.append("Create the file from scratch. Return the full new file content only.")
+    sections.append("Do not add markdown fences or explanations.")
+    return "\n\n".join(sections)
+
+
+def _focused_create_retry_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    review_feedback: ProposedUpdateReview,
+    mode: str,
+) -> str:
+    request_text = session.task or route.requested_outcome
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
+    compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
+    request_digest = _compact_request_digest(
+        request_text,
+        snapshot=session.workspace_snapshot if session is not None else None,
+        max_chars=220 if mode == "full" else 160,
+    )
+    request_excerpt_limit = 280 if mode == "full" else 220
+    sections = [
+        "Produce the full file content for exactly one file.",
+        f"Target path: {path}",
+        f"Latest user request: {_trim_text(request_text, request_excerpt_limit)}",
+        f"File-scoped focus: {json.dumps(compact_focus, ensure_ascii=False)}",
+        _single_file_boundary_instruction(path, route.entities.target_paths),
+        (
+            "Previous create draft was rejected by the pre-write review. "
+            "The next draft must materially expand the file instead of returning another starter scaffold."
+        ),
+        f"Self-review feedback on the previous proposal: {json.dumps(_compact_proposed_update_review(review_feedback), ensure_ascii=False)}",
+        _direct_review_corrections(review_feedback),
+    ]
+    if request_digest:
+        sections.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+    explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 260 if mode == "full" else 180)
+    if explicit_constraints:
+        sections.append(f"Explicit constraints: {explicit_constraints}")
+    file_requirement_summary = _file_local_requirement_summary(file_focus)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
+    file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+    if file_creation_instruction:
+        sections.append(file_creation_instruction)
+    sections.append("Create the file from scratch. Return the full new file content only.")
     sections.append("Do not add markdown fences or explanations.")
     return "\n\n".join(sections)
 

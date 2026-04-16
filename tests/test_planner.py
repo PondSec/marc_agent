@@ -31706,6 +31706,81 @@ def test_pre_write_create_review_rejects_low_line_large_scope_script_draft(tmp_p
     assert "too thin" in review.summary.lower()
 
 
+def test_compact_create_retry_prompt_stays_file_focused_for_large_scope_retries(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    task = (
+        "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit:\n"
+        "- index.html\n"
+        "- styles.css\n"
+        "- script.js\n\n"
+        "Die Website soll professionell und hochwertig wirken, nicht wie eine Anfänger-Demo.\n\n"
+        "Anforderungen:\n"
+        "- mehrere Automodelle anzeigen\n"
+        "- pro Auto mehrere Daten anzeigen, z. B. Marke, Modell, Baujahr, Leistung, Motor, Kraftstoff, Preis, Beschreibung\n"
+        "- funktionierende Suchfunktion nach Marke und Modell\n"
+        "- modernes, sauberes UI\n"
+        "- gutes UX\n"
+        "- responsive Layout\n"
+        "- sauberer, wartbarer HTML-, CSS- und JS-Code\n"
+        "- keine Frameworks, nur HTML, CSS und JavaScript\n"
+    )
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website files."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    initial_prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        mode="compact",
+    )
+    retry_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file for index.html is still too thin for the current large-scope create request.",
+            confidence=0.84,
+            blocking_issues=[
+                "index.html only contains 19 non-empty lines / 488 characters, which is too small to credibly satisfy the active scoped requirements.",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Expand the file into a concrete first-pass implementation that materially covers the scoped requirements instead of returning a starter scaffold.",
+            ],
+        ),
+        mode="compact",
+    )
+
+    assert len(retry_prompt) < len(initial_prompt)
+    assert "Self-review feedback on the previous proposal" in retry_prompt
+    assert "File-local requirements:" in retry_prompt
+    assert "Memory context:" not in retry_prompt
+    assert "Diagnostic context:" not in retry_prompt
+
+
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):
     payload = route_payload(
         intent="inspect",
