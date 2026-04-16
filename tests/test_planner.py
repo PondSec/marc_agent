@@ -29366,6 +29366,95 @@ def test_planner_extends_compact_primary_generation_budget_for_repairs(tmp_path)
     assert total_timeout_seconds == 210
 
 
+def test_planner_extends_initial_compact_budget_for_large_new_create_scope(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+    task = (
+        "Erstelle eine vollständige Inventory-Weboberfläche im aktuellen Workspace mit genau drei Dateien: "
+        "index.html, styles.css und script.js. Nutze kein Framework und keine externen Libraries. "
+        "In index.html muss es eine Toolbar mit Suche und Filtern geben. Verwende exakt diese DOM-IDs: "
+        "searchInput, typeFilter, countryFilter, sortOrder, inventoryGrid, detailPanel. "
+        "Jedes Fahrzeug braucht mindestens die Felder id, brand, model, type, country, price, stock. "
+        "In script.js soll die Suche, Filterung, Sortierung und Detailansicht funktionieren. "
+        "In styles.css soll ein sauberes responsives Layout mit Karten und Detailpanel entstehen. "
+        "Das Ergebnis darf kein Minimal-Scaffold sein, sondern muss direkt benutzbar sein."
+    )
+    session = SessionState(
+        task=task,
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "create_artifact",
+                "reason": "Create the requested multi-file web app.",
+            }
+        ],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested inventory web app, not as a minimal scaffold.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.request_requirements = [
+        "Create exactly index.html, styles.css, and script.js.",
+        "Use the exact DOM IDs searchInput, typeFilter, countryFilter, sortOrder, inventoryGrid, detailPanel.",
+        "Implement search and filtering in script.js.",
+        "Implement sorting and detail panel behavior in script.js.",
+        "Render a responsive inventory grid in index.html and styles.css.",
+        "Avoid minimal scaffolding and make it directly usable.",
+    ]
+
+    timeout_seconds, total_timeout_seconds = planner._content_generation_time_budget(
+        prompt_variant="compact",
+        repair_context=None,
+        route=session.router_result,
+        session=session,
+        path="index.html",
+        current_content=None,
+    )
+
+    assert timeout_seconds == 75
+    assert total_timeout_seconds == 270
+
+
+def test_planner_keeps_small_initial_compact_budget_for_simple_new_file(tmp_path):
+    planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
+    session = SessionState(
+        task="Erstelle app.py mit einer kleinen greet(name)-Funktion.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=build_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[
+            {
+                "step": 1,
+                "action": "create_artifact",
+                "reason": "Create the requested helper module.",
+            }
+        ],
+        target_paths=["app.py"],
+        target_name="app.py",
+        requested_outcome="Create app.py with a tiny greeting helper.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+    session.task_state.request_requirements = ["Create app.py with greet(name)."]
+
+    timeout_seconds, total_timeout_seconds = planner._content_generation_time_budget(
+        prompt_variant="compact",
+        repair_context=None,
+        route=session.router_result,
+        session=session,
+        path="app.py",
+        current_content=None,
+    )
+
+    assert timeout_seconds == 60
+    assert total_timeout_seconds == 150
+
+
 def test_planner_extends_generation_retry_budget_after_no_start_failure(tmp_path):
     planner = Planner(ScriptedLLM(config=AppConfig(workspace_root=str(tmp_path))), "")
 

@@ -6669,6 +6669,10 @@ class Planner:
         timeout_seconds, total_timeout_seconds = self._content_generation_time_budget(
             prompt_variant=prompt_variant,
             repair_context=repair_context,
+            route=route,
+            session=session,
+            path=path,
+            current_content=current_content,
         )
         num_ctx = self._content_generation_num_ctx(prompt_variant)
         context_pressure = self._context_pressure_estimate(
@@ -7732,15 +7736,78 @@ class Planner:
         *,
         prompt_variant: str,
         repair_context: ValidationFailureEvidence | None,
+        route: RouterOutput | None = None,
+        session: SessionState | None = None,
+        path: str | None = None,
+        current_content: str | None = None,
     ) -> tuple[int, int]:
         compact_prompt = str(prompt_variant or "").strip() == "compact"
+        large_create_scope = (
+            current_content is None
+            and route is not None
+            and session is not None
+            and str(path or "").strip()
+            and self._large_create_scope_requested(route, session, path=str(path or "").strip())
+        )
         if compact_prompt:
-            timeout_seconds = max(self._llm_timeout(60), 60)
-            total_timeout = 210 if repair_context is not None else 150
+            timeout_seconds = max(self._llm_timeout(75 if large_create_scope else 60), 75 if large_create_scope else 60)
+            if repair_context is not None:
+                total_timeout = 210
+            else:
+                total_timeout = 270 if large_create_scope else 150
         else:
-            timeout_seconds = max(self._llm_timeout(75), 75)
-            total_timeout = 240 if repair_context is not None else 210
+            timeout_seconds = max(self._llm_timeout(90 if large_create_scope else 75), 90 if large_create_scope else 75)
+            if repair_context is not None:
+                total_timeout = 240
+            else:
+                total_timeout = 300 if large_create_scope else 210
         return timeout_seconds, max(self._llm_timeout(total_timeout), total_timeout)
+
+    def _large_create_scope_requested(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+    ) -> bool:
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            return False
+        suffix = Path(normalized_path).suffix.lower()
+        if suffix not in {".html", ".htm", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx", ".py"}:
+            return False
+        latest_user_turn = str(getattr(session.task_state, "latest_user_turn", "") or session.task or "").strip()
+        request_digest = getattr(session.task_state, "request_digest", None)
+
+        def digest_items(key: str) -> list[object]:
+            if isinstance(request_digest, dict):
+                value = request_digest.get(key, [])
+            else:
+                value = getattr(request_digest, key, [])
+            return list(value or [])
+
+        requirement_count = len(getattr(session.task_state, "request_requirements", []) or [])
+        explicit_paths = list(getattr(route.entities, "target_paths", []) or [])
+        complexity_signals = len(explicit_paths)
+        complexity_signals += len(digest_items("requirements"))
+        complexity_signals += len(digest_items("completion_criteria"))
+        if len(latest_user_turn) < 280 and complexity_signals < 7 and requirement_count < 6:
+            return False
+        scope = _artifact_scoped_focus(route, session, normalized_path, current_content="")
+        scoped_requirements = [
+            str(item or "").strip()
+            for item in scope.get("current_write_requirements", [])[:4]
+            if str(item or "").strip()
+        ]
+        if len(scoped_requirements) < 2:
+            return False
+        output_expectation = str(getattr(session.task_state, "output_expectation", "") or "").strip().lower()
+        return (
+            len(explicit_paths) >= 3
+            or complexity_signals >= 10
+            or len(scoped_requirements) >= 3
+            or "not as a minimal scaffold" in output_expectation
+        )
 
     def _startup_failure_exhausted(
         self,
