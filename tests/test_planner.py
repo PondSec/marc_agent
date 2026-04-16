@@ -32581,6 +32581,44 @@ def test_artifact_scoped_focus_ignores_earlier_non_identifier_colon_in_single_li
     assert "CSS" not in index_focus["literal_constraints"]
 
 
+def test_artifact_scoped_focus_extracts_inline_id_requirements_without_colon_lists(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine hochwertige kleine deutsche Auto-Inventar-Webapp mit genau drei Dateien: "
+            "index.html, styles.css und script.js. Verwende nur HTML, CSS und Vanilla JavaScript. "
+            "Die Oberfläche muss ein Suchfeld mit id searchInput, ein Select mit id typeFilter, ein Select mit id sortOrder, "
+            "ein Grid mit id inventoryGrid und einen Detailbereich mit id detailPanel enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    index_focus = _artifact_scoped_focus(session.router_result, session, "index.html", current_content="")
+
+    assert "searchInput" in index_focus["literal_constraints"]
+    assert "typeFilter" in index_focus["literal_constraints"]
+    assert "sortOrder" in index_focus["literal_constraints"]
+    assert "inventoryGrid" in index_focus["literal_constraints"]
+    assert "detailPanel" in index_focus["literal_constraints"]
+
+
 def test_web_bundle_script_focus_keeps_detail_interaction_requirements(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

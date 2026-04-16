@@ -7835,7 +7835,15 @@ def _structured_identifier_literal_candidates(text: str, *, limit: int = 8) -> l
         cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", raw_line).strip()
         if not cleaned_line:
             continue
+        inline_candidates = _inline_identifier_literal_candidates(cleaned_line, limit=limit)
         body = _structured_identifier_body(cleaned_line, lines, index=index)
+        if not inline_candidates and (not body or not _looks_like_structured_identifier_request(cleaned_line)):
+            continue
+        for candidate in inline_candidates:
+            if candidate not in candidates:
+                candidates.append(candidate)
+            if len(candidates) >= limit:
+                return candidates[:limit]
         if not body or not _looks_like_structured_identifier_request(cleaned_line):
             continue
         for candidate in _identifier_list_candidates_from_text(body):
@@ -7843,6 +7851,26 @@ def _structured_identifier_literal_candidates(text: str, *, limit: int = 8) -> l
                 candidates.append(candidate)
             if len(candidates) >= limit:
                 return candidates[:limit]
+    return candidates[:limit]
+
+
+def _inline_identifier_literal_candidates(text: str, *, limit: int = 8) -> list[str]:
+    candidates: list[str] = []
+    normalized = str(text or "").strip()
+    if not normalized:
+        return candidates
+    pattern = re.compile(
+        r"\b(?:id|ids|dom-id|dom ids|selector|selectors|class|classes|field|fields|key|keys|prop|props|property|properties|attribute|attributes)\b"
+        r"(?:\s*(?:=|:)\s*|\s+)([`\"']?)([A-Za-z_][A-Za-z0-9_.:-]{1,80})\1",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(normalized):
+        candidate = str(match.group(2) or "").strip()
+        if not candidate or candidate in candidates:
+            continue
+        candidates.append(candidate)
+        if len(candidates) >= limit:
+            return candidates[:limit]
     return candidates[:limit]
 
 
@@ -8047,7 +8075,8 @@ def _explicit_request_identifier_anchor_details(
         scoped_target = _request_line_explicit_target(cleaned_line, explicit_targets)
         if scoped_target:
             active_target = scoped_target
-        if not _looks_like_structured_identifier_request(cleaned_line):
+        inline_candidates = _inline_identifier_literal_candidates(cleaned_line)
+        if not inline_candidates and not _looks_like_structured_identifier_request(cleaned_line):
             continue
         if active_target and not _artifact_matches_path(path, active_target, active_target):
             continue
@@ -8056,6 +8085,18 @@ def _explicit_request_identifier_anchor_details(
             other_score = max((_artifact_specific_relevance_score(cleaned_line, other) for other in other_paths), default=0)
             if current_score <= 0 or current_score < other_score:
                 continue
+        for candidate in inline_candidates:
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "request_identifier_inline",
+                    "type": "must_source_anchor",
+                    "hard_source_constraint": True,
+                },
+            )
+        if not _looks_like_structured_identifier_request(cleaned_line):
+            continue
         body = _structured_identifier_body(cleaned_line, lines, index=index)
         for candidate in _identifier_list_candidates_from_text(body):
             _append_literal_anchor_detail(
