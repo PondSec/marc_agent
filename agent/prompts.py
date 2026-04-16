@@ -1355,6 +1355,15 @@ def _focused_create_retry_prompt(
     review_feedback: ProposedUpdateReview,
     mode: str,
 ) -> str:
+    if _review_has_only_missing_literal_blockers(review_feedback, path=path):
+        return _focused_create_literal_retry_prompt(
+            route,
+            session,
+            path=path,
+            prior_proposed_content=prior_proposed_content,
+            review_feedback=review_feedback,
+            mode=mode,
+        )
     request_text = session.task or route.requested_outcome
     file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
     compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
@@ -1430,6 +1439,92 @@ def _focused_create_retry_prompt(
         sections.append("Revise this working draft into the complete final file. Return the full updated file content only.")
     else:
         sections.append("Create the file from scratch. Return the full new file content only.")
+    sections.append("Do not add markdown fences or explanations.")
+    return "\n\n".join(sections)
+
+
+def _focused_create_literal_retry_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    prior_proposed_content: str | None,
+    review_feedback: ProposedUpdateReview,
+    mode: str,
+) -> str:
+    request_text = session.task or route.requested_outcome
+    file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
+    compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
+    related_context = _compact_related_file_context(session, path, compact=True)
+    working_draft = str(prior_proposed_content or "").strip()
+    working_draft_budget = 1800 if mode == "full" else 1400
+    working_draft_complete = bool(working_draft) and len(working_draft) <= working_draft_budget
+    working_draft_snippet = (
+        working_draft
+        if working_draft_complete
+        else _trim_balanced_text(working_draft, working_draft_budget)
+        if working_draft
+        else ""
+    )
+    request_digest = _compact_request_digest(
+        request_text,
+        snapshot=session.workspace_snapshot if session is not None else None,
+        max_chars=180 if mode == "full" else 140,
+    )
+    missing_literals = _review_missing_literal_list(review_feedback, path=path, limit=6)
+    request_excerpt_limit = 240 if mode == "full" else 180
+    sections = [
+        "Produce the full file content for exactly one file.",
+        f"Target path: {path}",
+        f"Latest user request: {_trim_text(request_text, request_excerpt_limit)}",
+        f"File-scoped focus: {json.dumps(compact_focus, ensure_ascii=False)}",
+        _single_file_boundary_instruction(path, route.entities.target_paths),
+        (
+            "Targeted create retry objective: keep the working draft intact where it is already correct, "
+            "and add the exact missing source literals that blocked the write."
+        ),
+    ]
+    if missing_literals:
+        sections.append(
+            "Missing exact source literals for this retry: "
+            + " | ".join(f"`{literal}`" for literal in missing_literals)
+        )
+    if request_digest:
+        sections.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+    explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 220 if mode == "full" else 160)
+    if explicit_constraints:
+        sections.append(f"Explicit constraints: {explicit_constraints}")
+    exact_literal_checklist = _exact_source_literal_checklist(
+        file_focus,
+        path=path,
+        review_feedback=review_feedback,
+    )
+    if exact_literal_checklist:
+        sections.append(exact_literal_checklist)
+    if working_draft_snippet:
+        draft_label = (
+            "Current working draft to revise:"
+            if working_draft_complete
+            else "Current working draft excerpt to revise:"
+        )
+        sections.append(draft_label + "\n" + working_draft_snippet)
+        sections.append(
+            "Preserve the already-correct hooks and structure from this draft. Add the missing literals in real source syntax with the smallest structural change that makes them meaningful for this file."
+        )
+    file_requirement_summary = _file_local_requirement_summary(file_focus, limit=2)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
+    if related_context != "none":
+        sections.append(f"Related file hints: {related_context}")
+    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
+    sections.append(
+        "Do not redesign the file from scratch. Return the full updated file content only after the missing literals are actually present."
+    )
     sections.append("Do not add markdown fences or explanations.")
     return "\n\n".join(sections)
 
@@ -3303,6 +3398,33 @@ def _review_missing_literal_list(
         if len(literals) >= limit:
             break
     return literals
+
+
+def _review_has_only_missing_literal_blockers(
+    review: ProposedUpdateReview | None,
+    *,
+    path: str | None = None,
+) -> bool:
+    if review is None:
+        return False
+    missing_literals = _review_missing_literal_list(review, path=path, limit=8)
+    if not missing_literals:
+        return False
+    normalized_path = str(path or "").strip()
+    blocking_issues = [str(item or "").strip() for item in getattr(review, "blocking_issues", []) if str(item or "").strip()]
+    if not blocking_issues:
+        return False
+    for issue in blocking_issues:
+        literal_match = re.match(
+            r"^The exact requested literal is missing from (?P<path>[^:]+): (?P<literal>.+)$",
+            issue,
+        )
+        if literal_match is None:
+            return False
+        issue_path = str(literal_match.group("path") or "").strip()
+        if normalized_path and issue_path and issue_path != normalized_path:
+            return False
+    return True
 
 
 def _exact_source_literal_checklist(

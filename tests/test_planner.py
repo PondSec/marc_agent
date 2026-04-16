@@ -32344,6 +32344,10 @@ def test_focused_create_retry_prompt_prioritizes_missing_exact_literal_checklist
     assert "If any literal from this checklist is still missing, the draft will be rejected again before write." in retry_prompt
     assert "Satisfy these literals in real source syntax for this file" in retry_prompt
     assert "For HTML, identifier-style literals should appear as real markup hooks" in retry_prompt
+    assert "Targeted create retry objective: keep the working draft intact" in retry_prompt
+    assert "Missing exact source literals for this retry: `detailPanel`" in retry_prompt
+    assert "Do not redesign the file from scratch." in retry_prompt
+    assert "The next draft must materially expand the file" not in retry_prompt
 
 
 def test_compact_create_retry_prompt_keeps_full_rejected_draft_when_budget_allows(tmp_path):
