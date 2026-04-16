@@ -32348,6 +32348,8 @@ def test_focused_create_retry_prompt_prioritizes_missing_exact_literal_checklist
     assert "Missing exact source literals for this retry: `detailPanel`" in retry_prompt
     assert "Do not redesign the file from scratch." in retry_prompt
     assert "The next draft must materially expand the file" not in retry_prompt
+    assert "User request digest:" not in retry_prompt
+    assert "File-local requirements:" not in retry_prompt
 
 
 def test_compact_create_retry_prompt_keeps_full_rejected_draft_when_budget_allows(tmp_path):

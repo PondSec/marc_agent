@@ -1454,8 +1454,6 @@ def _focused_create_literal_retry_prompt(
 ) -> str:
     request_text = session.task or route.requested_outcome
     file_focus = _artifact_scoped_focus(route, session, path, current_content=None)
-    compact_focus = _compact_generation_file_focus(file_focus, target_path=path)
-    related_context = _compact_related_file_context(session, path, compact=True)
     working_draft = str(prior_proposed_content or "").strip()
     working_draft_budget = 1800 if mode == "full" else 1400
     working_draft_complete = bool(working_draft) and len(working_draft) <= working_draft_budget
@@ -1466,18 +1464,12 @@ def _focused_create_literal_retry_prompt(
         if working_draft
         else ""
     )
-    request_digest = _compact_request_digest(
-        request_text,
-        snapshot=session.workspace_snapshot if session is not None else None,
-        max_chars=180 if mode == "full" else 140,
-    )
     missing_literals = _review_missing_literal_list(review_feedback, path=path, limit=6)
-    request_excerpt_limit = 240 if mode == "full" else 180
+    request_excerpt_limit = 180 if mode == "full" else 140
     sections = [
         "Produce the full file content for exactly one file.",
         f"Target path: {path}",
         f"Latest user request: {_trim_text(request_text, request_excerpt_limit)}",
-        f"File-scoped focus: {json.dumps(compact_focus, ensure_ascii=False)}",
         _single_file_boundary_instruction(path, route.entities.target_paths),
         (
             "Targeted create retry objective: keep the working draft intact where it is already correct, "
@@ -1489,11 +1481,6 @@ def _focused_create_literal_retry_prompt(
             "Missing exact source literals for this retry: "
             + " | ".join(f"`{literal}`" for literal in missing_literals)
         )
-    if request_digest:
-        sections.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
-    explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 220 if mode == "full" else 160)
-    if explicit_constraints:
-        sections.append(f"Explicit constraints: {explicit_constraints}")
     exact_literal_checklist = _exact_source_literal_checklist(
         file_focus,
         path=path,
@@ -1511,17 +1498,13 @@ def _focused_create_literal_retry_prompt(
         sections.append(
             "Preserve the already-correct hooks and structure from this draft. Add the missing literals in real source syntax with the smallest structural change that makes them meaningful for this file."
         )
-    file_requirement_summary = _file_local_requirement_summary(file_focus, limit=2)
-    if file_requirement_summary:
-        sections.append(file_requirement_summary)
-    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
-    if grounding_instruction:
-        sections.append(grounding_instruction)
-    if related_context != "none":
-        sections.append(f"Related file hints: {related_context}")
-    web_bundle_contract = _explicit_web_bundle_contract_instruction(route, path)
-    if web_bundle_contract:
-        sections.append(web_bundle_contract)
+    related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
+    if related_targets:
+        sections.append(
+            "Keep existing shared hooks stable for companion files "
+            + _format_list(related_targets)
+            + ", but fix only this file in this retry."
+        )
     sections.append(
         "Do not redesign the file from scratch. Return the full updated file content only after the missing literals are actually present."
     )
