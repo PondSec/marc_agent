@@ -32748,6 +32748,152 @@ def test_pre_write_create_review_rejects_missing_exact_identifier_literals_for_n
     assert any("searchInput" in issue for issue in review.blocking_issues)
 
 
+def test_local_web_reference_review_rejects_unresolved_extra_bundle_assets(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine hochwertige kleine deutsche Auto-Inventar-Webapp "
+            "mit genau drei Dateien: index.html, styles.css und script.js."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._local_web_reference_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head>\n"
+            "  <meta charset=\"UTF-8\">\n"
+            "  <link rel=\"stylesheet\" href=\"styles.css\">\n"
+            "</head>\n"
+            "<body>\n"
+            "  <div id=\"inventoryGrid\">\n"
+            "    <img src=\"example-car-1.jpg\" alt=\"Auto\">\n"
+            "  </div>\n"
+            "  <section id=\"detailPanel\"></section>\n"
+            "  <script src=\"script.js\"></script>\n"
+            "</body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert "not available" in review.summary.lower()
+    assert any("example-car-1.jpg" in issue for issue in review.blocking_issues)
+
+
+def test_local_web_reference_review_allows_explicit_targets_and_existing_assets(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    assets_dir = tmp_path / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "logo.svg").write_text("<svg></svg>\n", encoding="utf-8")
+    session = SessionState(
+        task="Erstelle in diesem leeren Workspace eine kleine Web-App mit index.html, styles.css und script.js.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js", "assets/logo.svg"],
+                "focus_files": ["index.html", "styles.css", "script.js", "assets/logo.svg"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._local_web_reference_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head>\n"
+            "  <meta charset=\"UTF-8\">\n"
+            "  <link rel=\"stylesheet\" href=\"styles.css\">\n"
+            "</head>\n"
+            "<body>\n"
+            "  <img src=\"assets/logo.svg\" alt=\"Logo\">\n"
+            "  <section id=\"inventoryGrid\"></section>\n"
+            "  <section id=\"detailPanel\"></section>\n"
+            "  <script src=\"script.js\"></script>\n"
+            "</body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review is None
+
+
+def test_local_web_reference_review_rejects_unresolved_script_asset_strings(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task="Erstelle eine kleine Web-App mit index.html, styles.css und script.js.",
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="script.js",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._local_web_reference_review(
+        session.router_result,
+        session,
+        path="script.js",
+        proposed_content=(
+            "const preview = document.createElement('img');\n"
+            "preview.src = 'example.jpg';\n"
+            "document.getElementById('detailPanel')?.appendChild(preview);\n"
+        ),
+    )
+
+    assert review is not None
+    assert review.safe_to_write is False
+    assert any("example.jpg" in issue for issue in review.blocking_issues)
+
+
 def test_pre_write_create_review_rejects_invalid_javascript_token_soup(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     review = planner._pre_write_create_review(

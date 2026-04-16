@@ -4,6 +4,7 @@ import ast
 from dataclasses import dataclass, field
 import difflib
 import hashlib
+from html.parser import HTMLParser
 import io
 import json
 from pathlib import Path
@@ -242,6 +243,41 @@ WEB_CONTRACT_SUFFIXES = (
     | WEB_CONTRACT_CSS_SUFFIXES
     | WEB_CONTRACT_SCRIPT_SUFFIXES
 )
+LOCAL_WEB_REFERENCE_SUFFIXES = {
+    ".avif",
+    ".cjs",
+    ".css",
+    ".gif",
+    ".htm",
+    ".html",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".jsx",
+    ".less",
+    ".md",
+    ".mjs",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".otf",
+    ".png",
+    ".scss",
+    ".svg",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".wav",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
 WEB_CONTRACT_BEHAVIORAL_HTML_TAGS = {
     "button",
     "details",
@@ -371,6 +407,21 @@ class WebContractFinding:
     token: str
     source_paths: tuple[str, ...]
     summary: str
+
+
+class _PlannerHTMLReferenceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        del tag
+        for key, value in attrs:
+            if key not in {"src", "href"} or not value:
+                continue
+            cleaned = str(value).split("#", 1)[0].split("?", 1)[0].strip()
+            if cleaned:
+                self.references.append(cleaned)
 
 
 @dataclass(slots=True)
@@ -8366,6 +8417,143 @@ class Planner:
     def _path_is_web_contract_script(self, path: str) -> bool:
         return Path(path).suffix.lower() in WEB_CONTRACT_SCRIPT_SUFFIXES
 
+    def _local_web_reference_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        unresolved = self._unresolved_local_web_references(
+            route,
+            session,
+            path=path,
+            proposed_content=proposed_content,
+        )
+        if not unresolved:
+            return None
+        reference_preview = ", ".join(unresolved[:4])
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed web artifact introduces local file references that are not available in the requested bundle or workspace.",
+            confidence=0.96,
+            blocking_issues=[
+                f"{path} references local file(s) that are not currently available: {reference_preview}",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Keep the generated web bundle self-contained: remove unresolved local file references or ensure the referenced files already exist in the workspace.",
+                "If the request only names HTML, CSS, and JavaScript artifacts, do not invent extra local asset files unless you also create them as explicit targets.",
+            ],
+        )
+
+    def _unresolved_local_web_references(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> list[str]:
+        normalized_path = str(path or "").strip()
+        if not normalized_path or not self._path_is_web_contract_artifact(normalized_path):
+            return []
+        workspace_root = Path(session.workspace_root).resolve()
+        source_file = (workspace_root / normalized_path).resolve()
+        allowed_paths = {
+            candidate
+            for candidate in [
+                *self._explicit_target_paths(route, session),
+                *(str(item.path or "").strip() for item in session.changed_files),
+            ]
+            if str(candidate or "").strip()
+        }
+        unresolved: list[str] = []
+        for reference in self._local_web_reference_candidates(normalized_path, proposed_content):
+            resolved_path = self._resolve_local_web_reference_path(
+                source_file=source_file,
+                workspace_root=workspace_root,
+                reference=reference,
+            )
+            if resolved_path is None or resolved_path == normalized_path:
+                continue
+            if resolved_path in allowed_paths:
+                continue
+            if (workspace_root / resolved_path).exists():
+                continue
+            if reference not in unresolved:
+                unresolved.append(reference)
+        return unresolved[:6]
+
+    def _local_web_reference_candidates(
+        self,
+        path: str,
+        content: str,
+    ) -> list[str]:
+        suffix = Path(str(path or "").strip()).suffix.lower()
+        if suffix not in WEB_CONTRACT_SUFFIXES:
+            return []
+        references: list[str] = []
+        if suffix in WEB_CONTRACT_HTML_SUFFIXES:
+            parser = _PlannerHTMLReferenceParser()
+            parser.feed(str(content or ""))
+            references.extend(parser.references)
+        if suffix in WEB_CONTRACT_CSS_SUFFIXES:
+            references.extend(
+                str(match or "").strip()
+                for _quote, match in re.findall(
+                    r"url\(\s*([\"']?)([^)\"']+)\1\s*\)",
+                    str(content or ""),
+                    flags=re.IGNORECASE,
+                )
+            )
+        if suffix in WEB_CONTRACT_HTML_SUFFIXES | WEB_CONTRACT_CSS_SUFFIXES | WEB_CONTRACT_SCRIPT_SUFFIXES:
+            references.extend(
+                str(match or "").strip()
+                for match in re.findall(
+                    r"""['"]([^"'\\\n]*(?:/[^"'\\\n]*)?\.[A-Za-z0-9]{2,8})['"]""",
+                    str(content or ""),
+                )
+            )
+        candidates: list[str] = []
+        for reference in references:
+            cleaned = self._normalized_local_web_reference_candidate(reference)
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+        return candidates[:12]
+
+    def _normalized_local_web_reference_candidate(self, reference: str) -> str | None:
+        cleaned = str(reference or "").split("#", 1)[0].split("?", 1)[0].strip()
+        if not cleaned or "${" in cleaned:
+            return None
+        lowered = cleaned.lower()
+        if lowered.startswith(("http://", "https://", "data:", "mailto:", "javascript:")):
+            return None
+        suffix = Path(cleaned).suffix.lower()
+        if suffix not in LOCAL_WEB_REFERENCE_SUFFIXES:
+            return None
+        return cleaned
+
+    def _resolve_local_web_reference_path(
+        self,
+        *,
+        source_file: Path,
+        workspace_root: Path,
+        reference: str,
+    ) -> str | None:
+        cleaned = str(reference or "").strip()
+        if not cleaned:
+            return None
+        if cleaned.startswith("/"):
+            resolved = (workspace_root / cleaned.lstrip("/")).resolve()
+        else:
+            resolved = (source_file.parent / cleaned).resolve()
+        try:
+            return resolved.relative_to(workspace_root).as_posix()
+        except ValueError:
+            return cleaned.lstrip("/")
+
     def _normalize_web_hook_token(self, token: str) -> str | None:
         candidate = str(token or "").strip()
         if not candidate or not re.fullmatch(r"[A-Za-z_][\w-]*", candidate):
@@ -8792,6 +8980,14 @@ class Planner:
         path: str,
         proposed_content: str,
     ) -> ProposedUpdateReview | None:
+        local_reference_review = self._local_web_reference_review(
+            route,
+            session,
+            path=path,
+            proposed_content=proposed_content,
+        )
+        if local_reference_review is not None:
+            return local_reference_review
         findings, _, inventories = self._web_contract_analysis(
             session,
             route=route,
