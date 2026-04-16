@@ -32190,6 +32190,48 @@ def test_focused_create_prompt_prefers_dom_hooks_over_html_head_boilerplate(tmp_
     assert "<title>" not in related_section
 
 
+def test_artifact_scoped_focus_keeps_exact_identifier_lists_as_literal_constraints(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette, browserfertige Auto-Inventar-Webseite nur mit genau "
+            "diesen drei Dateien: index.html, styles.css und script.js.\n\n"
+            "Pflicht fuer index.html:\n"
+            "- benutze exakt diese DOM-IDs, weil die Dateien sauber zusammenarbeiten sollen:\n"
+            "  searchInput, typeFilter, countryFilter, sortOrder, inventoryGrid, detailPanel\n"
+            "- binde styles.css und script.js korrekt ein\n\n"
+            "Pflicht fuer script.js:\n"
+            "- jedes Fahrzeug braucht mindestens: id, brand, model, type, country, price, stock\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    index_focus = _artifact_scoped_focus(session.router_result, session, "index.html", current_content="")
+    script_focus = _artifact_scoped_focus(session.router_result, session, "script.js", current_content="")
+
+    assert "searchInput" in index_focus["literal_constraints"]
+    assert "detailPanel" in index_focus["literal_constraints"]
+    assert "id" in script_focus["literal_constraints"]
+    assert "stock" in script_focus["literal_constraints"]
+
+
 def test_web_bundle_script_focus_keeps_detail_interaction_requirements(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(
@@ -32227,6 +32269,53 @@ def test_web_bundle_script_focus_keeps_detail_interaction_requirements(tmp_path)
     script_focus = _artifact_scoped_focus(session.router_result, session, "script.js", current_content="")
 
     assert any("detail" in item.lower() or "klickbar" in item.lower() for item in script_focus["current_write_requirements"])
+
+
+def test_pre_write_create_review_rejects_missing_exact_identifier_literals_for_new_file(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette, browserfertige Auto-Inventar-Webseite nur mit genau "
+            "diesen drei Dateien: index.html, styles.css und script.js.\n\n"
+            "Pflicht fuer index.html:\n"
+            "- benutze exakt diese DOM-IDs, weil die Dateien sauber zusammenarbeiten sollen:\n"
+            "  searchInput, typeFilter, countryFilter, sortOrder, inventoryGrid, detailPanel\n"
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Auto-Inventar</title></head>\n"
+            "<body><main><section id=\"filters\"></section><ul id=\"inventory\"></ul></main></body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert any("searchInput" in issue for issue in review.blocking_issues)
 
 
 def test_pre_write_create_review_rejects_invalid_javascript_token_soup(tmp_path):

@@ -3192,7 +3192,7 @@ def _compact_generation_file_focus(
         "artifact_role": file_focus.get("artifact_role"),
         "literal_constraints": [
             _trim_text(str(item or "").strip(), 100)
-            for item in file_focus.get("literal_constraints", [])[:4]
+            for item in file_focus.get("literal_constraints", [])[:8]
             if str(item or "").strip()
         ],
         "current_write_requirements": current_requirements[:4],
@@ -6886,7 +6886,7 @@ def _artifact_scoped_focus(
         "target_path": path,
         "artifact_kind": current_artifact_kind,
         "artifact_role": current_artifact_role,
-        "literal_constraints": literal_constraints[:4],
+        "literal_constraints": literal_constraints[:8],
         "literal_anchor_details": literal_anchor_details[:6],
         "current_write_requirements": current_requirements[:4],
         "other_pending_requirements": other_requirements[:4],
@@ -7793,7 +7793,114 @@ def _request_literal_candidates(text: str) -> list[str]:
             if len(candidate) < 8 or candidate in candidates:
                 continue
             candidates.append(candidate)
+    for candidate in _structured_identifier_literal_candidates(normalized):
+        if candidate not in candidates:
+            candidates.append(candidate)
     return candidates[:8]
+
+
+def _structured_identifier_literal_candidates(text: str, *, limit: int = 8) -> list[str]:
+    candidates: list[str] = []
+    lines = [str(line or "") for line in str(text or "").splitlines()]
+    for index, raw_line in enumerate(lines):
+        cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", raw_line).strip()
+        if not cleaned_line:
+            continue
+        body = _structured_identifier_body(cleaned_line, lines, index=index)
+        if not body or not _looks_like_structured_identifier_request(cleaned_line):
+            continue
+        for candidate in _identifier_list_candidates_from_text(body):
+            if candidate not in candidates:
+                candidates.append(candidate)
+            if len(candidates) >= limit:
+                return candidates[:limit]
+    return candidates[:limit]
+
+
+def _structured_identifier_body(text: str, lines: list[str], *, index: int) -> str:
+    cleaned_text = str(text or "").strip()
+    if ":" in cleaned_text:
+        after = cleaned_text.split(":", 1)[1].strip()
+        if after:
+            return after
+    if index + 1 >= len(lines):
+        return ""
+    next_line = re.sub(r"^\s*[-*•]+\s*", "", str(lines[index + 1] or "")).strip()
+    return next_line
+
+
+def _looks_like_structured_identifier_request(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    exact_markers = (
+        "exact",
+        "exactly",
+        "exakt",
+        "genau",
+        "use",
+        "benutze",
+        "nutze",
+        "verwende",
+        "keep",
+        "preserve",
+        "behalte",
+        "mindestens",
+        "at least",
+        "must include",
+        "muss",
+        "braucht",
+        "should have",
+    )
+    identifier_markers = (
+        "id",
+        "ids",
+        "dom-id",
+        "dom ids",
+        "selector",
+        "selectors",
+        "class",
+        "classes",
+        "field",
+        "fields",
+        "key",
+        "keys",
+        "prop",
+        "props",
+        "property",
+        "properties",
+        "attribute",
+        "attributes",
+    )
+    return any(marker in normalized for marker in exact_markers) and any(
+        marker in normalized for marker in identifier_markers
+    )
+
+
+def _identifier_list_candidates_from_text(text: str, *, limit: int = 8) -> list[str]:
+    candidates: list[str] = []
+    normalized = str(text or "").strip()
+    if not normalized:
+        return candidates
+    parts = re.split(r",\s*", normalized)
+    for part in parts:
+        fragments = re.split(r"\s+(?:und|and|oder|or|either|entweder|sowie)\s+", part)
+        for fragment in fragments:
+            candidate = str(fragment or "").strip(" .;:-")
+            candidate = re.sub(r"^(?:either|entweder|mindestens|at|least)\s+", "", candidate, flags=re.IGNORECASE)
+            if not candidate:
+                continue
+            if candidate.startswith("--"):
+                token = candidate
+            else:
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{1,80}", candidate):
+                    continue
+                token = candidate
+            if token not in candidates:
+                candidates.append(token)
+            if len(candidates) >= limit:
+                return candidates[:limit]
+    return candidates[:limit]
 
 
 def _python_call_literal_contains_example_payload(candidate: str) -> bool:
@@ -7835,6 +7942,12 @@ def _literal_anchor_details(
         current_content=current_content,
     ):
         _append_literal_anchor_detail(details, detail)
+    for detail in _explicit_request_identifier_anchor_details(
+        route,
+        session,
+        path=path,
+    ):
+        _append_literal_anchor_detail(details, detail)
     for detail in _generation_literal_anchor_details(
         route,
         session,
@@ -7851,6 +7964,65 @@ def _literal_anchor_details(
         ):
             _append_literal_anchor_detail(details, detail)
     return details[:8]
+
+
+def _explicit_request_identifier_anchor_details(
+    route: RouterOutput,
+    session: SessionState | None,
+    *,
+    path: str,
+) -> list[dict[str, object]]:
+    request_text = _request_text_for_literals(route, session)
+    if not request_text:
+        return []
+    explicit_targets = [
+        str(item or "").strip()
+        for item in getattr(getattr(route, "entities", None), "target_paths", []) or []
+        if str(item or "").strip()
+    ]
+    other_paths = [candidate for candidate in explicit_targets if not _artifact_matches_path(path, candidate, candidate)]
+    active_target: str | None = None
+    details: list[dict[str, object]] = []
+    lines = [str(line or "") for line in request_text.splitlines()]
+    for index, raw_line in enumerate(lines):
+        cleaned_line = re.sub(r"^\s*[-*•]+\s*", "", raw_line).strip()
+        if not cleaned_line:
+            continue
+        scoped_target = _request_line_explicit_target(cleaned_line, explicit_targets)
+        if scoped_target:
+            active_target = scoped_target
+        if not _looks_like_structured_identifier_request(cleaned_line):
+            continue
+        if active_target and not _artifact_matches_path(path, active_target, active_target):
+            continue
+        if not active_target and explicit_targets:
+            current_score = _artifact_specific_relevance_score(cleaned_line, path)
+            other_score = max((_artifact_specific_relevance_score(cleaned_line, other) for other in other_paths), default=0)
+            if current_score <= 0 or current_score < other_score:
+                continue
+        body = _structured_identifier_body(cleaned_line, lines, index=index)
+        for candidate in _identifier_list_candidates_from_text(body):
+            _append_literal_anchor_detail(
+                details,
+                {
+                    "value": candidate,
+                    "source": "request_identifier_list",
+                    "type": "must_source_anchor",
+                    "hard_source_constraint": True,
+                },
+            )
+    return details[:8]
+
+
+def _request_line_explicit_target(line: str, explicit_targets: list[str]) -> str | None:
+    best_target = ""
+    best_score = 0
+    for target in explicit_targets:
+        score = _artifact_specific_relevance_score(line, target)
+        if score > best_score:
+            best_target = target
+            best_score = score
+    return best_target or None
 
 
 def _append_literal_anchor_detail(
