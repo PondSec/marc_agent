@@ -32233,6 +32233,119 @@ def test_compact_create_retry_prompt_revises_rejected_draft_instead_of_restartin
     assert "Create the file from scratch." not in retry_prompt
 
 
+def test_focused_create_prompt_surfaces_exact_source_literal_checklist_for_identifier_heavy_bundle(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine hochwertige kleine deutsche Auto-Inventar-Webapp mit genau drei Dateien: "
+            "index.html, styles.css und script.js. Verwende nur HTML, CSS und Vanilla JavaScript. "
+            "Die Oberfläche muss ein Suchfeld mit id searchInput, ein Select mit id typeFilter, ein Select mit id sortOrder, "
+            "ein Grid mit id inventoryGrid und einen Detailbereich mit id detailPanel enthalten. "
+            "Keine Frameworks, keine TODOs, keine halben Scaffolds."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert "Exact source literal checklist for this file:" in prompt
+    assert "`searchInput`" in prompt
+    assert "`typeFilter`" in prompt
+    assert "`sortOrder`" in prompt
+    assert "`inventoryGrid`" in prompt
+    assert "`detailPanel`" in prompt
+    assert "For HTML, identifier-style literals should appear as real markup hooks" in prompt
+
+
+def test_focused_create_retry_prompt_prioritizes_missing_exact_literal_checklist(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine hochwertige kleine deutsche Auto-Inventar-Webapp mit genau drei Dateien: "
+            "index.html, styles.css und script.js. Verwende nur HTML, CSS und Vanilla JavaScript. "
+            "Die Oberfläche muss ein Suchfeld mit id searchInput, ein Select mit id typeFilter, ein Select mit id sortOrder, "
+            "ein Grid mit id inventoryGrid und einen Detailbereich mit id detailPanel enthalten. "
+            "Keine Frameworks, keine TODOs, keine halben Scaffolds."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested web bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    retry_prompt = generate_content_retry_prompt(
+        session.router_result,
+        session,
+        path="index.html",
+        current_content=None,
+        prior_proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head><meta charset=\"UTF-8\"><title>Auto-Inventar</title></head>\n"
+            "<body><main><input id=\"searchInput\"><select id=\"typeFilter\"></select><select id=\"sortOrder\"></select><div id=\"inventoryGrid\"></div></main></body>\n"
+            "</html>\n"
+        ),
+        review_feedback=ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file misses an explicit literal constraint from the request.",
+            confidence=0.99,
+            blocking_issues=[
+                "The exact requested literal is missing from index.html: detailPanel",
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Keep the new file aligned with the exact requested literals when they are part of the required output.",
+            ],
+        ),
+        mode="compact",
+    )
+
+    assert "Exact source literal checklist for this file:" in retry_prompt
+    assert "Missing from the rejected draft and must be added now: `detailPanel`" in retry_prompt
+    assert "If any literal from this checklist is still missing, the draft will be rejected again before write." in retry_prompt
+    assert "Satisfy these literals in real source syntax for this file" in retry_prompt
+    assert "For HTML, identifier-style literals should appear as real markup hooks" in retry_prompt
+
+
 def test_compact_create_retry_prompt_keeps_full_rejected_draft_when_budget_allows(tmp_path):
     planner = Planner(ScriptedLLM(), "")
     session = SessionState(

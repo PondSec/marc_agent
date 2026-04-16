@@ -1016,6 +1016,9 @@ def _focused_create_prompt(
         sections.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
     if explicit_constraints != "none":
         sections.append(f"Explicit constraints: {explicit_constraints}")
+    exact_literal_checklist = _exact_source_literal_checklist(file_focus, path=path)
+    if exact_literal_checklist:
+        sections.append(exact_literal_checklist)
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
@@ -1390,6 +1393,13 @@ def _focused_create_retry_prompt(
     explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 260 if mode == "full" else 180)
     if explicit_constraints:
         sections.append(f"Explicit constraints: {explicit_constraints}")
+    exact_literal_checklist = _exact_source_literal_checklist(
+        file_focus,
+        path=path,
+        review_feedback=review_feedback,
+    )
+    if exact_literal_checklist:
+        sections.append(exact_literal_checklist)
     if working_draft_snippet:
         draft_label = (
             "Current working draft to revise:"
@@ -1459,6 +1469,13 @@ def _focused_create_continuation_prompt(
     explicit_constraints = _trim_text(_explicit_generation_constraints(route, session), 180)
     if explicit_constraints:
         sections.append(f"Explicit constraints: {explicit_constraints}")
+    exact_literal_checklist = _exact_source_literal_checklist(
+        file_focus,
+        path=path,
+        review_feedback=review_feedback,
+    )
+    if exact_literal_checklist:
+        sections.append(exact_literal_checklist)
     file_requirement_summary = _file_local_requirement_summary(file_focus)
     if file_requirement_summary:
         sections.append(file_requirement_summary)
@@ -3259,6 +3276,97 @@ def _file_local_requirement_summary(file_focus: dict[str, object], *, limit: int
     )
 
 
+def _review_missing_literal_list(
+    review: ProposedUpdateReview | None,
+    *,
+    path: str | None = None,
+    limit: int = 6,
+) -> list[str]:
+    if review is None:
+        return []
+    normalized_path = str(path or "").strip()
+    literals: list[str] = []
+    for issue in getattr(review, "blocking_issues", [])[:6]:
+        literal_match = re.match(
+            r"^The exact requested literal is missing from (?P<path>[^:]+): (?P<literal>.+)$",
+            str(issue or "").strip(),
+        )
+        if literal_match is None:
+            continue
+        issue_path = str(literal_match.group("path") or "").strip()
+        if normalized_path and issue_path and issue_path != normalized_path:
+            continue
+        literal = str(literal_match.group("literal") or "").strip()
+        if not literal or literal in literals:
+            continue
+        literals.append(literal)
+        if len(literals) >= limit:
+            break
+    return literals
+
+
+def _exact_source_literal_checklist(
+    file_focus: dict[str, object],
+    *,
+    path: str,
+    review_feedback: ProposedUpdateReview | None = None,
+    limit: int = 6,
+) -> str:
+    source_literals: list[str] = []
+    for item in file_focus.get("literal_constraints", [])[:8]:
+        literal = _trim_text(str(item or "").strip(), 80)
+        if not literal or literal in source_literals:
+            continue
+        source_literals.append(literal)
+        if len(source_literals) >= limit:
+            break
+    missing_literals = _review_missing_literal_list(review_feedback, path=path, limit=limit)
+    if not source_literals and not missing_literals:
+        return ""
+
+    ordered_literals = list(source_literals)
+    for literal in missing_literals:
+        if literal not in ordered_literals:
+            ordered_literals.append(literal)
+    suffix = Path(str(path or "").strip()).suffix.lower()
+    identifier_like_literals = [
+        literal
+        for literal in ordered_literals
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", literal)
+    ]
+
+    lines = ["Exact source literal checklist for this file:"]
+    if ordered_literals:
+        lines.append(
+            "- Include each exact literal verbatim somewhere in this file: "
+            + " | ".join(f"`{literal}`" for literal in ordered_literals[:limit])
+        )
+    if missing_literals:
+        lines.append(
+            "- Missing from the rejected draft and must be added now: "
+            + " | ".join(f"`{literal}`" for literal in missing_literals[:limit])
+        )
+    lines.append(
+        "- If any literal from this checklist is still missing, the draft will be rejected again before write."
+    )
+    lines.append(
+        "- Satisfy these literals in real source syntax for this file, not only in comments, prose, TODOs, placeholder text, or companion files."
+    )
+    if identifier_like_literals and suffix in {".html", ".htm", ".xhtml"}:
+        lines.append(
+            "- For HTML, identifier-style literals should appear as real markup hooks such as id/class/data-* attributes or matching structural hooks, not as visible body copy."
+        )
+    elif identifier_like_literals and suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        lines.append(
+            "- For JS/TS, identifier-style literals should appear in real DOM wiring, selector usage, state keys, or source logic, not only in comments or sample strings."
+        )
+    elif identifier_like_literals and suffix in {".css", ".scss", ".sass", ".less"}:
+        lines.append(
+            "- For CSS, identifier-style literals should appear in real selectors or state hooks, not only in comments or sample prose."
+        )
+    return "\n".join(lines)
+
+
 def _file_creation_completeness_instruction(file_focus: dict[str, object]) -> str:
     requirements = [
         str(item or "").strip()
@@ -4259,14 +4367,7 @@ def _direct_review_corrections(review: ProposedUpdateReview) -> str:
         lines.append(
             f"- Either import or otherwise bind '{undefined_symbol}' before its current use, or remove that failing use if it is unnecessary."
         )
-    for issue in review.blocking_issues[:2]:
-        literal_match = re.match(
-            r"^The exact requested literal is missing from (?P<path>[^:]+): (?P<literal>.+)$",
-            str(issue or "").strip(),
-        )
-        if not literal_match:
-            continue
-        literal = str(literal_match.group("literal") or "").strip()
+    for literal in _review_missing_literal_list(review, limit=2):
         if not literal:
             continue
         lines.append(
