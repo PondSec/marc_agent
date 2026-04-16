@@ -703,6 +703,19 @@ def generate_content_prompt(
             targeted_context={},
         )
         if current_content is None:
+            use_focused_create_prompt = compact_large_request or len(route.entities.target_paths or []) >= 2
+            if use_focused_create_prompt:
+                return _focused_create_prompt(
+                    route,
+                    session,
+                    path=path,
+                    request_text=request_text,
+                    file_focus=file_focus,
+                    compact_file_focus=compact_file_focus,
+                    request_digest=request_digest if include_request_digest else None,
+                    explicit_constraints=explicit_constraints,
+                    web_bundle_contract=web_bundle_contract,
+                )
             sections = [
                 "Produce the full file content for exactly one file.",
                 f"Target path: {path}",
@@ -974,6 +987,52 @@ def generate_content_prompt(
         )
     else:
         sections.append("Return the full new file content only. No markdown fences. No explanation.")
+    return "\n\n".join(sections)
+
+
+def _focused_create_prompt(
+    route: RouterOutput,
+    session: SessionState,
+    *,
+    path: str,
+    request_text: str,
+    file_focus: dict[str, object],
+    compact_file_focus: dict[str, object],
+    request_digest: dict[str, object] | None,
+    explicit_constraints: str,
+    web_bundle_contract: str,
+) -> str:
+    sections = [
+        "Produce the full file content for exactly one file.",
+        f"Target path: {path}",
+        f"Latest user request: {_trim_balanced_text(request_text, GENERATION_REQUEST_EXCERPT_CHAR_BUDGET)}",
+        f"Generation brief: {json.dumps(_compact_generation_brief(route, session, path=path), ensure_ascii=False)}",
+        f"File-scoped focus: {json.dumps(compact_file_focus, ensure_ascii=False)}",
+        _single_file_boundary_instruction(path, route.entities.target_paths),
+    ]
+    if request_digest:
+        sections.append(f"User request digest: {json.dumps(request_digest, ensure_ascii=False)}")
+    if explicit_constraints != "none":
+        sections.append(f"Explicit constraints: {explicit_constraints}")
+    file_requirement_summary = _file_local_requirement_summary(file_focus)
+    if file_requirement_summary:
+        sections.append(file_requirement_summary)
+    grounding_instruction = _user_facing_copy_grounding_instruction(path, route)
+    if grounding_instruction:
+        sections.append(grounding_instruction)
+    related_targets = [item for item in route.entities.target_paths if item and item != path][:4]
+    if related_targets:
+        sections.append(
+            f"Out-of-scope companion files for this step: {_format_list(related_targets)}. "
+            "Keep shared hooks stable, but do not include their content or rely on future placeholder cleanup."
+        )
+    if web_bundle_contract:
+        sections.append(web_bundle_contract)
+    file_creation_instruction = _file_creation_completeness_instruction(file_focus)
+    if file_creation_instruction:
+        sections.append(file_creation_instruction)
+    sections.append("Create the file from scratch. Return the full new file content only.")
+    sections.append("Do not add markdown fences or explanations.")
     return "\n\n".join(sections)
 
 

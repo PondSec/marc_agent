@@ -31982,6 +31982,188 @@ def test_compact_create_continuation_prompt_stays_file_focused_for_partial_retri
     assert "Diagnostic context:" not in continuation_prompt
 
 
+def test_generate_content_prompt_uses_focused_compact_create_prompt_for_large_multi_file_create(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen und eine Suche enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path).model_copy(
+            update={
+                "important_files": ["index.html", "styles.css", "script.js"],
+                "focus_files": ["index.html", "styles.css", "script.js"],
+                "entrypoints": ["index.html", "script.js"],
+                "language_counts": {"html": 1, "css": 1, "javascript": 1},
+                "project_labels": ["frontend", "website"],
+                "repo_summary": "Empty frontend workspace for a coordinated HTML/CSS/JS bundle.",
+            }
+        ),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    prompt = generate_content_prompt(
+        session.router_result,
+        session,
+        path="script.js",
+        current_content=None,
+        mode="compact",
+    )
+
+    assert len(prompt) < 5_400
+    assert "Memory context:" not in prompt
+    assert "Related file hints:" not in prompt
+    assert "File-scoped focus:" in prompt
+    assert "Shared web bundle contract:" in prompt
+    assert "Out-of-scope companion files for this step:" in prompt
+
+
+def test_pre_write_create_review_rejects_placeholder_html_bundle_scaffold_even_when_length_passes(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll professionell wirken, mehrere Autos zeigen und eine Suche enthalten."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="index.html",
+        proposed_content=(
+            "<!DOCTYPE html>\n"
+            "<html lang=\"de\">\n"
+            "<head>\n"
+            "    <meta charset=\"UTF-8\">\n"
+            "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+            "    <title>Autoverleih</title>\n"
+            "    <link rel=\"stylesheet\" href=\"styles.css\">\n"
+            "</head>\n"
+            "<body>\n"
+            "    <header>\n"
+            "        <h1>Autoverleih</h1>\n"
+            "        <input type=\"text\" id=\"searchInput\" placeholder=\"Suche nach Marke oder Modell...\">\n"
+            "    </header>\n"
+            "    <main>\n"
+            "        <section class=\"car-cards\">\n"
+            "            <!-- Car Card Template -->\n"
+            "            <article class=\"car-card\">\n"
+            "                <img src=\"placeholder.jpg\" alt=\"Auto\">\n"
+            "                <h2>Marke: Model</h2>\n"
+            "                <p>Baujahr: Jahr</p>\n"
+            "                <p>Leistung: PS</p>\n"
+            "                <p>Motor: Motorart</p>\n"
+            "                <p>Kraftstoff: Kraftstofftyp</p>\n"
+            "                <p>Preis: Preis</p>\n"
+            "                <p>Beschreibung: Beschreibung des Autos</p>\n"
+            "            </article>\n"
+            "            <!-- Repeat the above article for each car -->\n"
+            "        </section>\n"
+            "    </main>\n"
+            "    <script src=\"script.js\"></script>\n"
+            "</body>\n"
+            "</html>\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "placeholder" in review.summary.lower() or "scaffold" in review.summary.lower()
+    assert any("placeholder" in issue.lower() or "repeat the above" in issue.lower() for issue in review.blocking_issues)
+
+
+def test_pre_write_create_review_rejects_css_without_responsive_rules_when_requested(tmp_path):
+    planner = Planner(ScriptedLLM(), "")
+    session = SessionState(
+        task=(
+            "Erstelle in diesem leeren Workspace eine komplette moderne Auto-Website mit index.html, styles.css und script.js. "
+            "Die Website soll responsive sein und professionell wirken."
+        ),
+        workspace_root=str(tmp_path),
+        workspace_snapshot=empty_snapshot(tmp_path),
+    )
+    payload = route_payload(
+        intent="create",
+        action_plan=[{"step": 1, "action": "create_artifact", "reason": "Create the requested website bundle."}],
+        target_paths=["index.html", "styles.css", "script.js"],
+        target_name="index.html",
+        requested_outcome="Create the requested web bundle.",
+    )
+    commit_task_state_and_route(planner, session, payload)
+
+    review = planner._pre_write_create_review(
+        session.router_result,
+        session,
+        path="styles.css",
+        proposed_content=(
+            "body {\n"
+            "    font-family: 'Roboto', sans-serif;\n"
+            "    margin: 0;\n"
+            "    padding: 0;\n"
+            "    background-color: #f4f4f9;\n"
+            "    color: #333;\n"
+            "}\n\n"
+            "header {\n"
+            "    background-color: #28a745;\n"
+            "    color: #fff;\n"
+            "    padding: 1rem 2rem;\n"
+            "    text-align: center;\n"
+            "    width: 100%;\n"
+            "}\n\n"
+            ".container {\n"
+            "    max-width: 1200px;\n"
+            "    margin: 0 auto;\n"
+            "    padding: 2rem;\n"
+            "}\n\n"
+            ".car-card {\n"
+            "    border: 1px solid #ddd;\n"
+            "    border-radius: 4px;\n"
+            "    overflow: hidden;\n"
+            "    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);\n"
+            "    margin-bottom: 1rem;\n"
+            "}\n\n"
+            ".car-card img {\n"
+            "    width: 100%;\n"
+            "    height: auto;\n"
+            "}\n\n"
+            ".car-card .btn:hover {\n"
+            "    background-color: #218838;\n"
+            "}\n\n"
+            "footer {\n"
+            "    background-color: #343a40;\n"
+            "    color: #fff;\n"
+            "    text-align: center;\n"
+            "    padding: 1rem 0;\n"
+            "    position: fixed;\n"
+            "    bottom: 0;\n"
+            "    width: 100%;\n"
+            "}\n"
+        ),
+    )
+
+    assert review.safe_to_write is False
+    assert "responsive" in review.summary.lower()
+    assert any("responsive" in issue.lower() for issue in review.blocking_issues)
+
+
 def test_planner_structured_analysis_keeps_answer_sources_and_intro_localized(tmp_path):
     payload = route_payload(
         intent="inspect",

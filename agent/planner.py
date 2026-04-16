@@ -13486,6 +13486,20 @@ class Planner:
                 path=path,
                 proposed_content=proposed_content,
             )
+        if review is None:
+            review = self._create_placeholder_scaffold_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
+        if review is None:
+            review = self._create_missing_responsive_design_review(
+                route,
+                session,
+                path=path,
+                proposed_content=proposed_content,
+            )
         if review is not None:
             return review
         return ProposedUpdateReview(
@@ -13611,6 +13625,101 @@ class Planner:
             ],
             preservation_risks=[],
             repair_hints=repair_hints,
+        )
+
+    def _create_placeholder_scaffold_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        if self._starter_scope_requested(route, session, path=path):
+            return None
+        suffix = Path(path).suffix.lower()
+        if suffix not in {".html", ".htm", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx"}:
+            return None
+        lowered = str(proposed_content or "").lower()
+        scaffold_markers = (
+            "placeholder",
+            "repeat the above",
+            "todo",
+            "lorem ipsum",
+            "sample text",
+            "your text here",
+            "replace this",
+            "template -->",
+            "starter scaffold",
+        )
+        hits = [marker for marker in scaffold_markers if marker in lowered]
+        if not hits:
+            return None
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed new file still contains placeholder or scaffolding markers instead of concrete shipped content.",
+            confidence=0.88,
+            blocking_issues=[
+                (
+                    f"{path} still includes unresolved placeholder markers such as {', '.join(sorted(set(hits[:3])))}."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Replace placeholder text, template comments, and repeat-later notes with concrete shipped content or real dynamic hooks.",
+                "Do not leave future-manual-expansion instructions inside the generated file.",
+            ],
+        )
+
+    def _create_missing_responsive_design_review(
+        self,
+        route: RouterOutput,
+        session: SessionState,
+        *,
+        path: str,
+        proposed_content: str,
+    ) -> ProposedUpdateReview | None:
+        suffix = Path(path).suffix.lower()
+        if suffix not in {".css", ".scss", ".sass", ".less"}:
+            return None
+        request_text = "\n".join(
+            part
+            for part in [
+                str(session.task or "").strip(),
+                str(getattr(session.task_state, "latest_user_turn", "") or "").strip(),
+                " ".join(str(item or "").strip() for item in getattr(session.task_state, "request_requirements", []) or []),
+            ]
+            if part
+        ).lower()
+        if not any(marker in request_text for marker in ("responsive", "mobil", "mobile", "viewport")):
+            return None
+        lowered = str(proposed_content or "").lower()
+        responsive_markers = (
+            "@media",
+            "minmax(",
+            "clamp(",
+            "auto-fit",
+            "auto-fill",
+            "flex-wrap",
+            "width: min(",
+            "width:min(",
+        )
+        if any(marker in lowered for marker in responsive_markers):
+            return None
+        return ProposedUpdateReview(
+            safe_to_write=False,
+            summary="The proposed stylesheet still misses an explicit responsive layout strategy required by the request.",
+            confidence=0.85,
+            blocking_issues=[
+                (
+                    f"{path} does not show responsive rules such as media-query or adaptive layout behavior even though the request explicitly requires a responsive UI."
+                )
+            ],
+            preservation_risks=[],
+            repair_hints=[
+                "Add responsive layout behavior now, for example with media queries or adaptive grid/flex rules, instead of leaving the stylesheet desktop-only.",
+                "Keep the responsive rules tied to the real component structure that the companion HTML/JS files use.",
+            ],
         )
 
     def _local_pre_write_update_review(
